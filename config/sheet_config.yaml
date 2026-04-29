@@ -1,0 +1,465 @@
+reports_dir: reports
+output_dir: output
+
+supported_sheets:
+  "5. Material Cut List Price":
+    header_row: 8
+    aliases:
+      product_part_name:
+        - Machine Piece Description
+        - Product Part Name
+        - Product/Part Name
+        - Part Name
+        - Part
+        - Product Part
+      material_to_cut:
+        - Material to Cut
+        - Material
+        - Cut Material
+        - Material Name
+      qty:
+        - Quantity Nos
+        - Qty
+        - QTY
+        - Quantity
+        - Nos
+      dimension_to_cut_inches:
+        - Dimension to Cut (inches)
+      dimension_to_cut_mm:
+        - Dimension to Cut (mm)
+      total_material_used_inches:
+        - Total Material Used in Inches
+      kg_per_mtr:
+        - KG per Mtr
+      grams_per_inch:
+        - Grm per inch
+      total_grams:
+        - Total Grams
+      rate:
+        - Rate per KG
+        - Rate
+        - Unit Rate
+        - Price
+      cut_piece_cost:
+        - Cost of Cut Piece in Rs
+      transport_rate:
+        - Transport Rate
+      unloading_rate:
+        - Unloading Rate
+      fabrication_rate:
+        - Fabrication Rate
+      amount:
+        - Grand Total Cost of Piece
+        - Amount
+        - Total
+        - Value
+      in_use:
+        - In Use
+        - Use
+        - Active
+        - Status
+      optional_item_group_1:
+        - Optional Item Group 1
+        - Option Item Group 1
+        - Option Item group 1
+        - Option Group 1
+        - OptionGroup1
+      remarks:
+        - Remarks
+        - Remark
+      cr_log:
+        - CR Log
+        - CRLog
+        - Change Request Log
+    part_name_fields:
+      - product_part_name
+    inactive_rules:
+      blank_rows: true
+      required_any_fields:
+        - product_part_name
+        - material_to_cut
+      qty_fields:
+        - qty
+      inactive_flag_fields:
+        - in_use
+      inactive_values:
+        - "no"
+        - "n"
+        - "false"
+        - "0"
+        - "inactive"
+        - "not in use"
+        - "unused"
+        - "delete"
+    costing:
+      mode: blank
+      fields:
+        - rate
+        - cut_piece_cost
+        - transport_rate
+        - unloading_rate
+        - fabrication_rate
+        - amount
+    grist:
+      enabled: true
+      table_id: ProductPartMSList
+      key_fields:
+        - material_to_cut
+        - dimension_to_cut_mm
+        - qty
+        - optional_item_group_1
+      allow_blank_key_fields:
+        - optional_item_group_1
+      compare_fields: []
+      report_fields:
+        - product_part_name
+        - optional_item_group_1
+        - cr_log
+        - remarks
+        - cr_log
+      excluded_record_values:
+        Part_Status:
+          - Delete
+      material_field: material_to_cut
+      comparable_material_field: ODSComparableMaterial
+      tally_field: TallyWithODS
+      ods_to_grist_fields:
+        material_to_cut: MaterialToCut
+        dimension_to_cut_mm: Length_mm
+        qty: QtyNos
+        product_part_name: ProductPartName_ProductPartName
+        optional_item_group_1: OptionGroup1_TEMP
+        remarks: Remarks
+        # TODO: Confirm whether ProductPartMSList has a CR Log equivalent.
+        cr_log: CRLog
+
+  "Tool Shop Items":
+    header_row: 9
+    aliases:
+      product_part_name:
+        - Machine Piece Description
+        - Product Part Name
+        - Product/Part Name
+        - Part Name
+        - Item Part Name
+        - Part
+      item_name:
+        - Item Name
+        - Tool Item
+        - Material Used
+        - Description
+      material_to_cut:
+        - Material Used
+        - Material to Cut
+        - Material
+        - Cut Material
+      dimension_to_cut_mm:
+        - Dimension in mm
+        - Dimension to Cut (mm)
+        - Length_mm
+        - Length mm
+      qty:
+        - Qty
+        - QTY
+        - Quantity
+        - Nos
+      rate:
+        - Rate
+        - Unit Rate
+        - Price
+      amount:
+        - Grand Total Cost of Piece Rs.
+        - Total Amount (Rs.)
+        - Amount
+        - Total
+        - Value
+      in_use:
+        - In Use
+        - Use
+        - Active
+        - Status
+      optional_item_group_1:
+        - Optional Item Group 1
+        - Option Item Group 1
+        - Option Item group 1
+        - OptionGroup1
+        - Option Group 1
+      toolshop_part_name:
+        - Remarks
+        - ToolShop Part Name
+        - Tool Shop Part Name
+      job_remarks:
+        - Remarks on Job for this part
+        - Job Remarks
+        - Job_Remarks
+      cr_log:
+        - CR Log
+        - CRLog
+        - Change Request Log
+    part_name_fields:
+      - product_part_name
+    inactive_rules:
+      blank_rows: true
+      required_any_fields:
+        - product_part_name
+        - material_to_cut
+      qty_fields:
+        - qty
+      inactive_flag_fields:
+        - in_use
+    costing:
+      mode: blank
+      fields:
+        - amount
+    grist:
+      enabled: true
+      table_id: ProductPartToolShopList
+      key_fields:
+        - material_to_cut
+        - dimension_to_cut_mm
+        - qty
+        - optional_item_group_1
+      allow_blank_key_fields:
+        - optional_item_group_1
+      compare_fields: []
+      report_fields:
+        - product_part_name
+        - toolshop_part_name
+        - job_remarks
+        - optional_item_group_1
+        - cr_log
+      excluded_record_values:
+        Part_Status:
+          - Delete
+      material_field: material_to_cut
+      comparable_material_field: ODSComparableMaterial
+      tally_field: TallyWithODS
+      ods_to_grist_fields:
+        material_to_cut: MaterialToCut
+        dimension_to_cut_mm: Length_mm
+        qty: QtyNos
+        optional_item_group_1: OptionGroup1
+        product_part_name: ProductPartName_ProductPartName
+        toolshop_part_name: ToolShop_Part_Name
+        job_remarks: Job_Remarks
+        # TODO: Confirm whether ProductPartToolShopList has a CR Log equivalent.
+        cr_log: CRLog
+
+  "Stores and Consumables List":
+    header_row: 6
+    aliases:
+      product_part_name:
+        - Item
+        - Issue Slip Desc
+        - Product Part Name
+        - Product/Part Name
+        - Part Name
+        - Part
+      item_name:
+        - Item Name
+        - Item Description as per SparesDB
+        - Item Code
+        - Consumable
+        - Stores Item
+        - Description
+      qty:
+        - Qty
+        - QTY
+        - Quantity
+        - Nos
+      rate:
+        - Rate as per Master Price List Per Nos
+        - Rate
+        - Unit Rate
+        - Price
+      amount:
+        - Grand Total Amount
+        - Grand Total Amount 
+        - Total Amount (Rs.)
+        - Amount
+        - Total
+        - Value
+      in_use:
+        - In Use
+        - Use
+        - Active
+        - Status
+      optional_item_group_1:
+        - Optional Item Group 1
+        - Option Item Group 1
+        - Option Item group 1
+        - Option Group 1
+        - OptionGroup1
+    part_name_fields:
+      - product_part_name
+    inactive_rules:
+      blank_rows: true
+      required_any_fields:
+        - product_part_name
+        - item_name
+      qty_fields:
+        - qty
+      inactive_flag_fields:
+        - in_use
+    costing:
+      mode: blank
+      fields:
+        - rate
+        - amount
+
+  "CNC Cut List":
+    header_row: 8
+    aliases:
+      product_part_name:
+        - Plate Part to Cut
+        - Product Part Name
+        - Product/Part Name
+        - Part Name
+        - Part
+      material_to_cut:
+        - Material used
+        - Material to Cut
+        - Material
+        - Cut Material
+      qty:
+        - Qty Of Part Used
+        - Qty
+        - QTY
+        - Quantity
+        - Nos
+      length:
+        - Length
+        - Len
+        - L
+      width:
+        - Width
+        - W
+      thickness:
+        - Thickness
+        - Thick
+        - Thk
+      rate:
+        - Rate of Material Used Per Kg
+        - Rate
+        - Unit Rate
+        - Price
+      amount:
+        - Grand Total of Part Amount Rs.
+        - Amount of Material Rs.
+        - Amount
+        - Total
+        - Value
+      in_use:
+        - In Use
+        - Use
+        - Active
+        - Status
+      optional_item_group_1:
+        - Optional Item Group 1
+        - Option Item Group 1
+        - Option Item group 1
+        - Option Group 1
+        - OptionGroup1
+    part_name_fields:
+      - product_part_name
+    inactive_rules:
+      blank_rows: true
+      required_any_fields:
+        - product_part_name
+        - material_to_cut
+      qty_fields:
+        - qty
+      inactive_flag_fields:
+        - in_use
+    costing:
+      mode: blank
+      fields:
+        - rate
+        - amount
+    grist:
+      enabled: true
+      table_id: ProductPartCNCList
+      product_part_field: ProductPartName_ProductPartName2
+      key_fields:
+        - product_part_name
+        - material_to_cut
+        - qty
+        - optional_item_group_1
+      allow_blank_key_fields:
+        - optional_item_group_1
+      compare_fields: []
+      report_fields:
+        - product_part_name
+        - optional_item_group_1
+      excluded_record_values:
+        Part_Status:
+          - Delete
+      material_field: material_to_cut
+      comparable_material_field: ODSComparableMaterial
+      tally_field: TallyWithODS
+      ods_to_grist_fields:
+        product_part_name: CNC_Part_File_Name_CNCPartName
+        material_to_cut: MaterialToCut
+        qty: CNC_Part_File_Name_Qty_Of_Part_Used
+        optional_item_group_1: CNC_Part_File_Name_Optional_Item_Group_1
+
+  "Labour - Paint - Packing":
+    header_row: 6
+    aliases:
+      product_part_name:
+        - Paint Name
+        - Product Part Name
+        - Product/Part Name
+        - Part Name
+        - Part
+      activity:
+        - Activity
+        - Paint Description
+        - Paint Code
+        - Process
+        - Labour/Paint/Packing
+        - Description
+      qty:
+        - Qty Used Litres
+        - Qty
+        - QTY
+        - Quantity
+        - Hours
+        - Nos
+      rate:
+        - Price Per Litre
+        - Rate
+        - Unit Rate
+        - Price
+      amount:
+        - Total Amount of Paint Used Rs.
+        - Amount
+        - Total
+        - Value
+      in_use:
+        - In Use
+        - Use
+        - Active
+        - Status
+      optional_item_group_1:
+        - Optional Item Group 1
+        - Option Item Group 1
+        - Option Item group 1
+        - Option Group 1
+        - OptionGroup1
+    part_name_fields:
+      - product_part_name
+    inactive_rules:
+      blank_rows: true
+      required_any_fields:
+        - product_part_name
+        - activity
+      qty_fields:
+        - qty
+      inactive_flag_fields:
+        - in_use
+    costing:
+      mode: blank
+      fields:
+        - rate
+        - amount

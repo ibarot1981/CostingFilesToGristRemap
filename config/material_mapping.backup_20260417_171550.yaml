@@ -1,0 +1,1706 @@
+source: C:\Irshad\Safari\DRWGD\Products Costing\Template DB\MaterialCostDB.ods
+grist_table: MasterMaterial
+grist_value_field: MasterMaterial
+grist_alternate_field: AlternateSize
+materials:
+  Angles 20 x 20 x 3: MS-Angles 20 x 20 x 3
+  Angles 25 x 25 x 3: MS-Angles 25 x 25 x 3
+  Angles 30 x 30 x 3: MS-Angles 30 x 30 x 3
+  Angles 35 x 35 x 5: MS-Angles 35 x 35 x 5
+  Angles 40 x 40 x 6: MS-Angles 40 x 40 x 6
+  Angles 50 x 50 x 5: MS-Angles 50 x 50 x 5
+  Angles 50 x 50 x 6: MS-Angles 50 x 50 x 6
+  Angles 65 x 65 x 6: MS-Angles 65 x 65 x 6
+  Angles 65 x 65 x 8: MS-Angles 65 x 65 x 8
+  Angles 75 x 75 x 6: MS-Angles 75 x 75 x 6
+  Box Pipe 100 x 50 x 5: MS-Square Pipe 100 x 50 x 5
+  Box Pipe 120 X 45 x 5: MS-Square Pipe 120 x 45 x 5
+  Box Pipe 120 X 60 x 5: MS-Square Pipe 120 x 60 x 5
+  Box Pipe 180 X 80 x 5: MS-Square Pipe 180 x 80 x 5
+  Box Pipe 200 x 100 x 5: MS-Square Pipe 200 x 100 x 5
+  Box Pipe 25 x 25 x 3: MS-Square Pipe 25 x 25 x 3
+  Box Pipe 50 x 25 x 2: MS-Square Pipe 50 x 25 x 2
+  Box Pipe 50 x 25 x 3: MS-Square Pipe 50 x 25 x 3.2
+  Box Pipe 50 x 50 x 3: MS-Square Pipe 50 x 50 x 3.2
+  Box Pipe 50 x 50 x 5: MS-Square Pipe 50 x 50 x 5
+  Box Pipe 60 x 40 x 3: MS-Square Pipe 60 x 40 x 3
+  Box Pipe 70 x 70 x 5: MS-Square Pipe 70 x 70 x 5
+  Box Pipe 75 x 40 x 5: MS-Square Pipe 75 x 40 x 5
+  Box Pipe 75 x 75 x 3: MS-Square Pipe 75 x 75 x 3
+  Box Pipe 80 x 40 x 3: MS-Square Pipe 80 x 40 x 3
+  Box Pipe 80 x 40 x5: MS-Square Pipe 80 x 40 x 5
+  Box Pipe 90 x90 x 3: MS-Square Pipe 90 x 90 x 3
+  Bright Bar 10 mm f: Bright-Round Bar 10 mm
+  Bright Bar 12 mm f: Bright-Round Bar 12 mm
+  Bright Bar 16 mm f: Bright-Round Bar 16 mm
+  Bright Bar 20 mm f: Bright-Round Bar 20 mm
+  Bright Bar 25 mm f: Bright-Round Bar 25 mm
+  Bright Bar 25.4 mm f: Bright-Round Bar 25.4 mm
+  Bright Bar 28 mm f: Bright-Round Bar 28 mm
+  Bright Bar 31.7 mm f: Bright-Round Bar 31.7 mm
+  Bright Bar 32 mm f: Bright-Round Bar 32 mm
+  Bright Bar 38 mm f: Bright-Round Bar 38 mm
+  Bright Bar 38.1 mm f: Bright-Round Bar 38.1 mm
+  Bright Bar 44.4 mm f: Bright-Round Bar 44.4 mm
+  Bright Bar 45 mm f: Bright-Round Bar 45 mm
+  Bright Bar 50.80 mm f: Bright-Round Bar 50.80 mm
+  Bright Bar 60 mm f: Bright-Round Bar 60 mm
+  Bright Bar 8 mm f: Bright-Round Bar 8 mm
+  Bright Square Bar 10 x 10 mm: Bright-Square Bar 10 x 10 mm
+  Bright Square Bar 12 x 12 mm: Bright-Square Bar 12 x 12 mm
+  Bright Square Bar 16 x 12 mm: Bright-Square Bar 16 x 12 mm
+  Bright Square Bar 20 x 12 mm: Bright-Square Bar 20 x 12 mm
+  Bright Square Bar 6 x 6 mm: Bright-Square Bar 6 x 6 mm
+  Bright Square Bar 8 x 8 mm: Bright-Square Bar 8 x 8 mm
+  Channels 100 X 50: MS-Channels 100 x 50
+  Channels 125 x 65 (5" x 2 1/2"): MS-Channels 125 x 65
+  Channels 150 x 75 (6 " x 3"): MS-Channels 150 x 75
+  Channels 75 x 40 (3" x 1 1/2"): MS-Channels 75 x 40
+  D2 Square Bar 16 x 16 mm: D2-Square Bar 16 x 16 mm
+  D2 Square Bar 20 x 20 mm: D2-Square Bar 20 x 20 mm
+  D2 Square Bar 40 x 40 mm: D2-Square Bar 40 x 40 mm
+  EN - 8 125 mm f: EN-8-Round Bar 125 mm
+  EN - 8 56 mm f: EN-8-Round Bar 56 mm
+  EN - 8 65 mm f: EN-8-Round Bar 65 mm
+  EN – 31 Flats 32 x 40: EN-31-Flats 32 x 40
+  EN – 31 Flats 80 x 6: EN-31-Flats 80 x 6 mm
+  EN – 353 65 mm f: EN-353-Round Bar 65 mm
+  EN – 353 Flats 40 x 10: EN-353-Flats 40 x 10
+  EN – 8 12 mm f: EN-8-Round Bar 12 mm
+  EN – 8 150 mm f: EN-8-Round Bar 150 mm
+  EN – 8 170 mm f: EN-8-Round Bar 170 mm
+  EN – 8 35 mm f: EN-8-Round Bar 35 mm
+  EN – 8 40 mm f: EN-8-Round Bar 40 mm
+  EN – 8 45 mm f: EN-8-Round Bar 45 mm
+  EN – 8 50 mm f: EN-8-Round Bar 50 mm
+  EN – 8 Flats 40 x 10: EN-8-Flats 40 x 10
+  EN – 8 Flats 80 x 6: EN-8-Flats 80 x 6
+  EN – 8 Square Bar 32 x 32 mm: EN-8-Square Bar 32 x 32 mm
+  EN – 8 Square Bar 45 x 45 mm: EN-8-Square Bar 45 x 45 mm
+  EN-19 100 mm f: EN-19-Round Bar 100 mm
+  EN-19 120 mm f: EN-19-Round Bar 120 mm
+  EN-19 125 mm f: EN-19-Round Bar 125 mm
+  EN-19 25 mm f: EN-19-Round Bar 25 mm
+  EN-19 40 mm f: EN-19-Round Bar 40 mm
+  EN-19 45 mm f: EN-19-Round Bar 45 mm
+  EN-19 50 mm f: EN-19-Round Bar 50 mm
+  EN-19 55 mm f: EN-19-Round Bar 55 mm
+  EN-19 56 mm f: EN-19-Round Bar 56 mm
+  EN-19 65 mm f: EN-19-Round Bar 65 mm
+  EN-19 75 mm f: EN-19-Round Bar 75 mm
+  EN-19 85 mm f: EN-19-Round Bar 85 mm
+  EN-31 80 mm f: EN-31-Round Bar 80 mm
+  EN-9 45 mm f: EN-9-Round Bar 45 mm
+  Flats 100 x 10: MS-Flats 100 x 10
+  Flats 100 x 12: MS-Flats 100 x 12
+  Flats 100 x 16 (4" x 5/8"): MS-Flats 100 x 16
+  Flats 100 x 20: MS-Flats 100 x 20
+  Flats 100 x 6: MS-Flats 100 x 6
+  Flats 125 x 10: MS-Flats 125 x 10
+  Flats 125 x 6: MS-Flats 125 x 6
+  Flats 125 x 8: MS-Flats 125 x 8
+  Flats 150 x 10: MS-Flats 150 x 10
+  Flats 150 x 8: MS-Flats 150 x 8
+  Flats 20 x 3: MS-Flats 20 x 3
+  Flats 20 x 5: MS-Flats 20 x 5
+  Flats 20 X 6: MS-Flats 20 x 6
+  Flats 25 x 10: MS-Flats 25 x 10
+  Flats 25 x 6: MS-Flats 25 x 6
+  Flats 32 X 6: MS-Flats 32 x 6
+  Flats 35 x 6: MS-Flats 35 x 6
+  Flats 40 x 10: MS-Flats 40 x 10
+  Flats 40 X 6: MS-Flats 40 x 6
+  Flats 50 X 10: MS-Flats 50 x 10
+  Flats 50 x 12: MS-Flats 50 x 12
+  Flats 50 x 16 (2" x 5/8"): MS-Flats 50 x 16
+  Flats 50 x 6: MS-Flats 50 x 6
+  Flats 63 x 12: MS-Flats 63 x 12
+  Flats 65 x 10: MS-Flats 65 x 10
+  Flats 65 x 12: MS-Flats 65 x 12
+  Flats 65 x 16: MS-Flats 65 x 16
+  Flats 65 x 20: MS-Flats 65 x 20
+  Flats 65 x 6: MS-Flats 65 x 6
+  Flats 65 X 8: MS-Flats 65 x 8
+  Flats 75 X 10: MS-Flats 75 x 10
+  Flats 75 x 25: MS-Flats 75 x 25
+  Flats 75 X 6: MS-Flats 75 x 6
+  Hex Bar Bright 32 mm f: Bright-Hex Bar 32 mm
+  Hex Bar Bright 40 mm f: Bright-Hex Bar 40 mm
+  Hex Bar Bright 50 mm  f: Bright-Hex Bar 50 mm
+  MS 'A' Class Pipe 25 mm (1"): MS-Round Pipe OD 33.5 mm x ID 28.1 mm
+  MS 'A' Class Pipe 32 mm f: MS-Round Pipe OD 41.90 mm x ID 36.7 mm
+  MS 'A' Class Pipe 38 mm f: MS-Round Pipe OD 47.80 mm x ID 42 mm
+  MS 'A' Class Pipe 82.5x 88.9 f x 3.18 mm: MS-Round Pipe OD 82.50 mm x ID 42 x 3.18 mm
+  MS 'A' Class Pipe 90 x 100 f x 5 mm: MS-Round Pipe OD 100 mm x ID 90 x 5 mm
+  MS 'B' Class Pipe 10 mm: MS-Round Pipe OD 16 mm x ID 11.5 mm
+  MS 'B' Class Pipe 15 mm (1/2"): MS-Round Pipe OD 21.5 mm x ID 16 mm
+  MS 'B' Class Pipe 20 mm (3/4"): MS-Round Pipe OD 27 mm x ID 21.50 mm
+  MS 'B' Class Pipe 25 mm (1"): MS-Round Pipe OD 33.30 mm x ID 26.80 mm
+  MS 'B' Class Pipe 32 mm (1.25"): MS-Round Pipe OD 42.5 mm x ID 36 mm
+  MS 'B' Class Pipe 38 mm (1.5"): MS-Round Pipe OD 48 mm x ID 42 mm
+  MS 'B' Class Pipe-Non Standard 32 mm (1.25"): MS-Round Pipe OD 42 mm x ID 36 mm
+  MS 'C' Class Pipe 32 mm (1.25"): MS-Round Pipe OD 42 mm x ID 34 mm
+  MS 'C' Class Pipe 8” f x 5 mm: MS-Round Pipe OD 220 mm x 210 mm
+  MS 'C' Class Pipe Heavy 125 mm (5"): MS-Round Pipe OD 139.5 mm x ID 129 mm
+  MS 'C' Class Pipe Heavy 150 mm (6"): MS-Round Pipe OD 165.5 mm x ID 155.5 mm
+  MS Pipe 100 mm f x 5mm: MS-Round Pipe OD 100 mm x ID 90 x 5 mm
+  MS Pipe 80 mm f x 20mm (80x40): MS-Round Pipe 80 mm x 20 mm
+  MS Pipe 90 mm f x 7.5mm: MS-Round Pipe OD 90 mm x ID 75 mm
+  MS Round Bar 10 mm f: MS-Round Bar 10 mm
+  MS Round Bar 100 mm f: MS-Round Bar 100 mm
+  MS Round Bar 12 mm f: MS-Round Bar 12 mm
+  MS Round Bar 125 mm f: MS-Round Bar 125 mm
+  MS Round Bar 150 mm f: MS-Round Bar 150 mm
+  MS Round Bar 16 mm f: MS-Round Bar 16 mm
+  MS Round Bar 170 mm f: MS-Round Bar 170 mm
+  MS Round Bar 180 mm f: MS-Round Bar 180 mm
+  MS Round Bar 20 mm f: MS-Round Bar 20 mm
+  MS Round Bar 25 mm f: MS-Round Bar 25 mm
+  MS Round Bar 28 mm f: MS-Round Bar 28 mm
+  MS Round Bar 38 mm f: MS-Round Bar 38 mm
+  MS Round Bar 42 mm f: MS-Round Bar 42 mm
+  MS Round Bar 45 mm f: MS-Round Bar 45 mm
+  MS Round Bar 50 mm f: MS-Round Bar 50 mm
+  MS Round Bar 56 mm f: MS-Round Bar 56 mm
+  MS Round Bar 6 mm f: MS-Round Bar 6 mm
+  MS Round Bar 63 mm f: MS-Round Bar 63 mm
+  MS Round Bar 75 mm f: MS-Round Bar 75 mm
+  MS Round Bar 8 mm f: MS-Round Bar 8 mm
+  MS Round Bar 80 mm f: MS-Round Bar 80 mm
+  MS Round Bar 90 mm f: MS-Round Bar 90 mm
+  MS Round Pipe  ID 12” Thickness 8mm: MS-Round Pipe ID 12" x 8 mm thick
+  MS Round Pipe 48 mm f x 4mm (48x40): MS-Round Pipe 48 mm x 4 mm
+  MS Round Pipe OD 60mm X ID 50mm: MS-Round Pipe OD 60 mm x ID 50 mm
+  MS Seamless Pipe 10 x 16 mm: MS-Round Seamless Pipe 10 x 16 mm
+  MS Seamless Pipe 100 x 112 mm: MS-Round Seamless Pipe 100 x 112 mm
+  MS Seamless Pipe 32 x 60 mm: MS-Round Seamless Pipe 32 x 60 mm
+  MS Square Bar 16 x 16 mm: MS-Square Bar 16 x 16 mm
+  MS Square Bar 20 x 20 mm: MS-Square Bar 20 x 20 mm
+  MS Square Bar 25 x 25 mm: MS-Square Bar 25 x 25 mm
+  MS Square Bar 32 x 32 mm: MS-Square Bar 32 x 32 mm
+  MS Square Bar 45 x 45 mm: MS-Square Bar 45 x 45 mm
+  MS Square Pipe 100 x 100 x 5 mm: MS-Square Pipe 100 x 100 x 5 mm
+  MS Square Pipe 25 x 25 x 2 mm: MS-Square Pipe 25 x 25 x 2 mm
+  MS Square Pipe 49.5 x 49.5 x 2.9 mm: MS-Square Pipe 49.5 x 49.5 x 2.9 mm
+  MS Square Pipe 63 x 33 x 2.6 mm: MS-Square Pipe 63 x 33 x 2.6 mm
+  MS Square Pipe 96 x 48 x 3 mm: MS-Square Pipe 96 x 48 x 3 mm
+  Plates 10 Guage (3.15 mm): MS-HR Sheet 3.15 mm
+  Plates 10 Guage (3.15 mm) Chequered: MS-HR Sheet Chequered 3.15 mm
+  Plates 10 mm: MS-HR Sheet 10 mm
+  Plates 12 Guage (2.50 mm): MS-HR Sheet 2.50 mm
+  Plates 12 mm: MS-HR Sheet 12 mm
+  Plates 14 Guage (2 mm): MS-HR Sheet 2 mm
+  Plates 16 guage (1.6 mm): MS-HR Sheet 1.6 mm
+  Plates 16 mm: MS-HR Sheet 16 mm
+  Plates 18 guage (1.2 mm): MS-HR Sheet 1.2 mm
+  Plates 20 guage (1 mm): MS-CR Sheet 1 mm
+  Plates 4 mm: MS-HR Sheet 4 mm
+  Plates 5 mm: MS-HR Sheet 5 mm
+  Plates 6 mm: MS-HR Sheet 6 mm
+  Plates 8 mm: MS-HR Sheet 8 mm
+  Round Plate 10" x 10 mm: MS-Round Plate 10" x 10 mm
+  Round Plate 10" x 12 mm: MS-Round Plate 10" x 12 mm
+  Round Plate 10" x 20 mm: MS-Round Plate 10" x 20 mm
+  Round Plate 11" x 25 mm: MS-Round Plate 11" x 25 mm
+  Round Plate 110 x 8 mm: MS-Round Plate 110 x 8 mm
+  Round Plate 12" x 20 mm: MS-Round Plate 12" x 20 mm
+  Round Plate 130mm x 10 mm: MS-Round Pipe 130 x 10 mm
+  Round Plate 130mm x 12 mm: MS-Round Plate 130 x 12 mm
+  Round Plate 135mm x 8 mm: MS-Round Plate 135 x 8 mm
+  Round Plate 13” x 8mm: MS-Round Plate 13" x 8 mm
+  Round Plate 16.5" x 12 mm: MS-Round Plate 16.5" x 12 mm
+  Round Plate 16.5" x 16 mm: MS-Round Plate 16.5" x 16 mm
+  Round Plate 160mm x 12 mm: MS-Round Plate 160 x 12 mm
+  Round Plate 160mm x 16 mm: MS-Round Plate 160 x 16 mm
+  Round Plate 160mm x 50mm: MS-Round Plate 160 x 50 mm
+  Round Plate 19" x 16 mm: MS-Round Plate 19" x 16 mm
+  Round Plate 20" x 10 mm: MS-Round Plate 20" x 10 mm
+  Round Plate 24” x 12 mm: MS-Round Plate 24" x 12 mm
+  Round Plate 280 x 8 mm: MS-Round Plate 280 x 8 mm
+  Round Plate 505mm x 8mm: MS-Round Plate 505 x 8 mm
+  Round Plate 6 1/2” x 12 mm: MS-Round Plate 6 1/2" x 12 mm
+  Round Plate 7" x 12 mm: MS-Round Plate 7" x 12 mm
+  Round Plate 7" x 20 mm: MS-Round Plate 7" x 20 mm
+  Round Plate 7" x 8 mm: MS-Round Plate 7" x 8 mm
+  Round Plate 72x 8 mm: MS-Round Plate 72 x 8 mm
+  Round Plate 8" x 20 mm: MS-Round Plate 8" x 20 mm
+  Round Plate 82 x 8 mm: MS-Round Plate 82 x 8 mm
+  Round Plate 85 x 8 mm: MS-Round Plate 85 x 8 mm
+  Round Plate OD 600 mm x 10 mm Thick: MS-Round Plate OD 600 mm x 10 mm thick
+  WPS Flats 25 X 10: WPS-Flats 25 x 10
+  WPS Flats 25 X 40: WPS-Flats 25 x 40
+  WPS Flats 40 x 10: WPS-Flats 40 x 10
+  WPS Flats 40 X 32: WPS-Flats 40 x 32
+  WPS Flats 50 X 10: WPS-Flats 50 x 10
+  WPS Flats 65X 20: WPS-Flats 65 x 20
+audit:
+  total_ods_unique_items: 277
+  matched: 230
+  unmapped_count: 47
+  ambiguous_count: 0
+  unmapped:
+  - MS 'B' Class Pipe 42 mm
+  - Box Pipe 40 x 40 x 5
+  - Alang Cut Piece York Patta
+  - Alang Cut Piece
+  - Alang Cut Piece 15mm – 20mm
+  - Alang Cut Piece 20mm – 25mm
+  - Alang Cut Piece 26mm – 39mm
+  - Alang Cut Piece 40mm
+  - Alang Cut Piece 41mm – 50mm
+  - CI Casting
+  - EN-8 Casting
+  - MS Casting
+  - PB2 Material Material
+  - BB42 Top Plate MS (851mm x 790mm)- 10mm Thick
+  - BB42 Centre Rotating Wheel MS f 370mm & 65mm Thick
+  - BB42 Sliding Bar MS 80 x50 x 550
+  - BB42 Sliding Bracket MS Block
+  - BB42 Knob Bracket EN-8 Block
+  - BC42 MS 25mm Plate 534mm X 200mm
+  - BC42 MS 20mm Plate 440mm X 200mm
+  - BC42 MS 20mm Plate 600mm X 200mm
+  - BC42 MS 20mm Plate 610mm X 200mm
+  - BC42 MS 20mm Plate 137mm X 350mm
+  - BC42 MS 20mm Plate Right Side Plate (620mm X 532mm)
+  - BC42 MS 20mm Plate Left Side Plate (975mm X 590mm)
+  - BC42 MS 20mm Plate Connecting Rod Guide Plate (195mm X 120mm)
+  - BC42 MS 10mm Plate Motor Stand (255mm X 240mm)
+  - BC42 MS 8mm Plate Connecting Rod Guide Block support  (250mm X 180mm) X 8mm Plate
+  - BC42 EN-8 Adjusting Bar
+  - BC42 MS 80mm Plate Arm Support (500mm X 195mm)
+  - BC42 MS 80mm Plate Die Block (200mm X 180mm)
+  - BC42 MS 60mm Plate Connecting Rod Guide Block (120mm X 80mm)
+  - BC42 CI Wheel
+  - BC42 Fanchri
+  - BB25 Top Plate MS (820mm x 580mm)- 10mm Thick
+  - JKM MS Block
+  - SGI Casting
+  - Max2k-Drum MS 360mm OD X 265mm ID X 45mm Thick
+  - Max2k & Max4k Roller MS 205mm OD X 70mm Thick
+  - Max2k Round Pipe MS 112mm OD X 83mm ID
+  - Teflon Rod 32mm
+  - MS Rachet for Wirerope Drum
+  - BB42 CI Wheel (5”)
+  - BC36 MS Die Block  (146mm X 176mm X 68mm Plate)
+  - BC36 Arm Support  (446mm X 127mm X 60mm Plate)
+  - BC36 Connecting Rod Guide Block  (120mm X 75mm X 55mm Plate)
+  - BC36 EN-8 Adjusting Hex Bar
+  ambiguous: []
+  matched_details:
+  - ods: Angles 20 x 20 x 3
+    grist: MS-Angles 20 x 20 x 3
+    grist_id: 1
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 25 x 25 x 3
+    grist: MS-Angles 25 x 25 x 3
+    grist_id: 2
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 30 x 30 x 3
+    grist: MS-Angles 30 x 30 x 3
+    grist_id: 3
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 35 x 35 x 5
+    grist: MS-Angles 35 x 35 x 5
+    grist_id: 4
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 40 x 40 x 6
+    grist: MS-Angles 40 x 40 x 6
+    grist_id: 5
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 50 x 50 x 5
+    grist: MS-Angles 50 x 50 x 5
+    grist_id: 6
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 50 x 50 x 6
+    grist: MS-Angles 50 x 50 x 6
+    grist_id: 7
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 65 x 65 x 6
+    grist: MS-Angles 65 x 65 x 6
+    grist_id: 8
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 65 x 65 x 8
+    grist: MS-Angles 65 x 65 x 8
+    grist_id: 9
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Angles 75 x 75 x 6
+    grist: MS-Angles 75 x 75 x 6
+    grist_id: 10
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Box Pipe 100 x 50 x 5
+    grist: MS-Square Pipe 100 x 50 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 120 X 45 x 5
+    grist: MS-Square Pipe 120 x 45 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 120 X 60 x 5
+    grist: MS-Square Pipe 120 x 60 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 180 X 80 x 5
+    grist: MS-Square Pipe 180 x 80 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 200 x 100 x 5
+    grist: MS-Square Pipe 200 x 100 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 25 x 25 x 3
+    grist: MS-Square Pipe 25 x 25 x 3
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 50 x 25 x 2
+    grist: MS-Square Pipe 50 x 25 x 2
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 50 x 25 x 3
+    grist: MS-Square Pipe 50 x 25 x 3.2
+    grist_id: 164
+    match: user_confirmed
+    alternate_size: ''
+    in_use: true
+  - ods: Box Pipe 50 x 50 x 3
+    grist: MS-Square Pipe 50 x 50 x 3.2
+    grist_id: 165
+    match: user_confirmed
+    alternate_size: ''
+    in_use: true
+  - ods: Box Pipe 50 x 50 x 5
+    grist: MS-Square Pipe 50 x 50 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 60 x 40 x 3
+    grist: MS-Square Pipe 60 x 40 x 3
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 70 x 70 x 5
+    grist: MS-Square Pipe 70 x 70 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 75 x 40 x 5
+    grist: MS-Square Pipe 75 x 40 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 75 x 75 x 3
+    grist: MS-Square Pipe 75 x 75 x 3
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 80 x 40 x 3
+    grist: MS-Square Pipe 80 x 40 x 3
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 80 x 40 x5
+    grist: MS-Square Pipe 80 x 40 x 5
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Box Pipe 90 x90 x 3
+    grist: MS-Square Pipe 90 x 90 x 3
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Bright Bar 10 mm f
+    grist: Bright-Round Bar 10 mm
+    grist_id: 74
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 12 mm f
+    grist: Bright-Round Bar 12 mm
+    grist_id: 75
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 16 mm f
+    grist: Bright-Round Bar 16 mm
+    grist_id: 76
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 20 mm f
+    grist: Bright-Round Bar 20 mm
+    grist_id: 77
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 25 mm f
+    grist: Bright-Round Bar 25 mm
+    grist_id: 78
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 25.4 mm f
+    grist: Bright-Round Bar 25.4 mm
+    grist_id: 79
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 28 mm f
+    grist: Bright-Round Bar 28 mm
+    grist_id: 80
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 31.7 mm f
+    grist: Bright-Round Bar 31.7 mm
+    grist_id: 81
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 32 mm f
+    grist: Bright-Round Bar 32 mm
+    grist_id: 82
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 38 mm f
+    grist: Bright-Round Bar 38 mm
+    grist_id: 83
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 38.1 mm f
+    grist: Bright-Round Bar 38.1 mm
+    grist_id: 84
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 44.4 mm f
+    grist: Bright-Round Bar 44.4 mm
+    grist_id: 85
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 45 mm f
+    grist: Bright-Round Bar 45 mm
+    grist_id: 86
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 50.80 mm f
+    grist: Bright-Round Bar 50.80 mm
+    grist_id: 87
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 60 mm f
+    grist: Bright-Round Bar 60 mm
+    grist_id: 88
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Bar 8 mm f
+    grist: Bright-Round Bar 8 mm
+    grist_id: 73
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 10 x 10 mm
+    grist: Bright-Square Bar 10 x 10 mm
+    grist_id: 122
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 12 x 12 mm
+    grist: Bright-Square Bar 12 x 12 mm
+    grist_id: 123
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 16 x 12 mm
+    grist: Bright-Square Bar 16 x 12 mm
+    grist_id: 124
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 20 x 12 mm
+    grist: Bright-Square Bar 20 x 12 mm
+    grist_id: 125
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 6 x 6 mm
+    grist: Bright-Square Bar 6 x 6 mm
+    grist_id: 120
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Bright Square Bar 8 x 8 mm
+    grist: Bright-Square Bar 8 x 8 mm
+    grist_id: 121
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Channels 100 X 50
+    grist: MS-Channels 100 x 50
+    grist_id: 12
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Channels 125 x 65 (5" x 2 1/2")
+    grist: MS-Channels 125 x 65
+    grist_id: 13
+    match: master_without_ms_prefix_and_parenthetical
+    alternate_size: 5" x 2 1/2"
+    in_use: true
+  - ods: Channels 150 x 75 (6 " x 3")
+    grist: MS-Channels 150 x 75
+    grist_id: 14
+    match: master_without_ms_prefix_and_parenthetical
+    alternate_size: 6" x 3"
+    in_use: true
+  - ods: Channels 75 x 40 (3" x 1 1/2")
+    grist: MS-Channels 75 x 40
+    grist_id: 11
+    match: master_without_ms_prefix_and_parenthetical
+    alternate_size: 3" x 1 1/2"
+    in_use: true
+  - ods: D2 Square Bar 16 x 16 mm
+    grist: D2-Square Bar 16 x 16 mm
+    grist_id: 127
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: D2 Square Bar 20 x 20 mm
+    grist: D2-Square Bar 20 x 20 mm
+    grist_id: 128
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: D2 Square Bar 40 x 40 mm
+    grist: D2-Square Bar 40 x 40 mm
+    grist_id: 129
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN - 8 125 mm f
+    grist: EN-8-Round Bar 125 mm
+    grist_id: 107
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN - 8 56 mm f
+    grist: EN-8-Round Bar 56 mm
+    grist_id: 105
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN - 8 65 mm f
+    grist: EN-8-Round Bar 65 mm
+    grist_id: 106
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 31 Flats 32 x 40
+    grist: EN-31-Flats 32 x 40
+    grist_id: 261
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 31 Flats 80 x 6
+    grist: EN-31-Flats 80 x 6 mm
+    grist_id: 248
+    match: master_without_mm_word
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 353 65 mm f
+    grist: EN-353-Round Bar 65 mm
+    grist_id: 113
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 353 Flats 40 x 10
+    grist: EN-353-Flats 40 x 10
+    grist_id: 114
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 12 mm f
+    grist: EN-8-Round Bar 12 mm
+    grist_id: 235
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 150 mm f
+    grist: EN-8-Round Bar 150 mm
+    grist_id: 108
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 170 mm f
+    grist: EN-8-Round Bar 170 mm
+    grist_id: 109
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 35 mm f
+    grist: EN-8-Round Bar 35 mm
+    grist_id: 101
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 40 mm f
+    grist: EN-8-Round Bar 40 mm
+    grist_id: 102
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 45 mm f
+    grist: EN-8-Round Bar 45 mm
+    grist_id: 103
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 50 mm f
+    grist: EN-8-Round Bar 50 mm
+    grist_id: 104
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 Flats 40 x 10
+    grist: EN-8-Flats 40 x 10
+    grist_id: 111
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 Flats 80 x 6
+    grist: EN-8-Flats 80 x 6
+    grist_id: 112
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 Square Bar 32 x 32 mm
+    grist: EN-8-Square Bar 32 x 32 mm
+    grist_id: 236
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN – 8 Square Bar 45 x 45 mm
+    grist: EN-8-Square Bar 45 x 45 mm
+    grist_id: 110
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 100 mm f
+    grist: EN-19-Round Bar 100 mm
+    grist_id: 98
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 120 mm f
+    grist: EN-19-Round Bar 120 mm
+    grist_id: 99
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 125 mm f
+    grist: EN-19-Round Bar 125 mm
+    grist_id: 100
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 25 mm f
+    grist: EN-19-Round Bar 25 mm
+    grist_id: 89
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 40 mm f
+    grist: EN-19-Round Bar 40 mm
+    grist_id: 90
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 45 mm f
+    grist: EN-19-Round Bar 45 mm
+    grist_id: 91
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 50 mm f
+    grist: EN-19-Round Bar 50 mm
+    grist_id: 92
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 55 mm f
+    grist: EN-19-Round Bar 55 mm
+    grist_id: 93
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 56 mm f
+    grist: EN-19-Round Bar 56 mm
+    grist_id: 94
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 65 mm f
+    grist: EN-19-Round Bar 65 mm
+    grist_id: 95
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 75 mm f
+    grist: EN-19-Round Bar 75 mm
+    grist_id: 96
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-19 85 mm f
+    grist: EN-19-Round Bar 85 mm
+    grist_id: 97
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-31 80 mm f
+    grist: EN-31-Round Bar 80 mm
+    grist_id: 237
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: EN-9 45 mm f
+    grist: EN-9-Round Bar 45 mm
+    grist_id: 399
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 100 x 10
+    grist: MS-Flats 100 x 10
+    grist_id: 39
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 100 x 12
+    grist: MS-Flats 100 x 12
+    grist_id: 40
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 100 x 16 (4" x 5/8")
+    grist: MS-Flats 100 x 16
+    grist_id: 41
+    match: master_without_ms_prefix_and_parenthetical
+    alternate_size: 4" x 5/8"
+    in_use: true
+  - ods: Flats 100 x 20
+    grist: MS-Flats 100 x 20
+    grist_id: 42
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 100 x 6
+    grist: MS-Flats 100 x 6
+    grist_id: 38
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 125 x 10
+    grist: MS-Flats 125 x 10
+    grist_id: 44
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 125 x 6
+    grist: MS-Flats 125 x 6
+    grist_id: 294
+    match: master_without_ms_prefix
+    alternate_size: For Multi Function
+    in_use: true
+  - ods: Flats 125 x 8
+    grist: MS-Flats 125 x 8
+    grist_id: 43
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 150 x 10
+    grist: MS-Flats 150 x 10
+    grist_id: 45
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 150 x 8
+    grist: MS-Flats 150 x 8
+    grist_id: 234
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 20 x 3
+    grist: MS-Flats 20 x 3
+    grist_id: 15
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 20 x 5
+    grist: MS-Flats 20 x 5
+    grist_id: 16
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 20 X 6
+    grist: MS-Flats 20 x 6
+    grist_id: 17
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 25 x 10
+    grist: MS-Flats 25 x 10
+    grist_id: 19
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 25 x 6
+    grist: MS-Flats 25 x 6
+    grist_id: 18
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 32 X 6
+    grist: MS-Flats 32 x 6
+    grist_id: 20
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 35 x 6
+    grist: MS-Flats 35 x 6
+    grist_id: 21
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 40 x 10
+    grist: MS-Flats 40 x 10
+    grist_id: 23
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 40 X 6
+    grist: MS-Flats 40 x 6
+    grist_id: 22
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 50 X 10
+    grist: MS-Flats 50 x 10
+    grist_id: 25
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 50 x 12
+    grist: MS-Flats 50 x 12
+    grist_id: 26
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 50 x 16 (2" x 5/8")
+    grist: MS-Flats 50 x 16
+    grist_id: 27
+    match: master_without_ms_prefix_and_parenthetical
+    alternate_size: 2" x 5/8"
+    in_use: true
+  - ods: Flats 50 x 6
+    grist: MS-Flats 50 x 6
+    grist_id: 24
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 63 x 12
+    grist: MS-Flats 63 x 12
+    grist_id: 28
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 x 10
+    grist: MS-Flats 65 x 10
+    grist_id: 31
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 x 12
+    grist: MS-Flats 65 x 12
+    grist_id: 32
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 x 16
+    grist: MS-Flats 65 x 16
+    grist_id: 33
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 x 20
+    grist: MS-Flats 65 x 20
+    grist_id: 263
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 x 6
+    grist: MS-Flats 65 x 6
+    grist_id: 29
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 65 X 8
+    grist: MS-Flats 65 x 8
+    grist_id: 30
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 75 X 10
+    grist: MS-Flats 75 x 10
+    grist_id: 36
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 75 x 25
+    grist: MS-Flats 75 x 25
+    grist_id: 37
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Flats 75 X 6
+    grist: MS-Flats 75 x 6
+    grist_id: 35
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Hex Bar Bright 32 mm f
+    grist: Bright-Hex Bar 32 mm
+    grist_id: 130
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Hex Bar Bright 40 mm f
+    grist: Bright-Hex Bar 40 mm
+    grist_id: 131
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: Hex Bar Bright 50 mm  f
+    grist: Bright-Hex Bar 50 mm
+    grist_id: 132
+    match: family_rule
+    alternate_size: ''
+    in_use: true
+  - ods: MS 'A' Class Pipe 25 mm (1")
+    grist: MS-Round Pipe OD 33.5 mm x ID 28.1 mm
+    grist_id: 133
+    match: pipe_alternate
+    alternate_size: '''A'' Class Pipe 25 mm'
+    in_use: true
+  - ods: MS 'A' Class Pipe 32 mm f
+    grist: MS-Round Pipe OD 41.90 mm x ID 36.7 mm
+    grist_id: 134
+    match: alternate_size_strip_ms_and_round_f
+    alternate_size: '''A'' Class Pipe 32 mm'
+    in_use: true
+  - ods: MS 'A' Class Pipe 38 mm f
+    grist: MS-Round Pipe OD 47.80 mm x ID 42 mm
+    grist_id: 135
+    match: alternate_size_strip_ms_and_round_f
+    alternate_size: '''A'' Class Pipe 38 mm'
+    in_use: true
+  - ods: MS 'A' Class Pipe 82.5x 88.9 f x 3.18 mm
+    grist: MS-Round Pipe OD 82.50 mm x ID 42 x 3.18 mm
+    grist_id: 136
+    match: dimension_rule
+    alternate_size: '''A'' Class Pipe'
+    in_use: true
+  - ods: MS 'A' Class Pipe 90 x 100 f x 5 mm
+    grist: MS-Round Pipe OD 100 mm x ID 90 x 5 mm
+    grist_id: 137
+    match: dimension_rule
+    alternate_size: '''C'' Class Pipe'
+    in_use: true
+  - ods: MS 'B' Class Pipe 10 mm
+    grist: MS-Round Pipe OD 16 mm x ID 11.5 mm
+    grist_id: 138
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe 10 mm'
+    in_use: true
+  - ods: MS 'B' Class Pipe 15 mm (1/2")
+    grist: MS-Round Pipe OD 21.5 mm x ID 16 mm
+    grist_id: 139
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe15 mm (1/2")'
+    in_use: true
+  - ods: MS 'B' Class Pipe 20 mm (3/4")
+    grist: MS-Round Pipe OD 27 mm x ID 21.50 mm
+    grist_id: 140
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe 20 mm (3/4")'
+    in_use: true
+  - ods: MS 'B' Class Pipe 25 mm (1")
+    grist: MS-Round Pipe OD 33.30 mm x ID 26.80 mm
+    grist_id: 141
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe 25 mm (1")'
+    in_use: true
+  - ods: MS 'B' Class Pipe 32 mm (1.25")
+    grist: MS-Round Pipe OD 42.5 mm x ID 36 mm
+    grist_id: 142
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe 32 mm (1.25")'
+    in_use: true
+  - ods: MS 'B' Class Pipe 38 mm (1.5")
+    grist: MS-Round Pipe OD 48 mm x ID 42 mm
+    grist_id: 143
+    match: alternate_size_inch_equivalent
+    alternate_size: '''B'' Class Pipe 40 mm (1.5")'
+    in_use: true
+  - ods: MS 'B' Class Pipe-Non Standard 32 mm (1.25")
+    grist: MS-Round Pipe OD 42 mm x ID 36 mm
+    grist_id: 147
+    match: pipe_alternate
+    alternate_size: '''B'' Class Pipe-Non Standard 32 mm (1.25")'
+    in_use: false
+  - ods: MS 'C' Class Pipe 32 mm (1.25")
+    grist: MS-Round Pipe OD 42 mm x ID 34 mm
+    grist_id: 148
+    match: pipe_alternate
+    alternate_size: '''C'' Class Pipe 32 mm (1.25")'
+    in_use: true
+  - ods: MS 'C' Class Pipe 8” f x 5 mm
+    grist: MS-Round Pipe OD 220 mm x 210 mm
+    grist_id: 149
+    match: alternate_size_dimension_rule
+    alternate_size: '''C'' Class Pipe 8" X 5 mm'
+    in_use: true
+  - ods: MS 'C' Class Pipe Heavy 125 mm (5")
+    grist: MS-Round Pipe OD 139.5 mm x ID 129 mm
+    grist_id: 145
+    match: pipe_alternate
+    alternate_size: '''C'' Class Pipe Heavy 125 mm (5")'
+    in_use: true
+  - ods: MS 'C' Class Pipe Heavy 150 mm (6")
+    grist: MS-Round Pipe OD 165.5 mm x ID 155.5 mm
+    grist_id: 146
+    match: pipe_alternate
+    alternate_size: '''C'' Class Pipe Heavy 150 mm (6")'
+    in_use: true
+  - ods: MS Pipe 100 mm f x 5mm
+    grist: MS-Round Pipe OD 100 mm x ID 90 x 5 mm
+    grist_id: 137
+    match: dimension_rule
+    alternate_size: '''C'' Class Pipe'
+    in_use: true
+  - ods: MS Pipe 80 mm f x 20mm (80x40)
+    grist: MS-Round Pipe 80 mm x 20 mm
+    grist_id: 150
+    match: alternate_size
+    alternate_size: 80 x 40
+    in_use: true
+  - ods: MS Pipe 90 mm f x 7.5mm
+    grist: MS-Round Pipe OD 90 mm x ID 75 mm
+    grist_id: 152
+    match: dimension_rule
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 10 mm f
+    grist: MS-Round Bar 10 mm
+    grist_id: 53
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 100 mm f
+    grist: MS-Round Bar 100 mm
+    grist_id: 68
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 12 mm f
+    grist: MS-Round Bar 12 mm
+    grist_id: 54
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 125 mm f
+    grist: MS-Round Bar 125 mm
+    grist_id: 69
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 150 mm f
+    grist: MS-Round Bar 150 mm
+    grist_id: 70
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 16 mm f
+    grist: MS-Round Bar 16 mm
+    grist_id: 55
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 170 mm f
+    grist: MS-Round Bar 170 mm
+    grist_id: 71
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 180 mm f
+    grist: MS-Round Bar 180 mm
+    grist_id: 72
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 20 mm f
+    grist: MS-Round Bar 20 mm
+    grist_id: 56
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 25 mm f
+    grist: MS-Round Bar 25 mm
+    grist_id: 57
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 28 mm f
+    grist: MS-Round Bar 28 mm
+    grist_id: 58
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 38 mm f
+    grist: MS-Round Bar 38 mm
+    grist_id: 59
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 42 mm f
+    grist: MS-Round Bar 42 mm
+    grist_id: 60
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 45 mm f
+    grist: MS-Round Bar 45 mm
+    grist_id: 61
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 50 mm f
+    grist: MS-Round Bar 50 mm
+    grist_id: 62
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 56 mm f
+    grist: MS-Round Bar 56 mm
+    grist_id: 63
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 6 mm f
+    grist: MS-Round Bar 6 mm
+    grist_id: 51
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 63 mm f
+    grist: MS-Round Bar 63 mm
+    grist_id: 64
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 75 mm f
+    grist: MS-Round Bar 75 mm
+    grist_id: 65
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 8 mm f
+    grist: MS-Round Bar 8 mm
+    grist_id: 52
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 80 mm f
+    grist: MS-Round Bar 80 mm
+    grist_id: 66
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Bar 90 mm f
+    grist: MS-Round Bar 90 mm
+    grist_id: 67
+    match: master_without_round_f
+    alternate_size: ''
+    in_use: true
+  - ods: MS Round Pipe  ID 12” Thickness 8mm
+    grist: MS-Round Pipe ID 12" x 8 mm thick
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: MS Round Pipe 48 mm f x 4mm (48x40)
+    grist: MS-Round Pipe 48 mm x 4 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: MS Round Pipe OD 60mm X ID 50mm
+    grist: MS-Round Pipe OD 60 mm x ID 50 mm
+    grist_id: 239
+    match: master_exact
+    alternate_size: '''C'' Class Pipe Heavy 50 mm'
+    in_use: true
+  - ods: MS Seamless Pipe 10 x 16 mm
+    grist: MS-Round Seamless Pipe 10 x 16 mm
+    grist_id: 154
+    match: dimension_rule
+    alternate_size: ''
+    in_use: true
+  - ods: MS Seamless Pipe 100 x 112 mm
+    grist: MS-Round Seamless Pipe 100 x 112 mm
+    grist_id: 156
+    match: dimension_rule
+    alternate_size: ''
+    in_use: true
+  - ods: MS Seamless Pipe 32 x 60 mm
+    grist: MS-Round Seamless Pipe 32 x 60 mm
+    grist_id: 155
+    match: dimension_rule
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Bar 16 x 16 mm
+    grist: MS-Square Bar 16 x 16 mm
+    grist_id: 116
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Bar 20 x 20 mm
+    grist: MS-Square Bar 20 x 20 mm
+    grist_id: 117
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Bar 25 x 25 mm
+    grist: MS-Square Bar 25 x 25 mm
+    grist_id: 118
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Bar 32 x 32 mm
+    grist: MS-Square Bar 32 x 32 mm
+    grist_id: 119
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Bar 45 x 45 mm
+    grist: MS-Square Bar 45 x 45 mm
+    grist_id: 126
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Pipe 100 x 100 x 5 mm
+    grist: MS-Square Pipe 100 x 100 x 5 mm
+    grist_id: 161
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Pipe 25 x 25 x 2 mm
+    grist: MS-Square Pipe 25 x 25 x 2 mm
+    grist_id: 157
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Pipe 49.5 x 49.5 x 2.9 mm
+    grist: MS-Square Pipe 49.5 x 49.5 x 2.9 mm
+    grist_id: 158
+    match: master_exact
+    alternate_size: ''
+    in_use: false
+  - ods: MS Square Pipe 63 x 33 x 2.6 mm
+    grist: MS-Square Pipe 63 x 33 x 2.6 mm
+    grist_id: 159
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: MS Square Pipe 96 x 48 x 3 mm
+    grist: MS-Square Pipe 96 x 48 x 3 mm
+    grist_id: 160
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: Plates 10 Guage (3.15 mm)
+    grist: MS-HR Sheet 3.15 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 10 Guage (3.15 mm) Chequered
+    grist: MS-HR Sheet Chequered 3.15 mm
+    grist_id: 190
+    match: user_confirmed
+    alternate_size: 10 Guage Chequered
+    in_use: true
+  - ods: Plates 10 mm
+    grist: MS-HR Sheet 10 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 12 Guage (2.50 mm)
+    grist: MS-HR Sheet 2.50 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 12 mm
+    grist: MS-HR Sheet 12 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 14 Guage (2 mm)
+    grist: MS-HR Sheet 2 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 16 guage (1.6 mm)
+    grist: MS-HR Sheet 1.6 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 16 mm
+    grist: MS-HR Sheet 16 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 18 guage (1.2 mm)
+    grist: MS-HR Sheet 1.2 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 20 guage (1 mm)
+    grist: MS-CR Sheet 1 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 4 mm
+    grist: MS-HR Sheet 4 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 5 mm
+    grist: MS-HR Sheet 5 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Plates 6 mm
+    grist: MS-HR Sheet 6 mm
+    grist_id: 397
+    match: user_confirmed
+    alternate_size: 6 mm MS Plate
+    in_use: true
+  - ods: Plates 8 mm
+    grist: MS-HR Sheet 8 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 10" x 10 mm
+    grist: MS-Round Plate 10" x 10 mm
+    grist_id: 200
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 10" x 12 mm
+    grist: MS-Round Plate 10" x 12 mm
+    grist_id: 206
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 10" x 20 mm
+    grist: MS-Round Plate 10" x 20 mm
+    grist_id: 214
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 11" x 25 mm
+    grist: MS-Round Plate 11" x 25 mm
+    grist_id: 216
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: false
+  - ods: Round Plate 110 x 8 mm
+    grist: MS-Round Plate 110 x 8 mm
+    grist_id: 194
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 12" x 20 mm
+    grist: MS-Round Plate 12" x 20 mm
+    grist_id: 215
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 130mm x 10 mm
+    grist: MS-Round Pipe 130 x 10 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 130mm x 12 mm
+    grist: MS-Round Plate 130 x 12 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 135mm x 8 mm
+    grist: MS-Round Plate 135 x 8 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 13” x 8mm
+    grist: MS-Round Plate 13" x 8 mm
+    grist_id: 198
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: false
+  - ods: Round Plate 16.5" x 12 mm
+    grist: MS-Round Plate 16.5" x 12 mm
+    grist_id: 207
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 16.5" x 16 mm
+    grist: MS-Round Plate 16.5" x 16 mm
+    grist_id: 210
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 160mm x 12 mm
+    grist: MS-Round Plate 160 x 12 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 160mm x 16 mm
+    grist: MS-Round Plate 160 x 16 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 160mm x 50mm
+    grist: MS-Round Plate 160 x 50 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 19" x 16 mm
+    grist: MS-Round Plate 19" x 16 mm
+    grist_id: 211
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: false
+  - ods: Round Plate 20" x 10 mm
+    grist: MS-Round Plate 20" x 10 mm
+    grist_id: 201
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 24” x 12 mm
+    grist: MS-Round Plate 24" x 12 mm
+    grist_id: 208
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 280 x 8 mm
+    grist: MS-Round Plate 280 x 8 mm
+    grist_id: 197
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 505mm x 8mm
+    grist: MS-Round Plate 505 x 8 mm
+    grist_id: ''
+    match: legacy_mapping_sheet
+    alternate_size: ''
+    in_use: ''
+  - ods: Round Plate 6 1/2” x 12 mm
+    grist: MS-Round Plate 6 1/2" x 12 mm
+    grist_id: 204
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 7" x 12 mm
+    grist: MS-Round Plate 7" x 12 mm
+    grist_id: 205
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 7" x 20 mm
+    grist: MS-Round Plate 7" x 20 mm
+    grist_id: 212
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 7" x 8 mm
+    grist: MS-Round Plate 7" x 8 mm
+    grist_id: 196
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 72x 8 mm
+    grist: MS-Round Plate 72 x 8 mm
+    grist_id: 191
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 8" x 20 mm
+    grist: MS-Round Plate 8" x 20 mm
+    grist_id: 213
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 82 x 8 mm
+    grist: MS-Round Plate 82 x 8 mm
+    grist_id: 192
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate 85 x 8 mm
+    grist: MS-Round Plate 85 x 8 mm
+    grist_id: 193
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: Round Plate OD 600 mm x 10 mm Thick
+    grist: MS-Round Plate OD 600 mm x 10 mm thick
+    grist_id: 240
+    match: master_without_ms_prefix
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 25 X 10
+    grist: WPS-Flats 25 x 10
+    grist_id: 46
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 25 X 40
+    grist: WPS-Flats 25 x 40
+    grist_id: 47
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 40 x 10
+    grist: WPS-Flats 40 x 10
+    grist_id: 262
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 40 X 32
+    grist: WPS-Flats 40 x 32
+    grist_id: 48
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 50 X 10
+    grist: WPS-Flats 50 x 10
+    grist_id: 49
+    match: master_exact
+    alternate_size: ''
+    in_use: true
+  - ods: WPS Flats 65X 20
+    grist: WPS-Flats 65 x 20
+    grist_id: 50
+    match: master_exact
+    alternate_size: 25MM THICK
+    in_use: true
+  legacy_mapping_sheet: C:\Irshad\Safari\DRWGD\Dev\Vaishali\Grist\MaterialMapping\MappingSheet.ods
+  legacy_mapping_rows_read: 240
+  legacy_mapping_rows_blank: 35
+  legacy_mapping_applied_count: 36
+  legacy_mapping_stale_target_count: 15
+  legacy_mapping_stale_targets:
+  - ods: MS 'B' Class Pipe 42 mm
+    legacy_grist: MS-Round Pipe
+  - ods: Box Pipe 40 x 40 x 5
+    legacy_grist: MS-Square Pipe 40 x 40 x 5
+  - ods: Alang Cut Piece York Patta
+    legacy_grist: Alang Cut Piece- York Patta
+  - ods: Alang Cut Piece
+    legacy_grist: Alang Cut Piece-
+  - ods: Alang Cut Piece 15mm – 20mm
+    legacy_grist: Alang Cut Piece- 15 mm - 20 mm
+  - ods: Alang Cut Piece 20mm – 25mm
+    legacy_grist: Alang Cut Piece- 20 mm - 25 mm
+  - ods: Alang Cut Piece 26mm – 39mm
+    legacy_grist: Alang Cut Piece- 26 mm - 39 mm
+  - ods: Alang Cut Piece 40mm
+    legacy_grist: Alang Cut Piece- 40 mm
+  - ods: CI Casting
+    legacy_grist: CI Casting-
+  - ods: EN-8 Casting
+    legacy_grist: EN-8 Casting-
+  - ods: MS Casting
+    legacy_grist: MS Casting-
+  - ods: PB2 Material Material
+    legacy_grist: PB2-
+  - ods: JKM MS Block
+    legacy_grist: MS-Blocks
+  - ods: SGI Casting
+    legacy_grist: SGI Casting-
+  - ods: Teflon Rod 32mm
+    legacy_grist: Teflon- 32 mm
