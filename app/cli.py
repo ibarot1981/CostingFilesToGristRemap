@@ -8,6 +8,7 @@ import webbrowser
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -24,6 +25,9 @@ from app.workbook import OdsWorkbook
 
 console = Console()
 logger = logging.getLogger(__name__)
+SHEET_MENU_LABELS = {
+    "5. Material Cut List Price": "Material Cut List",
+}
 app = typer.Typer(
     name=__app_name__,
     help="Process LibreOffice Calc .ods product costing files.",
@@ -95,8 +99,10 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                 verification_filter_mode=last_inputs.verification_filter_mode,
                 verification_product_model_index=last_inputs.verification_product_model_index,
                 verification_manual_product_part_names=last_inputs.verification_manual_product_part_names,
+                verification_scope_state=last_inputs.verification_scope_state,
                 verification_scope_mode=last_inputs.verification_scope_mode,
                 verification_specific_options=last_inputs.verification_specific_options,
+                verification_cnc_dxf_filter_state=last_inputs.verification_cnc_dxf_filter_state,
                 verification_cnc_dxf_filter_mode=last_inputs.verification_cnc_dxf_filter_mode,
                 verification_cnc_dxf_excluded_options=last_inputs.verification_cnc_dxf_excluded_options,
             )
@@ -111,7 +117,22 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                     workbook=workbook,
                     workbook_mtime=workbook_mtime,
                 )
-                sheet_name, sheet_index = ask_supported_sheet(app_config.supported_sheets.keys())
+                while True:
+                    sheet_name, sheet_index = ask_supported_sheet(app_config.supported_sheets.keys())
+                    if sheet_name is None:
+                        break
+                    verification_run = verify_sheet_with_grist(
+                        console=console,
+                        workbook=workbook,
+                        app_config=app_config,
+                        sheet_name=sheet_name,
+                        material_mapping_path=material_mapping_path,
+                    )
+                    if verification_run is None:
+                        continue
+                    break
+                if sheet_name is None or verification_run is None:
+                    continue
                 (
                     result,
                     csv_path,
@@ -120,17 +141,9 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                     filter_mode,
                     product_index,
                     manual_product_part_names,
-                    scope_mode,
-                    options_list,
-                    cnc_dxf_filter_mode,
-                    cnc_dxf_excluded_options,
-                ) = verify_sheet_with_grist(
-                    console=console,
-                    workbook=workbook,
-                    app_config=app_config,
-                    sheet_name=sheet_name,
-                    material_mapping_path=material_mapping_path,
-                )
+                    scope_state,
+                    cnc_dxf_filter_state,
+                ) = verification_run
                 save_last_inputs(
                     folder,
                     source_file,
@@ -138,10 +151,8 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                     verification_filter_mode=filter_mode,
                     verification_product_model_index=product_index,
                     verification_manual_product_part_names=manual_product_part_names,
-                    verification_scope_mode=scope_mode,
-                    verification_specific_options=options_list,
-                    verification_cnc_dxf_filter_mode=cnc_dxf_filter_mode,
-                    verification_cnc_dxf_excluded_options=cnc_dxf_excluded_options,
+                    verification_scope_state=scope_state,
+                    verification_cnc_dxf_filter_state=cnc_dxf_filter_state,
                 )
                 console.print(f"[green]HTML report:[/green] {html_path}")
                 console.print(f"[green]CSV report:[/green] {csv_path}")
@@ -185,6 +196,24 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                 source_file = last_inputs.source_file
                 workbook, workbook_mtime = load_workbook_from_disk(source_path)
                 sheet_name, _ = ask_supported_sheet(sheet_names, replay_index=last_inputs.verification_sheet_index)
+                verification_run = verify_sheet_with_grist(
+                    console=console,
+                    workbook=workbook,
+                    app_config=app_config,
+                    sheet_name=sheet_name,
+                    material_mapping_path=material_mapping_path,
+                    replay_filter_mode=last_inputs.verification_filter_mode,
+                    replay_product_index=last_inputs.verification_product_model_index,
+                    replay_manual_product_part_names=last_inputs.verification_manual_product_part_names,
+                    replay_scope_state=last_inputs.verification_scope_state,
+                    replay_scope_mode=last_inputs.verification_scope_mode,
+                    replay_options=last_inputs.verification_specific_options,
+                    replay_cnc_dxf_filter_state=last_inputs.verification_cnc_dxf_filter_state,
+                    replay_cnc_dxf_filter_mode=last_inputs.verification_cnc_dxf_filter_mode,
+                    replay_cnc_dxf_excluded_options=last_inputs.verification_cnc_dxf_excluded_options,
+                )
+                if verification_run is None:
+                    continue
                 (
                     result,
                     csv_path,
@@ -195,28 +224,13 @@ def interactive_run(config_path: Path, material_mapping_path: Path) -> None:
                     _,
                     _,
                     _,
-                    _,
-                    _,
-                ) = verify_sheet_with_grist(
-                    console=console,
-                    workbook=workbook,
-                    app_config=app_config,
-                    sheet_name=sheet_name,
-                    material_mapping_path=material_mapping_path,
-                    replay_filter_mode=last_inputs.verification_filter_mode,
-                    replay_product_index=last_inputs.verification_product_model_index,
-                    replay_manual_product_part_names=last_inputs.verification_manual_product_part_names,
-                    replay_scope_mode=last_inputs.verification_scope_mode,
-                    replay_options=last_inputs.verification_specific_options,
-                    replay_cnc_dxf_filter_mode=last_inputs.verification_cnc_dxf_filter_mode,
-                    replay_cnc_dxf_excluded_options=last_inputs.verification_cnc_dxf_excluded_options,
-                )
+                ) = verification_run
                 console.print(f"[green]HTML report:[/green] {html_path}")
                 console.print(f"[green]CSV report:[/green] {csv_path}")
                 console.print(f"[green]JSON report:[/green] {json_path}")
                 open_report_in_browser(html_path)
             elif choice == "7":
-                manage_product_part_names(console)
+                manage_product_part_names(console, workbook, app_config, material_mapping_path)
             else:
                 console.print("Goodbye.")
                 raise typer.Exit()
@@ -328,7 +342,7 @@ def has_previous_verification_options(last_inputs: LastInputs) -> bool:
         last_inputs.verification_sheet_index > 0
         and (
             (
-                last_inputs.verification_filter_mode == 1
+                last_inputs.verification_filter_mode in {1, 3}
                 and bool(last_inputs.verification_manual_product_part_names)
             )
             or (
@@ -336,26 +350,47 @@ def has_previous_verification_options(last_inputs: LastInputs) -> bool:
                 and last_inputs.verification_product_model_index > 0
             )
         )
-        and last_inputs.verification_scope_mode > 0
         and (
-            last_inputs.verification_scope_mode != 2
-            or bool(last_inputs.verification_specific_options)
+            bool(last_inputs.verification_scope_state)
+            or (
+                last_inputs.verification_scope_mode > 0
+                and (
+                    last_inputs.verification_scope_mode != 2
+                    or bool(last_inputs.verification_specific_options)
+                )
+            )
         )
     )
 
 
-def ask_supported_sheet(sheet_names: object, replay_index: int = 0) -> tuple[str, int]:
+def ask_supported_sheet(sheet_names: object, replay_index: int = 0) -> tuple[str | None, int]:
     """Prompt for sheet selection, or return replay sheet if index provided."""
     names = list(sheet_names)
     if replay_index > 0 and replay_index <= len(names):
         return names[replay_index - 1], replay_index
-    
+
+    console.print(
+        Panel(
+            "Select the sheet from the ODS file that should be used for verification against Grist.",
+            title="Verify With Grist",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
     table = Table(title="Supported Sheets")
     table.add_column("Option", justify="right", style="cyan")
-    table.add_column("Sheet Name")
+    table.add_column("ODS Sheet To Verify", style="bold")
     for i, name in enumerate(names, 1):
-        table.add_row(str(i), name)
+        table.add_row(str(i), SHEET_MENU_LABELS.get(name, name))
+    back_option = len(names) + 1
+    table.add_row(str(back_option), "Back")
     console.print(table)
-    choice = Prompt.ask("Choose a sheet", choices=[str(i) for i in range(1, len(names) + 1)], default="1")
+    choice = Prompt.ask(
+        "Choose a sheet",
+        choices=[str(i) for i in range(1, back_option + 1)],
+        default="1",
+    )
+    if int(choice) == back_option:
+        return None, 0
     index = int(choice)
     return names[index - 1], index

@@ -316,6 +316,8 @@ supported_sheets:
         - Product/Part Name
         - Part Name
         - Part
+      part_category:
+        - Part Category
       material_to_cut:
         - Material used
         - Material to Cut
@@ -390,6 +392,7 @@ supported_sheets:
       compare_fields: []
       report_fields:
         - product_part_name
+        - part_category
         - optional_item_group_1
       excluded_record_values:
         Part_Status:

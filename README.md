@@ -127,6 +127,44 @@ Report categories:
 
 The HTML report includes summary cards, sticky navigation, category tables, and a search box that filters all rows in the report.
 
+## TODO / Backlog
+
+### Verification Scope Enhancement: Choose ODS Scope Column and Then Search/List Values
+
+Requested future enhancement for `Verify with Grist`, especially for:
+
+- `5. Material Cut List Price`
+- `Tool Shop Items`
+
+Current behavior:
+
+- After selecting the Grist `ProductPartName` filter, the utility goes directly to `ODS Option Scope`.
+- That scope is currently based only on the ODS column `Optional Item Group 1`.
+
+Desired behavior:
+
+- After selecting the Grist `ProductPartName`, add one more ODS scope step that asks which ODS column should be used for narrowing rows before verification.
+- For `Material Cut List` and `Tool Shop Items`, allow choosing between:
+  - `Optional Item Group 1`
+  - `Machine Piece Description`
+- After choosing the ODS column, allow the user to choose how to find values from that column:
+  - `Search`
+  - `Show all`
+- Then let the user select values from that chosen ODS column for the active selected sheet only.
+
+Expected notes for implementation:
+
+- This should work for both `5. Material Cut List Price` and `Tool Shop Items`.
+- ODS value discovery must come only from the currently selected ODS sheet being verified.
+- The verification scope/filter object should be generalized so it can work with either:
+  - `optional_item_group_1`
+  - `product_part_name` / `Machine Piece Description`
+- Reports and ignored-row reporting should clearly state which ODS column was used as the verification scope.
+- Saved/replay verification state should also remember:
+  - selected ODS scope column
+  - selected values
+  - chosen search/list path if needed
+
 ## Create New Version
 
 The app scans all supported sheets for configured part-name fields, asks for replacements one by one, and applies the remapping everywhere those configured fields are found.
@@ -203,6 +241,71 @@ config/material_mapping.backup_20260417_153000.yaml
 ```
 
 The manager writes mappings sorted by ODS material name so the YAML remains readable.
+
+## Manage Product Part Names
+
+You can maintain product part master records, model-to-part config links, and MS Cut List part assignments from inside the utility.
+
+From the main interactive flow, choose:
+
+```text
+Manage Product Part Names
+```
+
+The manager currently provides these options:
+
+- `Add new Product Part Name`
+- `Assign part to config`
+- `Assign Product Part to MS Cut List`
+- `Add New MS Cut List from ODS`
+
+### Assign part to config
+
+This workflow creates a new row in `ProductModelConfig` linking a selected `ProductModelCode` to a selected `ProductPartName`.
+
+- The `ProductModelCode` picker is driven from `ProductModelMaster2`, so you can assign the first part to a new model even if it does not yet have any `ProductModelConfig` rows.
+- The utility still shows how many parts are already configured for that model and prevents duplicate model-to-part links.
+- After you choose the model and the target `ProductPartMaster` row, it creates the new `ProductModelConfig` entry with `ExistingProduct = Product Part`.
+
+### Assign Product Part to MS Cut List
+
+This workflow updates the `ProductPartName` field on existing rows in `ProductPartMSList`.
+
+- The utility first explains that you are filtering rows from `ProductPartMSList`.
+- It asks you to choose a filter option:
+  - `Search based on Existing ProductPartName field`
+  - `Show all Available ProductPartNames (Sorted)`
+- After you pick the current `ProductPartName`, it shows the distinct `MachinePieceDesc` values for that current MS Cut List scope.
+- After you choose the `MachinePieceDesc`, it previews the exact `ProductPartMSList` rows that will be updated.
+- It then asks you to choose the replacement `ProductPartMaster` entry.
+- After a final confirmation, it updates `ProductPartMSList.ProductPartName` on the selected rows.
+
+### Add New MS Cut List from ODS
+
+This workflow reads active rows from the ODS sheet `5. Material Cut List Price` and creates or syncs rows in `ProductPartMSList`.
+
+- The utility first scans the ODS sheet and skips rows whose material cannot be mapped to `MasterMaterial`.
+- It shows those skipped rows in an issue table so you can see which ODS materials are still unmapped.
+- It then shows the distinct ODS `Machine Piece Description` values and lets you choose one group to import.
+- After previewing the selected ODS rows, you choose whether the target should be:
+  - a new `ProductPartMaster` row, or
+  - an existing `ProductPartMaster` row.
+- If you choose a new part, the utility checks for duplicate `ProductPartName` values before creating the new `ProductPartMaster` row.
+- After the MS Cut List sync finishes, it can optionally run the existing `Assign part to config` flow for that new part.
+- If you choose an existing part, the utility asks whether it should:
+  - add only the missing ODS rows, or
+  - treat the selected ODS rows as the master list for that `ProductPartName + MachinePieceDesc` scope.
+- Matching between ODS and `ProductPartMSList` uses:
+  - `MaterialToCut`
+  - `Length_mm`
+  - `QtyNos`
+  - `OptionGroup1_TEMP`
+- `Remarks` is intentionally not part of the match key. If the row key matches and only `Remarks` changed, the utility updates the Grist row and marks it as `Part_Status = Modify`.
+- In master-list mode, any extra Grist rows in the selected scope are not deleted. They are only updated to `Part_Status = Delete`.
+- New rows created from ODS are marked `Part_Status = Active`.
+- Every status change writes a `Part_Status_Remark` message that includes the action timestamp and the change reason.
+
+The screens include guidance text so the utility explains what table is being filtered, what the current selection means, and what will be updated before any records are changed.
 
 ## Notes
 

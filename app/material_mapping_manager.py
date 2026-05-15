@@ -257,7 +257,11 @@ def choose_mapping(
         matches = matches[:MAX_ROWS_TO_SHOW]
 
     show_mapping_table(console, matches, title="Matching Material Mappings", query=query, include_numbers=True)
-    choice = Prompt.ask("Choose mapping number", choices=[str(i) for i in range(1, len(matches) + 1)])
+    back_option = len(matches) + 1
+    console.print(f"[cyan]{back_option}[/cyan] Back")
+    choice = Prompt.ask("Choose mapping number", choices=[str(i) for i in range(1, back_option + 1)])
+    if int(choice) == back_option:
+        return None
     return matches[int(choice) - 1]
 
 
