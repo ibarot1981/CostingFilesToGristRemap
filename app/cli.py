@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import logging
+import os
 import webbrowser
 
 import typer
@@ -14,7 +16,12 @@ from rich.table import Table
 
 from app import __app_name__, __version__
 from app.config import DEFAULT_CONFIG_PATH, DEFAULT_MATERIAL_MAPPING_PATH, load_app_config
-from app.exceptions import CostingAppError
+from app.exceptions import CostingAppError, GristPermissionError, GristValidationError, GristWorkspaceSelectionRequired
+from app.grist_admin import SAFARI_DOCUMENT_NAME, GristAdminClient, ensure_safari_document
+from app.catalog_import import import_catalog
+from app.catalog_grist import sync_catalog_to_grist
+from app.grist import GristClient
+from app.schema import FOUNDATION_TABLES, apply_schema, plan_schema
 from app.logging_config import setup_logging
 from app.material_mapping_manager import manage_material_mapping
 from app.product_part_name_manager import manage_product_part_names
@@ -76,6 +83,121 @@ def materials_command(
         manage_material_mapping(console, material_mapping_path)
     except CostingAppError as exc:
         logger.exception("Material mapping manager error")
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("safari-setup")
+def safari_setup_command(
+    workspace_id: str | None = typer.Option(None, "--workspace-id", help="Explicit writable Grist workspace ID."),
+    apply: bool = typer.Option(False, "--apply", help="Create/reuse the validated document. Plan is the default."),
+    schema_apply: bool = typer.Option(False, "--schema-apply", help="Apply the reviewed foundation schema after document validation."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the explicit apply action without an interactive prompt."),
+) -> None:
+    """Plan or apply guarded Safari Manufacturing document/schema setup."""
+    setup_logging()
+    try:
+        client = GristAdminClient.from_environment()
+        selected_workspace_id = workspace_id or os.getenv("SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID", "").strip() or None
+        legacy_doc_id = os.getenv("GRIST_DOC_ID", "").strip()
+        writable_workspaces = client.discover_writable_workspaces()
+        selected_workspace = next((item for item in writable_workspaces if item.id == selected_workspace_id), None) if selected_workspace_id else (writable_workspaces[0] if len(writable_workspaces) == 1 else None)
+        workspace_choices = ", ".join(f"{item.name} ({item.id}, org {item.organization_id})" for item in writable_workspaces) or "none"
+        console.print(Panel(
+            f"Base URL: {client.base_url}\n"
+            f"Organization: {selected_workspace.organization_id if selected_workspace else '(selection required)'}\n"
+            f"Workspace: {selected_workspace.name + ' (' + selected_workspace.id + ')' if selected_workspace else '(selection required)'}\n"
+            f"Writable choices: {workspace_choices}\n"
+            f"Document: {SAFARI_DOCUMENT_NAME}\n"
+            f"Legacy document guard: {legacy_doc_id or '(not configured)'}\n"
+            f"Mode: {'APPLY' if apply else 'PLAN ONLY'}",
+            title="Safari Manufacturing setup",
+            border_style="cyan",
+        ))
+        if schema_apply and not apply:
+            raise GristValidationError("--schema-apply requires --apply; run without --schema-apply to inspect a schema plan.")
+        if selected_workspace is None:
+            if selected_workspace_id:
+                raise GristValidationError("The explicitly selected workspace is not accessible and writable.")
+            if len(writable_workspaces) > 1:
+                choices = ", ".join(f"{item.name} ({item.id}, organization {item.organization_id})" for item in writable_workspaces)
+                raise GristWorkspaceSelectionRequired(f"Select SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID; writable workspace discovery returned {len(writable_workspaces)} choices: {choices}")
+            raise GristPermissionError("The authenticated Grist account has no writable workspace.")
+        if (apply or schema_apply) and not yes and not Confirm.ask("Proceed with the explicit Safari Manufacturing setup action?", default=False):
+            console.print("Cancelled; no Grist mutation was attempted.")
+            return
+        result = ensure_safari_document(client, workspace_id=selected_workspace.id, apply=apply, legacy_doc_id=legacy_doc_id)
+        console.print(f"Workspace: {result.workspace.name} ({result.workspace.id})")
+        console.print(f"Document action: {result.action}")
+        if result.document is None:
+            console.print("Plan: one Safari Manufacturing document would be created; rerun with --apply.")
+            console.print(f"Schema plan: deferred until document creation; {len(FOUNDATION_TABLES)} foundation tables are defined.")
+            return
+        console.print(f"Organization: {result.workspace.organization_id}")
+        console.print(f"Validated document: {result.document.name} ({result.document.id})")
+        schema_plan = plan_schema(client, result.document.id, workspace_id=result.workspace.id, document_name=result.document.name, legacy_doc_id=legacy_doc_id)
+        console.print(f"Schema plan {schema_plan.schema_version}: {len(schema_plan.create_tables)} tables to create, {len(schema_plan.add_columns)} tables to extend, {len(schema_plan.update_columns)} tables to update.")
+        if schema_apply:
+            apply_schema(client, schema_plan, legacy_doc_id=legacy_doc_id)
+            console.print("Schema applied to the independently revalidated Safari Manufacturing document.")
+        else:
+            console.print("Schema was not applied; use --apply --schema-apply after reviewing the plan.")
+        if apply:
+            local_config = Path("config") / "safari_manufacturing.local.json"
+            local_config.parent.mkdir(parents=True, exist_ok=True)
+            local_config.write_text(json.dumps({"baseUrl": client.base_url, "organizationId": result.workspace.organization_id, "workspaceId": result.workspace.id, "workspaceName": result.workspace.name, "documentId": result.document.id, "documentName": result.document.name}, indent=2), encoding="utf-8")
+            console.print(f"Validated document settings saved to ignored local config: {local_config}")
+        console.print("Store SAFARI_MANUFACTURING_GRIST_DOC_ID in ignored deployment configuration; it is not written to source control.")
+    except GristWorkspaceSelectionRequired as exc:
+        logger.error("Safari Manufacturing setup requires explicit workspace selection")
+        console.print(f"[yellow]Workspace selection required:[/yellow] {exc}")
+        console.print("Set SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID to one of the listed IDs and rerun. No Grist mutation was attempted.")
+        raise typer.Exit(code=2) from exc
+    except CostingAppError as exc:
+        logger.exception("Safari Manufacturing setup failed")
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("safari-catalog")
+def safari_catalog_command(
+    source: Path = typer.Option(..., "--source", exists=True, dir_okay=False, help="Canonical Product-ProductModelNo-ModelCode.ods path."),
+    output: Path | None = typer.Option(None, "--output", help="Optional JSON catalog/import-plan report path."),
+    grist_plan: bool = typer.Option(False, "--grist-plan", help="Compare the catalog with the explicitly configured Safari Manufacturing document."),
+    apply: bool = typer.Option(False, "--apply", help="Apply the reviewed identity upsert to Safari Manufacturing Grist."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the Grist catalog import without an interactive prompt."),
+) -> None:
+    """Read and report the canonical identity catalog without mutating its ODS source."""
+    try:
+        result = import_catalog(source)
+        report = result.to_dict()
+        console.print(f"Catalog plan: {len(result.products)} products, {len(result.models)} models, {len(result.codes)} codes, {len(result.issues)} issue(s).")
+        if grist_plan or apply:
+            client = GristClient.from_safari_environment()
+            plan = sync_catalog_to_grist(client, result)
+            report["gristPlan"] = plan.to_dict()
+            console.print(f"Safari Grist plan for {plan.document_id}: {sum(plan.creates.values())} creates, {sum(plan.updates.values())} updates; idempotent={plan.idempotent}.")
+            for change in plan.changes[:20]:
+                console.print(f"{change['action']} {change['table']}: {change['identity']}")
+            if len(plan.changes) > 20:
+                console.print(f"... {len(plan.changes) - 20} additional reviewed changes.")
+            if apply:
+                if not plan.idempotent and not yes and not Confirm.ask("Apply this identity catalog plan to the validated Safari Manufacturing document?", default=False):
+                    console.print("Cancelled; no Grist mutation was attempted.")
+                    return
+                applied = sync_catalog_to_grist(client, result, apply=True, expected_plan=plan)
+                console.print(f"Catalog import status: {'already applied' if applied.idempotent else 'applied'}.")
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            console.print(f"Report: {output.resolve()}")
+        else:
+            for issue in result.issues[:10]:
+                console.print(f"[yellow]{issue.issue_type}[/yellow] row {issue.source_row}: {issue.message}")
+        console.print("The source ODS was not modified.")
+        if not apply:
+            console.print("No Grist record was modified.")
+    except CostingAppError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

@@ -7,3 +7,4 @@ output/
 reports/
 
 .env
+config/safari_manufacturing.local.json

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Safari Manufacturing — Requirements &amp; Delivery Status</title>
+  <style>
+    :root{--navy:#102a43;--navy2:#163b5c;--copper:#b66a3c;--sand:#f3eadb;--paper:#fffdf8;--ink:#172533;--muted:#617284;--line:#d9d2c5;--green:#287a54;--amber:#9a6700;--red:#a33a3a;--blue:#356b9b;--shadow:0 10px 28px rgba(16,42,67,.12)}
+    *{box-sizing:border-box} body{margin:0;background:var(--sand);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+    header{background:linear-gradient(120deg,var(--navy),var(--navy2));color:white;padding:36px clamp(20px,5vw,72px) 44px;border-bottom:5px solid var(--copper)}
+    header h1{font-family:Georgia,serif;font-size:clamp(30px,4vw,50px);line-height:1.08;margin:0 0 10px} header p{max-width:950px;margin:6px 0;color:#dce8f2}
+    .eyebrow{text-transform:uppercase;letter-spacing:.16em;font-weight:750;color:#f0b58d;font-size:12px}
+    main{max-width:1500px;margin:-22px auto 60px;padding:0 22px}.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:22px;margin-bottom:18px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.card{background:white;border:1px solid var(--line);border-left:4px solid var(--copper);border-radius:8px;padding:14px}.card strong{font-size:27px;display:block;color:var(--navy)}
+    h2{font-family:Georgia,serif;color:var(--navy);margin:0 0 14px;font-size:25px} h3{color:var(--navy);margin:20px 0 8px} a{color:#8a4b28} code{background:#f1ede5;padding:2px 5px;border-radius:4px}
+    .callout{border-left:5px solid var(--copper);background:#fbf3e9;padding:14px 16px;border-radius:6px;margin:12px 0}.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px}
+    .flow{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.flow span{background:var(--navy);color:white;border-radius:6px;padding:8px 11px}.flow b{color:var(--copper)}
+    .filters{display:grid;grid-template-columns:2fr repeat(3,minmax(140px,1fr));gap:10px;margin:12px 0 16px}.filters input,.filters select{width:100%;padding:10px 11px;border:1px solid #b8c0c7;border-radius:6px;background:white;color:var(--ink)}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;min-width:1150px;background:white}th,td{text-align:left;vertical-align:top;padding:10px 11px;border-bottom:1px solid #e6e1d8}th{position:sticky;top:0;background:var(--navy);color:white;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tbody tr:hover{background:#fff7eb}.rid{font-weight:750;color:var(--navy);white-space:nowrap}.small{font-size:12px;color:var(--muted)}
+    .status{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:750;white-space:nowrap}.implemented{background:#dff3e8;color:#175c3b}.partial{background:#e2edf8;color:#255a85}.documented{background:#efe8fa;color:#644694}.planned{background:#f8edcf;color:#795600}.blocked{background:#f7dddd;color:#8d2929}
+    .phase{white-space:nowrap}.phase-list{display:grid;gap:10px}.phase-row{display:grid;grid-template-columns:100px 1fr 120px;gap:12px;align-items:center}.bar{height:10px;background:#e6e0d5;border-radius:20px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--copper),#db986d)}
+    footer{max-width:1500px;margin:0 auto 35px;padding:0 22px;color:var(--muted);font-size:13px}.hidden{display:none}
+    @media(max-width:760px){.filters{grid-template-columns:1fr}.phase-row{grid-template-columns:80px 1fr}.phase-row .small{grid-column:2}main{padding:0 10px}header{padding-left:20px;padding-right:20px}}
+  </style>
+</head>
+<body data-generated="2026-09-22">
+  <header>
+    <div class="eyebrow">Living delivery register · Phase 0</div>
+    <h1>Safari Manufacturing</h1>
+    <p>Requirements, decisions, source boundaries, and implementation status for the manufacturing ERP frontend. ODS costing files remain authoritative until controlled parity and cutover.</p>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <section class="panel grid2">
+      <div>
+        <h2>Current operating boundary</h2>
+        <div class="flow"><span>ODS source</span><b>→</b><span>Read &amp; reconcile</span><b>→</b><span>Safari Manufacturing</span></div>
+        <div class="callout"><strong>No third manual data point.</strong> The app records source observations and curated mappings. It does not silently promote newer purchase prices or overwrite source workbooks.</div>
+      </div>
+      <div>
+        <h2>Key artifacts</h2>
+        <p><a href="MANUFACTURING_ERP_REQUIREMENTS.md">Requirements baseline</a> · <a href="IMPLEMENTATION_ROADMAP.md">Roadmap and gates</a> · <a href="DECISION_LOG.md">Decision log</a> · <a href="MILESTONE_1_IMPLEMENTATION_PROMPT.md">Milestone 1 prompt</a></p>
+        <p class="small">Status vocabulary: Implemented = usable and verified; Partial = real work exists but acceptance is incomplete; Documented = specified, not built; Planned = sequenced; Blocked = awaits a required decision or external input.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Delivery progression</h2>
+      <div class="phase-list">
+        <div class="phase-row"><strong>Phase 0</strong><div class="bar"><i style="width:18%"></i></div><span class="small">Foundation active</span></div>
+        <div class="phase-row"><strong>Phase 1</strong><div class="bar"><i style="width:4%"></i></div><span class="small">Analysis only</span></div>
+        <div class="phase-row"><strong>Phase 2</strong><div class="bar"><i style="width:0%"></i></div><span class="small">Planned</span></div>
+        <div class="phase-row"><strong>Phase 3</strong><div class="bar"><i style="width:0%"></i></div><span class="small">Planned</span></div>
+        <div class="phase-row"><strong>Phase 4–6</strong><div class="bar"><i style="width:0%"></i></div><span class="small">Planned</span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Requirements register</h2>
+      <div class="filters">
+        <input id="q" type="search" placeholder="Search ID, requirement, evidence…" aria-label="Search requirements">
+        <select id="phase" aria-label="Filter phase"><option value="">All phases</option></select>
+        <select id="category" aria-label="Filter category"><option value="">All categories</option></select>
+        <select id="status" aria-label="Filter status"><option value="">All statuses</option></select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Requirement</th><th>Category</th><th>Phase</th><th>Status</th><th>Implementation / evidence</th><th>Next acceptance step</th></tr></thead>
+          <tbody id="requirements"></tbody>
+        </table>
+      </div>
+      <p id="visible" class="small" aria-live="polite"></p>
+    </section>
+
+    <section class="panel grid2">
+      <div>
+        <h2>Confirmed design decisions</h2>
+        <ul>
+          <li>New Safari Manufacturing Grist document; preserve <code>Costing-New</code>.</li>
+          <li>One file belongs to one Model; one Model can have many files; one Code has one active file.</li>
+          <li>Costing, manufacturing, and spares configurations are separate and versioned.</li>
+          <li>Observed purchase rates and approved costing rates are separate.</li>
+          <li>Tool Shop source and Stores issue route can coexist without double costing.</li>
+          <li>UI and services depend on repositories, allowing a later PostgreSQL adapter.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Inputs still needed</h2>
+        <ul>
+          <li>The three-file S1KHF pilot gate is satisfied, including the confirmed HF-MS Drum code set. Cost parity tolerance and rounding policy are still needed before the Phase 1 gate.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+  <footer>Last updated 22 September 2026. Update this file in the same change as any requirement, decision, architecture, or implementation-status change.</footer>
+  <script>
+    const rows = [
+      ["SRC-001","ODS product costing files remain authoritative during transition.","Source authority","Phase 0","Documented","Requirements §3; decision D-001.","Add runtime write guards and tests."],
+      ["SRC-002","Approved ODS material and purchase masters remain the costing-rate source until rate workflow cutover.","Source authority","Phase 0","Documented","Requirements §3.1; Spares List Master and SteelLog documented.","Capture source version/hash in pilot."],
+      ["SRC-003","Observed Google/Grist purchase prices remain separate from approved costing rates.","Rates","Phase 4","Documented","Decision D-011 and target rate domains defined.","Define approval policy and source connector."],
+      ["SRC-004","No Phase 0 writes to Costing-New or source ODS files.","Safety","Phase 0","Implemented","Source ODS access remains read-only; the live setup validated the separate Safari Manufacturing document before schema writes. Legacy document and path guards are covered by tests; no legacy or workbook writes occurred.","Preserve this boundary during the catalog and association pilot."],
+      ["ID-001","Import Product → Model Number → Model Code from the supplied catalog with provenance.","Identity","Phase 0","Implemented","The live Safari document now has 24 Products, 44 ProductModel rows, 173 Codes, 6 aliases, 68 reconciliation issues, and 2 applied import batches. The current source contains 42 Model identities; two additional active ProductModel rows remain unmatched, have no active codes, and were retained for owner reconciliation. The reviewed `catalog-0.2` import updated 17 existing code rows (`Description` and `SourceValues`); a follow-up plan is idempotent. Source file/row provenance is present and the source ODS hash is unchanged. `SourceValues` uses Grist's typed Any-list representation. Parser `catalog-0.2` keeps unresolved repeated codes inactive and records an error-level issue; tests verify association rejection.","Review the unmatched ProductModel rows and persisted reconciliation issues."],
+      ["ID-002","Preserve source display text and manage aliases explicitly.","Identity","Phase 0","Implemented","Six IdentityAlias rows and original source values were verified in live Grist; catalog display text and row provenance are retained.","Keep alias resolution explicit during association and reconciliation."],
+      ["ID-003","Duplicate GC variants use GCMC-7.5/GCMC-10 and GCMC18-7.5/GCMC18-10.","Identity","Phase 0","Implemented","All four canonical GC codes were verified in live Grist with their original GCM/GCM18 source values preserved.","Retain the GC mappings and provenance in future imports."],
+      ["ID-004","Bush variants are searchable legacy-spares-only records.","Identity","Phase 0","Partial","Importer classification and active-code exclusion are covered by tests; the source catalog contained no Bush variants, so none appeared in the live Grist import.","Verify the first real legacy-spares record when it is available."],
+      ["FILE-001","Browse Product Costing as an explorer-style directory tree.","File registry","Phase 0","Implemented","Lazy `/api/explorer/tree` endpoint and responsive three-pane Explorer are implemented. Path resolution rejects traversal and checks original path components with `lstat()` before resolving; a temporary Windows directory-junction escape was rejected.","Exercise against the S1KHF root and confirm owner keyboard walkthrough."],
+      ["FILE-002","Classify costing candidates, masters, templates, archives, outputs, and unreadable files.","File registry","Phase 0","Partial","Rule-based classification and typed unreadable inspection exist. The Export workbook was verified as a costing candidate from its `Cost Log` and `Total Summary` sheets; the narrow regression test passes. Broader root classification review remains.","Review classifications against the rest of the real costing root."],
+      ["FILE-003","Record path, normalized path, hash, size, modification time, and observations.","File registry","Phase 0","Partial","CostingFile and FileObservation records are persisted in Grist for three S1KHF sources. Fresh reads confirm all three hashes match their read-only ODS files; the new HF-MS Drum observation records readable=true and 61,125 external references. Broader change detection remains.","Verify changed/missing-file observations and review them in the browser."],
+      ["FILE-004","A costing file belongs to exactly one Product Model.","Association","Phase 0","Implemented","Three owner-provided S1KHF files have one active FileModelAssociation each in the validated Safari Manufacturing document, all assigned to Safari 1000 HF. Repository validation and direct Grist reads confirm one model per file; the new HF-MS Drum association was saved from the browser.","Keep the one-model cardinality guard covered as association workflows expand."],
+      ["FILE-005","A Product Model can have multiple costing files.","Association","Phase 0","Implemented","Three distinct S1KHF costing files are associated to the same Safari 1000 HF model in live Grist, satisfying one-model-to-many-files cardinality; model/code constraints remain covered by repository tests.","Review conflicts when an owner-approved conflict case is available."],
+      ["FILE-006","A Product Model Code has exactly one active costing file.","Association","Phase 0","Implemented","All 19 active codes across the three live S1KHF mappings have exactly one owner. Validation rejects active code-owner conflicts; supersede remains explicit.","Exercise a populated conflict/supersede review with an owner-approved change."],
+      ["FILE-007","Association changes preserve history, actor, reason, and audit trail.","Association","Phase 0","Partial","All three live file associations persist actor and reason, active code links, an AuditEvent, and a queued ImportBatch; fresh reads confirm all source hashes still match. The live Mapped Files drawers expose code sets, actor/reason, and audit history. Supersede history is covered by repository tests but has not been reviewed through the UI.","Review an owner-approved supersede in an isolated test workflow and confirm the preserved history."],
+      ["FILE-008","Directory-to-Product mappings support explicit approval and inheritance.","Association","Phase 0","Planned","Workflow described; approver still open.","Implement proposal first, then approval."],
+      ["PRE-001","Preview sheet names, dimensions, bounded cells, and formula/value information.","Workbook preview","Phase 0","Implemented","Synthetic ODS contract tests verify sheets and dimensions, bounded rows/columns, formula text alongside cached values, external-reference counts/warnings, the read-only marker, unsupported-extension rejection, and typed corrupt/encrypted errors. The UI renders sheet selection, dimensions, formula indicators, and external-link warnings.","Keep the preview contract covered as parser support evolves."],
+      ["PRE-002","Identify external ODS references without resolving them unsafely.","Workbook preview","Phase 0","Implemented","Read-only XML scan counts formula external references and the UI exposes a warning without resolving links.","Record dependency provenance in the Phase 0 pilot."],
+      ["MAP-001","Reuse CLI material aliases and Grist mappings through shared services.","CLI reuse","Phase 0","Partial","Extraction seam identified: verification orchestration/index/fallback/scope rules in app/verification.py; YAML edit/validation in app/material_mapping_manager.py; configuration/normalization in app/config_models.py and app/utils.py. No Phase 0 rule rewrite or duplication.","Extract the pure service with golden CLI-equivalence fixtures in Milestone 0.6."],
+      ["MAP-002","Retain alternate-size normalization and option-scope filtering.","CLI reuse","Phase 0","Partial","Implemented in legacy verification flow.","Refactor without changing CLI results."],
+      ["MAP-003","Preserve Product Part, MS, Tool Shop, and CNC mappings.","CLI reuse","Phase 0","Partial","Existing CLI mapping knowledge identified.","Inventory fields and test selected fixtures."],
+      ["COST-001","Provide real-time, explainable cost per Product Model configuration.","Costing","Phase 1","Planned","Workbook flow and target CostRun domains documented.","Define parity tolerance and engine contracts."],
+      ["COST-002","Support base, add, remove, replace, quantity override, and rate override rules.","Costing","Phase 1","Documented","Typed rule design replaces row-number edits.","Implement versioned ConfigurationRule engine."],
+      ["COST-003","Reuse common parts across products/models with versioned revisions.","Parts","Phase 3","Documented","ProductPart/PartRevision/PartComponent domains defined.","Build part service after ingestion parity."],
+      ["CFG-001","Keep selling/costing configuration separate from manufacturing configuration.","Configuration","Phase 3","Documented","Decision D-009.","Implement explicit mapping and versions."],
+      ["CFG-002","Manufacturing config supports BOM, routing, department, issue route, and per-part batch quantity.","Manufacturing","Phase 3","Documented","Target domains and examples recorded.","Validate pilot workflow with Production."],
+      ["CFG-003","Prince/Kirloskar and similar variants remain distinct where manufacturing or issue needs differ.","Manufacturing","Phase 3","Documented","P/K store-issue difference captured.","Encode in pilot configurations."],
+      ["STORE-001","Store Issue Slips contain purchased/store items and quantities for a manufacturing batch.","Stores","Phase 3","Documented","Business definition captured.","Define issue-slip version and status workflow."],
+      ["STORE-002","Tool Shop items routed through Stores preserve source and route without double costing.","Stores","Phase 3","Documented","Decision D-010.","Add fixture for current NO-marked lines."],
+      ["SPARE-001","Create and maintain recursive spare-parts configurations and applicability.","Spares","Phase 3","Documented","Spares Detail/Summary analysis and target model recorded.","Define cycle detection and legacy rules."],
+      ["SYNC-001","Imports and syncs are idempotent and proposed-change first.","Synchronization","Phase 2","Documented","Decision D-016.","Implement ChangeSet lifecycle and retry tests."],
+      ["SYNC-002","Every imported value keeps file/sheet/row/cell/hash/parser provenance.","Synchronization","Phase 0","Planned","ImportBatch/source observation domains defined.","Implement in S1KHF pilot parser."],
+      ["SYNC-003","Conflicts use reconciliation; never last-write-wins.","Synchronization","Phase 0","Documented","ReconciliationIssue workflow specified.","Implement mapped-files conflict queue."],
+      ["ARCH-001","Frontend and domain code use repository interfaces instead of Grist tables.","Architecture","Phase 0","Implemented","Domain/repository contracts, in-memory adapter, guarded Grist adapter, and live canonical catalog upsert exist. Three owner-provided S1KHF associations are persisted in Safari Grist with 19 unique active code owners, audit events, and queued batches; local ODS seeding is disabled for the Grist adapter. A validated browser Save was exercised against the live target.","Preserve the repository boundary and guarded live-write path."],
+      ["ARCH-002","Setup idempotently creates or validates Safari Manufacturing and applies its clean schema.","Architecture","Phase 0","Implemented","`main.py safari-setup` validated/reused the owner-created document in the explicitly selected Work workspace, added six missing idempotency columns across three tables, and the final remote inventory exactly matched all 11 manifest tables. Empty default `Table1` was removed after a zero-row check; follow-up schema plan is a no-op. Document settings are saved only in ignored local configuration.","Keep setup idempotent; use the guarded diff for future schema versions."],
+      ["GOV-001","Irshad is the sole approver for Phase 0 folder inheritance and Model Code reassignment.","Governance","Phase 0","Documented","Pilot authority approved in decision D-021.","Record approver identity and reason on each governed change."],
+      ["ARCH-003","A future PostgreSQL migration must not require frontend rewrite.","Architecture","Phase 6","Documented","Repository/adapter boundary chosen.","Validate no Grist identifiers leak into UI contracts."],
+      ["UI-001","Use Seey-style interaction with distinct navy/copper/warm-sand shading.","User interface","Phase 0","Partial","Browser smoke exercised the Explorer, bounded ODS preview, Product → Model → Code flow, and validation-gated Save. The live browser Save was tested with the new owner-approved HF-MS Drum mapping after hash validation; Mapped Files confirms eight codes, actor/reason, queued status, history, and an external-link warning. The inspected file hash is included in validation and Validate remains disabled during preview. Source ODS files stayed read-only. Component tests and responsive production build pass.","Get owner acceptance at target desktop and narrow widths."],
+      ["UI-002","Mapped Files view supports filtering, history, and mapping discrepancies.","User interface","Phase 0","Partial","Grouped Product/Model review filters mapped/unmapped/conflict/needs-review and sorts by path/name/last observed change. API derives duplicate active owners, catalog mismatches, missing/changed files, verified moves, and known parse/external-link issues; Node tests cover view-model grouping/filtering/sort. Live Mapped Files shows all three S1KHF mappings; the HF-MS Drum detail drawer shows its eight codes, actor/reason, audit, queue, and external-link issue. No live conflict row was available, and durable issue resolution is not built.","Verify conflict presentation when an owner-approved conflict exists and implement durable issue ownership/resolution."],
+      ["UI-003","Processing queue shows status after file association.","User interface","Phase 0","Implemented","Safari Grist contains a durable queued ImportBatch for each of the three live S1KHF associations. The live Mapped Files table and details drawers show `queued`; `GET /api/processing-queue` returns the persisted batches. Processing intentionally remains a safe stub with no parser execution.","Implement processing and status transitions in a later ingestion milestone."],
+      ["AUTH-001","Authenticate through Authentik OIDC using organizational users.","Access control","Phase 6","Planned","Identity source chosen; intentionally deferred.","Configure OIDC after workflow validation."],
+      ["AUTH-002","Manage application roles in the app and map Authentik groups.","Access control","Phase 6","Documented","Six initial roles proposed.","Confirm permission matrix and enforce server-side."],
+      ["DOC-001","Update requirements, decisions, architecture, and status with every material change.","Governance","Phase 0","Implemented","Baseline, roadmap, decision log, prompt, and living register created.","Maintain in every milestone change."],
+      ["TEST-001","Test traversal, duplicates, conflicts, idempotency, and ODS error cases.","Quality","Phase 0","Implemented","62 unittest cases run (61 pass; one symlink-creation case is skipped where unavailable), 2 dependency-free Node view-model tests, and 5 Vitest component/workflow tests pass. This Windows host created a temporary junction and verified escape rejection; a separate regression checks the reparse-point attribute before resolution. Coverage includes catalog duplicates, code ownership, partial Grist-write recovery, idempotency, CLI selection safety, ODS parsing/classification and preview contracts, mapped-file reconciliation, recursive search, trusted-proxy actor attribution, and duplicate-identity prevention. The live browser Save was validated against the owner-approved HF-MS Drum mapping; Grist reads confirm eight active links, matching hash, audit event, and queued batch.","Keep tests aligned with changes to identity, file safety, and association workflows."],
+      ["CUT-001","ODS write-back requires round-trip preservation, backups, preview, and approval.","Cutover","Phase 5","Planned","Phase gate explicitly defined.","Create fixtures only after read parity."],
+      ["CUT-002","Switch authority domain-by-domain only after reconciliation and user acceptance.","Cutover","Phase 5","Documented","Parallel-run and rollback gate defined.","Define operational cutover checklist later."]
+    ];
+
+    const body=document.getElementById('requirements');
+    const controls=['phase','category','status'].map(id=>document.getElementById(id));
+    const unique=i=>[...new Set(rows.map(r=>r[i]))].sort();
+    [[3,controls[0]],[2,controls[1]],[4,controls[2]]].forEach(([i,s])=>unique(i).forEach(v=>s.add(new Option(v,v))));
+    function statusClass(s){return s.toLowerCase()}
+    function render(){
+      const text=document.getElementById('q').value.toLowerCase(); const phase=controls[0].value,cat=controls[1].value,status=controls[2].value;
+      const filtered=rows.filter(r=>(!text||r.join(' ').toLowerCase().includes(text))&&(!phase||r[3]===phase)&&(!cat||r[2]===cat)&&(!status||r[4]===status));
+      body.innerHTML=filtered.map(r=>`<tr><td class="rid">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="phase">${r[3]}</td><td><span class="status ${statusClass(r[4])}">${r[4]}</span></td><td>${r[5]}</td><td>${r[6]}</td></tr>`).join('');
+      document.getElementById('visible').textContent=`Showing ${filtered.length} of ${rows.length} requirements.`;
+    }
+    document.getElementById('q').addEventListener('input',render); controls.forEach(c=>c.addEventListener('change',render));
+    const counts=rows.reduce((a,r)=>(a[r[4]]=(a[r[4]]||0)+1,a),{});
+    document.getElementById('cards').innerHTML=[['Requirements',rows.length],...Object.entries(counts)].map(([k,v])=>`<div class="card"><strong>${v}</strong><span>${k}</span></div>`).join('');
+    render();
+  </script>
+</body>
+</html>

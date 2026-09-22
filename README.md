@@ -2,6 +2,8 @@
 
 Windows-friendly Python CLI for processing LibreOffice Calc `.ods` product costing files.
 
+> **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [decision log](docs/DECISION_LOG.md), and the browser-friendly [requirements status register](docs/requirements-status.html). The ready-to-copy first implementation brief is in [MILESTONE_1_IMPLEMENTATION_PROMPT.md](docs/MILESTONE_1_IMPLEMENTATION_PROMPT.md).
+
 The app reads configured sheets, detects columns by header names and aliases, filters inactive rows from YAML rules, verifies Material Cut List data against Grist, and creates new versioned `.ods` files without overwriting the original workbook.
 
 ## Requirements
@@ -32,7 +34,101 @@ $env:GRIST_DOC_ID = "your-doc-id"
 $env:GRIST_API_KEY = "your-api-key"
 ```
 
-TODO: Confirm the production Grist document ID, API base URL, and any remaining optional `ProductPartMSList` field mappings before production use.
+Safari Manufacturing must use a separate Grist document. Its Phase 0 setup
+will discover the selected writable workspace, create or validate the document
+named `Safari Manufacturing`, and then store its returned ID in the ignored
+local/deployment configuration as `SAFARI_MANUFACTURING_GRIST_DOC_ID`. It must
+never reuse the legacy `GRIST_DOC_ID` as its write target.
+
+The Safari Manufacturing document has been validated and its foundation schema
+applied in the explicitly selected workspace. Its private document/workspace
+settings are stored in ignored `config/safari_manufacturing.local.json`; copy
+the required `SAFARI_MANUFACTURING_GRIST_DOC_ID` and
+`SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID` values into the intended runtime
+environment before selecting `SAFARI_REPOSITORY=grist`. Confirm the deployment
+base URL and any remaining optional `ProductPartMSList` field mappings before
+production use. The approved catalog import is live (24 Products, 44 stored
+ProductModel rows, 173 Codes, 6 aliases, 68 reconciliation issues, and two
+applied batches). The source catalog has 42 Model identities; two active stored
+ProductModel rows do not match a current source identity, own no active Codes,
+and remain for owner reconciliation. `catalog-0.2` updated 17 existing Code
+rows; the verified repeat plan returned zero creates and zero updates, and the
+source ODS hash is unchanged. Three owner-provided S1KHF Bearing Type mappings
+are now live for `Safari 1000 HF`: the standard Local workbook has eight codes,
+the Export workbook has three requested codes, and the HF-MS Drum workbook has
+eight `-MS` codes. Export source spellings match the catalog display values
+case-insensitively and exactly; catalog capitalization is preserved. All three
+source hashes still match their ODS files; Grist contains three active model
+associations, 19 unique active code owners, audit events, and queued import
+batches. The latest mapping was validated and saved through the browser UI;
+Mapped Files shows its codes, actor/reason, queued status, and history. Its
+read-only preview reports 61,125 external references, shown as a review warning.
+No source ODS or `Costing-New` data was changed. The several-file S1KHF pilot
+gate is now satisfied; conflict/supersede review and owner acceptance of the UI
+remain open.
+The versioned `catalog-0.2` importer keeps unresolved repeated canonical Model
+Codes inactive and records an error-level reconciliation issue; approved GC
+rating variants remain distinct and active.
+
+## Safari Manufacturing Phase 0
+
+Run the API and UI as described in [`ui/README.md`](ui/README.md). The API
+uses the in-memory adapter by default, which is visibly labelled in the UI and
+does not mutate Grist. Set `SAFARI_REPOSITORY=grist` only after the separate
+Safari document has been validated.
+The API contracts and mapped-files review fields are documented in
+[`docs/API_SCHEMA.md`](docs/API_SCHEMA.md); Mapped Files distinguishes
+repository observation timestamps from filesystem modification-time fallbacks.
+
+Plan guarded document creation (no Grist mutation):
+
+```powershell
+$env:GRIST_API_KEY = "..."
+$env:GRIST_BASE_URL = "https://docs.getgrist.com"
+$env:SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID = "workspace-id"
+.\.venv\Scripts\python.exe main.py safari-setup
+```
+
+Apply document creation/reuse and the reviewed schema explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe main.py safari-setup --apply --schema-apply --yes
+```
+
+The command prints the base URL, selected workspace, exact document name, and
+legacy `GRIST_DOC_ID` guard. It writes no document ID or secret to source
+control; set `SAFARI_MANUFACTURING_GRIST_DOC_ID` in ignored deployment
+configuration after validation. The schema plan is versioned in
+[`config/safari_manufacturing_schema.json`](config/safari_manufacturing_schema.json)
+and implemented in `app/schema.py`; normal API startup never creates Grist
+documents or tables.
+
+Read the canonical catalog without writing the source workbook or Grist:
+
+```powershell
+.\.venv\Scripts\python.exe main.py safari-catalog --source "C:\path\Product-ProductModelNo-ModelCode.ods" --output reports/catalog-plan.json
+```
+
+After schema bootstrap, compare with the explicitly configured Safari document,
+then apply the reviewed idempotent upsert only when requested:
+
+```powershell
+.\.venv\Scripts\python.exe main.py safari-catalog --source "C:\path\Product-ProductModelNo-ModelCode.ods" --grist-plan
+.\.venv\Scripts\python.exe main.py safari-catalog --source "C:\path\Product-ProductModelNo-ModelCode.ods" --apply
+```
+
+`--apply` prompts before writing; `--yes` is available for an explicitly
+reviewed non-interactive run. The configured Safari document and workspace are
+revalidated before writes. The catalog ODS remains read-only.
+
+Run focused backend checks and the production UI build with:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+cd ui
+npm test
+npm run build
+```
 
 ## Run
 

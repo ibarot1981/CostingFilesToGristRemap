@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "safari-foundation-2026-09-19.v2",
+  "documentName": "Safari Manufacturing",
+  "tables": [
+    "Product",
+    "ProductModel",
+    "ProductModelCode",
+    "IdentityAlias",
+    "CostingFile",
+    "FileObservation",
+    "FileModelAssociation",
+    "FileCodeAssociation",
+    "ImportBatch",
+    "ReconciliationIssue",
+    "AuditEvent"
+  ],
+  "applyPolicy": "explicit-only; dry-run by default; reject legacy GRIST_DOC_ID",
+  "requestRecovery": {
+    "requestKeyColumn": "RequestKey",
+    "fingerprintColumn": "RequestFingerprint",
+    "tables": ["FileModelAssociation", "AuditEvent", "ImportBatch"],
+    "behavior": "Sequential retries resume missing association children and governance records without duplicating rows."
+  }
+}
