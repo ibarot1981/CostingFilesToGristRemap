@@ -1,0 +1,27 @@
+export type Product = { id: string; name: string };
+export type ModelCode = { id: string; code: string; description: string; legacy_spares_only?: boolean; owner?: { fileId: string; associationId: string; name: string; relativePath?: string | null } | null };
+export type ProductModel = { id: string; product_id: string; model_number: string; name: string; productId?: string; modelNumber?: string; modelName?: string; codes: ModelCode[] };
+export type CatalogSummary = { root: string; file_count: number; readable_count?: number | null; unreadable_count?: number | null; files_with_external_references?: number | null; external_reference_count?: number | null };
+export type ExplorerItem = { id: string; name: string; type: "directory" | "file"; relative_path: string; relativePath?: string; extension: string; size_bytes?: number | null; sizeBytes?: number | null; modified_at?: string | null; modifiedAt?: string | null; candidate_classification?: string; candidateClassification?: string; mapping_status?: string; mappingStatus?: string; readable?: boolean | null; parse_error?: string | null; read_state?: string; readState?: string; sheet_count?: number | null; sheetCount?: number | null; external_reference_count?: number | null; externalReferenceCount?: number | null; external_link_warning?: boolean; externalLinkWarning?: boolean; content_hash?: string | null; contentHash?: string | null };
+export type PreviewCell = { value: unknown; kind: "value" | "formula"; formula?: string | null };
+export type Preview = { path: string; sheets: string[]; sheet: string; startRow: number; totalRows: number; totalColumns?: number; truncatedRows?: boolean; truncatedColumns: boolean; readOnly?: boolean; formulaCount?: number; externalReferenceCount?: number; externalLinkWarning?: boolean; rows: unknown[][]; cells?: PreviewCell[][] };
+export type ValidationError = { code: string; message: string; field?: string | null; details?: Record<string, unknown> };
+export type AssociationValidation = { valid: boolean; errors: ValidationError[]; warnings: ValidationError[]; proposal?: Record<string, unknown> | null };
+export type AssociationState = { schemaAvailable: boolean; writeEnabled: boolean; adapter: string; items: MappedFile[]; message?: string | null };
+export type ImportBatch = { id: string; source_file: string; source_hash?: string | null; parser_version: string; started_at: string; completed_at?: string | null; status: string; outcome: string };
+export type MappedFile = {
+  file: Record<string, unknown>;
+  product?: Record<string, unknown> | null;
+  model?: Record<string, unknown> | null;
+  codes: Record<string, unknown>[];
+  association?: Record<string, unknown> | null;
+  history: Record<string, unknown>[];
+  reviewStatus?: "mapped" | "unmapped" | "conflict";
+  issues?: string[];
+  conflictCodes?: string[];
+  lastObservedAt?: string | null;
+  lastObservedChange?: { modifiedAt?: string | null; observedAt?: string | null; sizeBytes?: number | null; source?: string } | null;
+  processingBatch?: ImportBatch | null;
+  latestObservation?: Record<string, unknown> | null;
+    movedTo?: string;
+  };

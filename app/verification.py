@@ -401,17 +401,6 @@ def verify_sheet_with_grist(
     show_count_summary(console, f"Verification Summary: {sheet_name}", verification_counts)
     cnc_dxf_filter_state: dict[str, Any] = {}
     if Confirm.ask("Update TallyWithODS in Grist for this verification result?", default=False):
-        tally_rows = update_grist_tally(
-            client=client,
-            table_id=grist_config.table_id,
-            tally_field=grist_config.tally_field,
-            sheet_config=sheet_config,
-            grist_records=grist_records,
-            filters=filters,
-            result=result,
-        )
-        result.grist_tally_updates.extend(tally_rows)
-        show_tally_update_summary(console, tally_rows)
         if sheet_name == "CNC Cut List":
             filtered_grist_records = [
                 raw_record
@@ -453,6 +442,29 @@ def verify_sheet_with_grist(
                     f"{dxf_outcome.unchanged_rows} unchanged, {dxf_outcome.skipped_rows} skipped, "
                     f"{dxf_outcome.created_rows} ProductPartCNCList rows created."
                 )
+                console.print("[cyan]Refreshing CNC verification before updating TallyWithODS.[/cyan]")
+                grist_records = client.fetch_table_records_with_ids(grist_config.table_id)
+                result = compare_sheet_to_grist(
+                    sheet,
+                    sheet_config,
+                    material_mapping,
+                    grist_records,
+                    master_material_index=master_material_index,
+                    filters=filters,
+                    ods_option_scope=ods_option_scope,
+                    last_value_row_number=last_value_row_number,
+                )
+        tally_rows = update_grist_tally(
+            client=client,
+            table_id=grist_config.table_id,
+            tally_field=grist_config.tally_field,
+            sheet_config=sheet_config,
+            grist_records=grist_records,
+            filters=filters,
+            result=result,
+        )
+        result.grist_tally_updates.extend(tally_rows)
+        show_tally_update_summary(console, tally_rows)
     else:
         console.print("[yellow]TallyWithODS was left unchanged in Grist.[/yellow]")
 

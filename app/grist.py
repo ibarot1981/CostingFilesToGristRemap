@@ -12,7 +12,8 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
-from app.exceptions import ConfigError, GristError
+from app.exceptions import ConfigError, GristError, GristValidationError
+from app.grist_admin import GristAdminClient, validate_safari_document
 
 
 class GristClient:
@@ -36,6 +37,41 @@ class GristClient:
                 "Copy .env.example, set the values, then export them in this shell."
             )
         return cls(api_key=api_key, doc_id=doc_id, base_url=base_url)
+
+    @classmethod
+    def from_safari_environment(cls) -> "GristClient":
+        """Create a client only from the explicitly separate Safari settings."""
+        load_dotenv()
+        api_key = os.getenv("GRIST_API_KEY", "").strip()
+        doc_id = os.getenv("SAFARI_MANUFACTURING_GRIST_DOC_ID", "").strip()
+        workspace_id = os.getenv("SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID", "").strip()
+        legacy_doc_id = os.getenv("GRIST_DOC_ID", "").strip()
+        base_url = os.getenv("GRIST_BASE_URL", "https://docs.getgrist.com").strip()
+        if not api_key or not doc_id or not workspace_id:
+            raise ConfigError("Safari Manufacturing needs GRIST_API_KEY, SAFARI_MANUFACTURING_GRIST_DOC_ID, and SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID.")
+        if doc_id.casefold() == legacy_doc_id.casefold() or doc_id.casefold() == "costing-new":
+            raise GristValidationError("Safari Manufacturing cannot target the legacy Costing-New document.")
+        client = cls(api_key=api_key, doc_id=doc_id, base_url=base_url)
+        client.safari_workspace_id = workspace_id
+        client.validate_safari_write_target()
+        return client
+
+    def validate_safari_write_target(self) -> None:
+        """Revalidate explicit settings and remote identity before any Grist write."""
+        configured_doc_id = os.getenv("SAFARI_MANUFACTURING_GRIST_DOC_ID", "").strip()
+        configured_workspace_id = os.getenv("SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID", "").strip()
+        legacy_doc_id = os.getenv("GRIST_DOC_ID", "").strip()
+        workspace_id = getattr(self, "safari_workspace_id", "")
+        if not configured_doc_id or configured_doc_id != self.doc_id or not workspace_id or configured_workspace_id != workspace_id:
+            raise ConfigError("Safari Manufacturing write target must match the explicitly configured document and workspace IDs.")
+        if self.doc_id.casefold() == legacy_doc_id.casefold() or self.doc_id.casefold() == "costing-new":
+            raise GristValidationError("Safari Manufacturing cannot target the legacy Costing-New document.")
+        admin = GristAdminClient(self.api_key, self.base_url)
+        writable = admin.discover_writable_workspaces()
+        if not any(item.id == workspace_id for item in writable):
+            raise GristValidationError("The configured Safari Manufacturing workspace is not accessible and writable.")
+        document = admin.get_document(self.doc_id)
+        validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id)
 
     def fetch_table_records(self, table_id: str) -> list[dict[str, Any]]:
         """Fetch records from a Grist table and return the record fields."""
