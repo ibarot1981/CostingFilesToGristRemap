@@ -108,7 +108,7 @@ export function App() {
   };
   const chooseFile = async (item: ExplorerItem) => {
     const path = item.relative_path;
-    invalidateAssociation(); setSelectedPath(path); setSelectedFile(item); setPreview(null); setNotice(""); setSupersede(false); setPreviewing(true);
+    invalidateAssociation(); setSelectedPath(path); setSelectedFile(item); setPreview(null); setNotice(""); setProductId(""); setModels([]); setModelId(""); setCodes([]); setSelectedCodes([]); setReason(""); setSupersede(false); setPreviewing(true);
     try { const [inspected, nextPreview] = await Promise.all([api.inspect(path), api.preview(path)]); setSelectedFile(inspected); setPreview(nextPreview); }
     catch (cause) { setError(message(cause)); }
     finally { setPreviewing(false); }

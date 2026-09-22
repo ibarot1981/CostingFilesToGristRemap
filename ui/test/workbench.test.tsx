@@ -56,6 +56,31 @@ function panelProps(): PanelProps {
 }
 
 describe("Costing Explorer association workbench", () => {
+  it("resets association selections when the explorer file changes", async () => {
+    apiMocks.tree.mockResolvedValue({ items: [
+      { id: "pilot.ods", name: "pilot.ods", type: "file", relative_path: "pilot.ods", extension: ".ods" },
+      { id: "second.ods", name: "second.ods", type: "file", relative_path: "second.ods", extension: ".ods" },
+    ] });
+    apiMocks.inspect.mockImplementation(async (path: string) => ({ id: path, name: path, type: "file", relative_path: path, extension: ".ods", content_hash: `${path}-hash` }));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /pilot\.ods/ }));
+    fireEvent.change(await screen.findByLabelText("Product"), { target: { value: "product-1" } });
+    await screen.findByRole("option", { name: /S1KHF/ });
+    fireEvent.change(screen.getByLabelText("Product Model"), { target: { value: "model-1" } });
+    fireEvent.click(await screen.findByRole("checkbox", { name: /S1KHFELP/ }));
+
+    expect((screen.getByLabelText("Product") as HTMLSelectElement).value).toBe("product-1");
+    expect((screen.getByLabelText("Product Model") as HTMLSelectElement).value).toBe("model-1");
+    fireEvent.click(screen.getByRole("button", { name: /second\.ods/ }));
+
+    await vi.waitFor(() => {
+      expect((screen.getByLabelText("Product") as HTMLSelectElement).value).toBe("");
+      expect((screen.getByLabelText("Product Model") as HTMLSelectElement).value).toBe("");
+      expect(screen.queryByRole("checkbox", { name: /S1KHFELP/ })).toBeNull();
+    });
+  });
+
   it("keeps a synchronized horizontal scrollbar in the file explorer", async () => {
     render(<App />);
 
