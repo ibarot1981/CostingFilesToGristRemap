@@ -56,6 +56,13 @@ function panelProps(): PanelProps {
 }
 
 describe("Costing Explorer association workbench", () => {
+  it("keeps a synchronized horizontal scrollbar in the file explorer", async () => {
+    render(<App />);
+
+    await screen.findByRole("button", { name: /pilot\.ods/ });
+    expect(screen.getByRole("region", { name: "File explorer horizontal scroll" })).toBeTruthy();
+  });
+
   it("keeps a floating horizontal scrollbar and supports full-page preview", () => {
     render(<PreviewPanel
       selectedFile={{ id: "pilot.ods", name: "pilot.ods", type: "file", relative_path: "pilot.ods", extension: ".ods" }}
