@@ -1,8 +1,29 @@
 # Safari Manufacturing — Implementation Roadmap
 
-Updated: 21 September 2026
+Updated: 1 October 2026
 
-Planning rule: every milestone ends with a demonstrable artifact, reconciliation evidence, tests, and updated documentation/status.
+Planning rule: every delivery milestone ends with a demonstrable artifact, reconciliation evidence, tests, and updated documentation/status.
+
+## Numbering and current position
+
+This roadmap previously used *milestone* for two different sequences. The
+decimal labels `0.1`–`0.7` and `1.1`–`1.4` identify work packages within a
+phase. The whole-number labels **Delivery Milestone 1, 2, 3** identify
+implementation efforts and their handoffs. Historical document names and
+references retain their original labels; the crosswalk and evidence are in
+`MILESTONE_NUMBERING_AUDIT.md`.
+
+| Delivery effort | Phase work covered | Current position |
+|---|---|---|
+| Milestone 1 / PR 1 | Phase 0 packages 0.2–0.4, with governance and some 0.5 work | Merged; conditional pass, not a Phase 0 exit |
+| Milestone 2 | Phase 0 package 0.5 governance and an accelerated Phase 1 S1KHF semantic-parity pilot | Agreed S1KHF scope complete in the current working tree; checkout still has uncommitted changes; Phase 0 gates remain open |
+| Milestone 3 — next | Phase 1 package 1.1, with the needed Phase 0 package 0.6 CLI mapping extraction and 0.7 pilot evidence carried into its entry work | Planned: normalized S1KHF part and process-line ingestion |
+
+We are working in **Phase 1**, following the Milestone 2 pilot. Phase 0 is
+not formally closed. Milestone 3 must track its outstanding gates separately
+and must not claim Phase 0 completion merely because normalized ingestion
+passes. The 45-entity target design is broader than Milestone 3; see
+`data-model.html` and `MILESTONE_3_IMPLEMENTATION_PROMPT.md` for the subset.
 
 ## Operating rules for every milestone
 
@@ -16,7 +37,7 @@ Planning rule: every milestone ends with a demonstrable artifact, reconciliation
 
 ## Phase 0 — Foundation and controlled mapping
 
-### Milestone 0.1 — Governance and source boundaries
+### Work package 0.1 — Governance and source boundaries
 
 **Outcome:** everyone can tell which system is authoritative for each field and what the software may change.
 
@@ -37,7 +58,7 @@ Verification:
 
 Exit gate: owner accepts the source-boundary matrix. The next milestone creates or validates the new document before any schema apply.
 
-### Milestone 0.2 — Safari Manufacturing document creation and schema bootstrap
+### Work package 0.2 — Safari Manufacturing document creation and schema bootstrap
 
 **Outcome:** exactly one correctly targeted Safari Manufacturing Grist document exists, and its design is reproducible and reviewable before business data is written.
 
@@ -78,7 +99,7 @@ no-op. The validated document settings are held in ignored local configuration;
 no document ID is recorded here. The catalog was imported after explicit owner
 approval; no costing-file association records were written.
 
-### Milestone 0.3 — Canonical identity import
+### Work package 0.3 — Canonical identity import
 
 **Outcome:** Product, Model Number, and Model Code identities exist with provenance and visible exceptions.
 
@@ -100,7 +121,7 @@ Verification:
 
 Exit gate: canonical catalog and exception report approved.
 
-### Milestone 0.4 — Costing Explorer and associations (first implementation milestone)
+### Work package 0.4 — Costing Explorer and associations (delivered in Milestone 1)
 
 **Outcome:** the user can browse the Product Costing tree, inspect a workbook, and explicitly map it to a model and eligible codes.
 
@@ -186,7 +207,7 @@ or supersede review.
   catalog duplicates/GC/Bush rules, code ownership, interrupted Grist-write
   recovery, idempotent-key collision, supersede history, schema target
   revalidation, proxy actor attribution, and Grist duplicate-name refusal. The
-  UI has 2 dependency-free Node view-model tests and 5 Vitest component/workflow
+  UI initially had 2 dependency-free Node view-model tests and 5 Vitest component/workflow
   tests; typecheck and production build pass.
 - A local browser smoke used the real Product Costing root: Explorer loaded 503
   files; Mapped Files loaded 504 ODS entries and its unmapped filter, search,
@@ -216,9 +237,11 @@ or supersede review.
   case-insensitively, to catalog values `S1KHFExEP`, `S1KHFExEK`, and
   `S1KHFExM`, with catalog capitalization preserved. Fresh reads confirm 19
   unique active code owners, three FileModelAssociation rows, three association
-  audit events, three queued association ImportBatch rows (five batches total,
-  including the two catalog imports), and hashes matching all three source
-  ODS files. Neither source workbook nor `Costing-New` was modified.
+  audit events, and three queued association ImportBatch rows (five batches total,
+  including the two catalog imports). All three hashes matched at association
+  verification time. A 23 September post-merge audit found that the HF-MS Drum
+  source has since changed; the other two still match. Neither the application
+  nor this audit modified a source workbook or `Costing-New`.
 - Explorer inspection now recognizes an ODS named with “Export” as a costing
   candidate when it contains both `Cost Log` and `Total Summary`; a regression
   test covers this narrow case. Other generated-output classifications remain
@@ -252,10 +275,12 @@ or supersede review.
 - On 22 September 2026, the live document was re-read without mutation:
   Safari Manufacturing remains in the Work workspace with all 11 foundation
   tables; the three active file-model associations and 19 active code links
-  remain unique; all three source hashes still match; and the five import
-  batches comprise two applied catalog batches plus three queued read-only
-  association batches. The 62-test Python suite, seven UI tests, and production
-  build were rerun successfully.
+  remained unique; all three source hashes matched in that dated check; and the
+  five import batches comprise two applied catalog batches plus three queued
+  read-only association batches. At that check, the 62-test Python suite, seven
+  UI tests, and production build passed. The 23 September read found the HF-MS
+  Drum source had since changed; the other two mapped source hashes still
+  match.
 - Live Grist discovery returned four writable workspaces; the owner explicitly
   selected Work. Setup safely reused the exact Safari Manufacturing document,
   applied and verified the complete foundation schema, and removed only the
@@ -266,11 +291,21 @@ or supersede review.
   catalog contained no Bush variants, so live persistence for that category
   was not exercised (classification remains covered by tests).
 
-### Milestone 0.5 — Mapped Files and reconciliation
+### Work package 0.5 — Mapped Files and reconciliation
 
 **Outcome:** mappings can be reviewed and corrected without hidden overwrites.
 
-**Current evidence (21 September 2026):** the review surface groups by
+**Post-merge audit (23 September 2026):** Milestone 1 received a conditional
+pass. A fresh read found the mapped HF-MS Drum workbook no longer matches its
+stored observation, and the API correctly derives `changed_file`. The catalog
+comparison also identified two active, unreferenced Safari SS ProductModel rows
+containing the Unicode replacement character where the source has an en dash.
+These are now the first two controlled reconciliation cases for this milestone.
+The full evidence and required safeguards are in
+`MILESTONE_1_POST_MERGE_AUDIT.md`; the implementation brief is
+`MILESTONE_2_IMPLEMENTATION_PROMPT.md`.
+
+**Milestone 1 evidence at implementation start (21 September 2026):** the review surface groups by
 Product/Model, filters by mapped/unmapped/conflict/needs-review, sorts by path,
 name, or last observed change, and opens preserved association history. The
 API projection surfaces duplicate active code owners, catalog-reference
@@ -278,10 +313,12 @@ mismatches, missing/changed files, verified moves, and known parse/external-link
 findings. A unique candidate move is only reported after recorded size and
 timestamp match and the file hash verifies. Endpoint tests cover duplicate
 ownership, changed metadata, observation timestamps, catalog mismatch, and a
-verified move, and CLI dry-run/workspace-selection safety. The backend now has
-62 tests (61 pass and one platform skip); two dependency-free Node tests cover
-mapped-file grouping, review/search filters, moved-path search, and
-last-observed sorting.
+verified move, and CLI dry-run/workspace-selection safety. At this 21 September
+check, the backend had 62 tests (61 pass and one platform skip); current
+verification is 78 tests (77 pass and one platform skip). The original two
+dependency-free Node tests cover mapped-file grouping, review/search filters,
+moved-path search, and last-observed sorting; current frontend coverage is 10
+Vitest tests.
 The post-change local browser smoke loaded 504 files, verified grouping,
 search/status/sort, timestamps, and keyboard-opened details. It used the
 in-memory adapter and had no actual conflict rows to display. The live browser
@@ -303,6 +340,49 @@ to a source ODS or Grist document. The first two owner-supplied associations
 were saved through the guarded Grist repository; the HF-MS Drum association was
 saved through the guarded browser UI.
 
+**Historical Milestone 0.5 checkpoint (23 September 2026; superseded by the
+Milestone 2 status dated 29 September below):** the durable
+issue lifecycle, bounded dry-run/materializing scan, filtered CSV/JSON export,
+source-revision preview/apply, identity-cleanup preview/apply, and versioned
+directory mapping proposal/approval workflows are implemented behind the
+storage-neutral repository contract. The API and Reconciliation UI expose
+evidence, history, audit, required-reason actions, optimistic versions, and
+guided duplicate-code owner review. Classification samples and rule decisions
+are recorded in `MILESTONE_0_5_CLASSIFICATION_REVIEW.md`.
+The current scanner still promotes hash drift to a `changed_file` issue
+candidate; D-033 clarifies this is only a source-revision signal until semantic
+costing/material comparison. Semantic snapshots, field-level diff, and a
+reviewable Grist change-set flow are required follow-up work. For Material Cut
+List, D-034 sets the workbook-scoped active key to Machine Piece Description,
+Material to Cut, Dimension to Cut (mm), Quantity Nos, and Optional Item Group 1.
+At this checkpoint, a changed key was treated as removal plus addition. D-051
+now supersedes that matching rule in part: a changed key may be paired as a
+probable modification only with unique strong evidence; otherwise it remains
+ambiguous for owner resolution or separate add/remove when no plausible match
+exists.
+
+Verification passes 78 Python tests (77 pass, one expected platform skip),
+2 dependency-free Node tests, 10 Vitest tests, and the TypeScript/production
+build. The synthetic browser smoke rendered the Explorer and Reconciliation at
+1280 × 720 and 390 × 844. At 390 px, the document width matched the 375 px
+layout viewport and no element overflowed horizontally. The issue component
+test exercises keyboard selection, required reasons, and focus transfer to the
+details heading. Owner visual acceptance remains open.
+
+Milestone 0.5 is **not at its exit gate**. A read-only live scan still has 8
+unmaterialized candidates: 3 `external_link_review`, 1 `changed_file`, 2
+`invalid_identity_encoding`, and 2 `unmatched_active_identity`. The durable
+register remains at 68 historical open `blank_description` issues; no candidate
+was materialized and no live issue was assigned, deferred, resolved, or
+reopened. The `changed_file` candidate is hash drift only; under D-033 it is a
+source-revision signal until semantic comparison confirms an unresolved
+business discrepancy. The validated v3 schema plan proposes one `DirectoryProductMapping`
+table and 2 table extensions, and remains unapplied. Grist governance writes
+fail closed with `SCHEMA_MIGRATION_REQUIRED` until that migration is explicitly
+approved and applied. The HF-MS semantic comparison and two model cleanups also
+remain pending; Milestone 0.6 stays gated until confirmed pilot issues have
+owners and a reasoned open, deferred, or audited resolved state.
+
 Deliverables:
 
 - grouped/filtered mapped-files screen;
@@ -313,7 +393,7 @@ Deliverables:
 
 Exit gate: all pilot mapping exceptions have a status, owner, and resolution or deferral reason.
 
-### Milestone 0.6 — Shared CLI material-mapping services
+### Work package 0.6 — Shared CLI material-mapping services
 
 **Outcome:** the UI/API reuse proven CLI mapping knowledge rather than reimplementing it.
 
@@ -335,7 +415,7 @@ remains planned work requiring golden CLI-equivalence tests.
 
 Exit gate: legacy CLI outputs remain equivalent for selected fixtures and API results identify the same materials.
 
-### Milestone 0.7 — S1KHF read-only pilot
+### Work package 0.7 — S1KHF read-only pilot
 
 **Outcome:** one real workbook is understood end to end as immutable source observations.
 
@@ -351,19 +431,109 @@ Exit gate: owner signs off the sheet interpretation and discrepancy report. Phas
 
 ## Phase 1 — Read-only ingestion and costing parity
 
-### Milestone 1.1 — Normalized process-line ingestion
+### Delivery Milestone 2 — Interim ODS costing reconciliation and S1KHF pilot
 
-Implement typed observations for Material Cut, Tool Shop, CNC, Stores, and Labour/Paint/Packing. Preserve workbook values and formulas separately; never convert unknown fields to guessed business meanings.
+**Status: COMPLETE for the agreed S1KHF Milestone 2 scope (29 September 2026).**
 
-### Milestone 1.2 — Dependency and approved-rate resolution
+**Outcome:** ODS remains the authority during this transition. Refresh and
+Calculate use a selected explorer workbook and current local RawSteel and
+SteelRateLog ODS dependencies. Those actions only read sources and a disposable
+LibreOffice-refreshed copy. A separate explicit Reconcile action persists
+semantic state and audit evidence to Safari Manufacturing. Source ODS and
+Costing-New are never written.
+
+**Implementation:**
+
+- `app/milestone2.py` parses RawSteel, the available SteelRateLog dump, the
+  product-local SteelLog, selected-workbook formula inputs, active and
+  historical MCL lines, other configured process lists, and Total Summary
+  option headings. It pins source hashes and formula/cell provenance.
+- Costing Review initiates LibreOffice `FULL_UPDATE` on a temporary sibling
+  copy, recalculates, calculates active lines, and removes the copy. The
+  selected workbook remains the default for its assigned Model Codes; alternate
+  scenario workbooks do not override that selection.
+- `CostingSnapshot` stores the accepted semantic content and source revisions.
+  `CostingChangeSetItem` stores classified rate and structure changes with
+  previous/current states, source evidence, affected lines, CR references, and
+  cost impact when available. Each item and baseline change receives an audit
+  event.
+- The five agreed MCL fields are exact-match identity. Unique strong semantic
+  evidence can pair a changed key as a probable modification. Matching never
+  uses MCL ID or row position. Configured process-list movement, option group
+  changes, additions/removals, material/dimension/quantity edits, formula and
+  parameter changes, and rate changes have separate classifications.
+- Ambiguous matching is shown for owner resolution. Deterministic changes do
+  not need line-by-line owner review; the explicit Reconcile action records the
+  full change set and advances the baseline. CR Log is carried as evidence and
+  never auto-accepts a change.
+- Grist writes stay staged until change items, source observation, and audit
+  records are durable. Optimistic baseline/source checks, actor attribution,
+  idempotency, and retry recovery are enforced. Safari schema v4 was applied to
+  the validated Safari Manufacturing document and the follow-up plan is clean.
+
+**S1KHF real cycle:** Safari had no accepted costing snapshot before this work,
+so there was no historical semantic baseline from which to reconstruct earlier
+changes. The selected workbook was refreshed and calculated: 42 active MCL
+lines, 16 historical lines excluded, zero blocked lines, active total
+₹11,056.401709. The explicit reconcile action established the first accepted
+semantic baseline. A second real refresh/compare found zero semantic changes;
+repeating acceptance with the same state is a no-op. Source workbook and linked
+ODS hashes were verified unchanged and the disposable copy was removed.
+
+**Validation:** `python -m unittest discover -s tests -v` passed 106 tests
+(105 passed, one platform skip); semantic and Grist persistence/retry fixtures
+are included. Python compile checks passed. UI tests passed (2 Node view-model
+tests and 10 Vitest tests), and TypeScript checking plus the production build
+passed. The live S1KHF refresh/compare/reconcile/baseline cycle is recorded
+above; no source ODS or linked ODS hash changed.
+
+**Limitations and deferred items:** this first baseline cannot recreate changes
+that predate its acceptance. Additional invalid-rate cases beyond the confirmed
+rules, automatic Google Sheets dump acquisition, expanded product-family
+parity, and future per-material/per-product costing configuration remain later
+work. The pilot snapshot is about 667 KB of JSON content and was accepted by
+the current Safari deployment; substantially larger workbooks may need chunked
+evidence storage if they exceed that deployment's request-size limit. The pilot
+matched identity and cost behavior on the current selected workbook; it does
+not claim broad parity across every product family.
+
+**Exit decision:** accepted snapshots, governed change-set persistence, semantic
+rate/structure comparison, ambiguity handling, CR evidence, read-only refresh
+and calculation, explicit acceptance, idempotency, and the S1KHF baseline cycle
+are implemented. Remaining deferred items do not block the defined Milestone 2
+exit criteria.
+
+### Work package 1.1 / Delivery Milestone 3 — Normalized part and process-line ingestion
+
+Milestone 2 already extracts configured Material Cut, Tool Shop, CNC, Stores, and Labour/Paint/Packing lines into accepted semantic snapshots for the S1KHF pilot. The next data-model milestone must normalize those records before broad product-family expansion. It introduces stable `LineMaster` identities, immutable `LineRevision` rows, typed process details, immutable `SourceLineObservation` rows, and explicit `SourceLineMapping` records. It must retain values and formulas separately, keep `In Use = No` rows historical, use the D-034 composite key for exact matches, and pair a changed key as a probable modification only with unique strong evidence. Ambiguous identity requires owner reconciliation; CR Log is evidence, never an automatic match or approval. The accepted JSON snapshot remains a parity oracle during migration, not the primary searchable line store.
+
+Milestone 3 starts with a schema and mapping plan against the accepted S1KHF
+snapshot. Its implementation scope is `ProductPart`, `PartRevision`,
+`PartComponentRevision` where supported by source evidence, `LineMaster`,
+`LineRevision`, the five typed process-detail families, material/purchase-item
+identity references, workbook/sheet/row observations, governed source-line
+mappings, and row-level revision audit. It includes the narrowly required
+extraction of existing CLI material-mapping rules with golden CLI equivalence.
+It does not implement the Costing Configuration builder, Manufacturing
+Configuration, Production Plans, stock reservations, live rates, or ODS
+write-back. Exact scope and acceptance tests are in
+`MILESTONE_3_IMPLEMENTATION_PROMPT.md`.
+
+Exit gate: one accepted S1KHF source revision is represented in queryable
+child rows; every row has source provenance and a stable or explicitly
+unresolved identity; active/historical counts and supported totals reconcile
+with the accepted semantic baseline; repeat import and interrupted-write
+recovery converge; the existing CLI still yields equivalent mappings.
+
+### Work package 1.2 — Dependency and approved-rate resolution
 
 Resolve references to Spares Master, Steel Log, Material masters, and other product workbooks. Replace fragile path semantics with explicit dependency records while retaining the original formula/reference as evidence.
 
-### Milestone 1.3 — Explainable costing engine
+### Work package 1.3 — Explainable costing engine
 
 Calculate base, additions, deductions, replacements, quantities, overhead, and final totals using decimal arithmetic and a pinned rate set. Every result must drill down to source lines and applied rules.
 
-### Milestone 1.4 — Parity expansion
+### Work package 1.4 — Parity expansion
 
 Reach approved tolerances on S1KHF, then extend to representative product families including shared parts, motors/engines, imported/local variants, spares, and GC variants.
 
@@ -384,6 +554,7 @@ Phase gate: repeated sync runs converge, failure recovery is proven, and no sour
 - Reusable versioned Product Parts and recursive composition.
 - Costing Configuration builder with base/add/remove/replace/quantity/rate rules.
 - Manufacturing BOM, routing, source department, issue route, and per-part batch policies.
+- Versioned Production Plans that instantiate an approved Manufacturing Configuration with independent requested quantities per part/subassembly, available/reserved stock consideration, and explicit overproduction or multi-run batch reasons.
 - Store Issue Slip generation without double counting Tool Shop items routed through Stores.
 - Spare-parts configuration with legacy Bush applicability.
 - Effective-date publication, draft/review/approved lifecycle, and comparison between revisions.

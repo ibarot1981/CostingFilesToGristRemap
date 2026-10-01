@@ -14,6 +14,39 @@ from app.web import _is_external_cache_sheet
 
 
 class WebTests(unittest.TestCase):
+    def test_costing_snapshot_audit_actor_comes_from_authenticated_headers(self) -> None:
+        import app.web as web
+        from app.domain import CostingFile
+        from app.repository import InMemorySafariRepository
+
+        repository = InMemorySafariRepository()
+        repository.add_file(CostingFile("file:s1khf.ods", "S1KHF/model.ods", "s1khf/model.ods", "model.ods", ".ods", 10, "2026-09-29T00:00:00+00:00", "file-hash"))
+        semantic = {
+            "semantic_hash": "semantic-hash",
+            "observed_at": "2026-09-29T00:00:00+00:00",
+            "source_hashes": {"selected_workbook_saved": "file-hash", "raw_steel": "raw-hash", "rate_log_dump": "rate-hash"},
+            "source_evidence": {"selected_workbook_saved": {"sha256": "file-hash"}},
+            "content": {},
+        }
+        current_review = {
+            "status": "ready_for_owner_review",
+            "semantic_snapshot": semantic,
+            "semantic_comparison": {"baseline_exists": False, "changes": [], "ambiguities": [], "owner_review_required": False},
+            "accepted_baseline": None,
+            "costing_file_id": "file:s1khf.ods",
+        }
+        request = Request({"type": "http", "headers": [(b"x-authentik-uid", b"user-123"), (b"x-authentik-username", b"Irshad")]})
+
+        with mock.patch.object(web, "_repository", repository), mock.patch.object(web, "costing_review", return_value=current_review):
+            result = web.accept_costing_review(
+                request,
+                {"path": "S1KHF/model.ods", "actor": "Spoofed User", "reason": "establish baseline", "semanticHash": "semantic-hash", "sourceHashes": semantic["source_hashes"], "acceptedSnapshotKey": None},
+                idempotency_key="costing-auth-test",
+            )
+
+        self.assertEqual(result["snapshot"]["accepted_by"], "Irshad")
+        self.assertEqual(next(iter(repository.audit_events.values())).actor, "Irshad")
+
     def test_association_save_http_contract_declares_idempotency_header(self) -> None:
         import app.web as web
 
@@ -229,7 +262,7 @@ class WebTests(unittest.TestCase):
             self.assertEqual(error.exception.detail["code"], "ASSOCIATION_CONFLICT")
             self.assertEqual(error.exception.detail["validation"]["errors"][0]["code"], "FILE_CHANGED_SINCE_PREVIEW")
 
-    def test_register_file_refreshes_metadata_and_preserves_mapping_state(self) -> None:
+    def test_register_file_preserves_stored_fingerprint_and_mapping_state_until_approval(self) -> None:
         import app.web as web
         from app.domain import CostingFile
         from app.repository import InMemorySafariRepository
@@ -245,10 +278,11 @@ class WebTests(unittest.TestCase):
                     file_id = web._register_file("model.ods")
                     current = repository.get_file(file_id)
                     expected_hash = web.sha256_file(workbook)
-                    expected_size = workbook.stat().st_size
 
-        self.assertEqual(current.file_hash, expected_hash)
-        self.assertEqual(current.size_bytes, expected_size)
+        self.assertNotEqual(current.file_hash, expected_hash)
+        self.assertEqual(current.file_hash, "stale-hash")
+        self.assertEqual(current.size_bytes, 1)
+        self.assertEqual(repository.observations, [])
         self.assertEqual(current.mapping_status, "mapped")
         self.assertEqual(current.product_id, "product-1")
 

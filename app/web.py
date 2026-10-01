@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 import json
+import csv
+import io
 from datetime import datetime
 import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from app.catalog import scan_costing_file
 from app.catalog_import import import_catalog
-from app.domain import CostingFile as DomainCostingFile, FileObservation, utc_now
+from app.domain import CostingFile as DomainCostingFile, FileObservation, ReconciliationIssue, utc_now
 from app.filesystem_catalog import FilesystemCatalog, PathSafetyError
-from app.repository import AssociationConflict, AssociationProposal, InMemorySafariRepository, sha256_file
+from app.repository import AssociationConflict, AssociationProposal, GovernanceConflict, InMemorySafariRepository, SafariRepository, sha256_file
 from app.workbook import OdsWorkbook
+from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
+from app.libreoffice_refresh import LibreOfficeRefreshError, refreshed_ods_copy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +34,7 @@ DEFAULT_CATALOG_NAME = "Product-ProductModelNo-ModelCode.ods"
 
 app = FastAPI(title="Safari Manufacturing ERP", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4320", "http://localhost:4320"], allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
-_repository: InMemorySafariRepository | None = None
+_repository: SafariRepository | None = None
 
 
 @app.get("/api/health")
@@ -61,7 +66,7 @@ def catalog_files(query: str = "", directory: str = "", status: str = "", classi
             files = [item for item in files if Path(item.relative_path).parent.as_posix().casefold() == directory.casefold()]
         if classification:
             files = [item for item in files if item.candidate_classification == classification]
-        rows = [_registry_status(item, conflicting_file_ids=conflicting_file_ids).to_dict() for item in files]
+        rows = [_explorer_node_payload(item, conflicting_file_ids=conflicting_file_ids) for item in files]
         if status == "mapped":
             mapped = {item["file"]["relative_path"] for item in repository.list_mapped_files() if item["association"]}
             rows = [item for item in rows if item["relative_path"] in mapped]
@@ -87,7 +92,7 @@ def catalog_tree(path: str = "") -> dict[str, Any]:
     except (FileNotFoundError, NotADirectoryError) as exc:
         raise _error(404, "DIRECTORY_NOT_FOUND", str(exc))
     conflicting_file_ids = _conflicting_file_ids(_get_repository())
-    return {"root": str(_costing_root()), "path": path, "items": [_registry_status(item, conflicting_file_ids=conflicting_file_ids).to_dict() for item in children]}
+    return {"root": str(_costing_root()), "path": path, "items": [_explorer_node_payload(item, conflicting_file_ids=conflicting_file_ids) for item in children]}
 
 
 @app.get("/api/catalog/inspect")
@@ -99,7 +104,7 @@ def inspect_file(path: str) -> dict[str, Any]:
         raise _error(400, exc.code, str(exc))
     except FileNotFoundError as exc:
         raise _error(404, "FILE_NOT_FOUND", str(exc))
-    return _registry_status(node, conflicting_file_ids=_conflicting_file_ids(_get_repository())).to_dict()
+    return _explorer_node_payload(node, conflicting_file_ids=_conflicting_file_ids(_get_repository()))
 
 
 @app.get("/api/products")
@@ -192,7 +197,7 @@ def processing_queue(status: str = "", limit: int = Query(100, ge=1, le=500)) ->
 
 
 @app.get("/api/mapped-files")
-def mapped_files(status: str = "", product_id: str = "", model_id: str = "") -> dict[str, Any]:
+def mapped_files(status: str = "", product_id: str = "", model_id: str = "", query: str = "") -> dict[str, Any]:
     repository = _get_repository()
     existing = repository.list_mapped_files()
     by_path = {str(item["file"].get("relative_path", "")).casefold(): item for item in existing}
@@ -215,7 +220,213 @@ def mapped_files(status: str = "", product_id: str = "", model_id: str = "") -> 
         rows = [item for item in rows if item["association"] and item["association"]["product_id"] == product_id]
     if model_id:
         rows = [item for item in rows if item["association"] and item["association"]["model_id"] == model_id]
+    if query.strip():
+        needle = query.strip().casefold()
+        rows = [item for item in rows if needle in json.dumps(item, ensure_ascii=False).casefold()]
     return {"items": rows, "total": len(rows), "adapter": _get_repository().adapter_name}
+
+
+@app.get("/api/reconciliation/issues")
+def reconciliation_issues(status: str = "", issue_type: str = "", severity: str = "", owner: str = "", product_id: str = "", model_id: str = "", file_id: str = "", query: str = "", offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    repository = _get_repository()
+    issues = list(repository.issues.values())
+    if status:
+        issues = [item for item in issues if item.status.casefold() == status.casefold()]
+    if issue_type:
+        issues = [item for item in issues if item.issue_type.casefold() == issue_type.casefold()]
+    if severity:
+        issues = [item for item in issues if item.severity.casefold() == severity.casefold()]
+    if owner:
+        issues = [item for item in issues if (item.assigned_owner or "").casefold() == owner.casefold()]
+    if file_id:
+        issues = [item for item in issues if _issue_affects_file(item, file_id, repository)]
+    if product_id or model_id:
+        issues = [item for item in issues if _issue_matches_identity(item, product_id, model_id, repository)]
+    if query.strip():
+        needle = query.strip().casefold()
+        issues = [item for item in issues if needle in json.dumps(item.to_dict(), ensure_ascii=False).casefold()]
+    issues.sort(key=lambda item: (item.last_seen_at, item.id), reverse=True)
+    return {"total": len(issues), "offset": offset, "limit": limit, "items": [item.to_dict() for item in issues[offset:offset + limit]], "adapter": repository.adapter_name}
+
+
+@app.get("/api/reconciliation/issues/{issue_id}")
+def reconciliation_issue_detail(issue_id: str) -> dict[str, Any]:
+    detail = _get_repository().issue_details(issue_id)
+    if detail is None:
+        raise _error(404, "ISSUE_NOT_FOUND", "Reconciliation issue was not found.")
+    return detail
+
+
+@app.post("/api/reconciliation/issues/{issue_id}/actions/{action}")
+def reconciliation_issue_action(issue_id: str, action: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    repository = _get_repository()
+    allowed = {"assign", "unassign", "defer", "resolve", "reopen", "keep-open"}
+    if action not in allowed:
+        raise _error(400, "INVALID_ISSUE_ACTION", f"Unsupported issue action: {action}.")
+    current_issue = repository.issues.get(issue_id)
+    if action == "resolve" and current_issue and current_issue.issue_type == "invalid_rate_entry":
+        try:
+            rate_path = _filesystem().resolve(current_issue.source_path)
+        except (PathSafetyError, FileNotFoundError):
+            raise _error(409, "ISSUE_SOURCE_UNAVAILABLE", "The SteelRateLog source is unavailable; the invalid-rate issue cannot be verified for resolution.")
+        try:
+            rate_doc = read_ods(rate_path, {"SteelRateLog"})
+            _rows, current_findings = extract_rate_log(rate_doc)
+        except (OSError, KeyError, ValueError) as exc:
+            raise _error(409, "ISSUE_SOURCE_UNAVAILABLE", f"The SteelRateLog source could not be checked: {exc}")
+        original_codes = set(current_issue.detected_facts.get("issueCodes", []))
+        still_invalid = any(
+            finding.get("source_row") == current_issue.source_row
+            and finding.get("material") == current_issue.entity_id
+            and (not original_codes or finding.get("code") in original_codes)
+            for finding in current_findings
+        )
+        if still_invalid:
+            raise _error(409, "ISSUE_CONDITION_STILL_PRESENT", "Correct the SteelRateLog source entry and refresh the costing workbook before resolving this issue.")
+    try:
+        issue = repository.mutate_issue(issue_id, action.replace("-", "_"), actor=_request_actor(request), reason=str(payload.get("reason") or ""), expected_version=int(payload.get("expectedVersion", 0)), assigned_owner=payload.get("owner"), idempotency_key=idempotency_key)
+    except GovernanceConflict as exc:
+        status_code = 404 if exc.code.endswith("NOT_FOUND") else 409 if exc.code.startswith(("STALE", "IDEMPOTENCY", "INVALID_ISSUE", "SCHEMA_MIGRATION")) else 422
+        raise _error(status_code, exc.code, str(exc), {"current": exc.current.to_dict() if hasattr(exc.current, "to_dict") else None})
+    return {"issue": issue.to_dict()}
+
+
+@app.post("/api/reconciliation/scan")
+def reconciliation_scan(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    limit = min(100, max(1, int(payload.get("limit", 50))))
+    dry_run = bool(payload.get("dryRun", True))
+    candidates = _build_reconciliation_candidates(limit)
+    repository = _get_repository()
+    materialized = []
+    if not dry_run:
+        try:
+            materialized = [repository.upsert_issue(issue) for issue in candidates]
+        except GovernanceConflict as exc:
+            raise _error(409, exc.code, str(exc))
+    items = materialized if not dry_run else candidates
+    return {"dryRun": dry_run, "scanned": min(limit, len([item for item in repository.files.values() if item.extension.casefold() == ".ods"])), "detected": len(candidates), "materialized": len(materialized), "countsByType": _count_by(items, lambda item: item.issue_type), "countsByStatus": _count_by(items, lambda item: item.status), "items": [item.to_dict() for item in items]}
+
+
+@app.get("/api/reconciliation/export")
+def reconciliation_export(format: str = "json", status: str = "", issue_type: str = "", severity: str = "", owner: str = "", product_id: str = "", model_id: str = "", file_id: str = "", query: str = "") -> Response:
+    result = reconciliation_issues(status, issue_type, severity, owner, product_id, model_id, file_id, query, 0, 5000)
+    if result["total"] > 5000:
+        raise _error(413, "EXPORT_LIMIT_EXCEEDED", "The filtered register exceeds 5,000 issues; narrow the filters before exporting.")
+    items = result["items"]
+    if format.casefold() == "json":
+        content = json.dumps({"total": result["total"], "items": items}, ensure_ascii=False, indent=2)
+        return Response(content, media_type="application/json; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="reconciliation-register.json"'})
+    if format.casefold() != "csv":
+        raise _error(400, "INVALID_EXPORT_FORMAT", "format must be csv or json.")
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\r\n")
+    writer.writerow(("id", "fingerprint", "type", "severity", "status", "owner", "entityType", "entityId", "fileId", "sourcePath", "sourceRow", "message", "firstSeenAt", "lastSeenAt", "version", "resolutionAction", "resolutionReason", "detectedFacts"))
+    for item in items:
+        writer.writerow((item.get("id"), item.get("fingerprint"), item.get("issue_type"), item.get("severity"), item.get("status"), item.get("assigned_owner"), item.get("entity_type"), item.get("entity_id"), item.get("costing_file_id"), item.get("source_path"), item.get("source_row"), item.get("message"), item.get("first_seen_at"), item.get("last_seen_at"), item.get("version"), item.get("resolution_action"), item.get("resolution_reason"), json.dumps(item.get("detected_facts") or {}, ensure_ascii=False, sort_keys=True)))
+    return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="reconciliation-register.csv"'})
+
+
+@app.post("/api/reconciliation/issues/{issue_id}/source-revision/preview")
+def source_revision_preview(issue_id: str) -> dict[str, Any]:
+    repository = _get_repository()
+    issue = repository.issues.get(issue_id)
+    if issue is None:
+        raise _error(404, "ISSUE_NOT_FOUND", "Reconciliation issue was not found.")
+    if issue.issue_type != "changed_file" or not issue.costing_file_id:
+        raise _error(422, "ISSUE_NOT_SOURCE_REVISION", "This issue does not describe a changed registered source file.")
+    return _source_revision_plan(issue, repository)
+
+
+@app.post("/api/reconciliation/issues/{issue_id}/source-revision/apply")
+def source_revision_apply(issue_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    repository = _get_repository()
+    issue = repository.issues.get(issue_id)
+    if issue is None or not issue.costing_file_id:
+        raise _error(404, "ISSUE_NOT_FOUND", "Source revision issue was not found.")
+    actor = _request_actor(request)
+    if actor.strip().casefold() != "irshad":
+        raise _error(403, "APPROVER_NOT_AUTHORIZED", "Only Irshad may accept source revisions during Phase 0.")
+    try:
+        expected_issue_version = int(payload.get("expectedIssueVersion", 0))
+        expected_stored_hash = str(payload.get("expectedStoredHash") or "")
+        expected_current_hash = str(payload.get("expectedCurrentHash") or "")
+        replay = repository.replay_source_revision(
+            idempotency_key,
+            file_id=issue.costing_file_id,
+            issue_id=issue_id,
+            actor=actor,
+            reason=str(payload.get("reason") or ""),
+            expected_issue_version=expected_issue_version,
+            expected_stored_hash=expected_stored_hash,
+            expected_current_hash=expected_current_hash,
+        )
+        if replay is not None:
+            return replay
+        plan = _source_revision_plan(issue, repository)
+        if plan["current"]["sha256"] != expected_current_hash:
+            raise GovernanceConflict("STALE_REVISION_FACTS", "The source file changed after preview.", issue)
+        final_hash = _current_hash(issue.costing_file_id)
+        if final_hash != plan["current"]["sha256"]:
+            raise GovernanceConflict("STALE_REVISION_FACTS", "The source file changed while apply was being prepared.", issue)
+        observation = _observation_from_revision(issue.costing_file_id, plan["current"])
+        return repository.accept_file_revision(issue.costing_file_id, observation, issue_id=issue_id, actor=actor, reason=str(payload.get("reason") or ""), expected_issue_version=expected_issue_version, expected_stored_hash=expected_stored_hash, expected_current_hash=plan["current"]["sha256"], idempotency_key=idempotency_key)
+    except GovernanceConflict as exc:
+        status_code = 403 if exc.code == "APPROVER_NOT_AUTHORIZED" else 409 if exc.code.startswith(("STALE", "IDEMPOTENCY", "ASSOCIATION", "SCHEMA_MIGRATION")) else 422
+        raise _error(status_code, exc.code, str(exc), {"current": exc.current.to_dict() if hasattr(exc.current, "to_dict") else None})
+
+
+@app.post("/api/reconciliation/identity-cleanup/preview")
+def identity_cleanup_preview(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    plans = _get_repository().plan_identity_cleanup(payload.get("modelIds"))
+    for plan in plans:
+        model_id = plan["model"]["id"]
+        issue = next((item for item in _get_repository().issues.values() if item.issue_type == "invalid_identity_encoding" and item.entity_id == model_id), None)
+        plan["issue"] = issue.to_dict() if issue else None
+    return {"dryRun": True, "items": plans, "canApplyCount": sum(bool(item["canApply"]) for item in plans)}
+
+
+@app.post("/api/reconciliation/identity-cleanup/apply")
+def identity_cleanup_apply(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    actor = _request_actor(request)
+    if actor.strip().casefold() != "irshad":
+        raise _error(403, "APPROVER_NOT_AUTHORIZED", "Only Irshad may approve identity cleanup during Phase 0.")
+    try:
+        result = _get_repository().apply_identity_cleanup(str(payload.get("modelId") or ""), str(payload.get("canonicalModelId") or ""), issue_id=str(payload.get("issueId") or ""), actor=actor, reason=str(payload.get("reason") or ""), expected_issue_version=int(payload.get("expectedIssueVersion", 0)), idempotency_key=idempotency_key)
+        return result
+    except GovernanceConflict as exc:
+        code = exc.code
+        status_code = 409 if code.startswith(("STALE", "IDEMPOTENCY", "IDENTITY_CLEANUP", "SCHEMA_MIGRATION")) else 403 if code == "APPROVER_NOT_AUTHORIZED" else 422
+        raise _error(status_code, code, str(exc), {"current": exc.current.to_dict() if hasattr(exc.current, "to_dict") else None})
+
+
+@app.get("/api/directory-mappings")
+def directory_mappings(status: str = "") -> dict[str, Any]:
+    items = list(_get_repository().directory_mappings.values())
+    if status:
+        items = [item for item in items if item.status == status]
+    items.sort(key=lambda item: (item.normalized_path, item.version))
+    return {"total": len(items), "items": [item.to_dict() for item in items]}
+
+
+@app.post("/api/directory-mappings")
+def create_directory_mapping(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    try:
+        item = _get_repository().propose_directory_mapping(str(payload.get("relativePath") or ""), str(payload.get("productId") or ""), inherit=bool(payload.get("inherit", False)), actor=_request_actor(request), reason=str(payload.get("reason") or ""), idempotency_key=idempotency_key)
+        return {"mapping": item.to_dict()}
+    except GovernanceConflict as exc:
+        raise _error(409 if exc.code == "SCHEMA_MIGRATION_REQUIRED" else 422, exc.code, str(exc))
+
+
+@app.post("/api/directory-mappings/{mapping_id}/{action}")
+def directory_mapping_action(mapping_id: str, action: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    if action not in {"approve", "reject", "supersede"}:
+        raise _error(400, "INVALID_MAPPING_ACTION", f"Unsupported directory mapping action: {action}.")
+    try:
+        item = _get_repository().transition_directory_mapping(mapping_id, action, actor=_request_actor(request), reason=str(payload.get("reason") or ""), expected_version=int(payload.get("expectedVersion", 0)), idempotency_key=idempotency_key)
+        return {"mapping": item.to_dict()}
+    except GovernanceConflict as exc:
+        status_code = 403 if exc.code == "APPROVER_NOT_AUTHORIZED" else 409 if exc.code.startswith(("STALE", "INVALID_MAPPING", "IDEMPOTENCY", "SCHEMA_MIGRATION")) else 422
+        raise _error(status_code, exc.code, str(exc), {"current": exc.current.to_dict() if hasattr(exc.current, "to_dict") else None})
 
 
 def _mapped_file_review_row(item: dict[str, Any], current_by_path: dict[str, Any], repository: Any, filesystem: FilesystemCatalog, review_indexes: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -234,6 +445,9 @@ def _mapped_file_review_row(item: dict[str, Any], current_by_path: dict[str, Any
         for key in ("name", "relative_path", "extension", "size_bytes", "modified_at", "candidate_classification"):
             file_info[key] = current_info.get(key)
     row["file"] = file_info
+    directory_path = Path(path).parent.as_posix()
+    row["directoryProductMapping"] = repository.effective_directory_mapping(directory_path) if hasattr(repository, "effective_directory_mapping") else None
+    row["directoryMappingProposals"] = [item.to_dict() for item in repository.directory_mappings.values() if item.normalized_path == directory_path.casefold() and item.status == "proposed"] if hasattr(repository, "directory_mappings") else []
 
     path_key = path.replace("\\", "/").casefold()
     processing_batches = [
@@ -292,6 +506,8 @@ def _mapped_file_review_row(item: dict[str, Any], current_by_path: dict[str, Any
     row["issues"] = issues
     row["conflictCodes"] = conflict_codes
     row["latestObservation"] = latest.to_dict() if latest is not None else None
+    row["observationHistory"] = [item.to_dict() for item in repository.observations if item.file_id == file_id]
+    row["durableIssues"] = [item.to_dict() for item in repository.issues.values() if item.costing_file_id == file_id or (item.entity_type == "CostingFile" and item.entity_id == file_id)]
     row["lastObservedAt"] = latest.observed_at if latest is not None else None
     row["lastObservedChange"] = {
         "modifiedAt": latest.modified_at if latest is not None else (current.modified_at if current is not None else file_info.get("modified_at")),
@@ -330,22 +546,227 @@ def _same_timestamp(left: Any, right: Any) -> bool:
         return str(left) == str(right)
 
 
-@app.get("/api/catalog/preview")
-def preview(path: str, sheet: str = "", start_row: int = Query(1, ge=1), row_count: int = Query(40, ge=1, le=200), start_col: int = Query(1, ge=1), column_count: int = Query(40, ge=1, le=80)) -> dict[str, Any]:
-    # Defaults are Query objects when this function is exercised directly in
-    # a unit test; FastAPI supplies integers in normal requests.
-    start_row = start_row if isinstance(start_row, int) else 1
-    row_count = row_count if isinstance(row_count, int) else 40
-    start_col = start_col if isinstance(start_col, int) else 1
-    column_count = column_count if isinstance(column_count, int) else 40
+def _build_reconciliation_candidates(limit: int) -> list[ReconciliationIssue]:
+    repository = _get_repository()
+    candidates: list[ReconciliationIssue] = []
     try:
-        workbook_path = _filesystem().resolve(path)
-    except PathSafetyError as exc:
-        raise _error(400, exc.code, str(exc))
-    except FileNotFoundError:
-        raise _error(404, "FILE_NOT_FOUND", "ODS file not found below the configured root.")
-    if workbook_path.suffix.casefold() != ".ods":
-        raise _error(415, "UNSUPPORTED_EXTENSION", "Workbook preview supports ODS files only.")
+        filesystem = _filesystem()
+        nodes = filesystem.walk_files(extension=".ods")
+    except (FileNotFoundError, PathSafetyError):
+        filesystem = None
+        nodes = []
+    node_by_path = {item.relative_path.casefold(): item for item in nodes}
+    registered = [item for item in repository.files.values() if item.extension.casefold() == ".ods"]
+    registered.sort(key=lambda item: item.relative_path.casefold())
+    checked = 0
+    for file in registered:
+        if checked >= limit:
+            break
+        checked += 1
+        latest = max((item for item in repository.observations if item.file_id == file.id), key=lambda item: item.observed_at, default=None)
+        current_node = node_by_path.get(file.relative_path.casefold())
+        if filesystem is None:
+            continue
+        if current_node is None:
+            moved_to = _find_moved_file(file.relative_path, latest.modified_at if latest else file.modified_at, latest.size_bytes if latest else file.size_bytes, latest.file_hash if latest else file.file_hash, node_by_path, filesystem)
+            issue_type = "moved_file" if moved_to else "missing_file"
+            candidates.append(_make_issue(issue_type, "warning" if moved_to else "error", f"Registered costing file is {'possibly moved to ' + moved_to if moved_to else 'missing from the configured root'}.", file=file, facts={"storedPath": file.relative_path, "movedTo": moved_to, "storedHash": latest.file_hash if latest else file.file_hash}, resolution={"action": "verify_moved_file" if moved_to else "restore_or_retire_mapping"}))
+            continue
+        try:
+            current = filesystem.inspect(file.relative_path)
+        except (OSError, PathSafetyError) as exc:
+            candidates.append(_make_issue("unreadable_file", "error", f"Registered costing file could not be inspected: {exc}", file=file, facts={"path": file.relative_path, "error": str(exc)}))
+            continue
+        baseline_hash = latest.file_hash if latest else file.file_hash
+        baseline_size = latest.size_bytes if latest else file.size_bytes
+        baseline_mtime = latest.modified_at if latest else file.modified_at
+        if baseline_hash and current.content_hash and baseline_hash != current.content_hash:
+            candidates.append(_make_issue("changed_file", "high", "The registered costing workbook differs from its last accepted source observation.", file=file, facts={"stored": _observation_facts(file.relative_path, baseline_size, baseline_mtime, baseline_hash, latest), "current": _node_facts(current)}, resolution={"action": "accept_source_revision", "requiresOwnerApproval": True}))
+        if current.readable is False or current.parse_error:
+            candidates.append(_make_issue("parse_error", "error", current.parse_error or "The costing workbook could not be read.", file=file, facts=_node_facts(current), resolution={"action": "review_unreadable_source"}))
+        if (current.external_reference_count or 0) > 0:
+            candidates.append(_make_issue("external_link_review", "warning", f"Workbook contains {current.external_reference_count} external references requiring review.", file=file, facts=_node_facts(current), resolution={"action": "review_external_links"}))
+
+    # Rate warnings are derived for previews, then become durable issues only
+    # when the operator explicitly materializes a reconciliation scan.
+    master_root = _costing_root() / "Template DB"
+    rate_dump = master_root / "Spares List - Master.ods"
+    rate_findings: dict[tuple[str, int], dict[str, Any]] = {}
+    if filesystem is not None and rate_dump.is_file():
+        for file in registered[:checked]:
+            current_node = node_by_path.get(file.relative_path.casefold())
+            if current_node is None or current_node.readable is False or current_node.parse_error:
+                continue
+            try:
+                selected_path = filesystem.resolve(file.relative_path)
+                rate_index = build_mcl_rate_warning_index(
+                    selected_path,
+                    master_root / "MaterialCostDB.ods",
+                    rate_dump,
+                )
+            except (OSError, PathSafetyError, KeyError, ValueError):
+                continue
+            if rate_index.get("status") == "unavailable":
+                continue
+            for mcl_row, warning in rate_index.get("rows", {}).items():
+                for source_row in warning.get("rateLogRows", []):
+                    key = (str(warning.get("material", "")), int(source_row))
+                    if not key[0]:
+                        continue
+                    finding = rate_findings.setdefault(key, {
+                        "material": key[0],
+                        "rateLogRow": key[1],
+                        "issueCodes": set(),
+                        "rateLogCells": set(),
+                        "affectedMclRows": [],
+                    })
+                    finding["issueCodes"].update(warning.get("issueCodes", []))
+                    finding["rateLogCells"].update(warning.get("rateLogCells", []))
+                    finding["affectedMclRows"].append({"path": file.relative_path, "row": int(mcl_row)})
+    rate_dump_relative = str(rate_dump.relative_to(_costing_root())).replace("\\", "/")
+    for (material, source_row), finding in sorted(rate_findings.items()):
+        affected = sorted(finding["affectedMclRows"], key=lambda item: (item["path"].casefold(), item["row"]))
+        candidates.append(_make_issue(
+            "invalid_rate_entry",
+            "high",
+            f"A confirmed invalid SteelRateLog entry for {material!r} at source row {source_row} blocks its effective rate and dependent cost in {len(affected)} active Material Cut List row(s).",
+            entity_type="Material",
+            entity_id=material,
+            source_file=rate_dump_relative,
+            source_row=source_row,
+            facts={
+                "material": material,
+                "sourcePath": rate_dump_relative,
+                "sourceRow": source_row,
+                "sourceCells": sorted(finding["rateLogCells"]),
+                "issueCodes": sorted(finding["issueCodes"]),
+                "affectedMclRows": affected,
+            },
+            resolution={"action": "correct_rate_log_source_then_review", "requiresUserReview": True},
+        ))
+
+    owners_by_code: dict[str, list[Any]] = {}
+    for link in repository.code_associations.values():
+        if link.active:
+            owners_by_code.setdefault(link.code_id, []).append(link)
+    for code_id, owners in owners_by_code.items():
+        if len(owners) > 1:
+            code = repository.codes.get(code_id)
+            candidates.append(_make_issue("duplicate_code_ownership", "error", f"Model Code {code.code if code else code_id} has multiple active file owners.", entity_type="ProductModelCode", entity_id=code_id, facts={"ownerFileIds": sorted(item.file_id for item in owners)}, resolution={"action": "guided_supersede_review"}))
+
+    for model in repository.models.values():
+        if not model.active:
+            continue
+        codes = [item for item in repository.codes.values() if item.model_id == model.id and item.active]
+        canonical = None
+        if "\ufffd" in f"{model.model_number} {model.name}":
+            expected = f"{model.model_number} {model.name}".replace("\ufffd", "–")
+            canonical = next((item for item in repository.models.values() if item.id != model.id and item.active and item.product_id == model.product_id and f"{item.model_number} {item.name}" == expected), None)
+            candidates.append(_make_issue("invalid_identity_encoding", "error", f"Active Product Model {model.model_number!r} contains a Unicode replacement character.", entity_type="ProductModel", entity_id=model.id, source_file=model.source_file or "", source_row=model.source_row, facts={"previousValue": model.model_number, "sourceFile": model.source_file, "sourceRow": model.source_row, "canonicalReplacementId": canonical.id if canonical else None, "canonicalReplacement": canonical.model_number if canonical else None}, resolution={"action": "supersede_corrupted_identity", "requiresOwnerApproval": True}))
+        if not codes:
+            candidates.append(_make_issue("unmatched_active_identity", "warning", f"Active Product Model {model.model_number!r} has no active Model Codes.", entity_type="ProductModel", entity_id=model.id, source_file=model.source_file or "", source_row=model.source_row, facts={"modelNumber": model.model_number, "sourceFile": model.source_file, "sourceRow": model.source_row}, resolution={"action": "review_catalog_identity"}))
+
+    for code in repository.codes.values():
+        model = repository.models.get(code.model_id)
+        if model is None or model.product_id not in repository.products:
+            candidates.append(_make_issue("catalog_reference_mismatch", "error", f"Model Code {code.code!r} points to a missing Model or Product.", entity_type="ProductModelCode", entity_id=code.id, facts={"modelId": code.model_id, "productId": model.product_id if model else None}, resolution={"action": "repair_catalog_reference"}))
+    return candidates
+
+
+def _make_issue(issue_type: str, severity: str, message: str, *, file: Any = None, entity_type: str = "", entity_id: str | None = None, source_file: str = "", source_row: int | None = None, facts: dict[str, Any] | None = None, resolution: dict[str, Any] | None = None) -> ReconciliationIssue:
+    from hashlib import sha256
+    file_id = file.id if file is not None else None
+    path = file.relative_path if file is not None else source_file
+    fingerprint_source = "\0".join((issue_type, entity_type or ("CostingFile" if file is not None else ""), entity_id or file_id or path, path.casefold(), str(source_row or "")))
+    fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()
+    return ReconciliationIssue(id=f"issue:auto:{fingerprint[:24]}", issue_type=issue_type, severity=severity, message=message, source_file=source_file or path, source_row=source_row, entity_id=entity_id or file_id, fingerprint=fingerprint, entity_type=entity_type or ("CostingFile" if file is not None else ""), costing_file_id=file_id, source_path=path, detected_facts=facts or {}, proposed_resolution=resolution or {})
+
+
+def _node_facts(node: Any) -> dict[str, Any]:
+    return {"path": node.relative_path, "sizeBytes": node.size_bytes, "modifiedAt": node.modified_at, "sha256": node.content_hash, "readable": node.readable, "sheetCount": node.sheet_count, "externalReferenceCount": node.external_reference_count, "parseError": node.parse_error}
+
+
+def _observation_facts(path: str, size_bytes: int, modified_at: str, file_hash: str | None, observation: Any) -> dict[str, Any]:
+    return {"path": path, "sizeBytes": size_bytes, "modifiedAt": modified_at, "sha256": file_hash, "readable": observation.readable if observation else None, "sheetCount": observation.sheet_count if observation else None, "externalReferenceCount": observation.external_reference_count if observation else None, "parseError": observation.parse_error if observation else None, "observationId": observation.id if observation else None}
+
+
+def _source_revision_plan(issue: ReconciliationIssue, repository: SafariRepository) -> dict[str, Any]:
+    file = repository.get_file(issue.costing_file_id or "")
+    if file is None:
+        raise _error(409, "REVISION_FILE_MISSING", "The registered costing file no longer exists.")
+    latest = max((item for item in repository.observations if item.file_id == file.id), key=lambda item: item.observed_at, default=None)
+    try:
+        current = _filesystem().inspect(file.relative_path)
+    except (OSError, PathSafetyError) as exc:
+        raise _error(409, "REVISION_SOURCE_UNAVAILABLE", str(exc))
+    if not current.content_hash:
+        raise _error(422, "REVISION_HASH_UNAVAILABLE", "The current workbook hash could not be computed.")
+    association = repository.current_association(file.id)
+    active_codes = [item for item in repository.code_associations.values() if association and item.active and item.association_id == association.id]
+    ownership_valid = bool(association and active_codes) and all(repository.codes.get(item.code_id) and repository.codes[item.code_id].active and repository.codes[item.code_id].model_id == association.model_id and len([owner for owner in repository.code_associations.values() if owner.active and owner.code_id == item.code_id]) == 1 for item in active_codes)
+    return {"issue": issue.to_dict(), "file": file.to_dict(), "stored": _observation_facts(file.relative_path, latest.size_bytes if latest else file.size_bytes, latest.modified_at if latest else file.modified_at, latest.file_hash if latest else file.file_hash, latest), "current": _node_facts(current), "association": association.to_dict() if association else None, "ownedCodes": [repository.codes[item.code_id].to_dict() for item in active_codes if item.code_id in repository.codes], "canApply": bool(ownership_valid and current.readable and current.content_hash != (latest.file_hash if latest else file.file_hash)), "issueVersion": issue.version}
+
+
+def _observation_from_revision(file_id: str, facts: dict[str, Any]) -> FileObservation:
+    return FileObservation(id=f"observation:{file_id}:{facts['sha256']}", file_id=file_id, observed_at=utc_now(), relative_path=str(facts["path"]), normalized_path=str(facts["path"]).casefold(), size_bytes=int(facts["sizeBytes"] or 0), modified_at=str(facts["modifiedAt"] or ""), file_hash=str(facts["sha256"]), readable=bool(facts["readable"]), sheet_count=facts.get("sheetCount"), external_reference_count=facts.get("externalReferenceCount"), parse_error=facts.get("parseError"))
+
+
+def _issue_matches_identity(issue: ReconciliationIssue, product_id: str, model_id: str, repository: SafariRepository) -> bool:
+    candidate_models: dict[str, Any] = {}
+    if issue.entity_type.casefold() == "productmodel":
+        direct_model = repository.models.get(issue.entity_id or "")
+        if direct_model:
+            candidate_models[direct_model.id] = direct_model
+    if issue.entity_type.casefold() == "productmodelcode":
+        code = repository.codes.get(issue.entity_id or "")
+        if code and code.model_id in repository.models:
+            candidate_models[code.model_id] = repository.models[code.model_id]
+    fact_model = repository.models.get(str(issue.detected_facts.get("modelId") or ""))
+    if fact_model:
+        candidate_models[fact_model.id] = fact_model
+    if issue.costing_file_id:
+        association = repository.current_association(issue.costing_file_id)
+        if association and association.model_id in repository.models:
+            candidate_models[association.model_id] = repository.models[association.model_id]
+    affected_paths = {
+        str(row.get("path", "")).casefold()
+        for row in issue.detected_facts.get("affectedMclRows", [])
+        if isinstance(row, dict) and row.get("path")
+    }
+    for file in repository.files.values():
+        if file.relative_path.casefold() in affected_paths:
+            association = repository.current_association(file.id)
+            if association and association.model_id in repository.models:
+                candidate_models[association.model_id] = repository.models[association.model_id]
+    if model_id and not any(model.id == model_id for model in candidate_models.values()):
+        return False
+    if product_id and not any(model.product_id == product_id for model in candidate_models.values()):
+        return issue.detected_facts.get("productId") == product_id and not model_id
+    return True
+
+
+def _issue_affects_file(issue: ReconciliationIssue, file_id: str, repository: SafariRepository) -> bool:
+    if issue.costing_file_id == file_id or issue.entity_id == file_id:
+        return True
+    target = repository.files.get(file_id)
+    if target is None:
+        return False
+    return any(
+        isinstance(row, dict)
+        and str(row.get("path", "")).casefold() == target.relative_path.casefold()
+        for row in issue.detected_facts.get("affectedMclRows", [])
+    )
+
+
+def _count_by(items: list[Any], selector: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in items:
+        key = str(selector(item))
+        result[key] = result.get(key, 0) + 1
+    return result
+
+
+def _preview_workbook(path: str, workbook_path: Path, sheet: str, start_row: int, row_count: int, start_col: int, column_count: int, refresh_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     scan = scan_costing_file(workbook_path, _costing_root())
     if not scan.readable:
         error_text = (scan.error or "").casefold()
@@ -368,10 +789,275 @@ def preview(path: str, sheet: str = "", start_row: int = Query(1, ge=1), row_cou
     cells = []
     for row_index, row in enumerate(selected):
         cells.append([{"value": _json_cell(value), "kind": "formula" if (row_index, column_index) in formulas else "value", "formula": formulas.get((row_index, column_index))} for column_index, value in enumerate(row[:width])])
-    return {"path": path, "sheets": sheet_names, "sheet": selected_sheet, "startRow": start_row, "startColumn": start_col, "totalRows": len(rows), "totalColumns": max((len(row) for row in rows), default=0), "truncatedRows": row_start + row_count < len(rows), "truncatedColumns": any(len(row) > col_start + width for row in selected_rows), "readOnly": True, "formulaCount": scan.formula_count, "externalReferenceCount": scan.external_reference_count, "externalLinkWarning": scan.external_reference_count > 0, "rows": [[_json_cell(value) for value in row[:width]] for row in selected], "cells": cells}
+    rate_warnings: dict[str, Any] = {"status": "not_applicable", "rows": {}, "globalWarnings": []}
+    if selected_sheet == "5. Material Cut List Price":
+        master_root = _costing_root() / "Template DB"
+        try:
+            rate_warnings = build_mcl_rate_warning_index(
+                workbook_path,
+                master_root / "MaterialCostDB.ods",
+                master_root / "Spares List - Master.ods",
+            )
+        except (OSError, KeyError, ValueError) as exc:
+            rate_warnings = {
+                "status": "unavailable",
+                "message": f"Rate validation could not be completed: {exc}",
+                "missingSources": [],
+                "rows": {},
+                "globalWarnings": [],
+            }
+    if rate_warnings.get("rows"):
+        try:
+            durable_rate_issues = [
+                item for item in _get_repository().issues.values()
+                if item.issue_type == "invalid_rate_entry"
+            ]
+            for warning in rate_warnings["rows"].values():
+                source_rows = set(warning.get("rateLogRows", []))
+                warning["durableIssues"] = [
+                    {"id": issue.id, "status": issue.status, "version": issue.version, "sourceRow": issue.source_row}
+                    for issue in durable_rate_issues
+                    if issue.entity_id == warning.get("material") and issue.source_row in source_rows
+                ]
+        except (AttributeError, KeyError, TypeError):
+            # Derived preview warnings remain available before issue materialization.
+            pass
+    rows_payload = [[_json_cell(value) for value in row[:width]] for row in selected]
+    warning_rows = rate_warnings.get("rows", {})
+    if selected_sheet == "5. Material Cut List Price" and warning_rows:
+        field_numbers = {
+            name: field_number - 1
+            for name, field_number in zip(
+                ("rate_per_kg", "material_cost", "grand_total"),
+                rate_warnings.get("maskedColumns", []),
+            )
+        }
+        rate_column = field_numbers.get("rate_per_kg")
+        for row_index, physical_row in enumerate(range(start_row, start_row + len(selected))):
+            warning = warning_rows.get(str(physical_row))
+            if not warning:
+                continue
+            for field_name, column_index in field_numbers.items():
+                local_column = column_index - col_start
+                if not 0 <= local_column < width:
+                    continue
+                replacement = "RATE BLOCKED" if field_name == "rate_per_kg" else None
+                rows_payload[row_index][local_column] = replacement
+                cells[row_index][local_column] = {
+                    "value": replacement,
+                    "kind": "warning",
+                    "formula": cells[row_index][local_column].get("formula"),
+                }
+            material_column = rate_warnings.get("materialColumn")
+            local_material_column = (material_column - 1 - col_start) if material_column else -1
+            for local_column in range(width):
+                cells[row_index][local_column]["kind"] = "warning"
+            if 0 <= local_material_column < width:
+                cells[row_index][local_material_column]["warning"] = warning
+    result = {"path": path, "sheets": sheet_names, "sheet": selected_sheet, "startRow": start_row, "startColumn": start_col, "totalRows": len(rows), "totalColumns": max((len(row) for row in rows), default=0), "truncatedRows": row_start + row_count < len(rows), "truncatedColumns": any(len(row) > col_start + width for row in selected_rows), "readOnly": True, "formulaCount": scan.formula_count, "externalReferenceCount": scan.external_reference_count, "externalLinkWarning": scan.external_reference_count > 0, "rows": rows_payload, "cells": cells, "rateWarnings": rate_warnings}
+    if refresh_metadata:
+        result["refreshMetadata"] = refresh_metadata
+    return result
 
 
-def _get_repository() -> InMemorySafariRepository:
+def _preview_arguments(start_row: Any, row_count: Any, start_col: Any, column_count: Any) -> tuple[int, int, int, int]:
+    # Defaults are Query objects when endpoints are exercised directly.
+    return (
+        start_row if isinstance(start_row, int) else 1,
+        row_count if isinstance(row_count, int) else 40,
+        start_col if isinstance(start_col, int) else 1,
+        column_count if isinstance(column_count, int) else 40,
+    )
+
+
+def _resolve_preview_workbook(path: str) -> Path:
+    try:
+        workbook_path = _filesystem().resolve(path)
+    except PathSafetyError as exc:
+        raise _error(400, exc.code, str(exc))
+    except FileNotFoundError:
+        raise _error(404, "FILE_NOT_FOUND", "ODS file not found below the configured root.")
+    if workbook_path.suffix.casefold() != ".ods":
+        raise _error(415, "UNSUPPORTED_EXTENSION", "Workbook preview supports ODS files only.")
+    return workbook_path
+
+
+def _costing_file_id_for_path(workbook_path: Path, repository: SafariRepository) -> str | None:
+    """Resolve one registered Safari file by its path, never by basename alone."""
+    target = workbook_path.resolve()
+    root = _costing_root()
+    matches: list[str] = []
+    for item in repository.files.values():
+        for value in (item.relative_path, item.normalized_path):
+            if not value:
+                continue
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                if candidate.resolve() == target:
+                    matches.append(item.id)
+                    break
+            except (OSError, RuntimeError):
+                continue
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+@app.get("/api/catalog/preview")
+def preview(path: str, sheet: str = "", start_row: int = Query(1, ge=1), row_count: int = Query(40, ge=1, le=200), start_col: int = Query(1, ge=1), column_count: int = Query(40, ge=1, le=80)) -> dict[str, Any]:
+    start_row, row_count, start_col, column_count = _preview_arguments(start_row, row_count, start_col, column_count)
+    workbook_path = _resolve_preview_workbook(path)
+    return _preview_workbook(path, workbook_path, sheet, start_row, row_count, start_col, column_count)
+
+
+@app.post("/api/catalog/preview/refresh")
+def refresh_preview(path: str, sheet: str = "", start_row: int = Query(1, ge=1), row_count: int = Query(40, ge=1, le=200), start_col: int = Query(1, ge=1), column_count: int = Query(40, ge=1, le=80)) -> dict[str, Any]:
+    start_row, row_count, start_col, column_count = _preview_arguments(start_row, row_count, start_col, column_count)
+    workbook_path = _resolve_preview_workbook(path)
+    try:
+        with refreshed_ods_copy(workbook_path, _costing_root()) as evidence:
+            metadata = {
+                "status": "refreshed_temporary_copy",
+                "checkedAt": evidence.checked_at,
+                "originalSha256": evidence.original_sha256,
+                "refreshedCopySha256": evidence.refreshed_copy_sha256,
+                "linkedSources": evidence.linked_sources,
+                "sourceWorkbookUnchanged": True,
+                "linkedSourcesUnchanged": True,
+            }
+            return _preview_workbook(
+                path, evidence.temporary_path, sheet, start_row, row_count,
+                start_col, column_count, metadata,
+            )
+    except LibreOfficeRefreshError as exc:
+        raise _error(422, "EXTERNAL_REFRESH_FAILED", str(exc))
+
+
+@app.post("/api/catalog/costing-review")
+def costing_review(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Refresh and calculate without writing; compare with the accepted Safari state."""
+    relative_path = str(payload.get("path") or "").strip()
+    if not relative_path:
+        raise _error(400, "COSTING_FILE_REQUIRED", "Select a product costing workbook first.")
+    workbook_path = _resolve_preview_workbook(relative_path)
+    master_root = _costing_root() / "Template DB"
+    raw_steel_path = master_root / "MaterialCostDB.ods"
+    rate_dump_path = master_root / "Spares List - Master.ods"
+    missing = [str(path.relative_to(_costing_root())) for path in (raw_steel_path, rate_dump_path) if not path.is_file()]
+    if missing:
+        raise _error(
+            422,
+            "COSTING_SOURCE_UNAVAILABLE",
+            "Current costing review needs the configured RawSteel and SteelRateLog source workbooks.",
+            {"missingSources": missing},
+        )
+    try:
+        repository = _get_repository()
+        file_id = _costing_file_id_for_path(workbook_path, repository)
+        accepted = repository.latest_accepted_costing_snapshot(file_id) if file_id else None
+        accepted_payload = ({
+            "snapshot_key": accepted.snapshot_key,
+            "semantic_hash": accepted.semantic_hash,
+            "content": accepted.semantic_content,
+        } if accepted else None)
+        with refreshed_ods_copy(workbook_path, _costing_root()) as evidence:
+            review = build_current_costing_review(
+                workbook_path,
+                evidence.temporary_path,
+                raw_steel_path,
+                rate_dump_path,
+                accepted_payload,
+            )
+            review["refresh"] = {
+                "required": True,
+                "verified": True,
+                "status": "refreshed_temporary_copy",
+                "checked_at": evidence.checked_at,
+                "original_sha256": evidence.original_sha256,
+                "refreshed_copy_sha256": evidence.refreshed_copy_sha256,
+                "linked_sources": evidence.linked_sources,
+                "source_workbook_unchanged": True,
+                "linked_sources_unchanged": True,
+            }
+            review["costing_file_id"] = file_id
+            review["accepted_baseline"] = ({
+                "snapshot_key": accepted.snapshot_key,
+                "semantic_hash": accepted.semantic_hash,
+                "accepted_at": accepted.accepted_at,
+                "accepted_by": accepted.accepted_by,
+            } if accepted else None)
+            review["persistence_adapter"] = repository.adapter_name
+            review["can_accept"] = bool(
+                file_id
+                and review["status"] == "ready_for_owner_review"
+                and not review["semantic_comparison"]["owner_review_required"]
+            )
+            return review
+    except LibreOfficeRefreshError as exc:
+        raise _error(422, "EXTERNAL_REFRESH_FAILED", str(exc))
+    except (OSError, KeyError, ValueError, BadZipFile, ET.ParseError) as exc:
+        raise _error(422, "COSTING_REVIEW_UNAVAILABLE", str(exc))
+
+
+@app.post("/api/catalog/costing-review/accept")
+def accept_costing_review(
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """Re-refresh, re-compare, and explicitly accept a non-ambiguous cost state."""
+    relative_path = str(payload.get("path") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    actor = _request_actor(request).strip()
+    expected_hash = str(payload.get("semanticHash") or "").strip()
+    expected_sources = payload.get("sourceHashes")
+    expected_baseline = payload.get("acceptedSnapshotKey")
+    decisions = payload.get("ambiguityDecisions") or {}
+    if not relative_path:
+        raise _error(400, "COSTING_FILE_REQUIRED", "Select a product costing workbook first.")
+    if not reason:
+        raise _error(422, "REASON_REQUIRED", "Enter the reason for accepting this costing reconciliation.")
+    if not idempotency_key:
+        raise _error(400, "IDEMPOTENCY_KEY_REQUIRED", "Costing acceptance requires an Idempotency-Key header.")
+    if not expected_hash or not isinstance(expected_sources, dict):
+        raise _error(400, "REVIEW_FINGERPRINT_REQUIRED", "The acceptance request must include the reviewed semantic hash and source revisions.")
+    try:
+        current = costing_review({"path": relative_path})
+    except HTTPException:
+        raise
+    comparison = current.get("semantic_comparison", {})
+    if current.get("semantic_snapshot", {}).get("semantic_hash") != expected_hash or current.get("semantic_snapshot", {}).get("source_hashes") != expected_sources:
+        raise _error(409, "STALE_COSTING_PREVIEW", "The selected workbook or one of its ODS dependencies changed after review. Refresh and compare again.")
+    if (current.get("accepted_baseline") or {}).get("snapshot_key") != expected_baseline:
+        raise _error(409, "STALE_COSTING_BASELINE", "The accepted Safari baseline changed after review. Refresh and compare again.")
+    if current.get("status") != "ready_for_owner_review":
+        raise _error(409, "COSTING_RECONCILIATION_BLOCKED", "Blocked rates, unreadable data, or incomplete costing inputs must be resolved before acceptance.")
+    comparison = resolve_semantic_ambiguities(comparison, decisions if isinstance(decisions, dict) else {})
+    if comparison.get("owner_review_required"):
+        raise _error(409, "AMBIGUOUS_COSTING_CHANGES_REMAIN", "Resolve each ambiguous line match in the review panel before accepting the new baseline.", {"ambiguities": comparison.get("ambiguities", [])})
+    file_id = current.get("costing_file_id")
+    if not file_id:
+        raise _error(409, "COSTING_FILE_NOT_REGISTERED", "Associate this selected workbook with its Product Model in Safari before accepting a costing baseline.")
+    repository = _get_repository()
+    try:
+        result = repository.accept_costing_snapshot(
+            costing_file_id=file_id,
+            semantic_snapshot=current["semantic_snapshot"],
+            changes=comparison.get("changes", []),
+            actor=actor,
+            reason=reason,
+            expected_previous_snapshot_key=expected_baseline,
+            expected_semantic_hash=expected_hash,
+            expected_source_hashes=expected_sources,
+            idempotency_key=idempotency_key,
+        )
+    except GovernanceConflict as exc:
+        status_code = 403 if exc.code == "APPROVER_NOT_AUTHORIZED" else 409 if exc.code.startswith(("STALE", "AMBIGUOUS", "IDEMPOTENCY", "SCHEMA", "COSTING_ACCEPTANCE")) else 422
+        raise _error(status_code, exc.code, str(exc))
+    return {**result, "comparison": comparison, "adapter": repository.adapter_name}
+
+
+def _get_repository() -> SafariRepository:
     global _repository
     if _repository is not None:
         return _repository
@@ -398,7 +1084,8 @@ def _get_repository() -> InMemorySafariRepository:
             for item in result.codes:
                 repository.add_code(item)
             repository.aliases.update({item.id: item for item in result.aliases})
-            repository.issues.update({item.id: item for item in result.issues})
+            for item in result.issues:
+                repository.upsert_issue(item)
         except Exception:
             pass
     _repository = repository
@@ -449,9 +1136,13 @@ def _register_file(relative_path: str) -> str:
     file_id = f"file:{node.relative_path.casefold()}"
     repository = _get_repository()
     existing = repository.get_file(file_id)
-    repository.add_file(DomainCostingFile(id=file_id, relative_path=node.relative_path, normalized_path=node.relative_path.casefold(), name=node.name, extension=node.extension, size_bytes=node.size_bytes or 0, modified_at=node.modified_at or "", file_hash=node.content_hash, product_id=existing.product_id if existing else None, candidate_classification=node.candidate_classification, mapping_status=existing.mapping_status if existing else node.mapping_status, readable=node.readable, parse_error=node.parse_error, source="filesystem-explorer"))
+    # An inspect of an already-registered file is evidence for reconciliation,
+    # not implicit acceptance of a changed source fingerprint. Preserve the
+    # stored baseline until the reviewed source-revision action updates it.
+    repository.add_file(DomainCostingFile(id=file_id, relative_path=existing.relative_path if existing else node.relative_path, normalized_path=existing.normalized_path if existing else node.relative_path.casefold(), name=existing.name if existing else node.name, extension=node.extension, size_bytes=existing.size_bytes if existing else (node.size_bytes or 0), modified_at=existing.modified_at if existing else (node.modified_at or ""), file_hash=existing.file_hash if existing else node.content_hash, product_id=existing.product_id if existing else None, candidate_classification=node.candidate_classification, mapping_status=existing.mapping_status if existing else node.mapping_status, readable=existing.readable if existing else node.readable, parse_error=existing.parse_error if existing else node.parse_error, source="filesystem-explorer"))
     observation_id = f"observation:{file_id}:{node.modified_at}:{node.content_hash or 'unhashed'}"
-    if not any(item.id == observation_id for item in repository.observations):
+    has_history = any(item.file_id == file_id for item in repository.observations)
+    if not has_history and (existing is None or not existing.file_hash or existing.file_hash == node.content_hash):
         repository.add_observation(FileObservation(id=observation_id, file_id=file_id, observed_at=utc_now(), relative_path=node.relative_path, normalized_path=node.relative_path.casefold(), size_bytes=node.size_bytes or 0, modified_at=node.modified_at or "", file_hash=node.content_hash, readable=node.readable, sheet_count=node.sheet_count, external_reference_count=node.external_reference_count, parse_error=node.parse_error))
     return file_id
 
@@ -513,6 +1204,15 @@ def _registry_status(node: Any, *, conflicting_file_ids: set[str] | None = None)
     return replace(node, mapping_status=record.mapping_status) if record else node
 
 
+def _explorer_node_payload(node: Any, *, conflicting_file_ids: set[str] | None = None) -> dict[str, Any]:
+    projected = _registry_status(node, conflicting_file_ids=conflicting_file_ids).to_dict()
+    directory_path = node.relative_path if node.type == "directory" else Path(node.relative_path).parent.as_posix()
+    repository = _get_repository()
+    projected["directoryProductMapping"] = repository.effective_directory_mapping(directory_path) if hasattr(repository, "effective_directory_mapping") else None
+    projected["directoryMappingProposals"] = [item.to_dict() for item in repository.directory_mappings.values() if item.normalized_path == directory_path.casefold() and item.status == "proposed"] if hasattr(repository, "directory_mappings") else []
+    return projected
+
+
 def _owner_payload(owner: Any) -> dict[str, Any] | None:
     if owner is None:
         return None
@@ -570,6 +1270,11 @@ def _formula_cells(path: Path, sheet_name: str, start_row: int, start_col: int, 
 
 def _request_user(request: Request) -> dict[str, str]:
     return {"id": request.headers.get("x-authentik-uid", "local-development"), "username": request.headers.get("x-authentik-username", "Local user"), "email": request.headers.get("x-authentik-email", "")}
+
+
+def _request_actor(request: Request) -> str:
+    user = _request_user(request)
+    return user["username"] if user["username"] != "Local user" else user["id"]
 
 
 def _error(status: int, code: str, message: str, extra: dict[str, Any] | None = None) -> HTTPException:

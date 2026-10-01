@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -85,7 +86,8 @@ def plan_catalog_import(repository: Any, result: CatalogImportResult, *, apply: 
         for item in result.codes:
             repository.add_code(item)
         repository.aliases.update({item.id: item for item in result.aliases})
-        repository.issues.update({item.id: item for item in result.issues})
+        for item in result.issues:
+            repository.upsert_issue(item)
         repository.import_batches[batch.id] = batch
     return CatalogImportPlan(result.source_file, source_hash, parser_version, False, len(result.products), len(result.models), len(result.codes), len(result.aliases), len(result.issues), batch)
 
@@ -110,6 +112,24 @@ def import_catalog_rows(rows: Iterable[list[Any]], *, source_file: str = "catalo
         model_number = _cell(row, indexes["model"]) or current_model
         code_value = _cell(row, indexes["code"])
         description = _cell(row, indexes["description"])
+        invalid_fields = {
+            name: value
+            for name, value in (("product", product_name), ("model", model_number), ("code", code_value), ("description", description))
+            if _has_invalid_identity_text(value)
+        }
+        if invalid_fields:
+            issues.append(ReconciliationIssue(
+                id=f"issue-invalid-identity-{row_number}",
+                issue_type="invalid_identity_encoding",
+                severity="error",
+                message=f"Catalog row {row_number} contains invalid identity text; the row was not imported.",
+                source_file=source_file,
+                source_row=row_number,
+                entity_type="CatalogRow",
+                source_path=source_file,
+                detected_facts={"invalidFields": invalid_fields},
+            ))
+            continue
         if product_name:
             current_product = product_name
         if model_number:
@@ -170,7 +190,7 @@ def _find_columns(rows: list[list[Any]]) -> tuple[int, dict[str, int]]:
     aliases = {
         "product": ("product", "product name", "productfamily"),
         "model": ("productmodelno", "product model no", "product model number", "product model", "model number", "model"),
-        "code": ("modelcode", "product model code", "productmodelcode", "code"),
+        "code": ("modelcode", "model code", "product model code", "productmodelcode", "code"),
         "description": ("description", "model description", "product model desc", "productmodeldesc", "commercial description"),
     }
     for index, row in enumerate(rows[:12]):
@@ -195,3 +215,14 @@ def _cell(row: list[Any], index: int | None) -> str:
 
 def _is_legacy_spares_only(*values: str) -> bool:
     return "bush" in " ".join(values).casefold()
+
+
+def _has_invalid_identity_text(value: str) -> bool:
+    if "\ufffd" in value:
+        return True
+    for char in value:
+        category = unicodedata.category(char)
+        codepoint = ord(char)
+        if category in {"Cc", "Cf", "Cs"} or 0xFDD0 <= codepoint <= 0xFDEF or codepoint & 0xFFFF in {0xFFFE, 0xFFFF}:
+            return True
+    return False

@@ -248,6 +248,11 @@ supported_sheets:
   "Stores and Consumables List":
     header_row: 6
     aliases:
+      item_code:
+        - Item Code
+        - Item Number
+        - Item No
+        - Code
       product_part_name:
         - Item
         - Issue Slip Desc
@@ -409,6 +414,9 @@ supported_sheets:
   "Labour - Paint - Packing":
     header_row: 6
     aliases:
+      item_code:
+        - Paint Code
+        - Paint Item Code
       product_part_name:
         - Paint Name
         - Product Part Name

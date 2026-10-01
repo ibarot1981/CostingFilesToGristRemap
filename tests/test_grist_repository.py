@@ -1,10 +1,14 @@
 import json
+import json
 import unittest
+from unittest import mock
 
-from app.domain import CostingFile, FileObservation
+from app.domain import CostingFile, FileObservation, ReconciliationIssue
 from app.exceptions import GristValidationError
+from app.grist import GristClient
 from app.grist_repository import GristSafariRepository, _datetime_text, _grist_datetime
-from app.repository import AssociationConflict, AssociationProposal
+from app.repository import AssociationConflict, AssociationProposal, GovernanceConflict
+from app.schema import SchemaPlan
 
 
 class FakeGristClient:
@@ -58,6 +62,167 @@ class FakeGristClient:
 
 
 class GristRepositoryTests(unittest.TestCase):
+    def test_costing_acceptance_persists_gated_snapshot_change_audit_and_reloads(self) -> None:
+        client = FakeGristClient()
+        repository = GristSafariRepository(client=client)
+        file = CostingFile("file:s1khf/model.ods", "S1KHF/model.ods", "s1khf/model.ods", "model.ods", ".ods", 125, "2026-09-29T00:00:00+00:00", "prior-hash", readable=True)
+        repository.add_file(file)
+        semantic = {
+            "semantic_hash": "semantic-sha",
+            "observed_at": "2026-09-29T10:00:00+05:30",
+            "source_hashes": {"selected_workbook_saved": "ods-sha", "raw_steel": "raw-sha", "rate_log_dump": "rates-sha"},
+            "source_evidence": {"selected_workbook_saved": {"sha256": "ods-sha", "size_bytes": 125, "modified_at": "2026-09-29T00:00:00+00:00", "sheet_count": 6}},
+            "content": {"process_lists": {"5. Material Cut List Price": []}},
+        }
+        change = {
+            "change_key": "mcl-qty-1", "change_type": "line_quantity_changed",
+            "classification": "design_structure_change", "reason": "CR-12 changed quantity.",
+            "previous_state": {"fields": {"qty": 2}, "source_evidence": {"source_row": 7}},
+            "current_state": {"fields": {"qty": 3}, "source_evidence": {"source_row": 9}},
+            "cost_impact": "12.75", "cr_reference": {"current": "CR-12"},
+        }
+
+        result = repository.accept_costing_snapshot(
+            costing_file_id=file.id, semantic_snapshot=semantic, changes=[change], actor="Irshad",
+            reason="Reconcile S1KHF ODS", expected_previous_snapshot_key=None,
+            expected_semantic_hash="semantic-sha", expected_source_hashes=semantic["source_hashes"],
+            idempotency_key="s1khf-accept-1",
+        )
+
+        self.assertEqual(len(client.tables["CostingSnapshot"]), 1)
+        self.assertEqual(client.tables["CostingSnapshot"][0]["fields"]["Status"], "accepted")
+        self.assertEqual(client.tables["CostingChangeSetItem"][0]["fields"]["Status"], "accepted")
+        self.assertEqual(client.tables["CostingChangeSetItem"][0]["fields"]["CostImpact"], 12.75)
+        self.assertEqual(client.tables["CostingChangeSetItem"][0]["fields"]["CRReference"], '{"current":"CR-12"}')
+        snapshot_fields = client.tables["CostingSnapshot"][0]["fields"]
+        change_fields = client.tables["CostingChangeSetItem"][0]["fields"]
+        self.assertEqual(json.loads(snapshot_fields["SemanticContent"]), semantic["content"])
+        self.assertEqual(json.loads(snapshot_fields["SourceHashes"]), semantic["source_hashes"])
+        self.assertEqual(json.loads(change_fields["ChangeData"]), change)
+        self.assertEqual(client.tables["CostingFile"][0]["fields"]["FileHash"], "ods-sha")
+        self.assertEqual(len(client.tables["FileObservation"]), 1)
+        self.assertEqual(len(client.tables["AuditEvent"]), 2)
+        self.assertEqual(repository.latest_accepted_costing_snapshot(file.id).snapshot_key, result["snapshot"]["snapshot_key"])
+        self.assertEqual(len(repository.costing_change_items), 1)
+        reloaded = GristSafariRepository(client=client)
+        saved = reloaded.latest_accepted_costing_snapshot(file.id)
+        self.assertEqual(saved.semantic_content, semantic["content"])
+        self.assertEqual(saved.source_hashes, semantic["source_hashes"])
+        self.assertEqual(len(reloaded.costing_change_items), 1)
+        write_count = (len(client.created), len(client.updated))
+        unchanged = reloaded.accept_costing_snapshot(
+            costing_file_id=file.id,
+            semantic_snapshot=semantic,
+            changes=[],
+            actor="Irshad",
+            reason="Confirm unchanged source state does not create another baseline.",
+            expected_previous_snapshot_key=result["snapshot"]["snapshot_key"],
+            expected_semantic_hash=semantic["semantic_hash"],
+            expected_source_hashes=semantic["source_hashes"],
+            idempotency_key="s1khf-unchanged-acceptance",
+        )
+        self.assertTrue(unchanged["unchanged"])
+        self.assertEqual((len(client.created), len(client.updated)), write_count)
+
+    def test_partial_costing_write_stays_staged_and_retry_completes_baseline(self) -> None:
+        client = FakeGristClient()
+        client.fail_after_create_once = "CostingChangeSetItem"
+        repository = GristSafariRepository(client=client)
+        file = CostingFile("file:s1khf/model.ods", "S1KHF/model.ods", "s1khf/model.ods", "model.ods", ".ods", 125, "2026-09-29T00:00:00+00:00", "prior-hash", readable=True)
+        repository.add_file(file)
+        semantic = {
+            "semantic_hash": "semantic-sha",
+            "observed_at": "2026-09-29T10:00:00+05:30",
+            "source_hashes": {"selected_workbook_saved": "ods-sha", "raw_steel": "raw-sha", "rate_log_dump": "rates-sha"},
+            "source_evidence": {"selected_workbook_saved": {"sha256": "ods-sha", "size_bytes": 125, "modified_at": "2026-09-29T00:00:00+00:00", "sheet_count": 6}},
+            "content": {"process_lists": {"5. Material Cut List Price": []}},
+        }
+        changes = [{"change_key": "change-retry-1", "change_type": "line_quantity_changed", "classification": "design_structure_change", "previous_state": {"fields": {"qty": 2}}, "current_state": {"fields": {"qty": 3}}, "cost_impact": "10"}]
+        kwargs = dict(
+            costing_file_id=file.id, semantic_snapshot=semantic, changes=changes, actor="Irshad",
+            reason="Retry test", expected_previous_snapshot_key=None, expected_semantic_hash="semantic-sha",
+            expected_source_hashes=semantic["source_hashes"], idempotency_key="retry-costing-1",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "simulated connection drop"):
+            repository.accept_costing_snapshot(**kwargs)
+        self.assertEqual(client.tables["CostingSnapshot"][0]["fields"]["Status"], "staging")
+        self.assertEqual(client.tables["CostingChangeSetItem"][0]["fields"]["Status"], "staging")
+        self.assertIsNone(repository.latest_accepted_costing_snapshot(file.id))
+
+        result = repository.accept_costing_snapshot(**kwargs)
+
+        self.assertFalse(result.get("unchanged", False))
+        self.assertEqual(client.tables["CostingSnapshot"][0]["fields"]["Status"], "accepted")
+        self.assertEqual(client.tables["CostingChangeSetItem"][0]["fields"]["Status"], "accepted")
+        self.assertEqual(len(client.tables["CostingSnapshot"]), 1)
+        self.assertEqual(len(client.tables["CostingChangeSetItem"]), 1)
+
+    def test_governance_writes_stop_before_mutation_when_schema_diff_is_pending(self) -> None:
+        class ConcreteGristFake(FakeGristClient, GristClient):
+            def __init__(self) -> None:
+                FakeGristClient.__init__(self)
+                self.api_key = "test-key"
+                self.doc_id = "safari-doc"
+                self.base_url = "https://example.invalid"
+                self.safari_workspace_id = "work"
+
+        client = ConcreteGristFake()
+        repository = GristSafariRepository(client=client)
+        pending = SchemaPlan("safari-doc", "Safari Manufacturing", "work", "v3", ({"id": "DirectoryProductMapping"},), (), ())
+        with mock.patch("app.grist_repository.plan_schema", return_value=pending):
+            with self.assertRaises(GovernanceConflict) as raised:
+                repository.upsert_issue(ReconciliationIssue("i1", "changed_file", "high", "Changed", fingerprint="changed:file"))
+        self.assertEqual(raised.exception.code, "SCHEMA_MIGRATION_REQUIRED")
+        self.assertEqual(client.created, [])
+        self.assertEqual(client.updated, [])
+
+    def test_identity_cleanup_idempotency_survives_repository_restart(self) -> None:
+        client = FakeGristClient()
+        client.tables["ProductModel"] = [
+            {"id": 2, "fields": {"Product": 1, "ModelNumber": "Safari � SSV", "Name": "", "Active": True}},
+            {"id": 5, "fields": {"Product": 1, "ModelNumber": "Safari – SSV", "Name": "", "Active": True}},
+        ]
+        client.tables["ProductModelCode"] = []
+        first_repository = GristSafariRepository(client=client)
+        issue = first_repository.upsert_issue(ReconciliationIssue("detected", "invalid_identity_encoding", "error", "Invalid identity", entity_type="ProductModel", entity_id="2", fingerprint="encoding:2"))
+        payload = {"issue_id": issue.id, "actor": "Irshad", "reason": "Approved cleanup", "expected_issue_version": issue.version, "idempotency_key": "cleanup-request-1"}
+        first_result = first_repository.apply_identity_cleanup("2", "5", **payload)
+
+        restarted_repository = GristSafariRepository(client=client)
+        replay = restarted_repository.apply_identity_cleanup("2", "5", **payload)
+
+        self.assertFalse(replay["model"]["active"])
+        self.assertEqual(replay["model"]["superseded_by_id"], "5")
+        self.assertEqual(replay["auditEvent"]["id"], first_result["auditEvent"]["id"])
+        self.assertTrue(replay["idempotent"])
+
+    def test_reconciliation_repository_contract_persists_issue_lifecycle_and_directory_mapping(self) -> None:
+        from app.repository import InMemorySafariRepository, SafariRepository, SafariRepositoryBase
+
+        client = FakeGristClient()
+        repository = GristSafariRepository(client=client)
+        self.assertFalse(isinstance(repository, InMemorySafariRepository))
+        self.assertIsInstance(repository, SafariRepositoryBase)
+        self.assertIsInstance(repository, SafariRepository)
+        self.assertIsInstance(InMemorySafariRepository(), SafariRepository)
+        self.assertTrue(hasattr(repository, "mutate_issue"))
+        self.assertTrue(hasattr(repository, "accept_file_revision"))
+
+        issue = repository.upsert_issue(ReconciliationIssue("detected", "missing_file", "error", "File is missing", entity_type="CostingFile", entity_id="file:model.ods", fingerprint="missing:model"))
+        self.assertTrue(issue.id.startswith("issue:"))
+        self.assertEqual(client.tables["ReconciliationIssue"][0]["fields"]["Fingerprint"], "missing:model")
+        deferred = repository.mutate_issue(issue.id, "defer", actor="owner", reason="Waiting on owner", expected_version=1, idempotency_key="issue-request-1")
+        self.assertEqual(deferred.status, "deferred")
+        self.assertEqual(client.tables["ReconciliationIssue"][0]["fields"]["Version"], 2)
+        self.assertEqual(client.tables["AuditEvent"][0]["fields"]["RequestKey"], "issue-request-1")
+
+        mapping = repository.propose_directory_mapping("S1KHF/Local", "1", inherit=True, actor="owner", reason="proposal")
+        approved = repository.transition_directory_mapping(mapping.id, "approve", actor="Irshad", reason="reviewed", expected_version=mapping.version)
+        self.assertEqual(approved.status, "approved")
+        self.assertEqual(client.tables["DirectoryProductMapping"][0]["fields"]["Status"], "approved")
+        self.assertTrue(client.target_checks >= 4)
+
     def test_refresh_loads_catalog_governance_and_processing_records(self) -> None:
         client = FakeGristClient()
         client.tables["ProductModelCode"][0]["fields"]["SourceValues"] = ["L", "SOURCE-CODE", "OLD-CODE"]

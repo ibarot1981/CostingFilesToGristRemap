@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -130,11 +131,14 @@ def sync_catalog_to_grist(
             creates["IdentityAlias"].append((alias.id, fields, {}))
             changes.append({"table": "IdentityAlias", "action": "create", "identity": alias.value})
 
-    existing_issues = {_issue_signature(item.get("fields", {})) for item in tables["ReconciliationIssue"]}
+    existing_issues = {_text(item.get("fields", {}).get("Fingerprint")) or _issue_signature(item.get("fields", {})) for item in tables["ReconciliationIssue"]}
     for issue in result.issues:
-        fields = {"IssueType": issue.issue_type, "Severity": issue.severity, "Message": issue.message, "SourceFile": issue.source_file, "SourceRow": issue.source_row or 0, "EntityId": issue.entity_id or "", "Status": "open", "CreatedAt": grist_datetime(issue.created_at)}
-        if _issue_signature(fields) not in existing_issues:
+        fingerprint = issue.fingerprint or _catalog_issue_fingerprint(issue)
+        fields = {"IssueType": issue.issue_type, "Severity": issue.severity, "Message": issue.message, "SourceFile": issue.source_file, "SourceRow": issue.source_row or 0, "EntityId": issue.entity_id or "", "Status": issue.status, "CreatedAt": grist_datetime(issue.first_seen_at or issue.created_at), "Fingerprint": fingerprint, "EntityType": issue.entity_type, "SourcePath": issue.source_path or issue.source_file, "SourceCell": issue.source_cell, "DetectedFacts": issue.detected_facts, "ProposedResolution": issue.proposed_resolution, "AssignedOwner": issue.assigned_owner or "", "FirstSeenAt": grist_datetime(issue.first_seen_at or issue.created_at), "LastSeenAt": grist_datetime(issue.last_seen_at or issue.created_at), "Version": issue.version, "ResolutionAction": issue.resolution_action, "ResolutionReason": issue.resolution_reason}
+        signature = _text(fields.get("Fingerprint")) or _issue_signature(fields)
+        if signature not in existing_issues:
             creates["ReconciliationIssue"].append((issue.id, fields, {}))
+            existing_issues.add(signature)
             changes.append({"table": "ReconciliationIssue", "action": "create", "identity": f"row {issue.source_row}: {issue.issue_type}"})
 
     now = utc_now()
@@ -235,6 +239,11 @@ def _alias_signature(fields: dict[str, Any]) -> tuple[str, str, str, str, int]:
 
 def _issue_signature(fields: dict[str, Any]) -> tuple[str, str, int, str, str]:
     return (normalize_text(fields.get("IssueType")), normalize_text(fields.get("SourceFile")), _int(fields.get("SourceRow")), normalize_text(fields.get("EntityId")), normalize_text(fields.get("Message")))
+
+
+def _catalog_issue_fingerprint(issue: Any) -> str:
+    payload = "\0".join((issue.issue_type, issue.entity_type, issue.entity_id or "", issue.source_file.casefold(), str(issue.source_row or ""), issue.source_cell.casefold()))
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _text(value: Any) -> str:

@@ -2,7 +2,7 @@
 
 Windows-friendly Python CLI for processing LibreOffice Calc `.ods` product costing files.
 
-> **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [decision log](docs/DECISION_LOG.md), and the browser-friendly [requirements status register](docs/requirements-status.html). The ready-to-copy first implementation brief is in [MILESTONE_1_IMPLEMENTATION_PROMPT.md](docs/MILESTONE_1_IMPLEMENTATION_PROMPT.md).
+> **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [interactive data model](docs/data-model.html), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [numbering audit](docs/MILESTONE_NUMBERING_AUDIT.md), [decision log](docs/DECISION_LOG.md), and [requirements status register](docs/requirements-status.html). PR 1 is assessed in the [Milestone 1 post-merge audit](docs/MILESTONE_1_POST_MERGE_AUDIT.md); the next implementation brief is [Delivery Milestone 3](docs/MILESTONE_3_IMPLEMENTATION_PROMPT.md) for Phase 1 work package 1.1.
 
 The app reads configured sheets, detects columns by header names and aliases, filters inactive rows from YAML rules, verifies Material Cut List data against Grist, and creates new versioned `.ods` files without overwriting the original workbook.
 
@@ -58,14 +58,18 @@ are now live for `Safari 1000 HF`: the standard Local workbook has eight codes,
 the Export workbook has three requested codes, and the HF-MS Drum workbook has
 eight `-MS` codes. Export source spellings match the catalog display values
 case-insensitively and exactly; catalog capitalization is preserved. All three
-source hashes still match their ODS files; Grist contains three active model
+hashes matched when those associations were saved. A read-only check on 23
+September found the HF-MS Drum workbook had changed since its stored
+observation; the other two still match. Grist contains three active model
 associations, 19 unique active code owners, audit events, and queued import
 batches. The latest mapping was validated and saved through the browser UI;
 Mapped Files shows its codes, actor/reason, queued status, and history. Its
 read-only preview reports 61,125 external references, shown as a review warning.
-No source ODS or `Costing-New` data was changed. The several-file S1KHF pilot
-gate is now satisfied; conflict/supersede review and owner acceptance of the UI
-remain open.
+No source ODS or `Costing-New` data was changed by that mapping work. The
+several-file S1KHF pilot gate is satisfied; semantic comparison of the HF-MS
+revision and any resulting Grist synchronization, encoding cleanup, and owner
+acceptance of the UI remain open. Its hash drift alone is not a confirmed
+business issue.
 The versioned `catalog-0.2` importer keeps unresolved repeated canonical Model
 Codes inactive and records an error-level reconciliation issue; approved GC
 rating variants remain distinct and active.
@@ -76,9 +80,14 @@ Run the API and UI as described in [`ui/README.md`](ui/README.md). The API
 uses the in-memory adapter by default, which is visibly labelled in the UI and
 does not mutate Grist. Set `SAFARI_REPOSITORY=grist` only after the separate
 Safari document has been validated.
-The API contracts and mapped-files review fields are documented in
-[`docs/API_SCHEMA.md`](docs/API_SCHEMA.md); Mapped Files distinguishes
-repository observation timestamps from filesystem modification-time fallbacks.
+The Reconciliation view provides a bounded dry-run scan, durable issue queue,
+reasoned lifecycle actions, source-revision and identity-cleanup previews,
+directory Product proposals, and filtered CSV/JSON exports. Apply actions are
+restricted to the Phase 0 approver and require a review reason. The schema
+upgrade is separately planned and never runs at API startup. See
+[`docs/API_SCHEMA.md`](docs/API_SCHEMA.md) for endpoints and the current live
+schema diff. Mapped Files distinguishes repository observation timestamps from
+filesystem modification-time fallbacks.
 
 Plan guarded document creation (no Grist mutation):
 

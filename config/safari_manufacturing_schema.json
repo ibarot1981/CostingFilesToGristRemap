@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "safari-foundation-2026-09-19.v2",
+  "schemaVersion": "safari-foundation-2026-09-29.v4",
   "documentName": "Safari Manufacturing",
   "tables": [
     "Product",
@@ -12,8 +12,18 @@
     "FileCodeAssociation",
     "ImportBatch",
     "ReconciliationIssue",
-    "AuditEvent"
+    "AuditEvent",
+    "DirectoryProductMapping",
+    "CostingSnapshot",
+    "CostingChangeSetItem"
   ],
+  "milestone05Fields": {
+    "ProductModel": ["SupersededById", "SupersededAt"],
+    "ReconciliationIssue": ["Fingerprint", "EntityType", "CostingFile", "SourcePath", "SourceCell", "DetectedFacts", "ProposedResolution", "AssignedOwner", "FirstSeenAt", "LastSeenAt", "Version", "ResolutionAction", "ResolutionReason", "ResolvedActor", "ResolvedAt", "DeferredActor", "DeferredAt", "ReopenedActor", "ReopenedAt"],
+    "DirectoryProductMapping": ["RelativePath", "NormalizedPath", "Product", "Inherit", "Status", "Proposer", "Approver", "Reason", "CreatedAt", "UpdatedAt", "Version", "SupersedesId", "RequestKey", "RequestFingerprint"],
+    "CostingSnapshot": ["SnapshotKey", "CostingFile", "ObservedAt", "SemanticHash", "SemanticContent", "SourceHashes", "Status", "PreviousSnapshotKey", "AcceptedAt", "AcceptedBy", "AcceptanceReason", "RequestKey"],
+    "CostingChangeSetItem": ["ItemKey", "ChangeKey", "Snapshot", "PreviousSnapshotKey", "CostingFile", "ChangeType", "Classification", "ChangeData", "PreviousState", "CurrentState", "SourceEvidence", "CostImpact", "CRReference", "Status", "AcceptedAt", "AcceptedBy", "AcceptanceReason", "RequestKey"]
+  },
   "applyPolicy": "explicit-only; dry-run by default; reject legacy GRIST_DOC_ID",
   "requestRecovery": {
     "requestKeyColumn": "RequestKey",

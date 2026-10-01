@@ -1,8 +1,9 @@
 # Safari Manufacturing ERP UI
 
-Safari Manufacturing Phase 0 workbench: a responsive three-pane Costing
-Explorer (lazy filesystem tree, association workbench, and bounded workbook
-preview) plus a Mapped Files view. Association writes use the in-memory
+Safari Manufacturing workbench: a responsive Costing Explorer (lazy
+filesystem tree, association workbench, and bounded workbook preview), a
+read-only Milestone 2 Costing Review, a Mapped Files view, and a governed
+Reconciliation view. Association writes use the in-memory
 repository by default for local development and are visibly labelled; select
 the explicit Safari Grist adapter only after guarded document/schema setup.
 The required association rules and milestone acceptance tests are defined in
@@ -65,3 +66,28 @@ status filter and a bounded result limit; processing remains a visible safe
 stub and does not run a costing parser. The view does not auto-resolve issues
 or scan/hash every workbook. Its API projection is specified in
 [`docs/API_SCHEMA.md`](../docs/API_SCHEMA.md).
+
+Reconciliation starts with a dry-run scan of at most 50 registered ODS files.
+The issue queue filters by status, type, severity, owner, Product, Model, and
+search text; issue details show evidence, immutable observation history,
+association history, and audit events. Lifecycle decisions require reasons.
+Source revision and corrupted-identity actions require a preview and an
+explicit Irshad review. Directory Product mappings remain proposals until
+approval and never create file/model/code associations. CSV and JSON exports
+respect the active issue filters. Governance writes are blocked until the v3
+schema diff has been applied through the guarded setup command.
+
+The responsive review surfaces use labelled controls, keyboard reachable issue
+rows, focus transfer into issue details, explicit text status, and visible
+stale/permission/API errors. Automated UI tests cover keyboard issue selection,
+required reasons, and the Mapped Files projections; owner visual acceptance is
+still a separate checklist item.
+
+To review costing, select the product workbook in **Costing Explorer**, open
+**Costing Review**, and choose **Refresh and calculate**. Each review refreshes
+the selected workbook's local links on a temporary copy and reads the current
+`Template DB` RawSteel and SteelRateLog snapshots. It shows active and historical
+Material Cut List rows, exact calculations, saved/refreshed cache evidence,
+rate changes, and composite-key row comparisons. Invalid rates or unresolved
+inputs block affected line values and withhold the overall total. The view is
+read-only and does not persist semantic changes to Grist yet.

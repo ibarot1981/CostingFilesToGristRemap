@@ -1,17 +1,24 @@
-import type { AssociationState, AssociationValidation, CatalogSummary, ExplorerItem, MappedFile, ModelCode, Preview, Product, ProductModel } from "./types";
+import type { AssociationState, AssociationValidation, CatalogSummary, CostingReview, DirectoryProductMapping, ExplorerItem, MappedFile, ModelCode, Preview, Product, ProductModel, ReconciliationIssue } from "./types";
 
 async function get<T>(path: string): Promise<T> {
   const response = await fetch(path);
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.detail?.message || payload.detail || `Request failed (${response.status})`);
+  if (!response.ok) throw apiError(payload, response.status);
   return payload;
 }
 
 async function send<T>(path: string, body: unknown, headers: Record<string, string> = {}): Promise<T> {
   const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.detail?.message || payload.detail || `Request failed (${response.status})`);
+  if (!response.ok) throw apiError(payload, response.status);
   return payload;
+}
+
+function apiError(payload: any, status: number): Error {
+  const detail = payload?.detail;
+  const code = typeof detail?.code === "string" ? `${detail.code}: ` : "";
+  const message = typeof detail?.message === "string" ? detail.message : typeof detail === "string" ? detail : `Request failed (${status})`;
+  return new Error(`${code}${message}`);
 }
 
 export const api = {
@@ -22,9 +29,26 @@ export const api = {
   tree: (path = "") => get<{ root: string; path: string; items: ExplorerItem[] }>(`/api/explorer/tree?path=${encodeURIComponent(path)}`),
   files: (query = "") => get<{ total: number; items: ExplorerItem[]; source?: "filesystem" | "cached-report" }>(`/api/catalog/files?limit=1000&extension=.ods&query=${encodeURIComponent(query)}`),
   inspect: (path: string) => get<ExplorerItem>(`/api/explorer/inspect?path=${encodeURIComponent(path)}`),
-  preview: (path: string, sheet = "") => get<Preview>(`/api/catalog/preview?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}&row_count=50&column_count=30`),
+  preview: (path: string, sheet = "") => get<Preview>(`/api/catalog/preview?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}&row_count=200&column_count=30`),
+  refreshPreview: (path: string, sheet = "") => send<Preview>(`/api/catalog/preview/refresh?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}&row_count=200&column_count=30`, {}),
+  costingReview: (path: string) => send<CostingReview>("/api/catalog/costing-review", { path }),
+  acceptCostingReview: (payload: unknown, idempotencyKey: string) => send<Record<string, unknown>>("/api/catalog/costing-review/accept", payload, { "Idempotency-Key": idempotencyKey }),
   validateAssociation: (payload: unknown) => send<AssociationValidation>("/api/associations/validate", payload),
   saveAssociation: (payload: unknown, idempotencyKey: string) => send<Record<string, unknown>>("/api/associations", payload, { "Idempotency-Key": idempotencyKey }),
   mappedFiles: () => get<{ total: number; items: MappedFile[] }>("/api/mapped-files"),
   associations: () => get<AssociationState>("/api/associations"),
+  reconciliationIssues: (filters: Record<string, string> = {}) => {
+    const query = new URLSearchParams(Object.entries(filters).filter(([, value]) => Boolean(value)));
+    return get<{ total: number; items: ReconciliationIssue[] }>(`/api/reconciliation/issues?${query.toString()}`);
+  },
+  reconciliationIssue: (id: string) => get<{ issue: ReconciliationIssue; observations: Record<string, unknown>[]; associationHistory: Record<string, unknown>[]; auditTrail: Record<string, unknown>[] }>(`/api/reconciliation/issues/${encodeURIComponent(id)}`),
+  issueAction: (id: string, action: string, payload: unknown, key: string) => send<{ issue: ReconciliationIssue }>(`/api/reconciliation/issues/${encodeURIComponent(id)}/actions/${encodeURIComponent(action)}`, payload, { "Idempotency-Key": key }),
+  reconciliationScan: (dryRun = true, limit = 50) => send<Record<string, unknown>>("/api/reconciliation/scan", { dryRun, limit }),
+  sourceRevisionPreview: (id: string) => send<Record<string, unknown>>(`/api/reconciliation/issues/${encodeURIComponent(id)}/source-revision/preview`, {}),
+  sourceRevisionApply: (id: string, payload: unknown, key: string) => send<Record<string, unknown>>(`/api/reconciliation/issues/${encodeURIComponent(id)}/source-revision/apply`, payload, { "Idempotency-Key": key }),
+  identityCleanupPreview: (modelIds: string[] = []) => send<{ items: Record<string, unknown>[]; canApplyCount: number }>("/api/reconciliation/identity-cleanup/preview", { modelIds }),
+  identityCleanupApply: (payload: unknown, key: string) => send<Record<string, unknown>>("/api/reconciliation/identity-cleanup/apply", payload, { "Idempotency-Key": key }),
+  directoryMappings: (status = "") => get<{ total: number; items: DirectoryProductMapping[] }>(`/api/directory-mappings${status ? `?status=${encodeURIComponent(status)}` : ""}`),
+  proposeDirectoryMapping: (payload: unknown, key: string) => send<{ mapping: DirectoryProductMapping }>("/api/directory-mappings", payload, { "Idempotency-Key": key }),
+  directoryMappingAction: (id: string, action: string, payload: unknown, key: string) => send<{ mapping: DirectoryProductMapping }>(`/api/directory-mappings/${encodeURIComponent(id)}/${action}`, payload, { "Idempotency-Key": key }),
 };

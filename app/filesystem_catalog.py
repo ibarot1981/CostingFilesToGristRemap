@@ -132,7 +132,9 @@ class FilesystemCatalog:
             read_state = "readable" if scanned.readable else ("encrypted" if "encrypted" in (scanned.error or "").casefold() else "parse_error")
             classification = node.candidate_classification
             costing_sheets = {sheet.strip().casefold() for sheet in scanned.sheets}
-            if (
+            if not scanned.readable:
+                classification = "unreadable"
+            elif (
                 classification == "generated_output"
                 and "export" in path.name.casefold()
                 and {"cost log", "total summary"}.issubset(costing_sheets)
@@ -145,7 +147,7 @@ class FilesystemCatalog:
                    "candidate_classification": classification}
             )
         except (OSError, ValueError) as exc:
-            return FileNode(**{**asdict(node), "readable": False, "parse_error": f"{type(exc).__name__}: {exc}", "read_state": "parse_error"})
+            return FileNode(**{**asdict(node), "candidate_classification": "unreadable", "readable": False, "parse_error": f"{type(exc).__name__}: {exc}", "read_state": "parse_error"})
 
     def _node(self, path: Path) -> FileNode:
         relative = self._relative(path)
@@ -170,14 +172,16 @@ class FilesystemCatalog:
         lower = path.name.casefold()
         if path.is_dir():
             return "directory"
-        if path.suffix.casefold() != ".ods":
+        if lower == "thumbs.db":
             return "unsupported"
         if any(token in lower for token in ("archive", "old", "backup")):
             return "archive"
-        if any(token in lower for token in ("template", "master", "database", "db")):
+        if path.suffix.casefold() in {".db", ".sqlite", ".sqlite3", ".mdb", ".accdb", ".xltx"} or any(token in lower for token in ("template", "master", "database", "db")):
             return "master_or_template"
         if any(token in lower for token in ("output", "generated", "export")):
             return "generated_output"
+        if path.suffix.casefold() != ".ods":
+            return "unsupported"
         return "costing_candidate"
 
     def _reject_reparse_points(self, candidate: Path) -> None:

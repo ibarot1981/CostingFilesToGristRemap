@@ -37,6 +37,39 @@ class Phase0Tests(unittest.TestCase):
         self.assertTrue(node.readable)
         self.assertEqual(node.candidate_classification, "costing_candidate")
 
+    def test_export_filename_alone_does_not_make_a_costing_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "S1KHF-Export 1.0.ods"
+            with ZipFile(path, "w") as package:
+                package.writestr("content.xml", '<office:document-content><table:table table:name="Cover"/></office:document-content>')
+
+            node = FilesystemCatalog(root).inspect(path.name)
+
+        self.assertTrue(node.readable)
+        self.assertEqual(node.candidate_classification, "generated_output")
+
+    def test_filename_classification_categories_are_narrow_and_support_file_types_are_separate(self) -> None:
+        classify = FilesystemCatalog.classify
+        self.assertEqual(classify(Path("Model.ods")), "costing_candidate")
+        self.assertEqual(classify(Path("Old Model.ods")), "archive")
+        self.assertEqual(classify(Path("Spares Master.ods")), "master_or_template")
+        self.assertEqual(classify(Path("Model Output.ods")), "generated_output")
+        self.assertEqual(classify(Path("Supporting.sqlite")), "master_or_template")
+        self.assertEqual(classify(Path("Costing Export.xlsx")), "generated_output")
+        self.assertEqual(classify(Path("Costing Template.xltx")), "master_or_template")
+        self.assertEqual(classify(Path("Thumbs.db")), "unsupported")
+
+    def test_unreadable_ods_is_classified_separately_from_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "Safari Summary.ods"
+            path.write_bytes(b"not an ODS package")
+            node = FilesystemCatalog(root).inspect(path.name)
+
+        self.assertFalse(node.readable)
+        self.assertEqual(node.candidate_classification, "unreadable")
+
     def test_root_confinement_rejects_traversal_and_absolute_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

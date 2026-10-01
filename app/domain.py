@@ -40,6 +40,8 @@ class ProductModel(DomainRecord):
     source_row: int | None = None
     source_file: str | None = None
     active: bool = True
+    superseded_by_id: str | None = None
+    superseded_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,39 @@ class FileObservation(DomainRecord):
 
 
 @dataclass(frozen=True)
+class CostingSnapshot(DomainRecord):
+    id: str
+    snapshot_key: str
+    costing_file_id: str
+    observed_at: str
+    semantic_hash: str
+    semantic_content: dict[str, Any]
+    source_hashes: dict[str, Any]
+    status: str = "accepted"
+    previous_snapshot_key: str | None = None
+    accepted_at: str = field(default_factory=utc_now)
+    accepted_by: str = ""
+    acceptance_reason: str = ""
+    request_key: str = ""
+
+
+@dataclass(frozen=True)
+class CostingChangeSetItem(DomainRecord):
+    id: str
+    change_key: str
+    snapshot_key: str
+    previous_snapshot_key: str | None
+    costing_file_id: str
+    change_type: str
+    classification: str
+    change_data: dict[str, Any]
+    status: str = "accepted"
+    accepted_at: str = field(default_factory=utc_now)
+    accepted_by: str = ""
+    acceptance_reason: str = ""
+
+
+@dataclass(frozen=True)
 class FileModelAssociation(DomainRecord):
     id: str
     file_id: str
@@ -150,6 +185,25 @@ class ReconciliationIssue(DomainRecord):
     entity_id: str | None = None
     status: str = "open"
     created_at: str = field(default_factory=utc_now)
+    fingerprint: str = ""
+    entity_type: str = ""
+    costing_file_id: str | None = None
+    source_path: str = ""
+    source_cell: str = ""
+    detected_facts: dict[str, Any] = field(default_factory=dict)
+    proposed_resolution: dict[str, Any] = field(default_factory=dict)
+    assigned_owner: str | None = None
+    first_seen_at: str = field(default_factory=utc_now)
+    last_seen_at: str = field(default_factory=utc_now)
+    version: int = 1
+    resolution_action: str = ""
+    resolution_reason: str = ""
+    resolved_actor: str | None = None
+    resolved_at: str | None = None
+    deferred_actor: str | None = None
+    deferred_at: str | None = None
+    reopened_actor: str | None = None
+    reopened_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,3 +216,20 @@ class AuditEvent(DomainRecord):
     entity_id: str
     reason: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DirectoryProductMapping(DomainRecord):
+    id: str
+    relative_path: str
+    normalized_path: str
+    product_id: str
+    inherit: bool
+    status: str
+    proposer: str
+    approver: str | None = None
+    reason: str = ""
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+    version: int = 1
+    supersedes_id: str | None = None
