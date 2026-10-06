@@ -6,7 +6,7 @@ import type { ComponentProps } from "react";
 const apiMocks = vi.hoisted(() => ({
   summary: vi.fn(), products: vi.fn(), tree: vi.fn(), files: vi.fn(), associations: vi.fn(), models: vi.fn(),
   codes: vi.fn(), inspect: vi.fn(), preview: vi.fn(), validateAssociation: vi.fn(),
-  saveAssociation: vi.fn(), mappedFiles: vi.fn(),
+  saveAssociation: vi.fn(), mappedFiles: vi.fn(), fileAssociation: vi.fn(), refreshPreview: vi.fn(), processingState: vi.fn(), changeProcessingState: vi.fn(),
 }));
 
 vi.mock("../src/api", () => ({ api: apiMocks }));
@@ -17,6 +17,9 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 beforeEach(() => {
   Object.values(apiMocks).forEach((mock) => mock.mockReset());
+  apiMocks.processingState.mockResolvedValue({state:"associated",effectiveState:"associated",version:0,sourceHash:"preview-hash",schemaAvailable:true,history:[]});
+  apiMocks.fileAssociation.mockResolvedValue({ fileId: "file:pilot.ods", current: null, product: null, model: null, codes: [], history: [], mappingStatus: "unmapped", processingBatch: null });
+  apiMocks.refreshPreview.mockResolvedValue({ path: "pilot.ods", sheets: ["Summary"], sheet: "Summary", startRow: 1, totalRows: 1, truncatedColumns: false, rows: [["Fresh cost"]], refreshMetadata: { status: "refreshed_temporary_copy", checkedAt: "2026-10-03", originalSha256: "source-hash", refreshedCopySha256: "copy-hash", linkedSources: [], sourceWorkbookUnchanged: true, linkedSourcesUnchanged: true } });
   apiMocks.summary.mockResolvedValue({ root: "C:/costing", file_count: 1 });
   apiMocks.products.mockResolvedValue([{ id: "product-1", name: "Mini Crane" }]);
   apiMocks.tree.mockResolvedValue({ items: [{ id: "pilot.ods", name: "pilot.ods", type: "file", relative_path: "pilot.ods", extension: ".ods" }] });
@@ -56,6 +59,60 @@ function panelProps(): PanelProps {
 }
 
 describe("Costing Explorer association workbench", () => {
+  it("hydrates saved selections, status and history without saving on Validate", async () => {
+    apiMocks.fileAssociation.mockResolvedValue({
+      fileId: "file:pilot.ods", current: { id: "assoc-1", product_id: "product-1", model_id: "model-1", version: 4, actor: "Irshad", reason: "Reviewed", created_at: "2026-10-03" },
+      product: { id: "product-1", name: "Mini Crane" }, model: null,
+      codes: [{ id: "code-1", code: "S1KHFELP", description: "Local electric" }], mappingStatus: "mapped", processingBatch: { status: "queued" },
+      history: [{ association: { id: "assoc-1", active: true, actor: "Irshad", reason: "Reviewed", created_at: "2026-10-03" }, codes: [{ id: "code-1", code: "S1KHFELP" }], auditEvents: [] }],
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /pilot\.ods/ }));
+    await screen.findByText("Saved association · version 4");
+    expect((screen.getByLabelText("Product") as HTMLSelectElement).value).toBe("product-1");
+    expect((screen.getByLabelText("Product Model") as HTMLSelectElement).value).toBe("model-1");
+    expect((screen.getByRole("checkbox", { name: /S1KHFELP/ }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByText("Status: mapped · queued")).toBeTruthy();
+    expect(screen.getByText("Association history (1)")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Validate" }));
+    await vi.waitFor(() => expect(apiMocks.validateAssociation).toHaveBeenCalledOnce());
+    expect(apiMocks.saveAssociation).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late saved-association response after selecting another file", async () => {
+    let finish: (value: unknown) => void = () => {};
+    apiMocks.fileAssociation.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    apiMocks.tree.mockResolvedValue({ items: ["pilot.ods", "second.ods"].map((path) => ({ id: path, name: path, type: "file", relative_path: path, extension: ".ods" })) });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /pilot\.ods/ }));
+    fireEvent.click(screen.getByRole("button", { name: /second\.ods/ }));
+    await screen.findByText("No saved association");
+    finish({ current: { product_id: "product-1", model_id: "model-1" }, codes: [{ id: "code-1" }], history: [] });
+    await vi.waitFor(() => expect(apiMocks.codes).toHaveBeenCalled());
+    expect((screen.getByLabelText("Product") as HTMLSelectElement).value).toBe("");
+    expect(screen.queryByText(/Saved association · version/)).toBeNull();
+  });
+
+  it("automatically refreshes each preview-tab selection and reports errors without stale cells", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /pilot\.ods/ }));
+    await screen.findByText("No saved association");
+    const tab = screen.getByRole("button", { name: "Workbook Preview" });
+    fireEvent.click(tab);
+    await screen.findByText("Fresh cost");
+    expect(screen.getByText("Source revision: source-hash")).toBeTruthy();
+    expect(document.querySelector(".workbook-preview-tab")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    apiMocks.refreshPreview.mockRejectedValueOnce(new Error("EXTERNAL_REFRESH_FAILED: missing dependency"));
+    fireEvent.click(tab);
+    await screen.findByText("EXTERNAL_REFRESH_FAILED: missing dependency");
+    expect(apiMocks.refreshPreview).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("Fresh cost")).toBeNull();
+    fireEvent.click(tab);
+    await screen.findByText("Fresh cost");
+    expect(apiMocks.refreshPreview).toHaveBeenCalledTimes(3);
+  });
+
   it("resets association selections when the explorer file changes", async () => {
     apiMocks.tree.mockResolvedValue({ items: [
       { id: "pilot.ods", name: "pilot.ods", type: "file", relative_path: "pilot.ods", extension: ".ods" },

@@ -21,10 +21,11 @@ from app.catalog import scan_costing_file
 from app.catalog_import import import_catalog
 from app.domain import CostingFile as DomainCostingFile, FileObservation, ReconciliationIssue, utc_now
 from app.filesystem_catalog import FilesystemCatalog, PathSafetyError
+from app.exceptions import CostingAppError, GristError
 from app.repository import AssociationConflict, AssociationProposal, GovernanceConflict, InMemorySafariRepository, SafariRepository, sha256_file
 from app.workbook import OdsWorkbook
 from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
-from app.libreoffice_refresh import LibreOfficeRefreshError, refreshed_ods_copy
+from app.libreoffice_refresh import LibreOfficeRefreshError, linked_ods_sources, refreshed_ods_copy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -181,8 +182,14 @@ def association_history(file_id: str) -> list[dict[str, Any]]:
 
 @app.get("/api/associations/{file_id}")
 def association_detail(file_id: str) -> dict[str, Any]:
-    repository = _get_repository()
-    return {"current": repository.current_association(file_id).to_dict() if repository.current_association(file_id) else None, "history": repository.association_history(file_id)}
+    return _get_repository().association_detail(file_id)
+
+
+@app.get("/api/explorer/association")
+def file_association(path: str) -> dict[str, Any]:
+    workbook_path = _resolve_preview_workbook(path)
+    relative_path = workbook_path.relative_to(_costing_root()).as_posix()
+    return _get_repository().association_detail(f"file:{relative_path.casefold()}")
 
 
 @app.get("/api/processing-queue")
@@ -194,6 +201,108 @@ def processing_queue(status: str = "", limit: int = Query(100, ge=1, le=500)) ->
         batches = [item for item in batches if item.status.casefold() == status.casefold()]
     batches.sort(key=lambda item: (item.started_at, item.id), reverse=True)
     return {"items": [item.to_dict() for item in batches[:limit]], "total": len(batches), "adapter": repository.adapter_name}
+
+
+def _processing_context(path: str):
+    # Retrieving the association refreshes the durable adapter without mutations.
+    detail = file_association(path)
+    repository = _get_repository()
+    return repository, detail["fileId"], repository.current_association(detail["fileId"]), sha256_file(_resolve_preview_workbook(path))
+
+
+def _part_context(path: str):
+    from app.part_mapping import PartConflict, source_groups
+    from app.milestone2 import _configured_process_lines
+    repository, file_id, association, source_hash = _processing_context(path)
+    try:
+        groups = source_groups(_configured_process_lines(read_ods(_resolve_preview_workbook(path))))
+    except (OSError, KeyError, ValueError, BadZipFile, ET.ParseError) as exc:
+        raise _error(422, "PART_SOURCE_UNAVAILABLE", str(exc))
+    if sha256_file(_resolve_preview_workbook(path)) != source_hash:
+        raise PartConflict("PART_REVIEW_STALE", "The workbook changed while reading; reload the review")
+    return repository, file_id, association, source_hash, groups
+
+
+@app.post("/api/parts")
+def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.part_mapping import PartConflict, create_part
+    try:
+        return create_part(_get_repository().part_store, name=str(payload.get("name") or ""),
+            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartConflict as exc:
+        raise _error(409, exc.code, str(exc))
+
+
+@app.get("/api/parts/mappings")
+def part_mappings(path: str):
+    from app.part_mapping import PartConflict, mapping_detail
+    try:
+        repository, file_id, association, source_hash, groups = _part_context(path)
+        return mapping_detail(repository.part_store, file_id=file_id, source_hash=source_hash, association=association, groups=groups)
+    except PartConflict as exc:
+        raise _error(409, exc.code, str(exc))
+
+
+@app.post("/api/parts/mappings")
+def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.part_mapping import PartConflict, save_mapping
+    from app.processing import processing_detail
+    version = payload.get("expectedVersion")
+    association_version = payload.get("expectedAssociationVersion")
+    decisions = payload.get("decisions")
+    if (type(version) is not int or type(association_version) is not int or not isinstance(decisions, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in decisions.items())):
+        raise _error(422, "PART_REVIEW_INPUT_INVALID", "Mapping versions and selected Parts are required")
+    path = str(payload.get("path") or "")
+    try:
+        repository, file_id, association, source_hash, groups = _part_context(path)
+        def verify_current():
+            fresh_repo, fresh_id, fresh_association, fresh_hash = _processing_context(path)
+            if (fresh_id != file_id or fresh_hash != source_hash or not fresh_association or not association
+                    or (fresh_association.id, fresh_association.version) != (association.id, association.version)):
+                raise PartConflict("PART_REVIEW_STALE", "The workbook or association changed; reload the review")
+            state = processing_detail(fresh_repo.processing_store, file_id, fresh_association, fresh_hash)
+            if state["state"] == "processed":
+                raise PartConflict("PART_REOPEN_REQUIRED", "Record Changes Pending before revising Parts for a processed file")
+        return save_mapping(repository.part_store, file_id=file_id, source_hash=source_hash, association=association,
+            groups=groups, decisions=decisions, expected_hash=str(payload.get("expectedHash") or ""),
+            expected_version=version, expected_association=str(payload.get("expectedAssociationKey") or ""),
+            expected_association_version=association_version, actor=_request_actor(request),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "", before_write=verify_current)
+    except PartConflict as exc:
+        raise _error(409, exc.code, str(exc))
+
+
+@app.get("/api/processing/state")
+def file_processing_state(path: str) -> dict[str, Any]:
+    from app.processing import ProcessingConflict, processing_detail
+    try:
+        repository, file_id, association, source_hash = _processing_context(path)
+        return processing_detail(repository.processing_store, file_id, association, source_hash)
+    except ProcessingConflict as exc:
+        raise _error(409, exc.code, str(exc))
+
+
+@app.post("/api/processing/state")
+def change_processing_state(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    from app.processing import ProcessingConflict, transition
+    path = str(payload.get("path") or "")
+    version = payload.get("expectedVersion")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise _error(422, "PROCESSING_VERSION_REQUIRED", "A processing version is required.")
+    try:
+        repository, file_id, association, source_hash = _processing_context(path)
+        snapshot = repository.latest_accepted_costing_snapshot(file_id)
+        hashes = snapshot.source_hashes if snapshot else {}
+        return transition(repository.processing_store, file_id=file_id, association=association,
+            source_hash=source_hash, expected_hash=str(payload.get("expectedHash") or ""),
+            expected_version=version, state=str(payload.get("state") or ""),
+            expected_association_key=str(payload.get("expectedAssociationKey") or ""),
+            expected_association_version=payload.get("expectedAssociationVersion"),
+            actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+            request_key=idempotency_key or "", extracted_hash=hashes.get("selected_workbook_saved"))
+    except ProcessingConflict as exc:
+        raise _error(409, exc.code, str(exc))
 
 
 @app.get("/api/mapped-files")
@@ -915,6 +1024,16 @@ def refresh_preview(path: str, sheet: str = "", start_row: int = Query(1, ge=1),
     start_row, row_count, start_col, column_count = _preview_arguments(start_row, row_count, start_col, column_count)
     workbook_path = _resolve_preview_workbook(path)
     try:
+        if not linked_ods_sources(workbook_path, _costing_root(), allow_empty=True):
+            original_hash = sha256_file(workbook_path)
+            result = _preview_workbook(path, workbook_path, sheet, start_row, row_count, start_col, column_count, {
+                "status": "no_external_links", "checkedAt": utc_now(),
+                "originalSha256": original_hash, "refreshedCopySha256": None,
+                "linkedSources": [], "sourceWorkbookUnchanged": True, "linkedSourcesUnchanged": True,
+            })
+            if sha256_file(workbook_path) != original_hash:
+                raise LibreOfficeRefreshError("The source workbook changed while previewing.")
+            return result
         with refreshed_ods_copy(workbook_path, _costing_root()) as evidence:
             metadata = {
                 "status": "refreshed_temporary_copy",
@@ -992,11 +1111,192 @@ def costing_review(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                 and review["status"] == "ready_for_owner_review"
                 and not review["semantic_comparison"]["owner_review_required"]
             )
+            from app.interim_rates import load_interim_rates
+            rate_state = review.get("semantic_snapshot", {}).get("content", {}).get("rate_state", {})
+            try:
+                review["interim_rates"] = load_interim_rates({name: value.get("effective_rate_per_kg") for name, value in rate_state.items()}) if rate_state else {
+                    "status": "not_applicable", "rows": [], "readOnly": True, "processingBlocker": False}
+            except (CostingAppError, ValueError, OSError) as exc:
+                review["interim_rates"] = {"status": "unavailable", "message": str(exc), "rows": [],
+                                           "readOnly": True, "processingBlocker": False}
+            if file_id and review.get("processing_evidence"):
+                from app.part_mapping import source_groups, mapping_detail, attach_mapping_evidence
+                detail = mapping_detail(repository.part_store, file_id=file_id,
+                    source_hash=evidence.original_sha256, association=repository.current_association(file_id),
+                    groups=source_groups(review["semantic_snapshot"]["content"]["process_lists"]))
+                attach_mapping_evidence(review["processing_evidence"], detail)
             return review
     except LibreOfficeRefreshError as exc:
         raise _error(422, "EXTERNAL_REFRESH_FAILED", str(exc))
     except (OSError, KeyError, ValueError, BadZipFile, ET.ParseError) as exc:
         raise _error(422, "COSTING_REVIEW_UNAVAILABLE", str(exc))
+
+
+@app.get("/api/model-codes/{code_id}/records")
+def model_code_records(
+    code_id: str,
+    sheet: str = "", process: str = "", master: str = "",
+    part: str = "", material: str = "", status: str = "",
+    offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Inspect stored file-baseline evidence without opening or hashing an ODS."""
+    repository = _get_repository()
+    code = repository.codes.get(code_id)
+    if code is None or not code.active:
+        raise _error(404, "MODEL_CODE_NOT_FOUND", "Active Model Code not found")
+    owners = [link for link in repository.code_associations.values() if link.active and link.code_id == code_id]
+    if len(owners) > 1:
+        raise _error(409, "CODE_OWNERSHIP_CONFLICT", "Multiple active source files own this Model Code")
+    owner = owners[0] if owners else None
+    association = repository.associations.get(owner.association_id) if owner else None
+    file = repository.files.get(association.file_id) if association else None
+    if owner and (not association or not association.active or association.model_id != code.model_id or not file or owner.file_id != association.file_id):
+        raise _error(409, "CODE_OWNERSHIP_CONFLICT", "The source association is missing or inconsistent")
+    snapshot = repository.latest_accepted_costing_snapshot(file.id) if file else None
+    result: dict[str, Any] = {
+        "code": code.to_dict(), "source": file.to_dict() if file else None,
+        "association": association.to_dict() if association else None,
+        "readAt": utc_now(), "sourceRead": False, "authorityChanged": False,
+        "scope": "shared_file_baseline", "configurationStatus": "review_required",
+        "baseline": {"snapshotKey": snapshot.snapshot_key, "sourceHash": snapshot.source_hashes.get("selected_workbook_saved"),
+                     "acceptedAt": snapshot.accepted_at, "observedAt": snapshot.observed_at} if snapshot else None,
+        "persistence": repository.adapter_name, "total": 0, "items": [],
+        "status": "unassociated" if not file else "no_accepted_snapshot" if not snapshot else "storage_unavailable",
+    }
+    if snapshot and repository.adapter_name == "grist-safari":
+        from app.normalized_store import GristNormalizedStore
+        try:
+            result.update(GristNormalizedStore(repository.client).query(
+                snapshot_key=snapshot.snapshot_key,
+                filters={"sheet": sheet, "process": process, "master": master, "part": part, "material": material, "status": status},
+                offset=offset, limit=limit))
+            result["status"] = "stored"
+        except GristError as exc:
+            if "404" not in str(exc):
+                raise
+            result["status"] = "schema_unavailable"
+        except ValueError as exc:
+            raise _error(409, "STORED_BASELINE_CONFLICT", str(exc))
+    return result
+
+
+@app.get("/api/catalog/normalized")
+def normalized_inspection(
+    path: str,
+    sheet: str = "",
+    process: str = "",
+    master: str = "",
+    part: str = "",
+    material: str = "",
+    status: str = "",
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Read-only row inspection from the accepted Safari baseline."""
+    from app.config import load_material_mapping
+    from app.normalized import capture_source_rows, project_snapshot
+    from app.repository import sha256_file
+
+    workbook_path = _resolve_preview_workbook(path)
+    repository = _get_repository()
+    file_id = _costing_file_id_for_path(workbook_path, repository)
+    accepted = repository.latest_accepted_costing_snapshot(file_id) if file_id else None
+    current_hash = sha256_file(workbook_path)
+    cost_drift_assessment = None
+    if accepted is None:
+        from app.milestone2 import _configured_process_lines, extract_raw_steel, read_ods
+        raw_path = _costing_root() / "Template DB" / "MaterialCostDB.ods"
+        document = read_ods(workbook_path)
+        lines = _configured_process_lines(document)
+        raw_rows, _ = extract_raw_steel(read_ods(raw_path, {"RawSteel"})) if raw_path.is_file() else ([], [])
+        semantic_content = {"process_lists": lines, "material_master_state": {
+            row["unique_item_list"]: {} for row in raw_rows if row.get("unique_item_list")
+        }}
+        snapshot_key = f"local-unaccepted:{current_hash}"
+        accepted_hash = current_hash
+        source_row_cells = capture_source_rows(document, set(lines))
+        dependency_hashes = {name: sha256_file(source) for name, source in {
+            "raw_steel": raw_path,
+            "rate_log_dump": _costing_root() / "Template DB" / "Spares List - Master.ods",
+        }.items() if source.is_file()}
+    else:
+        semantic_content = accepted.semantic_content
+        snapshot_key = accepted.snapshot_key
+        accepted_hash = accepted.source_hashes.get("selected_workbook_saved")
+        dependency_hashes = accepted.source_hashes
+        from app.milestone2 import _configured_process_lines, extract_product_workbook, read_ods
+        from app.normalized_import import assess_cost_drift
+        document = read_ods(workbook_path)
+        current_lists = _configured_process_lines(document)
+        workbook_total = extract_product_workbook(document)["summary_totals"]["grand_total"]["cached_value"]
+        if workbook_total is not None:
+            cost_drift_assessment = assess_cost_drift(semantic_content, {"process_lists": current_lists}, workbook_total)
+        if cost_drift_assessment and cost_drift_assessment["cost_only_confirmed"]:
+            semantic_content = {**semantic_content, "process_lists": current_lists}
+            source_row_cells = capture_source_rows(document, set(current_lists))
+        else:
+            source_row_cells = None
+    projection = project_snapshot(
+        semantic_content,
+        snapshot_key=snapshot_key,
+        source_hash=str(current_hash if cost_drift_assessment and cost_drift_assessment["cost_only_confirmed"] else accepted_hash or ""),
+        material_mappings=load_material_mapping(),
+        dependency_hashes=dependency_hashes,
+        source_row_cells=source_row_cells,
+    )
+    if accepted is not None and repository.adapter_name == "grist-safari":
+        from app.normalized_store import GristNormalizedStore
+        store = GristNormalizedStore(repository.client)
+        try:
+            all_persisted = store.query(snapshot_key=snapshot_key, filters={}, offset=0, limit=100000)
+            if all_persisted["total"]:
+                persisted = store.query(snapshot_key=snapshot_key,
+                                        filters={"sheet": sheet, "process": process, "master": master, "part": part,
+                                                 "material": material, "status": status},
+                                        offset=offset, limit=limit)
+                from collections import Counter
+                persistent_counts = Counter((row["observation"]["sheet"], row["observation"]["status"]) for row in all_persisted["items"])
+                expected_counts = projection["reconciliation"]["expected_counts"]
+                count_differences = [{"sheet": name, "status": state, "expected": expected,
+                                      "actual": persistent_counts[(name, state)]}
+                                     for name, statuses in expected_counts.items() for state, expected in statuses.items()
+                                     if persistent_counts[(name, state)] != expected]
+                return {"baseline": {"snapshotKey": snapshot_key, "semanticHash": accepted.semantic_hash,
+                           "sourceHash": accepted_hash, "currentSourceHash": current_hash,
+                           "sourceMatchesBaseline": current_hash == accepted_hash, "accepted": True,
+                           "costDriftAssessment": cost_drift_assessment},
+                        "persistence": "grist", "counts": {"persisted_rows": len(all_persisted["items"])},
+                        "reconciliation": {**projection["reconciliation"], "persisted_count_differences": count_differences},
+                        "exceptions": projection["exceptions"], **persisted}
+        except GristError as exc:
+            if "404" not in str(exc):
+                raise
+    observations = {item["key"]: item for item in projection["source_observations"]}
+    masters = {item["key"]: item for item in projection["line_masters"]}
+    revisions = {item["master_key"]: item for item in projection["line_revisions"]}
+    details = {item["revision_key"]: item for item in projection["line_details"]}
+    rows = []
+    for mapping in projection["source_mappings"]:
+        observation = observations[mapping["observation_key"]]
+        master = masters.get(mapping["master_key"])
+        revision = revisions.get(mapping["master_key"])
+        detail = details.get(revision["key"]) if revision else None
+        row = {"mapping": mapping, "observation": observation, "master": master, "revision": revision, "detail": detail,
+               "audit": [item for item in projection["audit"] if item["master_key"] == mapping["master_key"]]}
+        if sheet and observation["sheet"] != sheet: continue
+        if process and (master or {}).get("process_type") != process: continue
+        if master and (row["master"] or {}).get("key") != master: continue
+        if part and part.casefold() not in observation["part_display_name"].casefold(): continue
+        if material and material.casefold() not in (detail or {}).get("material_display_name", "").casefold(): continue
+        if status and observation["status"] != status: continue
+        rows.append(row)
+    return {"baseline": {"snapshotKey": snapshot_key, "semanticHash": accepted.semantic_hash if accepted else None,
+                          "sourceHash": accepted_hash, "currentSourceHash": current_hash,
+                          "sourceMatchesBaseline": current_hash == accepted_hash if accepted else None,
+                          "accepted": accepted is not None, "costDriftAssessment": cost_drift_assessment},
+            "persistence": "projection_only", "counts": {key: len(value) for key, value in projection.items() if isinstance(value, list)},
+            "reconciliation": projection["reconciliation"], "exceptions": projection["exceptions"],
+            "total": len(rows), "items": rows[offset:offset + limit]}
 
 
 @app.post("/api/catalog/costing-review/accept")

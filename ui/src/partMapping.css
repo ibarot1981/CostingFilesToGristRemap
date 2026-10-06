@@ -1,0 +1,15 @@
+.part-mapping { padding: 28px; max-width: 1400px; margin: auto; }
+.part-heading { display: flex; justify-content: space-between; gap: 20px; align-items: center; }
+.part-mapping p { overflow-wrap: anywhere; color: #526477; }
+.part-mapping label { display: grid; gap: 8px; margin: 16px 0; }
+.part-mapping input, .part-mapping select, .part-mapping textarea { width: 100%; padding: 10px; border: 1px solid #ccd6df; border-radius: 6px; background: white; }
+.part-create, .part-history { margin: 20px 0; padding: 16px; border: 1px solid #d8e2ea; border-radius: 8px; }
+.part-create fieldset { border: none; padding: 0; }
+.part-hash { font-family: monospace; }
+.part-table { overflow: auto; margin: 18px 0; max-height: 620px; border: 1px solid #d8e2ea; border-radius: 8px; }
+.part-table table { width: 100%; border-collapse: collapse; }
+.part-table th, .part-table td { padding: 12px; text-align: left; vertical-align: top; border-bottom: 1px solid #d8e2ea; }
+.part-table th { position: sticky; top: 0; background: #eef4f8; }
+.part-table td:first-child { width: 30%; }
+.part-table td:last-child { width: 35%; min-width: 240px; }
+.part-table small { display: block; color: #66798c; margin-top: 6px; }

@@ -158,6 +158,14 @@ supported_sheets:
         - Dimension to Cut (mm)
         - Length_mm
         - Length mm
+      weight_per_meter_kg:
+        - Weight Kg/Mtr of Material
+      total_weight_kg:
+        - Total Weight in Kgs
+      internal_making_cost:
+        - In House Making Amount Rs.
+      external_machining_cost:
+        - External Vendor Machining Rate Per Nos (Job Work Cost) Rs
       qty:
         - Qty
         - QTY
@@ -248,6 +256,10 @@ supported_sheets:
   "Stores and Consumables List":
     header_row: 6
     aliases:
+      issue_slip_no:
+        - Issue Slip No
+      issue_slip_desc:
+        - Issue Slip Desc
       item_code:
         - Item Code
         - Item Number
@@ -323,6 +335,10 @@ supported_sheets:
         - Part
       part_category:
         - Part Category
+      part_weight_kg:
+        - Per Part Weight (Kg)
+      total_weight_kg:
+        - Total Weight (Kgs)
       material_to_cut:
         - Material used
         - Material to Cut

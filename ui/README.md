@@ -2,8 +2,14 @@
 
 Safari Manufacturing workbench: a responsive Costing Explorer (lazy
 filesystem tree, association workbench, and bounded workbook preview), a
-read-only Milestone 2 Costing Review, a Mapped Files view, and a governed
-Reconciliation view. Association writes use the in-memory
+read-only Milestone 2 Costing Review, a Mapped Files view, a read-only
+Milestone 3 Process Lines inspector, and a governed Reconciliation view.
+Process Lines filters sheet/process/part/material/status and shows source
+cells, formulas, revisions, mapping exceptions, and row audit. With
+`SAFARI_REPOSITORY=grist`, it queries the 313 persisted S1KHF pilot rows;
+10 mappings are labelled ambiguous. Without an
+accepted Safari snapshot it is visibly labelled a local unaccepted projection;
+it is not a claim of persisted Grist rows. Association writes use the in-memory
 repository by default for local development and are visibly labelled; select
 the explicit Safari Grist adapter only after guarded document/schema setup.
 The required association rules and milestone acceptance tests are defined in
@@ -91,3 +97,13 @@ Material Cut List rows, exact calculations, saved/refreshed cache evidence,
 rate changes, and composite-key row comparisons. Invalid rates or unresolved
 inputs block affected line values and withhold the overall total. The view is
 read-only and does not persist semantic changes to Grist yet.
+
+ProcessingPanel shows selected-file state/history, reviewed revision tokens and
+reasoned actions through the API. It preserves request keys across response-loss
+retries. Completion actions depend on later server-side evidence services.
+
+ModelCodeExplorer provides Product -> Model -> Code selection and paginated stored-row filters. Selection never calls source preview or costing review. Open source reconciliation reveals the explicit Refresh and calculate action. Late code/model responses are discarded. Shared file records are labelled pending per-code configuration review.
+
+The refreshed review presents sheet coverage, physical findings (including missing older-baseline weight evidence), unresolved Part assignments and nonblocking Costing-New rates. It does not expose a completion action before reviewed mapping/configuration/import services are connected.
+
+Part Mapping shows exact source-description groups and individual blank rows, canonical Part choices, a separate unique-name creation form, reasoned Save, and source/hash/version/audit history. Failed saves retain their request payload for retry; Reload review clears the attempt and checks persisted results. Source rows come from the saved workbook; full costing reconciliation refreshes a disposable copy separately.

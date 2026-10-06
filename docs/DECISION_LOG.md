@@ -1,6 +1,6 @@
 # Safari Manufacturing — Decision Log
 
-Updated: 28 September 2026
+Updated: 2 October 2026
 
 States: **Accepted**, **Provisional**, **Open**, **Superseded**
 
@@ -63,6 +63,14 @@ States: **Accepted**, **Provisional**, **Open**, **Superseded**
 | D-054 | Accepted 1 October 2026 | Costing configuration, manufacturing configuration, and an actual production plan are distinct versioned concepts. | Costing configuration represents the complete sellable BOM of a Model Code. Manufacturing configuration defines standard BOM/routing/batch policy. A production plan instantiates that definition with independent per-part quantities, such as Drum Assembly 80, Chassis 32, and Support 64 for one S1KHFELP run, without changing the costing BOM or reusable part revision. |
 | D-055 | Accepted 1 October 2026 | Decimal roadmap IDs are phase work packages; whole-number Milestone IDs are delivery efforts. The next delivery is Milestone 3 for Phase 1 work package 1.1. | Milestone 1 covered Phase 0 foundation, Milestone 2 combined Phase 0 governance and the Phase 1 S1KHF parity pilot, and Milestone 3 normalizes the pilot rows. Phase 0 remains open until its separate exit gates are evidenced. Preserve historical filenames and IDs with a crosswalk. |
 | D-056 | Accepted 1 October 2026 | Milestone 3 implements the normalized S1KHF part/line subset of the target ER model, using accepted semantic snapshots as a parity baseline. | Store individual process rows with stable identity, immutable revisions, typed details, source mapping, and audit. Reuse CLI material mapping behavior needed for the pilot. Defer configuration builders, manufacturing planning, live rate approval, and ODS write-back. |
+| D-057 | Applied to the validated Safari document, 2 October 2026 | Use one typed `LineDetail` table for the pilot, with a process discriminator and nullable typed columns; place uncertain source descriptions under a temporary unallocated Part. | This avoids inventing Part or component ownership and keeps every supported row individually queryable. Schema v5 and 2,043 normalized records were applied after exact live plans. Ten duplicate-composite rows remain explicitly unresolved; imported proposals are not owner-approved identity. |
+| D-058 | Accepted 2 October 2026; future cutover design | ODS-to-Grist ingestion transfers records but does not transfer costing authority. Cutover may be approved for one Model Code or for a whole Product Model, depending on the product. | ODS remains authoritative for each code until all required lines/sheets, material rates, parity, and owner gates pass. A whole-model cutover requires all active codes to qualify; record one effective authority per code with scope, version, approver, reason, and rollback. Once Grist is authoritative, normal UI costing/cut-list reads use typed Grist records and pinned rates without reparsing ODS; the target is dramatically lower load time, verified by benchmark. No Milestone 3 code is cut over. |
+| D-059 | Accepted 3 October 2026 | File selection restores saved association selections/status/history. Validate checks; separate Save persists with audit. | Fresh Grist reads and UI request-generation guards prevent stale selection display. |
+| D-060 | Accepted 3 October 2026 | Selecting the full-width Workbook Preview refreshes local external sheets on a disposable copy. | Show progress, hashes, result and errors; preserve all sources. Upstream Sheets refresh is separate. |
+| D-061 | Accepted 3 October 2026 | Processed is a workflow state, distinct from approved costing authority. Structural/configuration gates determine processing; price variance alone does not block. | Costing-New supplies reviewed interim price evidence read-only. Stored inspection is independent of authority; later approval may cover one Code or an entire Model. |
+
+| D-062 | Accepted 5 October 2026 | Processing transitions and their audit evidence share one immutable FileProcessingEvent row. | Source/association/version tokens and durable request fingerprints govern retries; duplicate versions require review. Completion remains gated by later structural/configuration evidence. |
+
 ## Open decisions
 
 | ID | Needed by | Question | Safe interim treatment |
@@ -91,3 +99,29 @@ States: **Accepted**, **Provisional**, **Open**, **Superseded**
 ## How to update this log
 
 Add a new decision when a business rule, source boundary, workflow, schema boundary, or irreversible technical choice changes. Do not edit history to make an old decision look current: mark it Superseded and add the replacement ID. Link implementation work and requirement IDs in the commit or pull request.
+
+### D063 — Stored Model Code inspection bypasses source workbooks
+
+Accepted 5 October 2026. Code selection resolves active file ownership and joins accepted Safari child records without reading/hashing ODS. Explicit reconciliation opens the existing refreshed review. Until Summary configuration is implemented, rows are labelled shared file-baseline evidence and configuration requires review. Revisions are pinned to their accepted snapshot; no authority is transferred.
+
+### D064 — Processing reconciliation rules and interim rate source
+
+Accepted by the user on 5 October 2026. Mandatory sheets: 5. Material Cut List Price, Tool Shop Items, Stores and Consumables List, CNC Cut List, Labour - Paint - Packing, Total Summary, Spares Detail, Spares Summary. Quantities match exactly. Weight compares in kg rounded to two decimals (implementation uses decimal half-up). Final configuration cost-total and material-price differences are displayed but are not completion gates. Structural option/addition/deduction membership still requires review. Costing-New MaterialLatestRate supplies interim material prices when a MaterialRateLog entry exists; otherwise use Default_MaterialRate. Missing/unmapped rates remain explicitly unavailable, never zero. Costing-New is read-only. New canonical Part names must be globally unique across Safari Manufacturing.
+
+Representative Summary sources: S1KHF/Local/Safari 1000 HF Local V 4.2.ods and S1KH/S1KH_2.0.ods. Their saved source hashes are retained in the private continuation archive. HF has tyre-deduction configurations; H includes a self-start engine option. Summary formulas/configurations are evidence, not automatically approved configuration.
+
+### D065 — Canonical Part creation and source-scoped review
+
+Partially superseded 6 October 2026 by D066 for name-derived identity and further Part mapping progression. Source review/audit behavior is retained.
+
+Implemented 5 October 2026 under the user's global uniqueness rule. Compare canonical names after NFKC, whitespace collapse and case folding across all existing Parts. Distinct source descriptions may select the same canonical Part; this is a reversible implementation assumption pending an explicit sharing rule. Group exact nonblank descriptions across active MCL/Tool/CNC rows and keep blanks individual. Each saved assignment retains typed source coordinates, ProductPart reference, file/hash/association version and audit/retry fields. Assignment saving does not change costing authority or existing line masters. Store Issue requires no Part; Paint/Packing and Summary require per-code configuration. Single-service serialization and duplicate detection fail closed; external concurrent writers are not protected by a Grist unique constraint.
+
+### D066 — Permanent Part identity, generated names and advisory sharing scope
+
+Accepted by the owner on 6 October 2026; implementation pending. Part number follows the discussed SM-P-000001 central sequence and is independent of name/scope/revision. Generate the name from the selected Global/Product/Product Model/Model Code shortcode, user-entered description and meaningful variant when needed. Sharing scope is for naming/advisory warnings; it must not restrict Model Code configuration or automatically assign descendant codes. Several chassis designs can share Model scope with different names/numbers and code subsets. Scope/name changes retain identity, number, engineering revision and references, while recording separate immutable metadata history and aliases.
+
+Part identity/number allocation, master shortcodes, generated-name uniqueness, metadata history and advisory usage must be implemented before advancing the Part mapping screens/import integration. The existing screen is a prototype pending this prerequisite. This supersedes the name-derived identity approach behind the 5 October Part creation slice, while preserving D065 source provenance, normalization, audit and retry rules. See [PART-002 specification](PART_IDENTITY_REQUIREMENTS.md) for acceptance cases and migration requirements.
+
+### D067 — Part engineering revisions require the CR process
+
+Accepted by the owner on 6 October 2026. All managed Parts remain Rev A until the CR flow is implemented. A Part engineering revision means the Part followed that flow; future Rev B or later requires the corresponding approved CR and retained approval/design evidence. Mapping, refresh, reuse, naming and scope changes cannot automatically revise the engineering definition. Name/scope metadata versions remain separate audit history and never imply CR approval. This constrains the future-revision language in PART-002/D066; see PART_IDENTITY_REQUIREMENTS.md.

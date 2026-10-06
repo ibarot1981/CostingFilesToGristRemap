@@ -92,6 +92,8 @@ class AssociationSaveResult:
 @runtime_checkable
 class SafariRepository(Protocol):
     adapter_name: str
+    processing_store: Any
+    part_store: Any
     products: dict[str, Product]
     models: dict[str, ProductModel]
     codes: dict[str, ProductModelCode]
@@ -121,6 +123,7 @@ class SafariRepository(Protocol):
     def validate_association(self, proposal: AssociationProposal, current_file_hash: str | None = None) -> AssociationValidation: ...
     def save_association(self, proposal: AssociationProposal, current_file_hash: str | None = None) -> AssociationSaveResult: ...
     def current_association(self, file_id: str) -> FileModelAssociation | None: ...
+    def association_detail(self, file_id: str) -> dict[str, Any]: ...
     def current_code_owner(self, code_id: str) -> FileCodeAssociation | None: ...
     def codes_for_association(self, association_id: str, *, active_only: bool = True) -> list[ProductModelCode]: ...
     def association_history(self, file_id: str) -> list[dict[str, Any]]: ...
@@ -165,6 +168,10 @@ class SafariRepositoryState:
         self._revision_mutations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._directory_mutations: dict[str, tuple[str, DirectoryProductMapping]] = {}
         self._costing_mutations: dict[str, tuple[str, dict[str, Any]]] = {}
+        from app.processing import MemoryProcessingStore
+        self.processing_store = MemoryProcessingStore()
+        from app.part_mapping import MemoryPartStore
+        self.part_store = MemoryPartStore()
 
     def add_product(self, item: Product) -> None:
         self.products[item.id] = item
@@ -393,6 +400,26 @@ class SafariRepositoryBase(SafariRepositoryState):
 
     def current_association(self, file_id: str) -> FileModelAssociation | None:
         return next((item for item in self.associations.values() if item.file_id == file_id and item.active), None)
+
+    def association_detail(self, file_id: str) -> dict[str, Any]:
+        association = self.current_association(file_id)
+        file = self.get_file(file_id)
+        product = self.products.get(association.product_id) if association else None
+        model = self.models.get(association.model_id) if association else None
+        batches = [item for item in self.import_batches.values()
+                   if file and item.source_file.casefold() == file.relative_path.casefold()
+                   and item.parser_version.startswith("association-")]
+        batch = max(batches, key=lambda item: (item.started_at, item.id), default=None)
+        return {
+            "fileId": file_id,
+            "current": association.to_dict() if association else None,
+            "product": product.to_dict() if product else None,
+            "model": model.to_dict() if model else None,
+            "codes": [item.to_dict() for item in self.codes_for_association(association.id)] if association else [],
+            "history": self.association_history(file_id),
+            "mappingStatus": file.mapping_status if file else "unmapped",
+            "processingBatch": batch.to_dict() if batch else None,
+        }
 
     def current_code_owner(self, code_id: str) -> FileCodeAssociation | None:
         return next((item for item in self.code_associations.values() if item.code_id == code_id and item.active), None)

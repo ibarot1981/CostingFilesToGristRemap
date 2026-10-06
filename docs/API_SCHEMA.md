@@ -11,6 +11,7 @@ All JSON errors have a stable `detail.code` and `detail.message`.
 | `POST /api/catalog/preview/refresh?path=&sheet=&start_row=&row_count=&start_col=&column_count=` | Ask headless LibreOffice to update local ODS links and recalculate a temporary copy, then return the bounded preview and pinned dependency hashes. Remote links and sources outside `COSTING_ROOT` fail closed; no source workbook is saved. |
 | `POST /api/catalog/costing-review` | Body: `{"path":"<root-relative selected .ods path>"}`. Refreshes the selected workbook's local ODS links on a disposable copy, reads current RawSteel and SteelRateLog sources, returns active-only calculations and compares semantic state with the accepted Safari snapshot. Reports rate-source changes, material/process-line additions, removals, probable modifications, list movements, option-group changes, CR evidence, source formulas/cells, and cost impact. Ambiguous identities block reconciliation. This endpoint is read-only and returns `EXTERNAL_REFRESH_FAILED`, `COSTING_SOURCE_UNAVAILABLE`, or `COSTING_REVIEW_UNAVAILABLE` on failure. |
 | `POST /api/catalog/costing-review/accept` | Body includes path, the preview's `semanticHash` and `sourceHashes`, `acceptedSnapshotKey`, optional `ambiguityDecisions`, and `reason`; requires `Idempotency-Key`. Repeats refresh and comparison, rejects stale source/baseline state, resolves explicit ambiguous-line choices, then persists accepted semantic snapshot/change-set/audit items to Safari Manufacturing. The actor comes from trusted Authentik proxy headers. ODS and Costing-New are not written. |
+| `GET /api/catalog/normalized?path=&sheet=&process=&master=&part=&material=&status=&offset=&limit=` | Read-only S1KHF row inspection. Queries normalized Grist child rows when the accepted snapshot and v5 rows exist; otherwise returns a clearly labelled `projection_only` view (or `local-unaccepted` when no accepted snapshot is configured). Returns source hashes, sheet/status counts, mapping exceptions, and paged typed rows with master, revision, source cells/formulas and audit. It does not create records. |
 | `GET /api/products` | Catalog Products. |
 | `GET /api/products/{product_id}/models` | Models for a Product. |
 | `GET /api/models/{model_id}/codes` | `active` selling Codes, `available` unowned active Codes, `conflicts` with current owner details, and `legacy` spares-only Codes. |
@@ -101,3 +102,61 @@ accept arbitrary nested objects directly. Snapshots keep full costing
 semantics and formula/cell evidence, but rate evidence stores the selected and
 last source rows plus source hashes rather than duplicating the entire rate
 history for every material.
+
+## Selected-file extensions - 3 October 2026
+
+GET /api/explorer/association?path= resolves a root-confined ODS path and returns
+{fileId, current, product, model, codes, history, mappingStatus, processingBatch}.
+Nested paths use a query parameter rather than slash-bearing route IDs.
+Unassociated files return current:null, empty codes/history. The read does not
+register a file or persist observations. The older association-detail route
+returns the same expanded DTO. Grist reads refresh durable state.
+
+Preview refreshMetadata.status now also accepts no_external_links, with a
+source hash and null refreshed-copy hash. Linked workbooks retain
+refreshed_temporary_copy. Errors remain EXTERNAL_REFRESH_FAILED; cached values
+are never silently presented as fresh. No schema migration for stages 1-2.
+
+## Processing lifecycle API - 5 October 2026
+
+GET /api/processing/state?path= returns state, effectiveState, version,
+sourceHash, recordedSourceHash, sourceChanged, associationKey/Version,
+schemaAvailable, stateBasis and immutable history. A changed source/association
+projects changes_pending; GET never persists that change. Initial new/associated
+states derive from the registered source/current saved association.
+
+POST /api/processing/state requires path, state, reason, expectedVersion,
+expectedHash, expectedAssociationKey/Version and Idempotency-Key. Proxy headers
+supply the actor. Replays return the original event; stale evidence, changed
+key payloads, absent associations and invalid transitions return typed 409s.
+Extraction must match the accepted source hash. Completion actions fail with
+PROCESSING_GATES_UNAVAILABLE until structural/configuration evidence is connected.
+
+Schema safari-processing-2026-10-05.v6 adds FileProcessingEvent with typed
+transition/audit/source columns, stable domain file/association keys, request
+fingerprint and version. One atomic event insert includes its audit evidence.
+Duplicate versions/requests require review; no last-write-wins selection.
+
+## Stored Model Code records (5 October 2026)
+
+GET /api/model-codes/{code_id}/records accepts sheet/process/master/part/material/status filters and bounded offset/limit. It resolves exactly one active owner, reads the latest accepted file snapshot and joins stored Safari child records without opening or hashing an ODS. Duplicate/inconsistent owners and duplicate accepted snapshot keys fail with 409. Responses include readAt, sourceRead=false, source/association, accepted/observed timestamps, snapshot/hash, status and total/items. Unassociated, no_accepted_snapshot, storage_unavailable and schema_unavailable are explicit empty states.
+
+The scope is shared_file_baseline; configurationStatus remains review_required. These rows are source-file evidence, not an implemented per-code configuration or approval of costing authority. Reconciliation is explicitly opened, then refreshed through the existing costing-review operation. Line revisions are pinned to the requested accepted snapshot.
+
+Costing-review adds processing_evidence (mandatory-sheet coverage, exact quantities, 2-decimal kg comparisons, missing/changed evidence status, Part/blank-row review, Summary inventory and explicit completionAvailable=false) and interim_rates (read-only Costing-New field values, reviewed material aliases, ODS/current differences, read time, default/latest basis and unavailable status). Rate failure is reported without replacing structural evidence. These fields do not modify snapshot acceptance or confer costing authority.
+
+## Canonical Parts and source assignments — 5 October 2026
+
+POST /api/parts requires name, reason and Idempotency-Key; trusted proxy headers supply actor. Name uniqueness spans every Safari ProductPart record after Unicode NFKC, whitespace collapse and case folding. Creation stores audit/retry fields in the same row. Duplicate/ambiguous names fail with PART_NAME_EXISTS/PART_NAME_CONFLICT. Replays return the original canonical Part.
+
+GET /api/parts/mappings?path= reads a root-confined saved workbook plus Safari records. It returns sourceBasis=saved_workbook, sourceHash, associationKey/Version, mapping version, schemaAvailable, parts, exact-description groups, individually scoped blank rows, unresolvedGroups and immutable history. Temporary Parts are not selectable. No record write or external-sheet refresh occurs.
+
+POST /api/parts/mappings requires path, decisions (group-key to Part-record-ID strings), reason, expectedHash, expectedVersion, expectedAssociationKey/Version and Idempotency-Key. Partial selection is supported; unassigned groups remain unresolved. New batches contain one typed PartMappingReview row per selected source row, referencing ProductPart. Stale source/association/mapping evidence, unknown groups, noncanonical/ambiguous Parts and conflicting/incomplete histories return typed errors. A final recheck precedes the guarded atomic record batch. Processed files must record Changes Pending before new assignments. Retry fingerprints include all reviewed tokens and choices.
+
+Schema safari-part-review-2026-10-05.v7 adds PartMappingReview and ProductPart NameKey/CreatedActor/CreatedReason/CreatedAt/CreateRequestKey/CreateFingerprint. Current reviewed mappings reduce costing-review.processing_evidence.partRowsRequiringReview; partMapping reports version, schema availability, reviewed row count and unresolved groups. No assignment silently changes accepted line masters, configuration or costing authority.
+
+## Pending Part identity contract — 6 October 2026
+
+PART-002 / D066 is a prerequisite to advancing Part mapping. The present /api/parts free-name, name-derived-key contract remains a prototype and does not yet implement the accepted rules. Future creation must accept scope/target, description and variant, derive/preview a unique name, and allocate a stable SM-P number with retry recovery. Scope/name changes require immutable metadata versions and aliases separate from engineering revisions. Model Code use outside scope returns advisory warning evidence and remains saveable; broad scope never auto-assigns codes. Endpoint shapes and schema migration are to be designed before implementation; no new API/schema was applied in this documentation update. See PART_IDENTITY_REQUIREMENTS.md.
+
+Pending PART-003 contract: Part creation fixes engineering revision to A. Reject requests for later engineering revisions until the CR flow is implemented; later release paths must verify the linked approved CR server-side. Metadata scope/name versions, mapping versions and source/line revisions must remain distinctly labelled. This requirement update does not migrate live records or implement new API behavior.

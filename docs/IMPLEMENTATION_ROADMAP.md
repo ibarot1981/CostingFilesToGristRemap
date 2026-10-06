@@ -16,14 +16,18 @@ references retain their original labels; the crosswalk and evidence are in
 | Delivery effort | Phase work covered | Current position |
 |---|---|---|
 | Milestone 1 / PR 1 | Phase 0 packages 0.2–0.4, with governance and some 0.5 work | Merged; conditional pass, not a Phase 0 exit |
-| Milestone 2 | Phase 0 package 0.5 governance and an accelerated Phase 1 S1KHF semantic-parity pilot | Agreed S1KHF scope complete in the current working tree; checkout still has uncommitted changes; Phase 0 gates remain open |
-| Milestone 3 — next | Phase 1 package 1.1, with the needed Phase 0 package 0.6 CLI mapping extraction and 0.7 pilot evidence carried into its entry work | Planned: normalized S1KHF part and process-line ingestion |
+| Milestone 2 | Phase 0 package 0.5 governance and an accelerated Phase 1 S1KHF semantic-parity pilot | Committed as `476ad3a` and synced to `origin/main`; Phase 0 gates remain open |
+| Milestone 3 — in progress | Phase 1 package 1.1, with the needed Phase 0 package 0.6 CLI mapping extraction and 0.7 pilot evidence carried into its entry work | Safari v5 schema and 2,043 normalized records applied; 313 lines are queryable and repeat import is a no-op; 10 mappings and Phase 0 owner gates remain open |
 
 We are working in **Phase 1**, following the Milestone 2 pilot. Phase 0 is
 not formally closed. Milestone 3 must track its outstanding gates separately
 and must not claim Phase 0 completion merely because normalized ingestion
 passes. The 45-entity target design is broader than Milestone 3; see
 `data-model.html` and `MILESTONE_3_IMPLEMENTATION_PROMPT.md` for the subset.
+The current implementation evidence and exact source drift are in
+`MILESTONE_3_PILOT_RECONCILIATION.md`. The selected workbook changed after the
+Milestone 2 archived report, so its local projection must not be called an
+accepted Safari normalization until the validated snapshot is compared.
 
 ## Operating rules for every milestone
 
@@ -519,6 +523,19 @@ Configuration, Production Plans, stock reservations, live rates, or ODS
 write-back. Exact scope and acceptance tests are in
 `MILESTONE_3_IMPLEMENTATION_PROMPT.md`.
 
+**2 October implementation checkpoint:** v5 defines 13 normalized tables and
+the local source projection covers all 313 configured pilot rows. A guarded
+Grist writer, key-based retry, local inspection API/UI, and the pilot direct
+material-alias service are implemented. Ten duplicate-composite rows retain
+unresolved identity. The Safari document was rediscovered in the Work
+workspace and a live schema plan found 13 new tables with no v4 column
+alterations. Those tables and 2,043 planned normalized records were applied;
+the post-apply schema and row diffs are empty. The source hash changed after the accepted snapshot;
+previously covered physical fields match and the current MCL active plus
+historical caches reconstruct workbook C7. The row import diff follows the
+reviewed import; owner resolution remains exit work. See
+`MILESTONE_3_PILOT_RECONCILIATION.md`.
+
 Exit gate: one accepted S1KHF source revision is represented in queryable
 child rows; every row has source provenance and a stable or explicitly
 unresolved identity; active/historical counts and supported totals reconcile
@@ -572,12 +589,35 @@ Phase gate: users can create, approve, cost, and manufacture a representative ne
 
 Phase gate: Purchase stops duplicate entry for the approved workflow and users can explain why each costing rate was selected.
 
+Rate readiness for cutover is per consuming Model Code: every material used by
+its approved active lines must resolve to a current, valid, governed rate in
+Safari Manufacturing, with the applied rate set pinned for reproducibility.
+The presence of imported line rows or an observed rate log alone is not an
+authority switch.
+
 ## Phase 5 — ODS write-back and operational cutover
 
 - Generate controlled ODS copies/exports first; never overwrite originals during development.
 - Verify formulas, named ranges, external links, styles, row/column structure, and LibreOffice recalculation.
 - Add backups, file locks, conflict detection, rollback, and signed change manifests.
 - Run parallel operations and user acceptance.
+- Permit costing-authority cutover at either a single Model Code or a whole
+  Product Model, as appropriate for each product. A whole-model decision
+  requires every active code in that model to meet the gates; other codes may
+  remain ODS-authoritative during a gradual code-level transfer.
+- Before switching a scope, verify complete import and mapping of every
+  required process sheet/line, governed rates for every consumed material,
+  approved configuration and calculation parity, and owner signoff. Record the
+  effective scope, source/rate revisions, actor, reason, time, and rollback
+  state; preserve exactly one effective authority per Model Code.
+- Route normal costing, cut-list, and inspection reads by that effective
+  authority. The Grist-authoritative path must use typed records and pinned
+  rates without opening or reparsing the ODS for every UI request; keep ODS
+  monitoring/provenance separate from the interactive read path.
+- Measure and expect a dramatic reduction in UI load time after cutover.
+  Benchmark against the ODS-backed path and set an explicit latency target
+  during the cutover trial; imported rows by themselves do not satisfy this
+  performance gate.
 - Switch data authority domain-by-domain, with a documented rollback window.
 
 Phase gate: approved parity, operational readiness, backups, training, and owner authorization.
@@ -610,3 +650,47 @@ For every completed milestone, record:
 - screenshots or demo notes where useful;
 - known limitations and next gate;
 - Git commit(s) and release/tag if created.
+
+## Ongoing workflow stages - 3 October 2026
+
+The owner-requested twelve-stage workflow is an active implementation goal.
+Stage numbers do not replace delivery milestone numbering. Uncommitted Milestone
+3 work was preserved in a local Git-metadata archive, manifest and binary patch.
+
+1. Saved association retrieval: implemented; selections, version, status, history
+   and audit load from the repository. Validate and Save remain separate.
+2. Full-width Workbook Preview: implemented; automatic disposable-copy refresh
+   on tab selection, progress, hashes, timestamp and explicit errors.
+3. Persisted, auditable processing states separate from authority: next.
+4. Files and Product Models -> Model Codes navigation with on-demand reconciliation.
+5. Required process sheets/Summary and structural versus pricing differences.
+6. Reviewed canonical Part mapping, including individual blank-description rows.
+7. Reviewable, idempotent typed imports and immutable revision handling.
+8. Model Code configuration/cost and structurally gated Mark processed action.
+9. Fast stored-record reads, optional ODS reconciliation and measured latency.
+10. Governed CR lifecycle before routine approved edits; separate write-back assessment.
+11. Spares ingestion/editor and all-tab Google Sheets integrations.
+12. Repeat processing of user-selected files and continued documentation updates.
+
+The ten ambiguous pilot identities, temporary Part ownership and later-source
+revision import limitation remain open. See WORKFLOW_IMPLEMENTATION.md for
+verification and next gates. First slices do not claim processing completion.
+
+### 5 October workflow progress
+
+Stage 3 lifecycle foundation is implemented and Safari v6 adds one immutable
+FileProcessingEvent table. State/history UI, source/association/version guards,
+retry recovery and audit are verified. Completion gates depend on stages 5-8
+and remain disabled. Stage 4 navigation and on-demand reconciliation are next.
+
+5 October stage 4 slice: Files and Product Models -> Model Codes navigation implemented. Code selection reads stored Grist rows only; revision/source provenance and explicit reconciliation entry points are present. Full structural/configuration reconciliation remains stage 5. Read-only live main S1KHF pilot: 313 rows, 1.934 seconds, no ODS read; MS Drum reports no accepted snapshot. This is one measurement, not a stage 9 performance comparison.
+
+Stage 5 is partial: required-sheet coverage, exact quantity/2-decimal kg evidence and nonblocking interim price differences are visible. User supplied representative HF/H Summary workbooks and confirmed global Part-name uniqueness. Next major slice: reviewed Part mapping UI and immutable storage, then per-code base/options/additions/deductions configuration and spares extraction. Completion remains unavailable.
+
+Stage 6 Part review slice implemented: canonical selection/unique creation, individual blank rows, audited typed assignment batches, stale-evidence checks and durable retries. Live v7 adds one review table and six Part creation fields; no business assignments made. Pilot has 55 unresolved groups / 100 active rows. Next gate: reviewed Part references in typed import plans and per-code Summary/Paint/Packing configuration. Completion remains gated; stages 5-8 are still partial.
+
+### 6 October prerequisite before further Part mapping
+
+PART-002 / D066 takes precedence over the previously stated next import gate. First implement permanent Part identity and SM-P sequence allocation, maintained master shortcodes, automatically generated scope/description/variant names, metadata history/aliases and separate engineering revisions. Sharing scope only determines naming and advisory warnings; it must not restrict Model Code configuration or auto-assign codes. Verify multiple designs shared by different subsets of one Model. Then adapt/advance Part mapping and import integration. Existing stage 6 work is preserved as a prototype and must not be treated as satisfying this prerequisite. See PART_IDENTITY_REQUIREMENTS.md.
+
+PART-003 / D067: the upcoming Part creation/mapping work must initialize all managed Parts at Rev A and prohibit later engineering revisions until the governed CR flow is implemented. Metadata naming/scope versions remain distinct. The implementation handoff is docs/PART_CREATION_MAPPING_IMPLEMENTATION_PROMPT.md; implement creation first, then mapping, before resuming later workflow stages.

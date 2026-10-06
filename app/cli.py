@@ -29,6 +29,8 @@ from app.state import LastInputs, load_last_inputs, normalize_ods_filename, save
 from app.verification import verify_sheet_with_grist
 from app.versioning import create_new_version
 from app.workbook import OdsWorkbook
+from app.milestone2 import DEFAULT_PILOT, DEFAULT_RAW_STEEL, PRODUCTS_ROOT
+from app.normalized_import import apply_reviewed_plan, local_preview, safari_plan
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -84,6 +86,33 @@ def materials_command(
     except CostingAppError as exc:
         logger.exception("Material mapping manager error")
         console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("safari-normalized")
+def safari_normalized_command(
+    workbook: Path = typer.Option(DEFAULT_PILOT, "--workbook", help="Selected S1KHF ODS source."),
+    safari: bool = typer.Option(False, "--safari-plan", help="Validate accepted Safari snapshot and show exact v5/import dry run."),
+    apply: bool = typer.Option(False, "--apply", help="Apply only a previously reviewed exact plan fingerprint."),
+    expected_plan_fingerprint: str = typer.Option("", "--expected-plan-fingerprint"),
+) -> None:
+    """Plan S1KHF normalized rows; default remains entirely local/read-only."""
+    if apply and (not safari or not expected_plan_fingerprint):
+        raise typer.BadParameter("--apply requires --safari-plan and --expected-plan-fingerprint")
+    try:
+        resolved = workbook.resolve(strict=True)
+        relative = resolved.relative_to(PRODUCTS_ROOT.resolve()).as_posix()
+        if relative != DEFAULT_PILOT.relative_to(PRODUCTS_ROOT).as_posix():
+            raise ValueError("This pilot command only accepts the selected S1KHF workbook")
+        if apply:
+            result = apply_reviewed_plan(resolved, relative, expected_plan_fingerprint=expected_plan_fingerprint)
+        elif safari:
+            result, _ = safari_plan(resolved, relative)
+        else:
+            result = local_preview(resolved, DEFAULT_RAW_STEEL)
+        console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+    except (OSError, ValueError, CostingAppError) as exc:
+        console.print(f"[red]Normalized pilot unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
 

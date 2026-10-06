@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-foundation-2026-09-29.v4"
+SCHEMA_VERSION = "safari-part-review-2026-10-05.v7"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -25,6 +25,30 @@ FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "CostingSnapshot", "name": "Costing Snapshot", "columns": [{"id": "SnapshotKey", "type": "Text"}, {"id": "CostingFile", "type": "Ref:CostingFile"}, {"id": "ObservedAt", "type": "DateTime"}, {"id": "SemanticHash", "type": "Text"}, {"id": "SemanticContent", "type": "Any"}, {"id": "SourceHashes", "type": "Any"}, {"id": "Status", "type": "Text"}, {"id": "PreviousSnapshotKey", "type": "Text"}, {"id": "AcceptedAt", "type": "DateTime"}, {"id": "AcceptedBy", "type": "Text"}, {"id": "AcceptanceReason", "type": "Text"}, {"id": "RequestKey", "type": "Text"}]},
     {"id": "CostingChangeSetItem", "name": "Costing Change Set Item", "columns": [{"id": "ItemKey", "type": "Text"}, {"id": "ChangeKey", "type": "Text"}, {"id": "Snapshot", "type": "Ref:CostingSnapshot"}, {"id": "PreviousSnapshotKey", "type": "Text"}, {"id": "CostingFile", "type": "Ref:CostingFile"}, {"id": "ChangeType", "type": "Text"}, {"id": "Classification", "type": "Text"}, {"id": "ChangeData", "type": "Any"}, {"id": "PreviousState", "type": "Any"}, {"id": "CurrentState", "type": "Any"}, {"id": "SourceEvidence", "type": "Any"}, {"id": "CostImpact", "type": "Numeric"}, {"id": "CRReference", "type": "Text"}, {"id": "Status", "type": "Text"}, {"id": "AcceptedAt", "type": "DateTime"}, {"id": "AcceptedBy", "type": "Text"}, {"id": "AcceptanceReason", "type": "Text"}, {"id": "RequestKey", "type": "Text"}]},
     {"id": "AuditEvent", "name": "Audit Event", "columns": [{"id": "EventType", "type": "Text"}, {"id": "Actor", "type": "Text"}, {"id": "OccurredAt", "type": "DateTime"}, {"id": "EntityType", "type": "Text"}, {"id": "EntityId", "type": "Text"}, {"id": "Reason", "type": "Text"}, {"id": "Payload", "type": "Any"}, {"id": "RequestKey", "type": "Text"}, {"id": "RequestFingerprint", "type": "Text"}]},
+)
+
+# Milestone 3 is appended so an explicit schema plan shows only the new tables
+# against a validated v4 Safari document. Startup never calls apply_schema.
+def _table(table_id: str, columns: dict[str, str]) -> dict[str, Any]:
+    return {"id": table_id, "name": table_id, "columns": [{"id": key, "type": value} for key, value in columns.items()]}
+
+
+FOUNDATION_TABLES += (
+    _table("FileProcessingEvent", {"EventKey": "Text", "FileKey": "Text", "Version": "Numeric", "FromState": "Text", "State": "Text", "SourceHash": "Text", "AssociationKey": "Text", "AssociationVersion": "Numeric", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("ProductPart", {"PartKey": "Text", "DisplayName": "Text", "Status": "Text", "NameKey": "Text", "CreatedActor": "Text", "CreatedReason": "Text", "CreatedAt": "DateTime", "CreateRequestKey": "Text", "CreateFingerprint": "Text"}),
+    _table("PartMappingReview", {"ReviewKey": "Text", "FileKey": "Text", "SourceHash": "Text", "AssociationKey": "Text", "AssociationVersion": "Numeric", "GroupKey": "Text", "SheetName": "Text", "SourceRow": "Numeric", "SourceDescription": "Text", "ProductPart": "Ref:ProductPart", "Version": "Numeric", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text", "RequestRowCount": "Numeric"}),
+    _table("PartRevision", {"RevisionKey": "Text", "ProductPart": "Ref:ProductPart", "Revision": "Numeric", "Status": "Text", "Snapshot": "Ref:CostingSnapshot"}),
+    _table("PartComponentRevision", {"ComponentKey": "Text", "ParentRevision": "Ref:PartRevision", "ChildRevision": "Ref:PartRevision", "Quantity": "Numeric", "Status": "Text"}),
+    _table("Material", {"MaterialKey": "Text", "CanonicalName": "Text", "ODSDisplayName": "Text", "MappingStatus": "Text"}),
+    _table("PurchaseItem", {"ItemKey": "Text", "DisplayName": "Text", "Status": "Text"}),
+    _table("ProcessOperation", {"OperationKey": "Text", "Name": "Text"}),
+    _table("WorkCenter", {"CenterKey": "Text", "Name": "Text", "Status": "Text"}),
+    _table("LineMaster", {"LineKey": "Text", "ProductPart": "Ref:ProductPart", "ProcessType": "Text", "Identity": "Any", "Status": "Text", "SourcePartName": "Text"}),
+    _table("LineRevision", {"RevisionKey": "Text", "LineMaster": "Ref:LineMaster", "PreviousRevision": "Ref:LineRevision", "PhysicalSignature": "Text", "Status": "Text", "Snapshot": "Ref:CostingSnapshot", "Actor": "Text", "Reason": "Text"}),
+    _table("LineDetail", {"DetailKey": "Text", "LineRevision": "Ref:LineRevision", "ProcessType": "Text", "Material": "Ref:Material", "PurchaseItem": "Ref:PurchaseItem", "ProcessOperation": "Ref:ProcessOperation", "WorkCenter": "Ref:WorkCenter", "SourceDepartment": "Text", "IssueRoute": "Text", "ActivityKind": "Text", "Quantity": "Numeric", "QuantityUOM": "Text", "DimensionMM": "Numeric", "DimensionInches": "Numeric", "WeightGrams": "Numeric", "WeightKg": "Numeric", "PartWeightKg": "Numeric", "Length": "Numeric", "Width": "Numeric", "Thickness": "Numeric", "IssueSlipNo": "Text", "IssueSlipDesc": "Text", "InternalMakingCost": "Numeric", "ExternalMachiningCost": "Numeric", "RateCached": "Numeric", "CostCached": "Numeric", "ItemName": "Text", "MaterialDisplayName": "Text", "OptionGroup": "Text"}),
+    _table("SourceLineObservation", {"ObservationKey": "Text", "Snapshot": "Ref:CostingSnapshot", "SourceHash": "Text", "DependencyHashes": "Any", "ParserVersion": "Text", "SheetName": "Text", "SourceRow": "Numeric", "Status": "Text", "Cells": "Any", "ObservedFields": "Any", "PartDisplayName": "Text", "CachedCost": "Numeric", "CurrentCost": "Numeric", "CRReference": "Text"}),
+    _table("SourceLineMapping", {"MappingKey": "Text", "Observation": "Ref:SourceLineObservation", "LineMaster": "Ref:LineMaster", "Status": "Text"}),
+    _table("LineAuditItem", {"AuditKey": "Text", "LineMaster": "Ref:LineMaster", "LineRevision": "Ref:LineRevision", "PreviousRevision": "Ref:LineRevision", "Observation": "Ref:SourceLineObservation", "Actor": "Text", "Reason": "Text", "CRReference": "Text"}),
 )
 
 

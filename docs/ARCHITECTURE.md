@@ -268,3 +268,99 @@ semantic snapshot is retained as a parity baseline. Costing and manufacturing
 configuration builders and actual production-plan quantities remain later
 schema/workflow slices. `docs/MILESTONE_NUMBERING_AUDIT.md` records the two
 numbering systems and the outstanding Phase 0 gates.
+
+The Milestone 3 implementation adds `app/normalized.py` as a pure projection
+of the accepted `CostingSnapshot.SemanticContent`, `app/normalized_store.py`
+as memory and guarded Grist append-only adapters, and
+`app/normalized_import.py` as a local/Safari dry-run planner. Schema v5 adds
+13 tables, including one typed `LineDetail` table with process discriminator
+and nullable process-specific numeric fields. `SourceLineObservation` pins
+all observed row cells, including uninterpreted columns, plus formula/cached-cell evidence, workbook and dependency hashes, parser version,
+sheet and row. `SourceLineMapping` records proposed/ambiguous identity;
+`LineAuditItem` links immutable revisions. A temporary S1KHF Part is used
+until real reusable Part ownership is confirmed. No component hierarchy is
+inferred from descriptions. Grist has no unique indexes declared through the
+current API, so adapters reject duplicate deterministic keys before writes.
+Staged writes validate the target, accepted snapshot, current source hash, and
+rate dependency hashes, and
+resume by key after partial failure. Normal API startup never migrates.
+
+The current UI/API queries normalized Grist child rows when an accepted Safari
+snapshot and v5 rows exist. Otherwise it inspects a labelled projection,
+including a `local-unaccepted` mode when Safari credentials are absent. It
+does not treat that projection as persisted Grist data. The live plan
+confirmed current cost drift against previously covered accepted physical
+fields and reconciled active plus historical MCL caches to workbook C7.
+Schema v5 and 2,043 normalized rows were applied to Safari Manufacturing;
+repeat plan/import found no additional work. Remaining owner decisions are recorded in
+`MILESTONE_3_PILOT_RECONCILIATION.md`.
+The v5 table keys, Ref cardinalities, search fields, and migration status are
+listed in `MILESTONE_3_SCHEMA_PLAN.md`.
+
+## Future costing-authority routing
+
+Importing source rows into Grist is not an authority switch. The effective
+costing authority is resolved for each Model Code from an approved, versioned
+assignment: either a code-level decision or a Product Model decision covering
+all eligible active codes. The assignment records its effective time, source
+revision and rate set, approver, reason, and rollback state. One code must
+resolve to one authority; a whole-model cutover waits until every active code
+meets the required sheet/line, rate, parity, and owner gates.
+
+The ODS route performs the existing source refresh, parse, and comparison.
+The future Grist route reads approved typed current line revisions and a
+pinned governed rate set through the repository, without opening the ODS for
+each costing, cut-list, or inspection request. Source drift monitoring and
+provenance remain separate background/review work. This read-path split is
+required for the expected large reduction in UI load time after cutover;
+benchmark both routes before claiming the performance gain. Milestone 3 has
+not switched any Model Code to Grist authority.
+
+## Selected-file workflow - 3 October 2026
+
+SafariRepository.association_detail returns a storage-neutral selected-file DTO.
+Grist refreshes durable state under its association lock before constructing it.
+The root-confined path endpoint neither registers files nor saves observations.
+UI hydration is independent of workbook parsing; selection generations reject
+late responses and saved history reloads after Save. Validation stays separate.
+
+The full-width Workbook Preview tab invokes disposable-copy refresh on each
+selection. Progress is indeterminate; metadata includes source/copy/dependency
+hashes and check time. Failures clear displayed preview values. No-link files
+report no_external_links without launching LibreOffice. This reads saved local
+dependencies; upstream Google Sheets refresh is a later integration. Processing
+and authority are separate; normal stored inspection will not require cutover.
+
+## Processing lifecycle foundation - 5 October 2026
+
+app/processing.py owns the state machine and immutable transition ledger;
+repositories supply a memory or guarded Grist event store. File/association
+keys remain storage-neutral. The API obtains fresh ownership and current ODS
+SHA-256, verifies reviewed source/state/association tokens and derives extraction
+evidence from the accepted repository snapshot. Client assertions cannot enable
+completion. The selected-file ProcessingPanel renders the API state and audit.
+
+FileProcessingEvent stores transition and audit together in one append-only
+row to avoid partially applied cross-table state/audit writes. Request keys and
+fingerprints recover lost responses; duplicate versions fail for review.
+Read-only old-schema access remains possible, while event writes need v6.
+Ready/processed gates remain unavailable pending structural and configuration
+services. Costing authority is neither read nor changed by a state transition.
+
+## Explorer source paths (5 October 2026)
+
+Files retains source inspection/preview and workbook process lines. Product Models -> Model Codes uses a separate stored-record endpoint, with no filesystem resolution, source hash calculation or workbook parse on selection. It displays accepted baseline provenance and permits opening the source file or on-demand source reconciliation. The shared file baseline is labelled separately from the future per-code Summary configuration. GristNormalizedStore selects revisions belonging to the requested snapshot rather than the newest unrelated revision. Stage 9 caching and before/after load measurement remain open.
+
+Processing evidence is a separate read-only projection from the refreshed semantic source and accepted baseline. It compares weight fields excluded by legacy cost comparisons, labels missing historical evidence separately from value mismatch and uses exact quantity/decimal kg rules. Costing-New interim display reads MasterMaterial and MaterialRateLog after exact source-name validation; no legacy write method is invoked. Structural/configuration completion remains unavailable pending reviewed mappings/configuration/spares/import.
+
+## Source-scoped Part review — 5 October 2026
+
+app/part_mapping.py separates canonical master creation from source assignment. Memory/Grist stores share the same contract. Canonical creation audits one row; mappings use immutable typed batches with ProductPart references. Description groups are scoped to file, saved source SHA-256 and association version. Blank descriptions are individual coordinates. Current groups must have complete, unambiguous latest assignments before reducing unresolved reconciliation evidence. The API rechecks source and association before append; durable fingerprints recover lost responses. UI retains retry payloads and ignores late responses after file selection changes.
+
+Global normalized names include legacy/inactive Parts. The service serializes writes and rejects detected collisions. Grist lacks declared uniqueness constraints; concurrent external writers require review if they create duplicates. Schema v7 was applied only after a narrow reviewed diff. Stage 7 import must integrate these reviewed references with immutable typed revisions. Paint/Packing and Summary belong to reviewed Model Code configuration; Store Issue has no required Part.
+
+## Part identity prerequisite — 6 October 2026 (design, not implemented)
+
+PART-002 / D066 replaces name-derived canonical identity with a permanent internal key and separately allocated unique Part number. Scope/target master shortcodes, description and variant generate display names. Immutable name/scope metadata versions and aliases are distinct from engineering revisions; existing configurations keep stable Part/revision references and historical name evidence. Model Code usage is explicit and advisory scope mismatches cannot block configuration. Number allocation needs a durable serialized/atomic uniqueness mechanism; the existing Grist record-count or process-local locking approach alone is insufficient. Plan compatibility/migration for existing keys before changes. This foundation precedes further Part mapping UI/import work. See PART_IDENTITY_REQUIREMENTS.md.
+
+PART-003 / D067 adds a server-enforced engineering revision lock: managed Parts remain Rev A until the CR service and approval evidence exist. Client assertions, mapping/import batches and source observations cannot authorize a Part engineering revision. Metadata/source versions are separate; legacy numeric PartRevision values need an explicit compatibility plan and are not evidence of CR approval.
