@@ -1,6 +1,6 @@
 # Milestone 3 cost drift by source line
 
-Accepted workbook SHA-256: `2a977a02191e5ae67e9d21b614d5a17f49974e30a423c45360d6ac5516c6b0ac`  
+Accepted workbook SHA-256: `2a977a02191e5ae67e9d21b614d5a17f49974e30a423c45360d6ac5516c6b0ac`
 Current workbook SHA-256: `d32f66eee6df2bae6b5fb304963e050d356eb6d460fdbe292b4b6d73b16c774b`
 
 These are cached line values from the accepted Safari snapshot and current source ODS. Every listed row retained its row number, identity values, and active/historical status. The physical comparison uses previously covered fields; newly configured parser fields have no accepted comparator. No source file was changed by this report.
@@ -104,4 +104,3 @@ These are cached line values from the accepted Safari snapshot and current sourc
 ## Tool Shop Items
 
 0 changed cached line values.
-
