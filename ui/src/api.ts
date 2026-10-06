@@ -22,6 +22,14 @@ function apiError(payload: any, status: number): Error {
 }
 
 export const api = {
+  partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
+  createPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, {"Idempotency-Key": key}),
+  savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
+  processingState: (path: string) => get<any>(`/api/processing/state?path=${encodeURIComponent(path)}`),
+  changeProcessingState: (payload: unknown, key: string) => send<any>("/api/processing/state", payload, {"Idempotency-Key":key}),
+  fileAssociation: (path: string) => get<import("./types").SavedAssociation>(`/api/explorer/association?path=${encodeURIComponent(path)}`),
+  normalized: (path: string, filters: Record<string, string> = {}) => get<any>(`/api/catalog/normalized?${new URLSearchParams({ path, ...filters })}`),
+  codeRecords: (codeId: string, filters: Record<string, string> = {}) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/records?${new URLSearchParams(filters)}`),
   summary: () => get<CatalogSummary>("/api/catalog/summary"),
   products: () => get<Product[]>("/api/products"),
   models: (productId?: string) => get<ProductModel[]>(`/api/products/models${productId ? `?product_id=${encodeURIComponent(productId)}` : ""}`),

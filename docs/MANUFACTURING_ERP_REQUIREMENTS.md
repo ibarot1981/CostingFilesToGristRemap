@@ -198,6 +198,36 @@ observation must not change its Product Model/Model Code association.
 Reconciliation remains a separate, explicit, idempotent operation with source
 provenance and preserved history.
 
+### 3.3 Product costing authority cutover
+
+ODS-to-Grist ingestion is a transfer of records, not an immediate transfer of
+costing authority. For each sellable Model Code, the selected ODS workbook
+remains the source of truth until its required process sheets and line items are
+completely imported and reconciled, every consumed material has a current,
+valid, governed rate available in Safari Manufacturing, and the Grist costing
+calculation passes the agreed parity and owner-acceptance gates. Imported rows
+alone do not make Grist authoritative.
+
+The authority decision may be made for one **Model Code** or for an entire
+**Product Model**, depending on the product. A Product Model cutover covers all
+of its active Model Codes only when each one satisfies the gates; otherwise
+eligible codes may cut over individually while the others continue to use ODS.
+Record the effective scope, authority, source revision/rate set, decision time,
+approver, reason, and rollback state. Resolve the effective authority to one
+unambiguous choice per Model Code before costing; never combine ODS line
+requirements with Grist rates or Grist line requirements with ODS rates
+without an explicitly reviewed mixed-source rule.
+
+For an ODS-authoritative code, the application continues to refresh/read the
+selected workbook and its dependencies. For a Grist-authoritative code, normal
+costing, cut-list, and inspection reads use the approved typed line revisions
+and pinned rate set in Grist, without parsing the ODS on each UI request. The
+ODS remains provenance and a separately monitored comparison/export source.
+This route should **decrease load times dramatically**; measure the current
+ODS-backed baseline and the Grist-backed latency at cutover rather than assume
+that merely copying rows has made the UI fast. No S1KHF Model Code has been
+declared Grist-authoritative by Milestone 3.
+
 ## 4. Evidence from the current system
 
 ### 4.1 Catalog and canonical workbook
@@ -409,6 +439,18 @@ needed by the pilot into a shared service, with golden CLI-equivalence tests.
 No source ODS or Costing-New write is authorized. The phase numbering and
 remaining Phase 0 gates are recorded in `MILESTONE_NUMBERING_AUDIT.md`.
 
+**Implementation checkpoint, 2 October 2026:** the selected local workbook
+projects 313 configured rows into individual observations, mappings, line
+masters/revisions, and typed detail records; 10 duplicated exact composites
+remain explicitly unresolved. The physical v5 schema and guarded append-only
+Grist importer are implemented and were applied to the validated Safari
+Manufacturing document: 13 v5 tables and 2,043 normalized records. The
+inspection UI queries those rows and labels its local projection when Safari
+is unavailable. Current source cost drift was confirmed against the accepted
+physical fields and workbook MCL C7; ten identities remain unresolved. Exact counts, values, unresolved identity,
+CLI extraction limits, and Phase 0 gates are in
+`MILESTONE_3_PILOT_RECONCILIATION.md`.
+
 ## 7. Required UI workflows
 
 ### 7.1 Costing Explorer
@@ -549,3 +591,59 @@ visible as a review warning. The several-file pilot gate is satisfied. The
 Milestone 0.5 workflow is implemented and covered with synthetic/fake-adapter
 tests; live issue materialization and resolution, an owner-reviewed live-safe
 conflict/supersede walkthrough, and owner UI acceptance remain open.
+
+## Ongoing processing workflow agreement - 3 October 2026
+
+These owner instructions extend earlier milestone-specific boundaries.
+
+- FILE-009: Restore saved Product, Model, Codes, version, status and history on
+  selection. Validate checks only; a separate Save persists with audit.
+- PRE-003: Full-width preview automatically refreshes external local sheets on
+  selection using a disposable copy, with progress, result, hashes and errors.
+- FLOW-001: Persist/audit new, associated, extracted, mapping review,
+  reconciliation review, ready to store, processed and changes pending states.
+- FLOW-002: The sole user may mark processed only after line items, quantities,
+  weights, optional groups, Parts and Model Code configuration are resolved.
+  Processing does not approve costing authority for any Code or Model.
+- FLOW-003: Costing-New stays read-only and supplies reviewed interim material
+  prices. Show ODS price variances and missing rate evidence. Price variance
+  alone never blocks processing; earlier total-cost acceptance tolerances must
+  not be reused as processing gates.
+- PART-001: Select existing canonical Parts or create uniquely named Parts.
+  Each blank-description row requires an individual assignment. Tool Shop/CNC
+  need Parts; Store Issue does not. Paint/Packing and reviewed Summary
+  configuration belong with Model Codes.
+- FLOW-004: Files show workbook records; Model Codes show stored Grist records,
+  both with on-demand reconciliation and explicit revisions/timestamps.
+- FLOW-005: After pilot completion, process files selected by the user, in any order.
+
+Owner inputs remain stage-specific: mandatory sheets and numeric tolerances,
+two Summary examples, current-rate selection, Part reuse/name uniqueness,
+CR approval/automatic proposals, write-back scope, spare retirement/codes,
+and Google Sheet IDs/tabs/access/cadence. Configure credentials locally.
+The current one-active-file-per-Code rule is retained pending cross-family confirmation.
+
+### FLOW-001 implementation progress - 5 October 2026
+
+The immutable processing event store, optimistic source/association/version
+checks, idempotent retry, trusted actor attribution and selected-file history
+UI are implemented. New/Associated derive from saved registry/association state
+until an explicit transition is recorded. All eight lifecycle states are defined.
+Completing Ready to store/Processed still requires the later structural and
+Model Code configuration evidence services; UI/API cannot assert completion.
+
+Workflow stage 4 navigation is implemented: Files for workbook evidence; Product Models -> Model Codes for stored shared file-baseline records with on-demand reconciliation. Per-code configuration/structural completion gates remain open; stored records and processing status do not confer authority. Stage 5 questions on mandatory sheets, numerical tolerances, Summary examples and interim rate selection were presented on 5 October.
+
+5 October processing rules accepted: all five process lists plus Total Summary/Spares Detail/Spares Summary are mandatory. Quantities match exactly; weights match at 2 decimals kg. Final cost-total and price variances are informational for file processing. Reviewed Part assignments and structural Model Code configuration remain gates. New Part names must be globally unique. Read-only interim Costing-New rates use MaterialLatestRate with MaterialRateLog evidence, otherwise Default_MaterialRate.
+
+5 October implementation evidence: Part Mapping supports canonical selection or globally unique creation, exact-description groups, individual blank rows, and reasoned source-pinned assignment history. Store Issue does not require a Part. Paint/Packing and reviewed Summary-to-Code configuration remain open. Existing line masters are not silently reassigned; importing reviewed Parts is the next gate. Pilot remains unprocessed with 55 unresolved groups / 100 active source rows.
+
+### PART-002 — Part identity and automatic naming prerequisite (6 October 2026)
+
+Accepted requirement; not implemented. Each Part has a permanent unique number independent of its name and sharing scope. Generate names from maintained scope shortcodes plus the entered description and meaningful design variant. Global, Product, Product Model and Model Code scope affect naming and warnings only; out-of-scope Model Code configuration is allowed. Multiple shared chassis designs within a Model have separate numbers and variant names, and explicit code usages. Scope/name changes record metadata versions and searchable aliases without changing identity or engineering revision. Central number allocation must be durable, unique and retry-safe; numbers are never recycled.
+
+This foundation must be implemented and verified before advancing Part mapping screens or reviewed-Part imports. The current screen remains an incomplete prototype. Detailed rules, scenarios and exit checks: [Part identity requirements](PART_IDENTITY_REQUIREMENTS.md).
+
+### PART-003 — Rev A until governed CR revisions exist
+
+Owner instruction, 6 October 2026: all managed Parts start and remain at Rev A until the CR flow is implemented. Part engineering revisions require that process and its approval evidence; block later revisions through every write path until available. Name/scope metadata history and source/line revision history are separate and do not imply Part CR approval. Implement this guard with PART-002 before progressing Part mapping.

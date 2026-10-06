@@ -117,6 +117,8 @@ function ReviewResult({ review, acceptanceReason, setAcceptanceReason, ambiguity
   const canAccept = !busy && Boolean(review.costing_file_id) && !statusBlocked && Boolean(acceptanceReason.trim())
     && (review.can_accept || (ambiguities.length > 0 && ambiguityChoicesComplete));
   return <div className="costing-review-results">
+    {review.processing_evidence && <ProcessingEvidence evidence={review.processing_evidence}/>}
+    {review.interim_rates && <section className="costing-review-selection processing-evidence"><div><h2>Costing-New material rates</h2><p>Latest MaterialRateLog rate through Material Latest Rate; Default Material rate when no log exists. Differences do not block file processing.</p>{review.interim_rates.message && <p role="alert">{review.interim_rates.message}</p>}{review.interim_rates.readAt && <p>Read {review.interim_rates.readAt}</p>}<table><thead><tr><th>ODS material</th><th>Reviewed mapping</th><th>ODS rate / kg</th><th>Costing-New rate / kg</th><th>Difference</th><th>Rate evidence</th></tr></thead><tbody>{review.interim_rates.rows.map(row => <tr key={row.material}><td>{row.material}</td><td>{row.canonicalMaterial || "Unmapped"}</td><td>{currency(row.odsRate)}</td><td>{currency(row.costingNewRate)}</td><td>{currency(row.difference)}</td><td>{row.status === "available" ? row.basis === "MaterialLatestRate" ? "Latest material rate" : "Default material rate" : row.status.replaceAll("_", " ")}</td></tr>)}</tbody></table></div></section>}
     <section className={`costing-review-status ${statusBlocked ? "blocked" : "ready"}`} role={statusBlocked ? "alert" : "status"}>
       {statusBlocked ? <AlertTriangle size={17}/> : <ShieldCheck size={17}/>}
       <div><strong>{statusBlocked ? "Current costing is blocked for reconciliation" : ambiguities.length ? "Owner input is needed to resolve line identity" : "Current calculation is ready to reconcile"}</strong>
@@ -202,6 +204,27 @@ function ReviewResult({ review, acceptanceReason, setAcceptanceReason, ambiguity
 
     <p className="costing-review-footer">{review.snapshot_comparison_basis} Refresh and calculate are read-only. The separate reconciliation action persists the accepted snapshot and its change items to Safari Manufacturing.</p>
   </div>;
+}
+
+export function ProcessingEvidence({ evidence }: { evidence: NonNullable<CostingReview["processing_evidence"]> }) {
+  const mismatches = evidence.physicalComparisons.filter(item => !item.matches);
+  const blankParts = evidence.partRowsRequiringReview.filter(item => item.blankDescription);
+  return <section className="costing-review-selection processing-evidence"><div>
+    <h2>File processing review</h2>
+    <p>Quantities must match exactly. Weights must match to two decimal places in kg. Price and final cost-total differences remain visible and do not block processing.</p>
+    <p>Reviewed {evidence.observedAt} · source revision {evidence.sourceHash}</p>
+    {evidence.missingRequiredSheets.length > 0 && <p role="alert">Missing required sheets: {evidence.missingRequiredSheets.join(", ")}</p>}
+    <table><thead><tr><th>Process sheet</th><th>Extraction</th><th>Active</th><th>Historical</th><th>Unclassified</th></tr></thead><tbody>{evidence.sheetCoverage.map(item => <tr key={item.sheet}><td>{item.sheet}</td><td>{!item.present ? "Missing" : item.extracted ? "Extracted" : "Unavailable"}</td><td>{item.active}</td><td>{item.historical}</td><td>{item.unexpected}</td></tr>)}</tbody></table>
+    <p>{evidence.structuralDifferences.length} structural/configuration differences · {evidence.pricingDifferences.length} pricing differences · {mismatches.length} quantity/weight findings requiring review.</p>
+    {!evidence.physicalComparisonAvailable && <p>No accepted baseline for physical comparison.</p>}
+    {mismatches.length > 0 && <details><summary>Inspect {mismatches.length} quantity/weight findings</summary><table><thead><tr><th>Sheet / row</th><th>Field</th><th>Previous</th><th>Current</th><th>Rule / finding</th></tr></thead><tbody>{mismatches.map(item => <tr key={`${item.sheet}:${item.row}:${item.field}`}><td>{item.sheet} #{item.row}</td><td>{item.field}</td><td>{String(item.previous ?? "Missing")}</td><td>{String(item.current ?? "Missing")}</td><td>{item.basis}{item.status && ` · ${item.status.replaceAll("_", " ")}`}</td></tr>)}</tbody></table></details>}
+    <p>{evidence.partRowsRequiringReview.length} active Part assignments require mapping review, including {blankParts.length} blank descriptions. Store Issue rows do not require a Part.</p>
+    {evidence.partMapping && <p>{evidence.partMapping.reviewedRows} source rows have current reviewed Part assignments · Part review version {evidence.partMapping.version}. Open Part Mapping to review the remaining rows.</p>}
+    {blankParts.length > 0 && <details><summary>Blank-description rows needing individual Parts</summary>{blankParts.map(item => <p key={`${item.sheet}:${item.row}`}>{item.sheet} #{item.row}</p>)}</details>}
+    <p>Total Summary: {evidence.summary.extractedItemCount} extracted items. Options: {evidence.summary.optionGroups.join(", ") || "None extracted"}. Model Code configuration needs review.</p>
+    {evidence.missingRateEvidence.length > 0 && <p>Unavailable rate evidence: {evidence.missingRateEvidence.map(item => item.material).join(", ")}. Prices remain unavailable until resolved.</p>}
+    <p>Completion is unavailable while {evidence.pendingPolicies.join(", ").toLowerCase()} remain open.</p>
+  </div></section>;
 }
 
 function SemanticChanges({ review, decisions, setDecisions }: {

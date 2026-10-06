@@ -2,7 +2,21 @@
 
 Windows-friendly Python CLI for processing LibreOffice Calc `.ods` product costing files.
 
-> **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [interactive data model](docs/data-model.html), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [numbering audit](docs/MILESTONE_NUMBERING_AUDIT.md), [decision log](docs/DECISION_LOG.md), and [requirements status register](docs/requirements-status.html). PR 1 is assessed in the [Milestone 1 post-merge audit](docs/MILESTONE_1_POST_MERGE_AUDIT.md); the next implementation brief is [Delivery Milestone 3](docs/MILESTONE_3_IMPLEMENTATION_PROMPT.md) for Phase 1 work package 1.1.
+> **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [interactive data model](docs/data-model.html), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [numbering audit](docs/MILESTONE_NUMBERING_AUDIT.md), [decision log](docs/DECISION_LOG.md), and [requirements status register](docs/requirements-status.html). Milestone 2 is synced as `476ad3a`; [Delivery Milestone 3](docs/MILESTONE_3_IMPLEMENTATION_PROMPT.md) implements Phase 1 work package 1.1. Its [pilot evidence](docs/MILESTONE_3_PILOT_RECONCILIATION.md) distinguishes local projection from live Safari normalization.
+
+To inspect the selected S1KHF workbook without writing any ODS or Grist data:
+
+```powershell
+.\.venv\Scripts\python.exe main.py safari-normalized
+```
+
+`safari-normalized --safari-plan` validates the separate Safari target,
+compares known physical fields with the accepted snapshot, reconciles current
+MCL line caches to workbook C7, and prints the live v5 schema diff. It reports
+new parser coverage separately. Schema v5 and 2,043 S1KHF pilot records are
+now applied to the validated Safari document; the repeat import diff is zero.
+An import requires a reviewed plan fingerprint;
+normal API startup never migrates.
 
 The app reads configured sheets, detects columns by header names and aliases, filters inactive rows from YAML rules, verifies Material Cut List data against Grist, and creates new versioned `.ods` files without overwriting the original workbook.
 
@@ -417,3 +431,23 @@ The screens include guidance text so the utility explains what table is being fi
 - The app uses `pyexcel-ods3` for ODS read/write. It preserves sheet data, unknown columns, reordered columns, and extra columns, but it is not intended as a high-fidelity formatting engine.
 - `pandas` is included for future reporting/data analysis convenience, but the workbook workflows do not depend on dataframe-shaped data.
 - Keep a backup workflow for production costing files until your exact sheet headers and Grist fields are validated.
+
+### Ongoing processing workflow
+
+Saved file selection restores Product/Model/Codes and shows status/history.
+Validate checks the proposal; separate Save records it with audit. Workbook
+Preview spans the page and automatically refreshes local external sheets on a
+disposable copy. Progress, revisions and failures are visible. See
+[workflow evidence](docs/WORKFLOW_IMPLEMENTATION.md). Later stages remain active;
+processing and approved costing authority are distinct.
+
+Processing state and its source/audit history now appear beneath the saved file
+association. Reasoned transitions use source, association and processing-version
+checks. Completion stays unavailable until structural/configuration review is
+connected. Schema v6 adds FileProcessingEvent in Safari Manufacturing only.
+
+The Files and Product Models tabs provide both Explorer paths. Model Code selection inspects stored Safari rows without accessing ODS, with accepted source revision/time, filters, revision/audit details and source reconciliation entry points. Per-code costing configuration and completion gates remain under implementation.
+
+Refreshed Costing Review now separates processing evidence from pricing: required sheets, exact quantities, weights to two decimals kg, Part assignment review and Summary inventory. Costing-New rates/differences use reviewed material aliases and remain nonblocking. Processed remains unavailable pending reviewed Parts, per-code configuration and spares/import work.
+
+Part Mapping now lets you choose existing canonical Parts or create globally unique names, then save reviewed source-row assignments with history and retry recovery. The pilot has 55 description groups / 100 active rows needing review. Safari schema v7 is applied; existing costing rows remain unchanged. Typed imports and per-code Summary configuration are the next open gates.

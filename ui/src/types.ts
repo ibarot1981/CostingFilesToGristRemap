@@ -1,11 +1,21 @@
 export type Product = { id: string; name: string };
+export type SavedAssociation = {
+  fileId: string;
+  current: { id: string; product_id: string; model_id: string; version: number; actor: string; reason: string; created_at: string } | null;
+  product: Product | null;
+  model: ProductModel | null;
+  codes: ModelCode[];
+  history: { association: { id: string; active: boolean; actor: string; reason: string; created_at: string }; codes: ModelCode[]; auditEvents: Record<string, unknown>[] }[];
+  mappingStatus: string;
+  processingBatch: ImportBatch | null;
+};
 export type ModelCode = { id: string; code: string; description: string; legacy_spares_only?: boolean; owner?: { fileId: string; associationId: string; name: string; relativePath?: string | null } | null };
 export type ProductModel = { id: string; product_id: string; model_number: string; name: string; productId?: string; modelNumber?: string; modelName?: string; codes: ModelCode[] };
 export type CatalogSummary = { root: string; file_count: number; readable_count?: number | null; unreadable_count?: number | null; files_with_external_references?: number | null; external_reference_count?: number | null };
 export type ExplorerItem = { id: string; name: string; type: "directory" | "file"; relative_path: string; relativePath?: string; extension: string; size_bytes?: number | null; sizeBytes?: number | null; modified_at?: string | null; modifiedAt?: string | null; candidate_classification?: string; candidateClassification?: string; mapping_status?: string; mappingStatus?: string; readable?: boolean | null; parse_error?: string | null; read_state?: string; readState?: string; sheet_count?: number | null; sheetCount?: number | null; external_reference_count?: number | null; externalReferenceCount?: number | null; external_link_warning?: boolean; externalLinkWarning?: boolean; content_hash?: string | null; contentHash?: string | null; directoryProductMapping?: { mapping: Record<string, unknown>; product: Product; inherited: boolean } | null; directoryMappingProposals?: Record<string, unknown>[] };
 export type PreviewCell = { value: unknown; kind: "value" | "formula" | "warning"; formula?: string | null; warning?: PreviewRowWarning };
 export type PreviewRowWarning = { severity: "warning"; label: string; message: string; material: string; issueCodes: string[]; rateLogRows: number[]; rateLogCells: string[]; hiddenFields: string[]; durableIssues?: { id: string; status: string; version: number; sourceRow?: number | null }[] };
-export type Preview = { path: string; sheets: string[]; sheet: string; startRow: number; startColumn?: number; totalRows: number; totalColumns?: number; truncatedRows?: boolean; truncatedColumns: boolean; readOnly?: boolean; formulaCount?: number; externalReferenceCount?: number; externalLinkWarning?: boolean; rows: unknown[][]; cells?: PreviewCell[][]; refreshMetadata?: { status: "refreshed_temporary_copy"; checkedAt: string; originalSha256: string; refreshedCopySha256: string; linkedSources: { path: string; sha256: string; modified_at: string }[]; sourceWorkbookUnchanged: boolean; linkedSourcesUnchanged: boolean }; rateWarnings?: { status: "not_applicable" | "clear" | "warnings" | "unavailable"; message?: string | null; checkedAt?: string; rows?: Record<string, PreviewRowWarning>; globalWarnings?: { code: string; sourceCell?: string; sourceRow?: number; message: string }[]; sources?: Record<string, { path: string; sha256: string; modified_at: string; observed_at: string }>; materialColumn?: number | null } };
+export type Preview = { path: string; sheets: string[]; sheet: string; startRow: number; startColumn?: number; totalRows: number; totalColumns?: number; truncatedRows?: boolean; truncatedColumns: boolean; readOnly?: boolean; formulaCount?: number; externalReferenceCount?: number; externalLinkWarning?: boolean; rows: unknown[][]; cells?: PreviewCell[][]; refreshMetadata?: { status: "refreshed_temporary_copy" | "no_external_links"; checkedAt: string; originalSha256: string; refreshedCopySha256: string | null; linkedSources: { path: string; sha256: string; modified_at: string }[]; sourceWorkbookUnchanged: boolean; linkedSourcesUnchanged: boolean }; rateWarnings?: { status: "not_applicable" | "clear" | "warnings" | "unavailable"; message?: string | null; checkedAt?: string; rows?: Record<string, PreviewRowWarning>; globalWarnings?: { code: string; sourceCell?: string; sourceRow?: number; message: string }[]; sources?: Record<string, { path: string; sha256: string; modified_at: string; observed_at: string }>; materialColumn?: number | null } };
 export type ValidationError = { code: string; message: string; field?: string | null; details?: Record<string, unknown> };
 export type AssociationValidation = { valid: boolean; errors: ValidationError[]; warnings: ValidationError[]; proposal?: Record<string, unknown> | null };
 export type AssociationState = { schemaAvailable: boolean; writeEnabled: boolean; adapter: string; items: MappedFile[]; message?: string | null };
@@ -84,6 +94,17 @@ export type CostingReview = {
   rate_changes_since_saved_snapshot: Record<string, unknown>[];
   material_list_changes_after_refresh: Record<string, unknown>[];
   semantic_snapshot: { semantic_hash: string; source_hashes: Record<string, string>; content: Record<string, unknown>; observed_at: string };
+  interim_rates?: { status: string; readAt?: string; message?: string; rows: { material: string; canonicalMaterial: string | null; status: string; odsRate: unknown; costingNewRate: unknown; difference: unknown; basis: string | null }[] };
+  processing_evidence?: {
+    partMapping?: {version: number; schemaAvailable: boolean; reviewedRows: number; unresolvedGroups: number};
+    sourceHash: string; observedAt: string; requiredSheets: string[]; missingRequiredSheets: string[];
+    sheetCoverage: { sheet: string; present: boolean; extracted: boolean; active: number; historical: number; unexpected: number }[];
+    physicalComparisons: { sheet: string; row: number; field: string; previous: unknown; current: unknown; matches: boolean; basis: string; status?: string }[];
+    physicalComparisonAvailable: boolean; structuralDifferences: unknown[]; pricingDifferences: unknown[];
+    partRowsRequiringReview: { sheet: string; row: number; description: string; blankDescription: boolean }[];
+    summary: { present: boolean; extractedItemCount: number; optionGroups: string[]; configurationStatus: string };
+    missingRateEvidence: { material: string; status: string }[]; completionAvailable: false; pendingPolicies: string[];
+  };
   semantic_comparison: {
     baseline_exists: boolean;
     previous_snapshot_key?: string | null;

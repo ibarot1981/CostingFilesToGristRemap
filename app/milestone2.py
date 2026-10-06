@@ -2690,6 +2690,8 @@ def build_current_costing_review(
         total_cost=refreshed_summary.get("grand_total"),
     )
     semantic_comparison = compare_semantic_snapshots(accepted_snapshot, semantic_snapshot)
+    from app.workflow_review import processing_review_evidence
+    workflow_evidence = processing_review_evidence(semantic_snapshot, semantic_comparison, set(current_document.sheets), accepted_snapshot)
     return {
         "schema_version": "milestone2-costing-review-2",
         "status": status,
@@ -2742,6 +2744,7 @@ def build_current_costing_review(
         "material_list_changes_after_refresh": snapshot_changes,
         "semantic_snapshot": semantic_snapshot,
         "semantic_comparison": semantic_comparison,
+        "processing_evidence": workflow_evidence,
         "issues": [{key: _json_value(value) for key, value in issue.items()} for issue in issues],
         "historical_cache_findings": [
             {key: _json_value(value) for key, value in issue.items()}

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "safari-foundation-2026-09-29.v4",
+  "schemaVersion": "safari-part-review-2026-10-05.v7",
   "documentName": "Safari Manufacturing",
   "tables": [
     "Product",
@@ -15,20 +15,161 @@
     "AuditEvent",
     "DirectoryProductMapping",
     "CostingSnapshot",
-    "CostingChangeSetItem"
+    "CostingChangeSetItem",
+    "ProductPart",
+    "PartRevision",
+    "PartComponentRevision",
+    "Material",
+    "PurchaseItem",
+    "ProcessOperation",
+    "WorkCenter",
+    "LineMaster",
+    "LineRevision",
+    "LineDetail",
+    "SourceLineObservation",
+    "SourceLineMapping",
+    "LineAuditItem",
+    "FileProcessingEvent",
+    "PartMappingReview"
   ],
   "milestone05Fields": {
-    "ProductModel": ["SupersededById", "SupersededAt"],
-    "ReconciliationIssue": ["Fingerprint", "EntityType", "CostingFile", "SourcePath", "SourceCell", "DetectedFacts", "ProposedResolution", "AssignedOwner", "FirstSeenAt", "LastSeenAt", "Version", "ResolutionAction", "ResolutionReason", "ResolvedActor", "ResolvedAt", "DeferredActor", "DeferredAt", "ReopenedActor", "ReopenedAt"],
-    "DirectoryProductMapping": ["RelativePath", "NormalizedPath", "Product", "Inherit", "Status", "Proposer", "Approver", "Reason", "CreatedAt", "UpdatedAt", "Version", "SupersedesId", "RequestKey", "RequestFingerprint"],
-    "CostingSnapshot": ["SnapshotKey", "CostingFile", "ObservedAt", "SemanticHash", "SemanticContent", "SourceHashes", "Status", "PreviousSnapshotKey", "AcceptedAt", "AcceptedBy", "AcceptanceReason", "RequestKey"],
-    "CostingChangeSetItem": ["ItemKey", "ChangeKey", "Snapshot", "PreviousSnapshotKey", "CostingFile", "ChangeType", "Classification", "ChangeData", "PreviousState", "CurrentState", "SourceEvidence", "CostImpact", "CRReference", "Status", "AcceptedAt", "AcceptedBy", "AcceptanceReason", "RequestKey"]
+    "ProductModel": [
+      "SupersededById",
+      "SupersededAt"
+    ],
+    "ReconciliationIssue": [
+      "Fingerprint",
+      "EntityType",
+      "CostingFile",
+      "SourcePath",
+      "SourceCell",
+      "DetectedFacts",
+      "ProposedResolution",
+      "AssignedOwner",
+      "FirstSeenAt",
+      "LastSeenAt",
+      "Version",
+      "ResolutionAction",
+      "ResolutionReason",
+      "ResolvedActor",
+      "ResolvedAt",
+      "DeferredActor",
+      "DeferredAt",
+      "ReopenedActor",
+      "ReopenedAt"
+    ],
+    "DirectoryProductMapping": [
+      "RelativePath",
+      "NormalizedPath",
+      "Product",
+      "Inherit",
+      "Status",
+      "Proposer",
+      "Approver",
+      "Reason",
+      "CreatedAt",
+      "UpdatedAt",
+      "Version",
+      "SupersedesId",
+      "RequestKey",
+      "RequestFingerprint"
+    ],
+    "CostingSnapshot": [
+      "SnapshotKey",
+      "CostingFile",
+      "ObservedAt",
+      "SemanticHash",
+      "SemanticContent",
+      "SourceHashes",
+      "Status",
+      "PreviousSnapshotKey",
+      "AcceptedAt",
+      "AcceptedBy",
+      "AcceptanceReason",
+      "RequestKey"
+    ],
+    "CostingChangeSetItem": [
+      "ItemKey",
+      "ChangeKey",
+      "Snapshot",
+      "PreviousSnapshotKey",
+      "CostingFile",
+      "ChangeType",
+      "Classification",
+      "ChangeData",
+      "PreviousState",
+      "CurrentState",
+      "SourceEvidence",
+      "CostImpact",
+      "CRReference",
+      "Status",
+      "AcceptedAt",
+      "AcceptedBy",
+      "AcceptanceReason",
+      "RequestKey"
+    ]
   },
   "applyPolicy": "explicit-only; dry-run by default; reject legacy GRIST_DOC_ID",
+  "milestone3": {
+    "delivery": "Delivery Milestone 3 / Phase 1 work package 1.1",
+    "status": "planned; not applied to live Safari",
+    "newTableCount": 13,
+    "uniqueKeys": {
+      "ProductPart": "PartKey",
+      "PartRevision": "RevisionKey",
+      "PartComponentRevision": "ComponentKey",
+      "Material": "MaterialKey",
+      "PurchaseItem": "ItemKey",
+      "ProcessOperation": "OperationKey",
+      "WorkCenter": "CenterKey",
+      "LineMaster": "LineKey",
+      "LineRevision": "RevisionKey",
+      "LineDetail": "DetailKey",
+      "SourceLineObservation": "ObservationKey",
+      "SourceLineMapping": "MappingKey",
+      "LineAuditItem": "AuditKey"
+    },
+    "indexes": "Grist has no declared unique/index constraints in this schema API; the importer checks all deterministic keys and rejects duplicates before writes.",
+    "retry": "Staged key-by-key append; re-read tables and resume missing rows. Accepted snapshot/source hashes are checked before each apply."
+  },
+  "processingLifecycle": {
+    "auditTable": "FileProcessingEvent",
+    "states": [
+      "new",
+      "associated",
+      "extracted",
+      "mapping_review",
+      "reconciliation_review",
+      "ready_to_store",
+      "processed",
+      "changes_pending"
+    ],
+    "authority": "separate",
+    "completionGate": "server structural/configuration evidence"
+  },
   "requestRecovery": {
     "requestKeyColumn": "RequestKey",
     "fingerprintColumn": "RequestFingerprint",
-    "tables": ["FileModelAssociation", "AuditEvent", "ImportBatch"],
+    "tables": [
+      "FileModelAssociation",
+      "AuditEvent",
+      "ImportBatch"
+    ],
     "behavior": "Sequential retries resume missing association children and governance records without duplicating rows."
+  },
+  "partReview": {
+    "table": "PartMappingReview",
+    "sourceBasis": "saved_workbook",
+    "creationAuditFields": [
+      "NameKey",
+      "CreatedActor",
+      "CreatedReason",
+      "CreatedAt",
+      "CreateRequestKey",
+      "CreateFingerprint"
+    ],
+    "nameUniqueness": "NFKC / collapsed whitespace / casefold; all ProductPart records",
+    "authorityChanged": false,
+    "importIntegration": "pending stage 7"
   }
 }

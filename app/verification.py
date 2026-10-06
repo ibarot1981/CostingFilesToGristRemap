@@ -16,6 +16,7 @@ from app.config_models import AppConfig, SheetConfig
 from app.cnc_dxf_review import review_and_update_cnc_dxf_paths
 from app.exceptions import ConfigError, GristError
 from app.grist import GristClient
+from app.material_resolution import resolve_material
 from app.reports import ReportWriter, report_dir_for_source, show_count_summary
 from app.utils import as_decimal, display_text, is_blank, normalize_text, values_equal
 from app.workbook import ColumnMap, OdsWorkbook, RowInfo, SheetView
@@ -2362,7 +2363,8 @@ def ods_compare_record(
             if is_blank(value):
                 return None
             ods_material = display_text(value)
-            mapped = material_mapping.get(ods_material)
+            match = resolve_material(ods_material, material_mapping)
+            mapped = match.canonical_name if match.status == "reviewed_alias" else None
             comparable_material = comparable_materials.get(normalize_text(ods_material))
             if mapped:
                 mapped_resolution = material_name_to_resolution.get(normalize_text(mapped))

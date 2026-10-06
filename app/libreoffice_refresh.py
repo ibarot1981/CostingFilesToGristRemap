@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -75,7 +76,7 @@ def _url_path(url: str) -> Path:
     return Path(remainder).resolve()
 
 
-def linked_ods_sources(workbook_path: Path, allowed_root: Path) -> list[Path]:
+def linked_ods_sources(workbook_path: Path, allowed_root: Path, *, allow_empty: bool = False) -> list[Path]:
     """Find and validate every local ODS workbook linked by the selected file."""
     root = allowed_root.resolve()
     urls, unsupported = _external_source_urls(workbook_path)
@@ -97,7 +98,7 @@ def linked_ods_sources(workbook_path: Path, allowed_root: Path) -> list[Path]:
         if not source.is_file():
             raise LibreOfficeRefreshError(f"Linked ODS source was not found: {source}")
         sources.add(source)
-    if not sources:
+    if not sources and not allow_empty:
         raise LibreOfficeRefreshError("No local ODS dependencies were found to refresh.")
     return sorted(sources, key=lambda path: str(path).casefold())
 

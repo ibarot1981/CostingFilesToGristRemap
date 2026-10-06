@@ -40,6 +40,10 @@ class GristSafariRepository(SafariRepositoryBase):
         self._grist_costing_snapshot_ids: dict[str, int] = {}
         self._grist_costing_change_ids: dict[str, int] = {}
         self._association_write_lock = RLock()
+        from app.processing import GristProcessingStore
+        self.processing_store = GristProcessingStore(self.client)
+        from app.part_mapping import GristPartStore
+        self.part_store = GristPartStore(self.client)
         self.refresh_identity()
 
     def save_association(self, proposal: AssociationProposal, current_file_hash: str | None = None) -> AssociationSaveResult:
@@ -51,6 +55,11 @@ class GristSafariRepository(SafariRepositoryBase):
         with self._association_write_lock:
             self._refresh_preserving_file(proposal.file_id)
             return super().validate_association(proposal, current_file_hash=current_file_hash)
+
+    def association_detail(self, file_id: str) -> dict[str, Any]:
+        with self._association_write_lock:
+            self.refresh_identity()
+            return super().association_detail(file_id)
 
     def _save_association(self, proposal: AssociationProposal, current_file_hash: str | None = None) -> AssociationSaveResult:
         """Persist a validated association and its governance records in Grist.

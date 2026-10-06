@@ -48,7 +48,7 @@
 
 </head>
 
-<body data-generated="2026-10-01">
+<body data-generated="2026-10-02">
 
   <header>
 
@@ -104,7 +104,7 @@
 
         <div class="phase-row"><strong>Phase 0</strong><div class="bar"><i style="width:18%"></i></div><span class="small">Foundation active</span></div>
 
-        <div class="phase-row"><strong>Phase 1</strong><div class="bar"><i style="width:20%"></i></div><span class="small">S1KHF pilot complete; normalized rows next</span></div>
+        <div class="phase-row"><strong>Phase 1</strong><div class="bar"><i style="width:35%"></i></div><span class="small">Normalized S1KHF rows live; owner gates open</span></div>
 
         <div class="phase-row"><strong>Phase 2</strong><div class="bar"><i style="width:0%"></i></div><span class="small">Planned</span></div>
 
@@ -214,7 +214,7 @@
 
   </main>
 
-  <footer>Last updated 1 October 2026. Update this file in the same change as any requirement, decision, architecture, or implementation-status change.</footer>
+  <footer>Last updated 2 October 2026. Update this file in the same change as any requirement, decision, architecture, or implementation-status change.</footer>
 
   <script>
 
@@ -268,7 +268,7 @@
 
       ["MAP-001","Reuse CLI material aliases and Grist mappings through shared services.","CLI reuse","Phase 0","Partial","Extraction seam identified: verification orchestration/index/fallback/scope rules in app/verification.py; YAML edit/validation in app/material_mapping_manager.py; configuration/normalization in app/config_models.py and app/utils.py. No Phase 0 rule rewrite or duplication.","Extract the pure service with golden CLI-equivalence fixtures in Milestone 0.6."],
 
-      ["MAP-002","Retain alternate-size normalization and option-scope filtering.","CLI reuse","Phase 0","Partial","Implemented in legacy verification flow.","Refactor without changing CLI results."],
+      ["MAP-002","Retain alternate-size normalization and option-scope filtering.","CLI reuse","Phase 0","Partial","Pilot service preserves exact YAML aliases, labels AlternateSize as a proposal, and keeps option scope on usage lines; wider CLI behavior remains legacy.","Extract comparable-class and option fallback paths with golden equivalence fixtures."],
 
       ["MAP-003","Preserve Product Part, MS, Tool Shop, and CNC mappings.","CLI reuse","Phase 0","Partial","Existing CLI mapping knowledge identified.","Inventory fields and test selected fixtures."],
 
@@ -284,9 +284,9 @@
 
       ["CFG-003","Prince/Kirloskar and similar variants remain distinct where manufacturing or issue needs differ.","Manufacturing","Phase 3","Documented","P/K store-issue difference captured.","Encode in pilot configurations."],
 
-      ["DATA-001","Normalize each process requirement through stable LineMaster identity, immutable LineRevision, typed process detail, and separate source observations/mappings.","Data model","Phase 1","Documented","Decisions D-053/D-056; interactive data model; requirements §§6.3–6.4.","Implement the S1KHF normalized-ingestion pilot in Delivery Milestone 3 / work package 1.1 before broad product-family expansion."],
+      ["DATA-001","Normalize each process requirement through stable LineMaster identity, immutable LineRevision, typed process detail, and separate source observations/mappings.","Data model","Phase 1","Partial","Safari v5 schema and 2,043 normalized records applied; 313 process rows are queryable, with 10 explicitly unresolved duplicate identities. Repeat import is a no-op.","Resolve ambiguous identities and confirm reusable Part ownership with the business owner."],
 
-      ["DATA-002","Keep the accepted semantic snapshot as a parity baseline while individual S1KHF process lines become queryable Safari child rows with row-level audit.","Data model","Phase 1","Documented","Milestone 3 scope in the numbering audit, requirements §6.4, and interactive ER page.","Verify child-row counts, source mapping, historical exclusion, idempotency, and supported totals against the accepted snapshot."],
+      ["DATA-002","Keep the accepted semantic snapshot as a parity baseline while individual S1KHF process lines become queryable Safari child rows with row-level audit.","Data model","Phase 1","Partial","Accepted snapshot retained; 313 live Grist observations, mappings, masters, revisions, details, and audit items query by the API. Previously covered physical fields match and current MCL caches reconstruct workbook C7.","Obtain owner decisions for ten ambiguous mappings and finish detailed per-line cost review."],
 
       ["CFG-004","A Production Plan instantiates an approved Manufacturing Configuration with independent per-part quantities without changing the costing BOM or reusable Part definitions.","Manufacturing","Phase 3","Documented","Decision D-054; S1KHFELP example records Drum 80, Chassis 32, Support 64.","Validate stock/reservation, carry-forward, skip, and batch-release rules with Production."],
 
@@ -326,11 +326,21 @@
 
       ["CUT-001","ODS write-back requires round-trip preservation, backups, preview, and approval.","Cutover","Phase 5","Planned","Phase gate explicitly defined.","Create fixtures only after read parity."],
 
-      ["CUT-002","Switch authority domain-by-domain only after reconciliation and user acceptance.","Cutover","Phase 5","Documented","Parallel-run and rollback gate defined.","Define operational cutover checklist later."]
+      ["CUT-002","Switch costing authority by Model Code or whole Product Model only after complete line/sheet import, governed material rates, parity, and owner acceptance.","Cutover","Phase 5","Documented","Decision D-058 preserves ODS authority after record transfer; each code must resolve to one effective authority, with scope, evidence, approver, and rollback.","Build the authority assignment and routing workflow after rate/configuration gates are met."],
+
+      ["CUT-003","For Grist-authoritative codes, serve normal costing, cut-list, and inspection reads from typed Grist records and pinned rates without reparsing ODS per request.","Cutover performance","Phase 5","Planned","Current ODS-backed UI remains slow; D-058 expects load times to decrease dramatically after Grist cutover, verified against a measured baseline.","Benchmark both routes and set an explicit latency target during the cutover trial."]
 
     ];
 
 
+
+    rows.push(
+      ["FILE-009","Restore saved associations with separate Validate/Save.","Association","Phase 1","Implemented","Read-only path lookup, saved selections/status/history, async guards and audited Save.","Owner visual acceptance remains separate."],
+      ["PRE-003","Automatically refreshed full-width workbook preview.","Workbook preview","Phase 1","Implemented","Disposable-copy refresh on tab selection; progress, hashes, timestamp, explicit errors and no-link result.","Verify the live pilot and source hashes."],
+      ["PART-003","Part engineering revisions follow CR; all Parts remain Rev A until CR flow exists.","Parts","Phase 1","Planned","Accepted 6 October 2026. Metadata/source histories are distinct from engineering revision and do not imply approval.","Enforce Rev A in creation/mapping services and reject later revisions until approved CR support is implemented."],
+      ["PART-002","Permanent Part numbers; automatic scope/description/variant naming; advisory scope and metadata history.","Parts","Phase 1","Planned","Accepted 6 October 2026. Scope never restricts Model Code configuration. Multiple shared chassis designs retain separate identities and explicit uses. Existing screen is a prototype.","Implement PART_IDENTITY_REQUIREMENTS.md before advancing Part mapping screens or reviewed-Part imports."],
+      ["FLOW-001","Audited processing states distinct from costing authority.","Processing","Phase 1","Partial","Safari v6 lifecycle/audit storage and selected-file UI implemented; source/version/association checks and retries verified. Both Explorer paths and stored-only Code inspection are implemented. Completion gates remain unavailable.","Sheet coverage, physical rules and nonblocking Costing-New rate evidence are visible. Part mapping UI and typed audited storage implemented in v7. First implement PART-002 identity/numbering/naming/history before advancing Part mapping; then integrate reviewed references and finish configuration/spares/completion gates."]
+    );
 
     const body=document.getElementById('requirements');
 
