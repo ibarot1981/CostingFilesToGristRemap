@@ -2,6 +2,7 @@
 from __future__ import annotations
 from hashlib import sha256
 import json
+import sqlite3
 from threading import RLock
 import unicodedata
 from typing import Any
@@ -51,11 +52,13 @@ class GristPartStore:
         self.client = client
         self.available = True
 
+    def legacy_part_records(self):
+        return self.records("ProductPart")
+
     def records(self, table: str):
         try:
             rows = self.client.fetch_table_records_with_ids(table)
-            if table == MAPPING_TABLE:
-                self.available = True
+            self.available = True
             return rows
         except GristError as exc:
             if "404" not in str(exc):
@@ -64,57 +67,71 @@ class GristPartStore:
             return []
 
     def append(self, table: str, fields: list[dict[str, Any]]):
-        self.client.validate_safari_write_target()
-        if not self.available:
-            raise PartConflict("PART_SCHEMA_UNAVAILABLE", "The Part review schema is unavailable")
-        rows = self.client.create_table_records(table, [{"fields": item} for item in fields])
-        if len(rows) != len(fields):
-            raise PartConflict("PART_WRITE_INCOMPLETE", "The Part write response was incomplete; retry the same request")
+        raise PartConflict("PART_LEGACY_READ_ONLY", "Legacy Grist Part records are read-only; new Parts and mappings use the local Part registry.")
+
+
+class PartRegistryMappingStore:
+    """Read legacy Grist Parts while writing new Part reviews to SQLite.
+
+    New assignments use stable Part UUIDs. Existing Grist Part and review rows
+    remain readable and are never rewritten by this adapter.
+    """
+
+    def __init__(self, legacy_store, identity_store):
+        self.legacy_store = legacy_store
+        self.identity_store = identity_store
+        self.lock = identity_store.lock
+        self.available = True
+        self.legacy_history_available = True
+        self.legacy_parts_available = True
+
+    def legacy_part_records(self):
+        rows = self.legacy_store.legacy_part_records() if hasattr(self.legacy_store, "legacy_part_records") else self.legacy_store.records("ProductPart")
+        self.legacy_parts_available = getattr(self.legacy_store, "available", True)
         return rows
+
+    def records(self, table: str):
+        if table == "ProductPart":
+            legacy = self.legacy_part_records()
+            return [*legacy, *self.identity_store.canonical_part_records()]
+        if table == MAPPING_TABLE:
+            legacy = self.legacy_store.records(MAPPING_TABLE)
+            self.legacy_history_available = getattr(self.legacy_store, "available", True)
+            return [*legacy, *self.identity_store.mapping_records()]
+        return self.legacy_store.records(table)
+
+    def append(self, table: str, fields: list[dict[str, Any]]):
+        if table == MAPPING_TABLE:
+            try:
+                return self.identity_store.append_mapping_records(fields)
+            except sqlite3.IntegrityError as exc:
+                raise PartConflict("PART_REVIEW_CONFLICT", "The Part review batch conflicts with saved review evidence.") from exc
+        raise PartConflict("PART_LEGACY_READ_ONLY", "Legacy Grist Part records are read-only; new Part reviews are stored in the local Part registry.")
 
 
 def list_parts(store) -> list[dict[str, Any]]:
     rows = store.records("ProductPart")
     names: dict[str, list[int]] = {}
     for row in rows:
-        names.setdefault(name_key(str(row["fields"].get("DisplayName") or "")), []).append(row["id"])
-    return [{"id": str(row["id"]), "key": row["fields"].get("PartKey"),
-             "name": row["fields"].get("DisplayName"), "status": row["fields"].get("Status"),
-             "selectable": bool(row["fields"].get("PartKey")) and row["fields"].get("Status") in {"canonical", "active", "reviewed"},
-             "duplicateName": len(names[name_key(str(row["fields"].get("DisplayName") or ""))]) > 1}
-            for row in rows]
-
-
-def create_part(store, *, name: str, actor: str, reason: str, request_key: str) -> dict[str, Any]:
-    name = " ".join(unicodedata.normalize("NFKC", name).split())
-    if not name or len(name) > 200 or not reason.strip() or not actor.strip() or not request_key.strip():
-        raise PartConflict("PART_INPUT_REQUIRED", "A unique Part name (up to 200 characters), actor, reason and request key are required")
-    payload_hash = fingerprint([name, actor, reason.strip()])
-    with store.lock:
-        store.records(MAPPING_TABLE)
-        if not store.available:
-            raise PartConflict("PART_SCHEMA_UNAVAILABLE", "The Part review schema is unavailable")
-        rows = store.records("ProductPart")
-        previous = [row for row in rows if row["fields"].get("CreateRequestKey") == request_key]
-        if previous:
-            if len(previous) != 1 or previous[0]["fields"].get("CreateFingerprint") != payload_hash:
-                raise PartConflict("PART_REQUEST_CONFLICT", "The Part creation request key was reused or duplicated")
-            part = next(part for part in list_parts(store) if part["id"] == str(previous[0]["id"]))
-            if part["duplicateName"]:
-                raise PartConflict("PART_NAME_CONFLICT", "Duplicate Part names require review before mapping")
-            return {"part": part, "idempotent": True}
-        if any(name_key(str(row["fields"].get("DisplayName") or "")) == name_key(name) for row in rows):
-            raise PartConflict("PART_NAME_EXISTS", "A Part with this name already exists in Safari Manufacturing; select the existing Part")
-        fields = {"PartKey": "part:canonical:" + fingerprint(name_key(name)), "DisplayName": name,
-                  "NameKey": name_key(name), "Status": "canonical", "CreatedActor": actor,
-                  "CreatedReason": reason.strip(), "CreatedAt": grist_datetime(utc_now()),
-                  "CreateRequestKey": request_key, "CreateFingerprint": payload_hash}
-        saved = store.append("ProductPart", [fields])[0]
-        fresh = list_parts(store)
-        part = next(part for part in fresh if part["id"] == str(saved["id"]))
-        if part["duplicateName"]:
-            raise PartConflict("PART_NAME_CONFLICT", "Concurrent Part creation produced a duplicate name; review is required before mapping")
-        return {"part": part, "idempotent": False}
+        fields = row["fields"]
+        labels = [str(fields.get("DisplayName") or ""), *(fields.get("Aliases") or [])]
+        for label in labels:
+            if name_key(label):
+                names.setdefault(name_key(label), []).append(row["id"])
+    result = []
+    for row in rows:
+        fields = row["fields"]
+        name = str(fields.get("DisplayName") or "")
+        labels = [name, *(fields.get("Aliases") or [])]
+        duplicate = any(len(set(names.get(name_key(label), []))) > 1 for label in labels if name_key(label))
+        result.append({"id": str(row["id"]), "key": fields.get("PartKey"),
+            "name": name, "status": fields.get("Status"),
+            "selectable": bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"},
+            "duplicateName": duplicate, "partNumber": fields.get("PartNumber"),
+            "engineeringRevision": fields.get("EngineeringRevision"), "scope": fields.get("ScopeType"),
+            "scopeTarget": fields.get("ScopeTarget"), "scopeTargetId": fields.get("ScopeTargetId"), "stableIdentity": bool(fields.get("StablePartId")),
+            "legacy": not bool(fields.get("StablePartId"))})
+    return result
 
 
 def source_groups(process_lists: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -167,7 +184,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         candidates = by_group.get(group["key"], [])
         version = max((row["fields"]["Version"] for row in candidates), default=0)
         latest = [row["fields"] for row in candidates if row["fields"]["Version"] == version]
-        refs = {str(row["ProductPart"]) for row in latest}
+        refs = {str(row.get("PartIdentity") or row.get("ProductPart")) for row in latest}
         expected = {(row["sheet"], row["row"]) for row in group["rows"]}
         actual = {(row["SheetName"], int(row["SourceRow"])) for row in latest}
         part = next((part for part in parts if len(refs) == 1 and part["id"] in refs), None)
@@ -176,7 +193,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
     return {"fileId": file_id, "sourceHash": source_hash, "sourceBasis": "saved_workbook",
             "associationKey": association.id if association else "", "associationVersion": association.version if association else 0,
             "version": max((int(row["fields"]["Version"]) for row in history), default=0),
-            "schemaAvailable": store.available, "parts": parts, "groups": resolved,
+            "schemaAvailable": store.available, "legacyHistoryAvailable": getattr(store, "legacy_history_available", True), "parts": parts, "groups": resolved,
             "unresolvedGroups": sum(not group["reviewed"] for group in resolved), "authorityChanged": False,
             "history": [{**row["fields"], "OccurredAt": datetime_text(row["fields"].get("OccurredAt"))} for row in history]}
 
@@ -221,7 +238,9 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                              "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
                              "AssociationVersion": association.version, "GroupKey": key,
                              "SheetName": source["sheet"], "SourceRow": source["row"],
-                             "SourceDescription": known[key]["description"], "ProductPart": int(part_id),
+                             "SourceDescription": known[key]["description"],
+                             "ProductPart": None if parts[part_id].get("stableIdentity") else int(part_id),
+                             "PartIdentity": part_id if parts[part_id].get("stableIdentity") else None,
                              "Version": version, "Actor": actor, "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
                              "RequestKey": request_key, "RequestFingerprint": payload_hash})
         for row in rows:

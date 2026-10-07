@@ -364,3 +364,37 @@ Global normalized names include legacy/inactive Parts. The service serializes wr
 PART-002 / D066 replaces name-derived canonical identity with a permanent internal key and separately allocated unique Part number. Scope/target master shortcodes, description and variant generate display names. Immutable name/scope metadata versions and aliases are distinct from engineering revisions; existing configurations keep stable Part/revision references and historical name evidence. Model Code usage is explicit and advisory scope mismatches cannot block configuration. Number allocation needs a durable serialized/atomic uniqueness mechanism; the existing Grist record-count or process-local locking approach alone is insufficient. Plan compatibility/migration for existing keys before changes. This foundation precedes further Part mapping UI/import work. See PART_IDENTITY_REQUIREMENTS.md.
 
 PART-003 / D067 adds a server-enforced engineering revision lock: managed Parts remain Rev A until the CR service and approval evidence exist. Client assertions, mapping/import batches and source observations cannot authorize a Part engineering revision. Metadata/source versions are separate; legacy numeric PartRevision values need an explicit compatibility plan and are not evidence of CR approval.
+
+## Part identity registry implementation — 7 October 2026
+
+`app/part_identity.py` is the write authority for new Part identities, permanent
+numbers, scope shortcodes, metadata aliases/history, retirement, and source
+mapping history. A UUID is the stable application identity; `SM-P-000001` is a
+separate monotonic number allocated in the same `BEGIN IMMEDIATE` transaction
+as the Part and its creation request record. Unique database constraints
+protect numbers, normalized current/historical names, aliases, and idempotency
+keys. Mapping review writes share the same SQLite database and writer lock, so
+metadata changes can compare affected-use evidence while assignments are
+serialized.
+
+The supported deployment is one host with all application processes pointing
+to the same local SQLite file. SQLite locking is not a cross-host coordination
+mechanism; network-share and multi-host deployments require moving this
+registry and allocator to a shared transactional database before they are
+supported. Existing Safari `ProductPart` and `PartMappingReview` data are
+read-only compatibility inputs. New names are checked against a fresh read of
+legacy names, but writes from another legacy editor are outside this
+single-writer contract and must be controlled until migration. `GristPartStore`
+rejects Part writes. The default database under `state/` and all SQLite/WAL
+files are ignored by Git. Use `scripts/backup_part_registry.py` for a verified
+online backup. No Grist schema/data migration or business record write is part
+of this PR.
+
+The Parts tab uses a two-pane explorer and guided create/details panel. The
+mapping view opens the same register without saving assignments, retains its
+source group and draft, and offers a separate explicit return action. Scope
+warnings are derived from the file's active Model Code associations; they never
+filter choices or block a mapping. Detailed line/drawing/per-code usage views
+remain explicitly unavailable or partial until stable identity is connected to
+those domains. Typed imports, Paint/Packing, Summary configuration, CR approval
+and legacy identity migration remain later work.

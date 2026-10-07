@@ -432,6 +432,32 @@ The screens include guidance text so the utility explains what table is being fi
 - `pandas` is included for future reporting/data analysis convenience, but the workbook workflows do not depend on dataframe-shaped data.
 - Keep a backup workflow for production costing files until your exact sheet headers and Grist fields are validated.
 
+### Managed Parts register
+
+The Parts tab provides permanent `SM-P-000001` identities, maintained scope
+shortcodes, generated names, aliases and metadata history. Part creation is
+separate from Part Mapping. New identities and mapping reviews use a local
+SQLite database shared by application processes on one host. Set
+`SAFARI_PART_DATABASE_PATH` to choose its location; keep it on local disk, not
+a network share. The default `state/safari_parts.sqlite3` and backup directory
+are ignored by Git. Create a consistent verified backup with:
+
+```powershell
+.venv\Scripts\python.exe scripts\backup_part_registry.py
+```
+
+Keep backups outside the checkout as well. For restore, stop every app process,
+preserve the current database for diagnosis, restore the newest verified
+backup to the configured path, then run the registry/API checks before enabling
+writes. If any allocated numbers may postdate the recovered backup, reconcile
+the number ledger before allocating another Part. Multi-host/network-share
+deployment is unsupported; it requires a shared transactional database.
+
+The existing Safari Grist Part and assignment data remain read-only legacy
+inputs. This implementation does not migrate Parts, change the Grist schema,
+or create live Part assignments. Legacy numeric PartRevision values remain
+unverified until a reviewed compatibility plan.
+
 ### Ongoing processing workflow
 
 Saved file selection restores Product/Model/Codes and shows status/history.

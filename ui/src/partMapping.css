@@ -13,3 +13,4 @@
 .part-table td:first-child { width: 30%; }
 .part-table td:last-child { width: 35%; min-width: 240px; }
 .part-table small { display: block; color: #66798c; margin-top: 6px; }
+.part-table .scope-advisory { color: #9b592d; background: #fff4e8; border-radius: 6px; padding: 7px; line-height: 1.4; }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Calculator, Check, ChevronDown, ChevronRight, Database, ExternalLink, FileSpreadsheet, Folder, FolderOpen, FolderTree, LoaderCircle, Map as MapIcon, Maximize2, Minimize2, RefreshCw, Search, ShieldCheck, Tags, X } from "lucide-react";
+import { AlertTriangle, Calculator, Check, ChevronDown, ChevronRight, Database, ExternalLink, FileSpreadsheet, Folder, FolderOpen, FolderTree, LoaderCircle, Map as MapIcon, Maximize2, Minimize2, PackageOpen, RefreshCw, Search, ShieldCheck, Tags, X } from "lucide-react";
 import { api } from "./api";
 import { deriveMappedFileGroups, mappedFileIssueLabels } from "./mappedFilesViewModel";
 import { CostingReviewView } from "./CostingReviewView";
@@ -7,6 +7,7 @@ import { ReconciliationView } from "./ReconciliationView";
 import { NormalizedView } from "./NormalizedView";
 import { ModelCodeExplorer } from "./ModelCodeExplorer";
 import { PartMappingView } from "./PartMappingView";
+import { PartsView } from "./PartsView";
 import { ProcessingPanel } from "./ProcessingPanel";
 import "./normalized.css";
 import "./reconciliation.css";
@@ -15,10 +16,12 @@ import type { AssociationValidation, CatalogSummary, ExplorerItem, MappedFile, M
 
 type TreeMap = Record<string, ExplorerItem[]>;
 type ExplorerSearch = { tree: TreeMap; total: number; itemCount: number; source?: "filesystem" | "cached-report" };
+type PartMappingReturn = { path: string; groupKey: string; partId: string | null };
 const emptyValidation: AssociationValidation = { valid: false, errors: [], warnings: [] };
 
 export function App() {
-  const [view, setView] = useState<"explorer" | "preview" | "costing" | "mapped" | "reconciliation" | "normalized" | "models" | "parts">("explorer");
+  const [view, setView] = useState<"explorer" | "preview" | "costing" | "mapped" | "reconciliation" | "normalized" | "models" | "parts" | "mapping">(window.location.hash.startsWith("#parts") ? "parts" : "explorer");
+  const [partMappingReturn, setPartMappingReturn] = useState<PartMappingReturn | null>(null);
   const [summary, setSummary] = useState<CatalogSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [models, setModels] = useState<ProductModel[]>([]);
@@ -218,13 +221,14 @@ export function App() {
 
   if (loading) return <div className="loading"><div className="brand-mark"><Tags size={20}/></div><LoaderCircle className="spin"/>Loading Safari Manufacturing…</div>;
     return <div className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Tags size={20}/></div><div><strong>Safari Manufacturing</strong><span>Costing workbench</span></div></div><nav><button className={view === "explorer" ? "active" : ""} onClick={() => setView("explorer")}><FileSpreadsheet size={15}/> Files</button><button className={view === "models" ? "active" : ""} onClick={() => setView("models")}><FolderTree size={15}/> Product Models</button><button className={view === "preview" ? "active" : ""} disabled={!selectedPath || associationLoading || previewing} onClick={() => { setView("preview"); void refreshExternalLinks(); }}><FileSpreadsheet size={15}/> Workbook Preview</button><button className={view === "costing" ? "active" : ""} onClick={() => setView("costing")}><Calculator size={15}/> Costing Review</button><button className={view === "parts" ? "active" : ""} onClick={() => setView("parts")}><Tags size={15}/> Part Mapping</button><button className={view === "normalized" ? "active" : ""} onClick={() => setView("normalized")}><Database size={15}/> Process Lines</button><button className={view === "mapped" ? "active" : ""} onClick={() => void openMapped()}><MapIcon size={15}/> Mapped Files</button><button className={view === "reconciliation" ? "active" : ""} onClick={() => setView("reconciliation")}><ShieldCheck size={15}/> Reconciliation</button></nav><div className="top-actions"><span className="auth"><ShieldCheck size={15}/> {adapter === "in-memory" ? "Local in-memory adapter" : "Safari Manufacturing Grist"}</span><button className="button ghost" onClick={() => void load()}><RefreshCw size={15}/> Refresh</button></div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Tags size={20}/></div><div><strong>Safari Manufacturing</strong><span>Costing workbench</span></div></div><nav><button className={view === "explorer" ? "active" : ""} onClick={() => setView("explorer")}><FileSpreadsheet size={15}/> Files</button><button className={view === "models" ? "active" : ""} onClick={() => setView("models")}><FolderTree size={15}/> Product Models</button><button className={view === "preview" ? "active" : ""} disabled={!selectedPath || associationLoading || previewing} onClick={() => { setView("preview"); void refreshExternalLinks(); }}><FileSpreadsheet size={15}/> Workbook Preview</button><button className={view === "costing" ? "active" : ""} onClick={() => setView("costing")}><Calculator size={15}/> Costing Review</button><button className={view === "parts" ? "active" : ""} onClick={() => setView("parts")}><PackageOpen size={15}/> Parts</button><button className={view === "mapping" ? "active" : ""} onClick={() => setView("mapping")}><Tags size={15}/> Part Mapping</button><button className={view === "normalized" ? "active" : ""} onClick={() => setView("normalized")}><Database size={15}/> Process Lines</button><button className={view === "mapped" ? "active" : ""} onClick={() => void openMapped()}><MapIcon size={15}/> Mapped Files</button><button className={view === "reconciliation" ? "active" : ""} onClick={() => setView("reconciliation")}><ShieldCheck size={15}/> Reconciliation</button></nav><div className="top-actions"><span className="auth"><ShieldCheck size={15}/> {adapter === "in-memory" ? "Local in-memory adapter" : "Safari Manufacturing Grist"}</span><button className="button ghost" onClick={() => void load()}><RefreshCw size={15}/> Refresh</button></div></header>
     {error && <div className="error-banner"><AlertTriangle size={16}/><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}><X size={15}/></button></div>}
     {notice && <div className="notice-banner"><Check size={16}/>{notice}</div>}
     {view === "mapped" ? <MappedView rows={mapped} onSelect={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
     : view === "models" ? <ModelCodeExplorer products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
     : view === "preview" ? <main className="workbook-preview-tab"><PreviewPanel selectedFile={selectedFile} preview={preview} previewing={previewing} refreshing={refreshingPreview} refreshExternalLinks={() => void refreshExternalLinks()} chooseSheet={(sheet) => void chooseSheet(sheet)} summary={null}/></main>
-    : view === "parts" ? <PartMappingView path={selectedFile?.relative_path || ""}/>
+    : view === "parts" ? <PartsView mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setView("mapping"); }}/>
+    : view === "mapping" ? <PartMappingView path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId }); setView("parts"); }}/>
     : view === "normalized" ? <NormalizedView selectedPath={selectedFile?.relative_path || ""} onReconcile={() => setView("costing")}/>
     : view === "costing" ? <CostingReviewView selectedPath={selectedFile?.relative_path || ""} selectedName={selectedFile?.name || ""}/>
     : view === "reconciliation" ? <ReconciliationView products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>

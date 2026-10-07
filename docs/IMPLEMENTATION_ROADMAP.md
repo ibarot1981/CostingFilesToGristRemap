@@ -694,3 +694,27 @@ Stage 6 Part review slice implemented: canonical selection/unique creation, indi
 PART-002 / D066 takes precedence over the previously stated next import gate. First implement permanent Part identity and SM-P sequence allocation, maintained master shortcodes, automatically generated scope/description/variant names, metadata history/aliases and separate engineering revisions. Sharing scope only determines naming and advisory warnings; it must not restrict Model Code configuration or auto-assign codes. Verify multiple designs shared by different subsets of one Model. Then adapt/advance Part mapping and import integration. Existing stage 6 work is preserved as a prototype and must not be treated as satisfying this prerequisite. See PART_IDENTITY_REQUIREMENTS.md.
 
 PART-003 / D067: the upcoming Part creation/mapping work must initialize all managed Parts at Rev A and prohibit later engineering revisions until the governed CR flow is implemented. Metadata naming/scope versions remain distinct. The implementation handoff is docs/PART_CREATION_MAPPING_IMPLEMENTATION_PROMPT.md; implement creation first, then mapping, before resuming later workflow stages.
+
+### 7 October Part identity implementation status
+
+The `codex/part-identity-foundation` implementation provides a local
+transactional Part register, atomic `SM-P` allocation, maintained scope
+shortcodes, server-generated names, normalized collision/alias checks,
+metadata and retirement history, a server-side Rev A constraint, the Parts
+explorer/details UI, and stable-UUID Part mapping with nonblocking scope
+warnings. New Part and mapping writes use the same ignored local SQLite file;
+legacy Grist ProductPart and assignment records are read-only. No Grist schema
+or live business data has been changed. The exact legacy identity and numeric
+revision migration remains a separate reviewed gate.
+
+Verification is complete: 159 Python tests ran (158 passed, one platform
+skip), 23 Vitest tests passed, and Python compilation, TypeScript production build and
+`git diff --check` passed. The read-only Safari recheck returned 24 Products,
+44 Models, 173 Codes, one temporary unallocated Part, one unverified numeric
+revision and no Part mappings. The normal Parts screen showed the legacy Part
+as unallocated and unverified. An isolated browser fixture created
+`SM-P-000001` at Rev A and saved one assignment for a workbook associated with
+a different Model Code; the scope warning was visible and fixture writes did
+not touch Safari. PR review is the remaining delivery check. Later typed
+imports, explicit per-code Summary configuration, Paint/Packing,
+drawings/line reconciliation, CR workflow and completion gates remain open.

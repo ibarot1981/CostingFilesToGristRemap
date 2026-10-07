@@ -5,6 +5,10 @@ __pycache__/
 logs/
 output/
 reports/
+state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 .env
 config/safari_manufacturing.local.json

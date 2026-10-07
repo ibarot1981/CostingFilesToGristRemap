@@ -61,3 +61,16 @@ whole numbers. Existing filenames are kept to preserve history.
    exit item with owner evidence.
 
 The detailed implementation brief is `MILESTONE_3_IMPLEMENTATION_PROMPT.md`.
+
+## Part identity slice — 7 October 2026
+
+The accepted D066/D067 Part identity prerequisite is now partially implemented
+on `codex/part-identity-foundation`. The app has a durable SQLite Part register,
+same-host transactional number allocation, generated scope names, metadata
+history, Rev A guard and stable-ID mapping reviews. The existing v7 Grist
+schema and live Part records are unchanged; no canonical Part or assignment
+was migrated or created. This is an application implementation slice, not a
+new delivery milestone or live Safari schema revision. Current gates are full
+verification, read-only live data recheck, a reviewed compatibility plan and
+the PR review; see `PART_CREATION_MAPPING_IMPLEMENTATION_PROMPT.md` and
+`WORKFLOW_IMPLEMENTATION.md`.

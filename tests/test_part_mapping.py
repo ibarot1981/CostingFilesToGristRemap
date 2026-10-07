@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest import mock
 from fastapi import HTTPException
 from starlette.requests import Request
-from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, source_groups, create_part, mapping_detail, save_mapping, attach_mapping_evidence
+from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, source_groups, list_parts, mapping_detail, save_mapping, attach_mapping_evidence
 from test_grist_repository import FakeGristClient
 
 
@@ -18,10 +18,9 @@ class PartMappingTests(unittest.TestCase):
             {"status": "active", "source_row": 13, "fields": {}},
             {"status": "historical", "source_row": 14, "fields": {"product_part_name": "Old"}}]})
 
-    def create(self, **overrides):
-        args = dict(name="Drive Shaft", actor="Irshad", reason="Reviewed canonical name", request_key="new-part")
-        args.update(overrides)
-        return create_part(self.store, **args)
+    def create(self, *, name="Drive Shaft", status="canonical", part_key="fixture-part"):
+        return self.store.append("ProductPart", [{"PartKey": part_key, "DisplayName": name, "NameKey": name,
+            "Status": status, "CreatedActor": "Irshad", "CreatedReason": "Legacy compatibility fixture"}])[0]
 
     def save(self, **overrides):
         args = dict(file_id="file:pilot.ods", source_hash="hash1", association=self.association, groups=self.groups,
@@ -43,17 +42,17 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(self.detail()["unresolvedGroups"], 3)
         self.assertEqual(self.store.tables["PartMappingReview"], [])
 
-    def test_unique_names_include_unicode_case_whitespace_and_legacy(self):
+    def test_legacy_duplicates_and_unallocated_parts_are_not_selectable(self):
         self.create()
+        self.create(name="  ＤＲＩＶＥ   shaft  ", part_key="duplicate-part")
+        self.create(name="Legacy Part", status="temporary", part_key="unallocated")
+        parts = list_parts(self.store)
+        self.assertTrue(all(part["duplicateName"] for part in parts if "shaft" in part["name"].casefold()))
+        unallocated = next(part for part in parts if part["name"] == "Legacy Part")
+        self.assertFalse(unallocated["selectable"])
         with self.assertRaises(PartConflict) as error:
-            self.create(name="  ＤＲＩＶＥ   shaft  ", request_key="other")
-        self.assertEqual(error.exception.code, "PART_NAME_EXISTS")
-        self.store.tables["ProductPart"].append({"id": 2, "fields": {"DisplayName": "Legacy Part", "Status": "temporary"}})
-        with self.assertRaises(PartConflict):
-            self.create(name="legacy part", request_key="legacy")
-        self.assertTrue(self.create()["idempotent"])
-        with self.assertRaises(PartConflict):
-            self.create(reason="Different reason")
+            self.save(decisions={self.groups[0]["key"]: "1"})
+        self.assertEqual(error.exception.code, "PART_SELECTION_INVALID")
 
     def test_typed_assignments_partial_review_and_stale_changes(self):
         self.create(); self.save()
@@ -69,24 +68,16 @@ class PartMappingTests(unittest.TestCase):
                 self.save(request_key="next", **overrides)
         self.assertEqual(len(rows), 2)
 
-    def test_durable_creation_and_mapping_recover_after_lost_responses(self):
+    def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)
-        client.fail_after_create_once = "ProductPart"
-        with self.assertRaises(RuntimeError): self.create()
-        self.store = GristPartStore(client)
-        part = self.create()["part"]
-        client.fail_after_create_once = "PartMappingReview"
-        decisions = {self.groups[0]["key"]: part["id"]}
-        with self.assertRaises(RuntimeError): self.save(decisions=decisions)
-        self.store = GristPartStore(client)
-        self.assertTrue(self.save(decisions=decisions)["idempotent"])
-        self.assertEqual(len(client.tables["ProductPart"]), 1)
-        self.assertEqual(len(client.tables["PartMappingReview"]), 2)
-        self.assertGreater(client.target_checks, 0)
+        with self.assertRaises(PartConflict) as error:
+            self.store.append("ProductPart", [{"DisplayName": "Must not be written"}])
+        self.assertEqual(error.exception.code, "PART_LEGACY_READ_ONLY")
+        self.assertEqual(client.created, [])
 
     def test_wrong_target_duplicate_names_and_prewrite_changes_block(self):
         client = FakeGristClient(); self.store = GristPartStore(client); client.target_valid = False
-        with self.assertRaises(Exception): self.create()
+        with self.assertRaises(PartConflict): self.store.append("ProductPart", [{"DisplayName": "Must not be written"}])
         self.assertEqual(client.created, [])
         self.store = MemoryPartStore(); self.create()
         guard = mock.Mock(side_effect=PartConflict("PART_REVIEW_STALE", "Changed source"))

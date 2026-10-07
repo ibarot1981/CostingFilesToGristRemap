@@ -22,8 +22,16 @@ function apiError(payload: any, status: number): Error {
 }
 
 export const api = {
+  parts: (search = "", scope = "", targetId = "") => get<any>(`/api/parts?${new URLSearchParams({ search, scope, target_id: targetId })}`),
+  partScopeTargets: () => get<any>("/api/parts/scope-targets"),
+  partNamePreview: (scope: string, targetId: string, description: string, variant: string, excludeId = "") => get<any>(`/api/parts/preview?${new URLSearchParams({ scope, target_id: targetId, description, variant, exclude_id: excludeId })}`),
+  createManagedPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, { "Idempotency-Key": key }),
+  maintainPartShortcode: (payload: unknown, key: string) => send<any>("/api/parts/shortcodes", payload, { "Idempotency-Key": key }),
+  partDetails: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}`),
+  partMetadataPreview: (id: string, scope: string, targetId: string, description: string, variant: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/metadata-preview?${new URLSearchParams({ scope, target_id: targetId, description, variant })}`),
+  updatePartMetadata: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/metadata`, payload, { "Idempotency-Key": key }),
+  retirePart: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/retire`, payload, { "Idempotency-Key": key }),
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
-  createPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, {"Idempotency-Key": key}),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
   processingState: (path: string) => get<any>(`/api/processing/state?path=${encodeURIComponent(path)}`),
   changeProcessingState: (payload: unknown, key: string) => send<any>("/api/processing/state", payload, {"Idempotency-Key":key}),
