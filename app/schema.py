@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-review-2026-10-05.v7"
+SCHEMA_VERSION = "safari-parts-grist-2026-10-07.v8"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -49,7 +49,51 @@ FOUNDATION_TABLES += (
     _table("SourceLineObservation", {"ObservationKey": "Text", "Snapshot": "Ref:CostingSnapshot", "SourceHash": "Text", "DependencyHashes": "Any", "ParserVersion": "Text", "SheetName": "Text", "SourceRow": "Numeric", "Status": "Text", "Cells": "Any", "ObservedFields": "Any", "PartDisplayName": "Text", "CachedCost": "Numeric", "CurrentCost": "Numeric", "CRReference": "Text"}),
     _table("SourceLineMapping", {"MappingKey": "Text", "Observation": "Ref:SourceLineObservation", "LineMaster": "Ref:LineMaster", "Status": "Text"}),
     _table("LineAuditItem", {"AuditKey": "Text", "LineMaster": "Ref:LineMaster", "LineRevision": "Ref:LineRevision", "PreviousRevision": "Ref:LineRevision", "Observation": "Ref:SourceLineObservation", "Actor": "Text", "Reason": "Text", "CRReference": "Text"}),
+    _table("PartMetadataVersion", {"MetadataKey": "Text", "ProductPart": "Ref:ProductPart", "Version": "Numeric", "ScopeType": "Text", "ScopeProduct": "Ref:Product", "ScopeProductModel": "Ref:ProductModel", "ScopeModelCode": "Ref:ProductModelCode", "ScopeTargetId": "Text", "ScopeTargetLabel": "Text", "Shortcode": "Text", "Description": "Text", "DesignVariant": "Text", "DisplayName": "Text", "NameKey": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartNameAlias", {"AliasKey": "Text", "ProductPart": "Ref:ProductPart", "MetadataVersion": "Ref:PartMetadataVersion", "DisplayName": "Text", "NameKey": "Text", "IsCurrent": "Bool", "CreatedAt": "DateTime", "Actor": "Text", "Reason": "Text", "RequestKey": "Text"}),
+    _table("PartScopeShortcode", {"ScopeKey": "Text", "ScopeType": "Text", "ScopeProduct": "Ref:Product", "ScopeProductModel": "Ref:ProductModel", "ScopeModelCode": "Ref:ProductModelCode", "ScopeTargetId": "Text", "ScopeTargetLabel": "Text", "Shortcode": "Text", "NormalizedShortcode": "Text", "Version": "Numeric", "UpdatedAt": "DateTime", "Actor": "Text", "Reason": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartShortcodeHistory", {"HistoryKey": "Text", "PartScopeShortcode": "Ref:PartScopeShortcode", "Version": "Numeric", "OldShortcode": "Text", "NewShortcode": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartRevisionLine", {"RevisionLineKey": "Text", "PartRevision": "Ref:PartRevision", "LineMaster": "Ref:LineMaster", "LineRevision": "Ref:LineRevision", "SourceLineObservation": "Ref:SourceLineObservation", "ProcessType": "Text", "QuantityPerPart": "Numeric", "QuantityUOM": "Text", "Status": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartDrawing", {"DrawingKey": "Text", "PartRevision": "Ref:PartRevision", "DrawingIdentity": "Text", "LinkType": "Text", "FilePath": "Text", "ExternalURL": "Text", "FileVersion": "Text", "ContentHash": "Text", "Status": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("Vendor", {"VendorKey": "Text", "DisplayName": "Text", "NameKey": "Text", "Status": "Text", "CreatedAt": "DateTime", "Actor": "Text", "Reason": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartPurchaseSpecification", {"SpecificationKey": "Text", "ProductPart": "Ref:ProductPart", "PartRevision": "Ref:PartRevision", "PurchaseItem": "Ref:PurchaseItem", "SpecificationCode": "Text", "Manufacturer": "Text", "ManufacturerPartNumber": "Text", "Description": "Text", "Attributes": "Any", "CostingUOM": "Text", "CostingCurrency": "Text", "Status": "Text", "Actor": "Text", "Reason": "Text", "CreatedAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("VendorPartMapping", {"VendorPartMappingKey": "Text", "Vendor": "Ref:Vendor", "PartPurchaseSpecification": "Ref:PartPurchaseSpecification", "VendorSKU": "Text", "NormalizedSKU": "Text", "VendorDescription": "Text", "Status": "Text", "ReviewedAt": "DateTime", "ReviewedBy": "Text", "ReviewReason": "Text", "Actor": "Text", "Reason": "Text", "CreatedAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartPurchaseUnitConversion", {"ConversionKey": "Text", "PartPurchaseSpecification": "Ref:PartPurchaseSpecification", "FromUOM": "Text", "ToUOM": "Text", "Factor": "Numeric", "EvidenceReference": "Text", "Status": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartPurchaseCurrencyConversion", {"ConversionKey": "Text", "PartPurchaseSpecification": "Ref:PartPurchaseSpecification", "FromCurrency": "Text", "ToCurrency": "Text", "Rate": "Numeric", "RateDate": "DateTime", "EvidenceReference": "Text", "Status": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartPurchaseRecord", {"PurchaseRecordKey": "Text", "VendorPartMapping": "Ref:VendorPartMapping", "PartPurchaseSpecification": "Ref:PartPurchaseSpecification", "ProductPart": "Ref:ProductPart", "PartRevision": "Ref:PartRevision", "Vendor": "Ref:Vendor", "TransactionKey": "Text", "TransactionLineKey": "Text", "RecordType": "Text", "Status": "Text", "TransactionAt": "DateTime", "DocumentReference": "Text", "Quantity": "Numeric", "QuantityUOM": "Text", "RateBasisUOM": "Text", "Currency": "Text", "ExtendedAmount": "Numeric", "DiscountAmount": "Numeric", "TaxAmount": "Numeric", "FreightAmount": "Numeric", "OtherCharges": "Numeric", "RatePolicy": "Text", "Actor": "Text", "Reason": "Text", "RecordedAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text", "ReversesRecord": "Ref:PartPurchaseRecord", "SupersedesRecord": "Text"}),
+    _table("PurchasedPartCostEvidence", {"EvidenceKey": "Text", "CostRunKey": "Text", "ConfigurationSelectionKey": "Text", "ProductPart": "Ref:ProductPart", "PartRevision": "Ref:PartRevision", "PartPurchaseSpecification": "Ref:PartPurchaseSpecification", "PurchaseRecord": "Ref:PartPurchaseRecord", "Vendor": "Ref:Vendor", "AsOfDate": "DateTime", "TransactionAt": "DateTime", "PurchaseQuantity": "Numeric", "PurchaseUOM": "Text", "NormalizedQuantity": "Numeric", "CostingUOM": "Text", "Currency": "Text", "BaseUnitPrice": "Numeric", "DiscountPerUnit": "Numeric", "AppliedUnitRate": "Numeric", "RatePolicy": "Text", "ResolutionStatus": "Text", "Reason": "Text", "Actor": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartRegistryCoordinator", {"RegistryKey": "Text", "WriterHostId": "Text", "CoordinatorId": "Text", "BoundAt": "DateTime", "Actor": "Text", "Reason": "Text", "RequestKey": "Text", "Fingerprint": "Text"}),
+    _table("PartRegistryRequest", {"RequestKey": "Text", "RequestType": "Text", "RequestFingerprint": "Text", "EntityUUID": "Text", "ReservedPartNumber": "Text", "ReservedNameKey": "Text", "Status": "Text", "Result": "Any", "StartedAt": "DateTime", "UpdatedAt": "DateTime", "WriterHostId": "Text", "CoordinatorId": "Text"}),
 )
+
+
+def _merge_table_definitions(tables: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+    """Coalesce additive definitions so one schema plan has no duplicate IDs."""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for table in tables:
+        table_id = str(table["id"])
+        if table_id not in merged:
+            merged[table_id] = {"id": table_id, "name": table["name"], "columns": []}
+            order.append(table_id)
+        by_id = {str(column["id"]): column for column in merged[table_id]["columns"]}
+        for column in table["columns"]:
+            by_id[str(column["id"])] = column
+        merged[table_id]["columns"] = list(by_id.values())
+    return tuple(merged[table_id] for table_id in order)
+
+
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# Additive Part columns. Existing legacy values remain in place and are not
+# interpreted as managed identities or engineering baselines.
+FOUNDATION_TABLES += (
+    _table("ProductPart", {"StablePartId": "Text", "PartNumber": "Text", "EngineeringRevision": "Text", "ScopeType": "Text", "ScopeProduct": "Ref:Product", "ScopeProductModel": "Ref:ProductModel", "ScopeModelCode": "Ref:ProductModelCode", "ScopeTargetId": "Text", "ScopeTargetLabel": "Text", "Description": "Text", "DesignVariant": "Text", "CurrentMetadataVersion": "Ref:PartMetadataVersion", "CurrentPartRevision": "Ref:PartRevision", "MetadataVersion": "Numeric", "PublishStatus": "Text"}),
+    _table("PartRevision", {"RevisionLabel": "Text", "BaselineStatus": "Text", "DefinitionHash": "Text", "FinalizedAt": "DateTime", "FinalizedBy": "Text", "FinalizationReason": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartMappingReview", {"StablePartId": "Text", "PartRevision": "Ref:PartRevision", "PartMetadataVersion": "Ref:PartMetadataVersion", "PartNumberUsed": "Text", "NameUsed": "Text"}),
+    _table("PartComponentRevision", {"QuantityUOM": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text", "ComponentStatus": "Text"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.catalog import scan_costing_file
 from app.catalog_import import import_catalog
@@ -26,6 +26,7 @@ from app.repository import AssociationConflict, AssociationProposal, GovernanceC
 from app.workbook import OdsWorkbook
 from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
 from app.libreoffice_refresh import LibreOfficeRefreshError, linked_ods_sources, refreshed_ods_copy
+from app.part_identity import PartIdentityError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,12 @@ app = FastAPI(title="Safari Manufacturing ERP", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4320", "http://localhost:4320"], allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
 _repository: SafariRepository | None = None
 _part_identity_registry = None
+
+
+@app.exception_handler(PartIdentityError)
+async def _part_identity_error_handler(request: Request, exc: PartIdentityError):
+    error = _part_http_error(exc)
+    return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
 
 @app.get("/api/health")
@@ -227,12 +234,25 @@ def _part_context(path: str):
 def _part_registry():
     global _part_identity_registry
     if _part_identity_registry is None:
-        from app.part_identity import PartIdentityStore
         try:
-            _part_identity_registry = PartIdentityStore()
+            repository = _get_repository()
+            if repository.adapter_name != "grist-safari":
+                raise _error(503, "PART_GRIST_REQUIRED", "Canonical Part writes require the configured Safari Manufacturing Grist adapter; local SQLite is not used as a business-data fallback.")
+            from app.grist_parts import GristPartRegistry
+            _part_identity_registry = GristPartRegistry(repository.client)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise _error(503, "PART_DATABASE_UNAVAILABLE", "The durable Part registry could not be opened.") from exc
     return _part_identity_registry
+
+
+def _part_features():
+    from app.grist_parts import GristPartFeatures, GristPartRegistry
+    registry = _part_registry()
+    if not isinstance(registry, GristPartRegistry):
+        raise _error(503, "PART_GRIST_REQUIRED", "Composition and purchased-Part records require the configured Safari Manufacturing Grist adapter.")
+    return GristPartFeatures(registry)
 
 
 def _legacy_part_rows(repository: SafariRepository) -> list[dict[str, Any]]:
@@ -240,6 +260,7 @@ def _legacy_part_rows(repository: SafariRepository) -> list[dict[str, Any]]:
         return []
     try:
         rows = repository.part_store.legacy_part_records() if hasattr(repository.part_store, "legacy_part_records") else repository.part_store.records("ProductPart")
+        rows = [row for row in rows if not row.get("fields", {}).get("StablePartId")]
     except Exception as exc:
         from app.part_identity import PartIdentityError
         raise PartIdentityError("PART_LEGACY_UNAVAILABLE", "Existing Safari Parts could not be read; creation is paused to protect name uniqueness.") from exc
@@ -365,7 +386,7 @@ def _legacy_part_payloads(repository: SafariRepository, rows: list[dict[str, Any
 
 
 def _part_http_error(exc) -> HTTPException:
-    status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED")) else 409
+    status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE", "PART_SCHEMA_UNAVAILABLE", "PART_COORDINATOR_UNBOUND", "PART_WRITE_UNCONFIRMED", "PART_COORDINATOR_UNCONFIRMED", "PART_GRIST_REQUIRED"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED")) else 409
     return _error(status, exc.code, str(exc))
 
 
@@ -379,7 +400,8 @@ def parts_register(search: str = "", scope: str = "", target_id: str = "", inclu
         registry.sync_legacy_names(legacy)
         return {"items": registry.list_parts(search=search, scope_type=scope, target_id=target_id, include_retired=include_retired),
                 "legacyItems": _legacy_part_payloads(repository, legacy, search),
-                "storage": "shared-local-sqlite", "schemaAvailable": True}
+                "storage": "Grist Safari Manufacturing" if repository.adapter_name == "grist-safari" else "in-memory local preview",
+                "schemaAvailable": True}
     except PartIdentityError as exc:
         raise _part_http_error(exc)
 
@@ -517,17 +539,42 @@ def part_details(part_id: str) -> dict[str, Any]:
     repository = _get_repository()
     part = _part_registry().get_part(part_id)
     if part:
+        registry = _part_registry()
+        if hasattr(registry, "history"):
+            history = registry.history(part_id)
+            part["metadataHistory"] = [{"part_id": part_id, "version": item.get("Version"), "display_name": item.get("DisplayName"),
+                "scope_type": item.get("ScopeType"), "target_label": item.get("ScopeTargetLabel"), "shortcode": item.get("Shortcode"),
+                "occurred_at": item.get("OccurredAt"), "description": item.get("Description"), "variant": item.get("DesignVariant"),
+                "actor": item.get("Actor"), "reason": item.get("Reason")} for item in history["metadata"]]
+            part["aliasHistory"] = history["aliases"]
+            part["revisionHistory"] = history["revisions"]
+            part["lifecycleHistory"] = [{"event_id": item.get("RequestKey"), "event_type": item.get("EventType"), "status": "recorded",
+                "occurred_at": item.get("OccurredAt"), "actor": item.get("Actor"), "reason": item.get("Reason")} for item in history["lifecycle"]]
+            part["mappingHistory"] = history["mappings"]
+        else:
+            history = {}
+        part.setdefault("mappingHistory", [])
         mapped_sources = [{"name": f"{item['SheetName']} · row {item['SourceRow']}", "sheet": item["SheetName"],
             "row": item["SourceRow"], "description": item["SourceDescription"], "sourceHash": item["SourceHash"],
             "associationVersion": item["AssociationVersion"], "mappingVersion": item["Version"],
-            "actor": item["Actor"], "reason": item["Reason"], "occurredAt": item["OccurredAt"]} for item in part["mappingHistory"]]
-        process_status = "partial" if mapped_sources else "unavailable"
-        process_message = ("Reviewed source rows are linked above. Typed line quantities, weights and normalized line revisions are not connected to the stable Part yet."
-            if mapped_sources else "Process-line records are still linked through legacy Part references and have not been reconciled to this stable Part identity.")
+            "actor": item.get("Actor"), "reason": item.get("Reason"), "occurredAt": item.get("OccurredAt")} for item in part["mappingHistory"]]
+        if registry.__class__.__name__ == "GristPartRegistry":
+            features = _part_features()
+            process_lines = features.process_lines(part_id)
+            components = features.components(part_id)
+            drawings = features.drawings(part_id)
+            purchases = features.purchase_detail(part_id)
+            part["compositionStatus"] = part.get("revisionStatus") or "draft"
+        else:
+            process_lines = {"status": "partial" if mapped_sources else "unavailable", "items": mapped_sources,
+                "message": "Process line requirements are not pinned to stable Parts in this local preview."}
+            components, drawings, purchases = [], [], {"specifications": [], "purchaseHistoryAvailable": False, "message": "Purchase capture requires Safari Grist."}
         return {"part": part, "mappingHistory": part["mappingHistory"],
-                "processLines": {"status": process_status, "items": mapped_sources, "message": process_message},
-                "drawings": {"status": "unavailable", "items": [], "message": "No drawing-link registry is available yet."},
-                "usedIn": {"status": "unavailable", "items": [], "message": "Explicit per-code Part configuration is not available yet."}}
+                "processLines": process_lines,
+                "components": {"status": "available", "items": components, "message": "No component Parts are linked." if not components else None},
+                "purchases": purchases,
+                "drawings": {"status": "available" if drawings else "empty", "items": drawings, "message": "No drawings are linked to this revision." if not drawings else None},
+                "usedIn": {"status": "unavailable", "items": [], "message": "Explicit per-code configuration tables are not implemented; source mappings are not configuration usage."}}
     if part_id.startswith("legacy:") and repository.adapter_name == "grist-safari":
         record_id = part_id.split(":", 1)[1]
         rows = _legacy_part_rows(repository)
@@ -538,6 +585,126 @@ def part_details(part_id: str) -> dict[str, Any]:
                     "drawings": {"status": "unavailable", "items": [], "message": "Legacy drawing references have not been reconciled."},
                     "usedIn": {"status": "unavailable", "items": [], "message": "Legacy configurations have not been reconciled."}}
     raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+
+
+@app.get("/api/parts/{part_id}/composition")
+def part_composition(part_id: str):
+    return {"items": _part_features().components(part_id)}
+
+
+@app.post("/api/parts/{part_id}/components")
+def add_part_component(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_component(parent_part_id=part_id, child_part_id=str(payload.get("childPartId") or ""),
+        quantity=payload.get("quantity"), uom=str(payload.get("uom") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+        request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/finalize-revision")
+def finalize_part_revision(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().finalize_revision(part_id=part_id, actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/process-lines")
+def link_part_process_line(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().link_process_line(part_id=part_id, line_master_id=int(payload.get("lineMasterId") or 0),
+        line_revision_id=int(payload.get("lineRevisionId") or 0), quantity=payload.get("quantity", 1), uom=str(payload.get("uom") or "each"),
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+        reassign_owner=bool(payload.get("reassignOwner")), expected_owner_id=payload.get("expectedOwnerId"))
+
+
+@app.get("/api/part-line-candidates")
+def part_line_candidates(search: str = ""):
+    return {"items": _part_features().line_candidates(search)}
+
+
+@app.post("/api/parts/{part_id}/drawings")
+def add_part_drawing(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_drawing(part_id=part_id, identity=str(payload.get("identity") or ""), link_type=str(payload.get("linkType") or ""),
+        file_path=str(payload.get("filePath") or ""), external_url=str(payload.get("externalUrl") or ""), file_version=str(payload.get("fileVersion") or ""),
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.get("/api/parts/drawings/{drawing_key}/open")
+def open_part_drawing(drawing_key: str):
+    features = _part_features()
+    rows = features.registry._rows("PartDrawing")
+    row = next((item for item in rows if str(item.get("fields", {}).get("DrawingKey") or "") == drawing_key), None)
+    if not row or row.get("fields", {}).get("LinkType") != "local_file":
+        raise _error(404, "PART_DRAWING_NOT_FOUND", "The local drawing link was not found.")
+    root_value = os.getenv("SAFARI_DRAWINGS_ROOT", "").strip()
+    if not root_value:
+        raise _error(503, "PART_DRAWINGS_ROOT_UNCONFIGURED", "Local drawing preview is unavailable because the approved drawings root is not configured.")
+    try:
+        root = Path(root_value).resolve(strict=True)
+        raw_path = Path(str(row.get("fields", {}).get("FilePath") or ""))
+        resolved = (root / raw_path).resolve(strict=True) if not raw_path.is_absolute() else raw_path.resolve(strict=True)
+        resolved.relative_to(root)
+        if not resolved.is_file() or resolved.suffix.casefold() not in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+            raise ValueError("Unsupported preview file")
+    except (OSError, ValueError):
+        raise _error(404, "PART_DRAWING_NOT_FOUND", "The drawing file is missing or outside the configured drawings root.")
+    return FileResponse(resolved, filename=resolved.name, content_disposition_type="inline")
+
+
+@app.post("/api/parts/{part_id}/vendors")
+def create_part_vendor(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    if not _part_registry().get_part(part_id):
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    return _part_features().create_vendor(name=str(payload.get("name") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications")
+def create_purchase_specification(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().create_purchase_specification(part_id=part_id, code=str(payload.get("code") or ""), manufacturer=str(payload.get("manufacturer") or ""),
+        manufacturer_part_number=str(payload.get("manufacturerPartNumber") or ""), description=str(payload.get("description") or ""),
+        costing_uom=str(payload.get("costingUOM") or ""), currency=str(payload.get("currency") or ""),
+        purchase_item_id=int(payload["purchaseItemId"]) if payload.get("purchaseItemId") not in (None, "") else None,
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/vendor-mappings")
+def create_vendor_part_mapping(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    if not _part_registry().get_part(part_id):
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    return _part_features().create_vendor_mapping(specification_id=int(payload.get("specificationId") or 0), vendor_id=int(payload.get("vendorId") or 0),
+        sku=str(payload.get("sku") or ""), description=str(payload.get("description") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchases")
+def record_part_purchase(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().capture_purchase(part_id=part_id, specification_id=int(payload.get("specificationId") or 0), mapping_id=int(payload.get("vendorMappingId") or 0),
+        transaction_key=str(payload.get("transactionKey") or ""), transaction_line_key=str(payload.get("transactionLineKey") or ""),
+        record_type=str(payload.get("recordType") or "actual_purchase"), status=str(payload.get("status") or "posted"),
+        transaction_at=str(payload.get("transactionAt") or ""), document_reference=str(payload.get("documentReference") or ""),
+        quantity=payload.get("quantity"), quantity_uom=str(payload.get("quantityUOM") or ""), currency=str(payload.get("currency") or ""),
+        extended_amount=payload.get("extendedAmount"), discount_amount=payload.get("discountAmount", 0), tax_amount=payload.get("taxAmount", 0),
+        freight_amount=payload.get("freightAmount", 0), other_charges=payload.get("otherCharges", 0), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+        request_key=idempotency_key or "", reverses_record_id=int(payload["reversesRecordId"]) if payload.get("reversesRecordId") else None,
+        supersedes_record_key=str(payload.get("supersedesRecordKey") or ""))
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications/{specification_id}/unit-conversions")
+def add_purchase_unit_conversion(part_id: str, specification_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_unit_conversion(specification_id=specification_id, from_uom=str(payload.get("fromUOM") or ""), to_uom=str(payload.get("toUOM") or ""),
+        factor=payload.get("factor"), evidence=str(payload.get("evidence") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications/{specification_id}/currency-conversions")
+def add_purchase_currency_conversion(part_id: str, specification_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_currency_conversion(specification_id=specification_id, from_currency=str(payload.get("fromCurrency") or ""), to_currency=str(payload.get("toCurrency") or ""),
+        rate=payload.get("rate"), rate_date=str(payload.get("rateDate") or ""), evidence=str(payload.get("evidence") or ""), actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.get("/api/parts/{part_id}/purchase-rate")
+def part_purchase_rate(part_id: str, as_of: str = ""):
+    return _part_features().purchase_detail(part_id, as_of=as_of or None)
+
+
+@app.post("/api/parts/{part_id}/purchase-rate-evidence")
+def save_part_purchase_rate_evidence(part_id: str, payload: dict[str, Any] = Body(...)):
+    return _part_features().purchase_detail(part_id, as_of=str(payload.get("asOf") or "") or None,
+        cost_run_key=str(payload.get("costRunKey") or ""), configuration_selection_key=str(payload.get("configurationSelectionKey") or ""))
 
 
 @app.post("/api/parts/mappings")

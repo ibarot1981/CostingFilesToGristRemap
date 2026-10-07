@@ -689,32 +689,40 @@ Stage 5 is partial: required-sheet coverage, exact quantity/2-decimal kg evidenc
 
 Stage 6 Part review slice implemented: canonical selection/unique creation, individual blank rows, audited typed assignment batches, stale-evidence checks and durable retries. Live v7 adds one review table and six Part creation fields; no business assignments made. Pilot has 55 unresolved groups / 100 active rows. Next gate: reviewed Part references in typed import plans and per-code Summary/Paint/Packing configuration. Completion remains gated; stages 5-8 are still partial.
 
-### 6 October prerequisite before further Part mapping
+### 6 October prerequisite before further Part mapping — completed 7 October
 
-PART-002 / D066 takes precedence over the previously stated next import gate. First implement permanent Part identity and SM-P sequence allocation, maintained master shortcodes, automatically generated scope/description/variant names, metadata history/aliases and separate engineering revisions. Sharing scope only determines naming and advisory warnings; it must not restrict Model Code configuration or auto-assign codes. Verify multiple designs shared by different subsets of one Model. Then adapt/advance Part mapping and import integration. Existing stage 6 work is preserved as a prototype and must not be treated as satisfying this prerequisite. See PART_IDENTITY_REQUIREMENTS.md.
+Historical sequencing note: PART-002 / D066 took precedence over the next import gate. That prerequisite—permanent Part identity/number, maintained shortcodes, generated names, metadata/alias history, Rev A, advisory scope, and distinct designs shared by different code subsets—was delivered in the 7 October Grist-backed slice below. Part mapping is now Grist-persisted. Typed imports and per-code configuration remain later work. See PART_IDENTITY_REQUIREMENTS.md.
 
 PART-003 / D067: the upcoming Part creation/mapping work must initialize all managed Parts at Rev A and prohibit later engineering revisions until the governed CR flow is implemented. Metadata naming/scope versions remain distinct. The implementation handoff is docs/PART_CREATION_MAPPING_IMPLEMENTATION_PROMPT.md; implement creation first, then mapping, before resuming later workflow stages.
 
-### 7 October Part identity implementation status
+### 7 October Part registry and purchase-history implementation status
 
-The `codex/part-identity-foundation` implementation provides a local
-transactional Part register, atomic `SM-P` allocation, maintained scope
-shortcodes, server-generated names, normalized collision/alias checks,
-metadata and retirement history, a server-side Rev A constraint, the Parts
-explorer/details UI, and stable-UUID Part mapping with nonblocking scope
-warnings. New Part and mapping writes use the same ignored local SQLite file;
-legacy Grist ProductPart and assignment records are read-only. No Grist schema
-or live business data has been changed. The exact legacy identity and numeric
-revision migration remains a separate reviewed gate.
+PR #3 now implements Grist-canonical Part business records under schema
+`safari-parts-grist-2026-10-07.v8`. Permanent numbering and request recovery use
+a local journal on one bound writer host; Grist stores ProductPart, Rev A,
+generated-name/metadata/alias history, source mapping references, composition,
+line/drawing links, vendor specifications/equivalences, actual purchase records
+and cost evidence. The v8 migration was additive after a native backup passed
+hash and integrity checks. Production keeps its one legacy Part, numeric
+revision and 313 line masters unchanged; no managed test records were added.
 
-Verification is complete: 159 Python tests ran (158 passed, one platform
-skip), 23 Vitest tests passed, and Python compilation, TypeScript production build and
-`git diff --check` passed. The read-only Safari recheck returned 24 Products,
-44 Models, 173 Codes, one temporary unallocated Part, one unverified numeric
-revision and no Part mappings. The normal Parts screen showed the legacy Part
-as unallocated and unverified. An isolated browser fixture created
-`SM-P-000001` at Rev A and saved one assignment for a workbook associated with
-a different Model Code; the scope warning was visible and fixture writes did
-not touch Safari. PR review is the remaining delivery check. Later typed
-imports, explicit per-code Summary configuration, Paint/Packing,
-drawings/line reconciliation, CR workflow and completion gates remain open.
+An isolated real-Grist fixture verified Part creation/readback, metadata rename
+and old alias, source mapping, child quantity, exact process line, multiple
+vendors, historical as-of selection, latest current purchase selection,
+persisted cost evidence and a fresh-adapter restart. The fixture document was
+moved to Grist Trash after verification. A local mock-browser check exercised
+the collapsible explorer, mixed MCL/Toolshop/CNC detail, child Part navigation,
+latest purchased rate/history and purchase capture UI.
+
+Updated verification: 174 Python tests passed (one platform skip), 25 Vitest
+tests passed, TypeScript and production build passed. The purchase policy is
+transaction-time ordering, posted/completed-only eligibility, net merchandise
+less discount, exclusion of tax/freight/other charges, explicit conversions,
+and a visible conflict/unavailable state for tied or incomparable latest
+transactions. MaterialRateLog/default selection is unchanged.
+
+**Still open:** legacy Part/numeric-revision classification and migration;
+explicit Model Code `CostingConfiguration`/`ConfigurationPartSelection`;
+automatic Summary extraction and end-to-end purchased-Part cost consumption;
+the approved CR workflow for Rev B+; costing completion and authority cutover.
+Passing this Part slice does not close those gates.

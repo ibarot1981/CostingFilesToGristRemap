@@ -155,12 +155,51 @@ POST /api/parts/mappings requires path, decisions (group-key to Part-record-ID s
 
 Schema safari-part-review-2026-10-05.v7 adds PartMappingReview and ProductPart NameKey/CreatedActor/CreatedReason/CreatedAt/CreateRequestKey/CreateFingerprint. Current reviewed mappings reduce costing-review.processing_evidence.partRowsRequiringReview; partMapping reports version, schema availability, reviewed row count and unresolved groups. No assignment silently changes accepted line masters, configuration or costing authority.
 
-## Part identity and mapping implementation — 7 October 2026
+## Grist-backed Parts API and schema — 7 October 2026
 
-PART-002 / D066 and PART-003 / D067 are implemented in the application on branch `codex/part-identity-foundation`. `GET /api/parts` searches current names, historical aliases, Part numbers and read-only legacy Grist names. `GET /api/parts/scope-targets` returns active Product, Product Model and Model Code targets plus maintained shortcodes. `GET /api/parts/preview` server-generates the scope/description/variant name and reports collisions. `POST /api/parts/shortcodes` audits shortcode maintenance; `POST /api/parts` allocates a permanent number and stable UUID with a durable idempotency key. Creation initializes Rev A and rejects conflicting client revision assertions.
+Schema `safari-parts-grist-2026-10-07.v8` extends the existing `ProductPart`, `PartRevision`, `PartMappingReview` and `PartComponentRevision` tables and defines typed metadata, alias, shortcode, line, drawing, vendor, purchase, evidence and coordinator/request tables. The business records are canonical in the validated Safari Manufacturing Grist document. The local `SAFARI_PART_DATABASE_PATH` SQLite file is a single-host reservation, serialization and recovery journal only. Do not copy a local DB as a substitute for Grist backup or use independently initialized allocators on multiple hosts.
 
-`GET /api/parts/{part_id}` returns the stable identity, metadata/lifecycle history and mapping history, with explicit unavailable states for line, drawing and per-code configuration data not yet connected. `GET /api/parts/{part_id}/metadata-preview` returns before/after naming, current source assignment evidence and a fingerprint. `POST /api/parts/{part_id}/metadata` requires the current metadata version and usage fingerprint; it preserves identity/number/Rev A, records aliases and audit history, and rejects design-variant changes. `POST /api/parts/{part_id}/retire` preserves the retired identity and reserved number.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/parts?search=&scope=&target_id=&include_retired=` | Search canonical managed Parts and visible read-only legacy records by number, current name or historical alias. |
+| `GET /api/parts/scope-targets` | Active Product, Product Model and Model Code targets plus maintained shortcodes. |
+| `GET /api/parts/preview?scope=&target_id=&description=&variant=&exclude_id=` | Server-generated name preview and normalized collision status. |
+| `POST /api/parts/shortcodes` | Create/update a scope shortcode with actor, reason and `Idempotency-Key`. |
+| `POST /api/parts` | Create stable UUID + permanent number, generated metadata/alias and Rev A in Grist. Actor comes from trusted request context; reason and `Idempotency-Key` are required. |
+| `GET /api/parts/{part_id}` | Stable Part detail with metadata/alias/mapping/lifecycle history and joined line, child, drawing and purchase sections. |
+| `GET /api/parts/{part_id}/metadata-preview` | Proposed name/scope change and current reference fingerprint. |
+| `POST /api/parts/{part_id}/metadata` | Version-checked metadata change; preserves identity/number/A and records prior name as alias. |
+| `POST /api/parts/{part_id}/retire` | Audited retirement; never releases or reuses number/name reservations. |
+| `GET /api/parts/mappings?path=` / `POST /api/parts/mappings` | Read source groups and save reviewed PartMappingReview rows with stable Part, revision and metadata references plus source hash, association, actor/reason and retry evidence. Part selection/creation remains separate from assignment Save. |
+| `GET /api/parts/{part_id}/composition` / `POST /api/parts/{part_id}/components` | Read or add a child Part pinned to the child revision with positive quantity/UOM; cycles are rejected. |
+| `POST /api/parts/{part_id}/finalize-revision` | Finalize the initial A definition. Finalized physical content is locked; later engineering revisions require a future approved CR workflow. |
+| `GET /api/part-line-candidates` / `POST /api/parts/{part_id}/process-lines` | Search existing normalized lines and link an exact line revision/process type/quantity to Rev A. |
+| `POST /api/parts/{part_id}/drawings` / `GET /api/parts/drawings/{drawing_key}/open` | Link an optional local file or HTTPS drawing with file version/audit; open only a validated local file link. |
+| `POST /api/parts/{part_id}/vendors` | Add canonical Vendor identity. |
+| `POST /api/parts/{part_id}/purchase-specifications` | Add purchased physical specification against the Part and engineering revision; optional `PurchaseItem`. |
+| `POST /api/parts/{part_id}/vendor-mappings` | Save reviewed Vendor SKU equivalence to the same canonical Part specification. |
+| `POST /api/parts/{part_id}/purchases` | Capture immutable posted actual purchase against a reviewed vendor mapping, with transaction identity/date, quantity/UOM, currency, extended amount, discount/charges, actor/reason and idempotency key. |
+| `POST /api/parts/{part_id}/purchase-specifications/{specification_id}/unit-conversions` | Add an explicit, reasoned and evidenced UOM conversion. |
+| `POST /api/parts/{part_id}/purchase-specifications/{specification_id}/currency-conversions` | Add an explicit dated currency conversion with source evidence. |
+| `GET /api/parts/{part_id}/purchase-rate?as_of=` | Show current or as-of rate resolution, vendor equivalents, transaction history and explicit unavailable/conflict state. |
+| `POST /api/parts/{part_id}/purchase-rate-evidence` | Resolve and persist deterministic `PurchasedPartCostEvidence` when cost-run and configuration-selection keys are both supplied. The evidence records the resolver actor, applied rate/status and policy reason. This is an interface; the full Summary costing consumer is deferred. |
 
-`GET /api/parts/mappings` and `POST /api/parts/mappings` retain the source/hash/association/version checks described above. New assignments use the stable Part UUID and pinned Rev A in local SQLite; existing Grist Part and mapping records remain readable and are never changed by this Part slice. Out-of-scope usage is advisory and does not block Save. Part creation and assignment remain separate.
+Mutating calls use stable idempotency keys; reusing a key with changed payload returns a conflict. After response loss, retry the identical key and payload. Inspect `PartRegistryRequest` and the relevant business table before manual recovery; do not allocate a second Part because a request timed out. One Grist `PartRegistryCoordinator` binds the configured host/local allocator. A different host/coordinator cannot take over automatically.
 
-The new registry is `state/safari_parts.sqlite3` by default, or `SAFARI_PART_DATABASE_PATH`. SQLite unique constraints and `BEGIN IMMEDIATE` serialize application writers sharing one local database file on one host. This supports concurrent processes on that host; a network share or multi-host deployment is unsupported. Back up with `python scripts/backup_part_registry.py`; the backup uses SQLite's online backup API and verifies integrity. No new Grist schema was applied: Safari remains at its previously reviewed v7 schema. No live Part or assignment was created or migrated by this implementation. Legacy `PartRevision` numeric values remain unverified and are not promoted to CR-approved revisions. The exact live compatibility diff and cutover require a separately reviewed migration plan.
+### Revision and compatibility boundaries
+
+New managed Parts use `ProductPart.EngineeringRevision=A` and a separate `PartRevision.RevisionLabel=A` baseline with Draft/Finalized status. The pre-existing numeric `PartRevision.Revision` field remains untouched as legacy/source evidence. Metadata version, source mapping version and drawing file version are not Part engineering revisions. Rev B+ cannot be created until the governed CR workflow and approval evidence exist.
+
+`PartRevisionLine` pins exact line revisions. `PartComponentRevision` pins parent/child revision plus quantity/UOM. MCL, Toolshop and CNC links are optional and may be mixed. Drawings are optional. Per-code `CostingConfiguration`/`ConfigurationPartSelection` and automatic Summary costing are not implemented; `Used in` must not infer configuration from scope or source mappings.
+
+### Purchased-Part costing policy
+
+Select the latest eligible posted/completed actual purchase by transaction timestamp across all reviewed vendors for the same canonical Part specification/revision. `RecordedAt` is audit only; a backdated purchase does not displace a later transaction. Quotes, drafts, voids, returns and reversed purchases are excluded. Identical transaction/line replay collapses idempotently; contradictory duplicate payloads and different-rate ties at the latest timestamp produce a visible conflict.
+
+Applied rate is net merchandise per costing UOM: deduct explicit discount, exclude tax/freight/other charges. Use explicit reviewed UOM conversion and dated currency conversion evidence. If the newest eligible transaction is incomparable, return unavailable/review-needed; do not choose an older rate. No eligible history returns unavailable, never zero or MaterialRateLog/default fallback. Persist selected record/vendor/date/rate/cost basis to `PurchasedPartCostEvidence` so newer purchases do not mutate historical results. Existing MaterialRateLog behavior remains unchanged.
+
+### Deployed schema and verification boundary
+
+The v8 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. Live production retains 1 legacy ProductPart, 1 legacy numeric PartRevision and 313 LineMaster rows, with 0 mapping reviews and 0 managed Part/purchase fixture rows. One coordinator row is bound. No legacy ownership or revision was silently migrated.
+
+An isolated temporary Grist document verified real API create/read-back/restart, metadata alias history, mapping, child quantity, process-line linkage, multiple vendors, current and historical purchase selection, and persisted cost evidence. Its synthetic records remained isolated; the document was moved to Trash after the check. Full Model Code configuration, Summary costing integration, CR approval and legacy identity migration are still open.

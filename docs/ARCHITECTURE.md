@@ -359,42 +359,16 @@ app/part_mapping.py separates canonical master creation from source assignment. 
 
 Global normalized names include legacy/inactive Parts. The service serializes writes and rejects detected collisions. Grist lacks declared uniqueness constraints; concurrent external writers require review if they create duplicates. Schema v7 was applied only after a narrow reviewed diff. Stage 7 import must integrate these reviewed references with immutable typed revisions. Paint/Packing and Summary belong to reviewed Model Code configuration; Store Issue has no required Part.
 
-## Part identity prerequisite — 6 October 2026 (design, not implemented)
+## Canonical Parts in Grist — 7 October 2026
 
-PART-002 / D066 replaces name-derived canonical identity with a permanent internal key and separately allocated unique Part number. Scope/target master shortcodes, description and variant generate display names. Immutable name/scope metadata versions and aliases are distinct from engineering revisions; existing configurations keep stable Part/revision references and historical name evidence. Model Code usage is explicit and advisory scope mismatches cannot block configuration. Number allocation needs a durable serialized/atomic uniqueness mechanism; the existing Grist record-count or process-local locking approach alone is insufficient. Plan compatibility/migration for existing keys before changes. This foundation precedes further Part mapping UI/import work. See PART_IDENTITY_REQUIREMENTS.md.
+PART-002/D066 and PART-003/D067 are implemented in the current Part slice. `app/grist_parts.py` is the Grist-backed business write/read authority: Safari Grist stores the canonical `ProductPart`, permanent `SM-P-000001` number, generated name and typed scope, metadata versions and aliases, shortcode history, explicit Rev A baseline, mapping references, composition, drawings, vendors, purchase specifications and purchase evidence. `app/part_mapping.py` writes assignments through the same registry. The local SQLite journal only coordinates the single supported host, reserves monotonic numbers and makes request recovery deterministic; it is not a Part business-data registry.
 
-PART-003 / D067 adds a server-enforced engineering revision lock: managed Parts remain Rev A until the CR service and approval evidence exist. Client assertions, mapping/import batches and source observations cannot authorize a Part engineering revision. Metadata/source versions are separate; legacy numeric PartRevision values need an explicit compatibility plan and are not evidence of CR approval.
+Schema `safari-parts-grist-2026-10-07.v8` was additively applied to the validated Safari Manufacturing document after downloading and checking a native Grist backup. Existing legacy Part rows, numeric revisions and line ownership were left unchanged. Live production has one legacy `ProductPart`, one legacy numeric `PartRevision`, 313 `LineMaster` rows, zero `PartMappingReview` rows, and zero managed Part/purchase fixture rows. One `PartRegistryCoordinator` row binds the supported writer host. Real create/update/restart/purchase persistence was verified in an isolated temporary Grist document; its synthetic records were not copied into production.
 
-## Part identity registry implementation — 7 October 2026
+The coordinator requires every application process on the writer host to share the same durable local SQLite path. A second host or changed allocator must not take over automatically; rebind/migration requires deliberate operator recovery. The request journal `PartRegistryRequest` and entity-level request keys allow retries to reconcile a Grist commit whose response was lost. For recovery, retry the exact same key and payload, then inspect Grist request/entity rows; a changed payload with the old key is a conflict. Do not manually create a replacement Part after a timeout. Preserve a current native `.grist` backup before schema or bulk data changes and verify its hash and SQLite integrity. The schema command enforces this before apply.
 
-`app/part_identity.py` is the write authority for new Part identities, permanent
-numbers, scope shortcodes, metadata aliases/history, retirement, and source
-mapping history. A UUID is the stable application identity; `SM-P-000001` is a
-separate monotonic number allocated in the same `BEGIN IMMEDIATE` transaction
-as the Part and its creation request record. Unique database constraints
-protect numbers, normalized current/historical names, aliases, and idempotency
-keys. Mapping review writes share the same SQLite database and writer lock, so
-metadata changes can compare affected-use evidence while assignments are
-serialized.
+`ProductPart.EngineeringRevision` and `PartRevision.RevisionLabel` explicitly identify managed engineering A. The older numeric `PartRevision.Revision` stays untouched as legacy/source evidence. Rev A can be finalized and its physical definition is then locked; no Rev B+ creation endpoint exists until the approved CR workflow is implemented. Metadata version, mapping/source version and drawing file version are not engineering revisions.
 
-The supported deployment is one host with all application processes pointing
-to the same local SQLite file. SQLite locking is not a cross-host coordination
-mechanism; network-share and multi-host deployments require moving this
-registry and allocator to a shared transactional database before they are
-supported. Existing Safari `ProductPart` and `PartMappingReview` data are
-read-only compatibility inputs. New names are checked against a fresh read of
-legacy names, but writes from another legacy editor are outside this
-single-writer contract and must be controlled until migration. `GristPartStore`
-rejects Part writes. The default database under `state/` and all SQLite/WAL
-files are ignored by Git. Use `scripts/backup_part_registry.py` for a verified
-online backup. No Grist schema/data migration or business record write is part
-of this PR.
+`PartRevisionLine` pins exact line revisions and process types; `PartComponentRevision` pins child engineering revisions and positive quantity/UOM. All MCL, Toolshop and CNC categories are optional and mixable. Revision-specific drawings are optional. Vendor equivalents and actual purchases attach to one canonical Part specification, so adding a vendor never duplicates the Part. `purchased_parts.py` resolves the latest eligible actual purchase by transaction time across vendors and can persist `PurchasedPartCostEvidence`; it does not use or change `MaterialRateLog` selection.
 
-The Parts tab uses a two-pane explorer and guided create/details panel. The
-mapping view opens the same register without saving assignments, retains its
-source group and draft, and offers a separate explicit return action. Scope
-warnings are derived from the file's active Model Code associations; they never
-filter choices or block a mapping. Detailed line/drawing/per-code usage views
-remain explicitly unavailable or partial until stable identity is connected to
-those domains. Typed imports, Paint/Packing, Summary configuration, CR approval
-and legacy identity migration remain later work.
+The dedicated Parts UI has a collapsible scope/target tree and full detail/capture sections. Actual per-code `CostingConfiguration` / `ConfigurationPartSelection`, Summary parser/cost-run integration, CR approvals and legacy identity classification/migration remain unimplemented. `Used in` reports the configuration limitation rather than misrepresenting source mappings as usage. These gates remain independent of the completed Part storage slice.

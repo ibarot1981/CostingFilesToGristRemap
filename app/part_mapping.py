@@ -9,6 +9,7 @@ from typing import Any
 from app.domain import utc_now
 from app.exceptions import GristError
 from app.grist_types import grist_datetime, datetime_text
+from app.part_identity import PartIdentityError
 
 
 PART_SHEETS = {"5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"}
@@ -71,11 +72,7 @@ class GristPartStore:
 
 
 class PartRegistryMappingStore:
-    """Read legacy Grist Parts while writing new Part reviews to SQLite.
-
-    New assignments use stable Part UUIDs. Existing Grist Part and review rows
-    remain readable and are never rewritten by this adapter.
-    """
+    """Read legacy and managed Grist Parts; persist all mapping evidence in Grist."""
 
     def __init__(self, legacy_store, identity_store):
         self.legacy_store = legacy_store
@@ -92,45 +89,71 @@ class PartRegistryMappingStore:
 
     def records(self, table: str):
         if table == "ProductPart":
-            legacy = self.legacy_part_records()
-            return [*legacy, *self.identity_store.canonical_part_records()]
+            if hasattr(self.identity_store, "canonical_part_records"):
+                return [*self.legacy_part_records(), *self.identity_store.canonical_part_records()]
+            return self.legacy_part_records()
         if table == MAPPING_TABLE:
             legacy = self.legacy_store.records(MAPPING_TABLE)
             self.legacy_history_available = getattr(self.legacy_store, "available", True)
-            return [*legacy, *self.identity_store.mapping_records()]
+            if hasattr(self.identity_store, "mapping_records"):
+                return [*legacy, *self.identity_store.mapping_records()]
+            return legacy
         return self.legacy_store.records(table)
 
     def append(self, table: str, fields: list[dict[str, Any]]):
         if table == MAPPING_TABLE:
             try:
+                if hasattr(self.identity_store, "client"):
+                    return self.identity_store.append_mapping_records(fields)
                 return self.identity_store.append_mapping_records(fields)
-            except sqlite3.IntegrityError as exc:
-                raise PartConflict("PART_REVIEW_CONFLICT", "The Part review batch conflicts with saved review evidence.") from exc
-        raise PartConflict("PART_LEGACY_READ_ONLY", "Legacy Grist Part records are read-only; new Part reviews are stored in the local Part registry.")
+            except (sqlite3.IntegrityError, PartIdentityError) as exc:
+                raise PartConflict("PART_REVIEW_CONFLICT", "The Part review batch conflicts with saved Grist evidence.") from exc
+        raise PartConflict("PART_LEGACY_READ_ONLY", "Legacy Part masters are read-only; managed Part changes use the canonical Grist registry.")
 
 
 def list_parts(store) -> list[dict[str, Any]]:
     rows = store.records("ProductPart")
-    names: dict[str, list[int]] = {}
+    names: dict[str, list[str]] = {}
+    aliases_by_part: dict[str, list[str]] = {}
+    part_id_by_record = {str(row.get("id")): str(row.get("fields", {}).get("StablePartId") or row.get("id")) for row in rows}
+    try:
+        alias_rows = store.records("PartNameAlias")
+    except (KeyError, GristError):
+        alias_rows = []
+    for alias in alias_rows:
+        fields = alias.get("fields", {})
+        owner_id = part_id_by_record.get(_record_ref(fields.get("ProductPart")))
+        label = str(fields.get("DisplayName") or "")
+        if owner_id and label:
+            aliases_by_part.setdefault(owner_id, []).append(label)
+            if name_key(label):
+                names.setdefault(name_key(label), []).append(owner_id)
     for row in rows:
         fields = row["fields"]
         labels = [str(fields.get("DisplayName") or ""), *(fields.get("Aliases") or [])]
         for label in labels:
             if name_key(label):
-                names.setdefault(name_key(label), []).append(row["id"])
+                names.setdefault(name_key(label), []).append(str(fields.get("StablePartId") or row["id"]))
     result = []
     for row in rows:
         fields = row["fields"]
+        stable_id = str(fields.get("StablePartId") or "")
+        identity_id = stable_id or str(row["id"])
+        try:
+            record_id = int(row["id"])
+        except (TypeError, ValueError):
+            record_id = None
         name = str(fields.get("DisplayName") or "")
-        labels = [name, *(fields.get("Aliases") or [])]
+        labels = [name, *(fields.get("Aliases") or []), *aliases_by_part.get(identity_id, [])]
         duplicate = any(len(set(names.get(name_key(label), []))) > 1 for label in labels if name_key(label))
-        result.append({"id": str(row["id"]), "key": fields.get("PartKey"),
-            "name": name, "status": fields.get("Status"),
-            "selectable": bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"},
+        result.append({"id": identity_id, "gristRecordId": record_id, "key": fields.get("PartKey"),
+            "name": name, "status": fields.get("Status"), "aliases": aliases_by_part.get(identity_id, []),
+            "selectable": bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"} and fields.get("PublishStatus", "published") == "published",
             "duplicateName": duplicate, "partNumber": fields.get("PartNumber"),
             "engineeringRevision": fields.get("EngineeringRevision"), "scope": fields.get("ScopeType"),
-            "scopeTarget": fields.get("ScopeTarget"), "scopeTargetId": fields.get("ScopeTargetId"), "stableIdentity": bool(fields.get("StablePartId")),
-            "legacy": not bool(fields.get("StablePartId"))})
+            "scopeTarget": fields.get("ScopeTargetLabel") or fields.get("ScopeTarget"), "scopeTargetId": fields.get("ScopeTargetId"), "stableIdentity": bool(fields.get("StablePartId")),
+            "stablePartId": stable_id or None, "partRevisionRecordId": fields.get("CurrentPartRevision"),
+            "partMetadataRecordId": fields.get("CurrentMetadataVersion"), "legacy": not bool(stable_id)})
     return result
 
 
@@ -184,7 +207,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         candidates = by_group.get(group["key"], [])
         version = max((row["fields"]["Version"] for row in candidates), default=0)
         latest = [row["fields"] for row in candidates if row["fields"]["Version"] == version]
-        refs = {str(row.get("PartIdentity") or row.get("ProductPart")) for row in latest}
+        refs = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart"))) for row in latest}
         expected = {(row["sheet"], row["row"]) for row in group["rows"]}
         actual = {(row["SheetName"], int(row["SourceRow"])) for row in latest}
         part = next((part for part in parts if len(refs) == 1 and part["id"] in refs), None)
@@ -239,17 +262,38 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                              "AssociationVersion": association.version, "GroupKey": key,
                              "SheetName": source["sheet"], "SourceRow": source["row"],
                              "SourceDescription": known[key]["description"],
-                             "ProductPart": None if parts[part_id].get("stableIdentity") else int(part_id),
-                             "PartIdentity": part_id if parts[part_id].get("stableIdentity") else None,
+                             "ProductPart": int(parts[part_id]["gristRecordId"]) if parts[part_id].get("gristRecordId") is not None else (None if parts[part_id].get("stableIdentity") else int(part_id)),
+                             "StablePartId": part_id if parts[part_id].get("stableIdentity") and parts[part_id].get("gristRecordId") is not None else "",
+                             "PartIdentity": part_id if parts[part_id].get("stableIdentity") and parts[part_id].get("gristRecordId") is None else None,
+                             "PartRevision": _grist_ref(parts[part_id].get("partRevisionRecordId")) if parts[part_id].get("gristRecordId") is not None else None,
+                             "PartMetadataVersion": _grist_ref(parts[part_id].get("partMetadataRecordId")) if parts[part_id].get("gristRecordId") is not None else None,
+                             "PartNumberUsed": str(parts[part_id].get("partNumber") or ""),
+                             "NameUsed": str(parts[part_id].get("name") or ""),
                              "Version": version, "Actor": actor, "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
                              "RequestKey": request_key, "RequestFingerprint": payload_hash})
         for row in rows:
+            if not (row.get("ProductPart") is None and row.get("PartIdentity")):
+                row.pop("PartIdentity", None)
             row["RequestRowCount"] = len(rows)
         if before_write:
             before_write()
         store.append(MAPPING_TABLE, rows)
         _history(store, file_id)
         return {"idempotent": False, "version": version, "savedRows": len(rows)}
+
+
+def _record_ref(value: Any) -> str:
+    if isinstance(value, list) and len(value) > 2 and value[0] == "R":
+        return str(value[2])
+    return str(value or "")
+
+
+def _grist_ref(value: Any):
+    if value in (None, ""):
+        return None
+    if isinstance(value, list) and len(value) > 2 and value[0] == "R":
+        return int(value[2])
+    return int(value)
 
 
 def attach_mapping_evidence(evidence: dict[str, Any], detail: dict[str, Any]):

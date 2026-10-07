@@ -1,8 +1,8 @@
 # Part identity, automatic naming and sharing scope
 
-Recorded from the owner's instructions on 6 October 2026. Requirement PART-002; decision D066. Status: accepted requirement, implementation pending.
+Recorded from the owner's instructions on 6 October 2026. Requirement PART-002; decision D066. Status: accepted; Grist-backed implementation delivered in PR #3, with explicit remaining workflow gates listed at the end of this document.
 
-This is a prerequisite to advancing the Part mapping screens or applying reviewed Parts to imports. The 5 October screen is a preserved prototype; it does not yet satisfy this requirement.
+The requirements below remain the acceptance baseline. The 5 October prototype has since been replaced by the Grist-backed Part register and Parts explorer; see the implementation outcome at the end of this document.
 
 ## Permanent identity and numbering
 
@@ -87,3 +87,33 @@ Required acceptance cases:
 - Every new managed Part starts at Rev A; client/service/import attempts to create a later Part engineering revision fail until the CR flow and its required approval are available. Metadata/source history remains separate.
 
 Recording this requirement does not apply a live migration or change business records. Existing source ODS and Costing-New remain read-only; the normal verified-target and audit rules apply to later implementation.
+
+## Parts UI direction — 6 October 2026
+
+Owner-selected direction: dedicated Parts tab, also reachable from Part Mapping; two panes with Parts explorer and guided creation/selected-Part panel. Reuse Files page UI elements and styling. Full Part details must expose linked process lines, engineering revision, optional drawings, code usage and separated metadata/source history. GPT-6 Luna with xhigh reasoning is selected for implementation. Navigation from mapping must preserve source/draft context and keep assignment Save separate. Detailed design: PARTS_UI_DESIGN.md.
+
+## Part composition and purchased Parts — owner clarification, 7 October 2026
+
+A Part may have only MCL lines, only Toolshop lines, only CNC lines, any combination, child Parts/subparts, purchased-item requirements, or a combination of all these. None of the three manufacturing line categories is mandatory. Assemblies and purchased Parts have the same permanent identity/number and initial Rev A rules. Composition characteristics must not be implemented as mutually exclusive Part types. Parent-child relationships pin child engineering revisions and positive quantities per parent unit; reject recursive cycles and preserve historical definitions. An actual change to an established physical definition remains controlled by the future CR process.
+
+One physical purchased item has one canonical Part identity and number regardless of how many vendors supply it. Configuration selects that Part once, independently of vendor/rate history. Different physical specifications must remain distinct Parts; vendor equivalence must be reviewed rather than inferred from similar descriptions. A bearing, motor or engine can be configured directly or be a child of an assembly without requiring fabrication lines.
+
+Vendors may supply the same Part at different rates. Keep vendor-specific item references and actual purchase history separate from canonical identity. For current purchased-Part costing, use the latest eligible actual purchase across all vendors supplying that canonical Part, not the cheapest vendor, preferred vendor, latest quote or latest manually entered material rate. Preserve the selected purchase reference, vendor, date, normalized unit rate, currency/UOM and calculation basis. Historical costing results pin their purchase/rate evidence and do not change when a newer purchase arrives. Missing or incomparable rates must be explicit rather than silently becoming zero.
+
+This vendor/purchase design is a new requirement absent from current ODS files. Implement authoritative typed records and capture/review controls in Grist; do not fabricate purchase evidence from ODS. Operational details such as purchase-date basis, eligibility, equal-time conflicts, currency/UOM conversion and included charges need an explicit documented policy. The follow-up implementation prompt states safe initial assumptions and requires unresolved cases to be visible.
+
+Material-rate behavior remains separate: use the latest entered MaterialRateLog rate for a material when available, otherwise its Default Material rate. The new purchased-Part rule must not replace that existing rule.
+
+Follow-up implementation brief: `PARTS_GRIST_COMPLETION_PROMPT.md`. The Parts-only entity model records the deployed schema and its remaining deferred configuration relationships.
+
+## Implementation outcome — 7 October 2026
+
+The current implementation stores managed Part business records in the validated Safari Manufacturing Grist document. Schema `safari-parts-grist-2026-10-07.v8` was applied after an integrity-checked native Grist backup. The live migration was additive: legacy `ProductPart`, numeric `PartRevision`, and existing `LineMaster` ownership were not reclassified or rewritten. The production document contains no managed Part or purchase fixture records; only the single writer-coordinator row was bound. Synthetic create/update/purchase records were written and read back in a separate temporary Grist document, then that document was moved to Grist Trash.
+
+The local SQLite file is only a single-host coordinator, monotonic number reservation and recovery journal. Grist `ProductPart`, `PartMetadataVersion`, `PartNameAlias`, `PartScopeShortcode`, `PartShortcodeHistory`, `PartRevision`, `PartMappingReview`, `PartComponentRevision`, `PartRevisionLine`, `PartDrawing`, `Vendor`, `PartPurchaseSpecification`, `VendorPartMapping`, `PartPurchaseUnitConversion`, `PartPurchaseCurrencyConversion`, `PartPurchaseRecord`, `PurchasedPartCostEvidence`, `PartRegistryCoordinator`, and `PartRegistryRequest` hold the business data or durable Grist request evidence. The remote coordinator prevents silent multi-host takeover; the configured host must keep all application processes on the same durable local allocator file.
+
+Implemented acceptance coverage includes generated names and aliases; Rev A draft/finalized baseline; reviewed mapping references; collapsible scope/target tree; mixed MCL, Toolshop and CNC links; pinned child Parts and positive quantities; optional revision-specific drawings; canonical purchased identity with multiple reviewed vendor equivalents; immutable actual purchase history; as-of latest eligible actual purchase resolution; and persisted cost-run evidence. Legacy numeric revision rows remain legacy evidence and are not converted to Rev A.
+
+The purchased-rate policy uses transaction date/time (not entry time); only posted/completed actual purchases set a rate. Quotes, drafts, voids, and returns are excluded. Identical transaction lines collapse idempotently; contradictory duplicates and different rates at the same latest timestamp require review. Net merchandise deducts explicit discounts and excludes tax, freight and other charges. Unit/currency changes require explicit approved conversion evidence; a latest incomparable purchase does not silently fall back to an older rate. No history is unavailable rather than zero. This resolver is separate from the existing `MaterialRateLog` / Default Material behavior.
+
+Verified locally with Python tests, isolated real-Grist create/read-back/restart and recovery checks, and isolated browser navigation through mixed composition and purchase capture. Full per-Model-Code `CostingConfiguration` / `ConfigurationPartSelection` creation, automatic Summary costing integration, the approved CR workflow for Rev B+, and legacy identity migration are still unimplemented. They remain explicit completion gates; passing the Part slice does not enable costing completion or authority cutover.

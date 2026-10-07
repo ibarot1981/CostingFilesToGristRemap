@@ -2,6 +2,22 @@
 
 Implement the accepted Part creation and mapping requirements in `D:\Irshad\Dev\Python\CostingFilesToGristRemap`. This is an implementation request. Complete and verify Part creation first; then adapt Part mapping. These prerequisites take priority over later typed imports, per-code Summary configuration, processing completion, performance, CR management and spares work. Continue the existing Safari costing workflow rather than starting another implementation project.
 
+## Execution model
+
+The owner selected **GPT-6 Luna with Extra High reasoning**: `gpt-6-luna`, `xhigh`. Set these in the implementation chat before starting; prompt text alone does not switch the running model. Do not silently substitute another Luna version.
+
+## Required Parts UI
+
+Create a dedicated **Parts** tab, also reachable from Part Mapping. Use a **two-pane layout**: a Parts explorer on the left and a creation/selected-Part panel on the right. Match and reuse the Files page UI elements, controls, typography, spacing, colours, selection states, validation messages and keyboard behavior. Extract shared components where appropriate rather than introducing a separate design system. Do not add a third preview pane.
+
+The explorer supports search by Part number, current name and aliases, scope/target grouping and selectable Part rows. New Part opens the guided creation panel. Ask: where is it intended to be shared, which scope target, what is it called, what distinguishes this design, and why is it being created? Show a live server-validated generated-name preview, number allocated on Save and Rev A. Keep creation separate from assignment.
+
+Selecting an existing Part opens its summary/details on the right. Provide Open full Part details with a stable Part identity route and return navigation that preserves explorer selection/search. The full Part page has Overview, Process lines, Drawings, Used in, and History sections. Process lines list linked MCL/Tool/CNC requirements and available quantities, weights and source/revision evidence; show empty/unavailable states accurately. Drawing links are optional and identify the associated Part engineering revision and separately recorded drawing/file version; do not invent drawings or alter files. Provide a drawing preview/open action when a valid linked drawing is available. History distinguishes engineering Rev A, name/scope metadata versions and mapping/source audit. Do not implement Rev B controls.
+
+From Part Mapping, opening creation/details must retain the workbook, selected source row/group and draft decisions. Returning with a selected/new Part may fill the choice, but never save the assignment automatically.
+
+The suggested Files layout is explorer plus association/details, with workbook inspection in its existing dedicated preview page. Treat that Files simplification as a separate layout proposal until its exact scope is confirmed; do not refactor it just to implement the Parts page. See docs/PARTS_UI_DESIGN.md.
+
 ## Inspect and preserve the current baseline
 
 Inspect git status, branch, recent commits, remotes and applicable AGENTS.md instructions. Preserve any uncommitted work before editing. Read:
