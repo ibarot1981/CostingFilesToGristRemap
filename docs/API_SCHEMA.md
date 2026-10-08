@@ -1,6 +1,6 @@
 # Phase 0 API and schema contract
 
-> Owner scope update D070, 8 October 2026: Live Cost, explicit normalized Cost Snapshots, policy inheritance and attributable comparisons are implemented in application code and the v9 schema. Ordinary live viewing persists no costing history/evidence. Existing source-workbook CostingSnapshot remains separate.
+> Owner scope update D070, 8 October 2026: Live Cost, explicit normalized Cost Snapshots, policy inheritance and attributable comparisons are implemented in the v9 base schema. Schema v10 adds normalized, audited Part intended-sharing relationships. Ordinary live viewing and intended-sharing edits persist no costing history/evidence. Existing source-workbook CostingSnapshot remains separate.
 
 All JSON errors have a stable `detail.code` and `detail.message`.
 
@@ -159,7 +159,7 @@ Schema safari-part-review-2026-10-05.v7 adds PartMappingReview and ProductPart N
 
 ## Grist-backed Parts API and schema — 8 October 2026
 
-Schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated Safari Manufacturing Grist document. It extends the existing Part tables, including `PartComponentRevision.SourcingRoute`, and adds explicit configuration, process-rate, snapshot, evidence, policy and publication-journal tables. The business records are canonical in Grist. The local `SAFARI_PART_DATABASE_PATH` SQLite file is a single-host reservation, serialization and recovery journal only. Do not copy a local DB as a substitute for Grist backup or use independently initialized allocators on multiple hosts.
+Schema `safari-part-intended-sharing-grist-2026-10-08.v10` is applied to the validated Safari Manufacturing Grist document on top of the v9 Live Cost/Snapshot base. It adds normalized intended-sharing links, sharing state/history and a durable request payload column. The business records are canonical in Grist. The local `SAFARI_PART_DATABASE_PATH` SQLite file is a single-host reservation, serialization and recovery journal only. Do not copy a local DB as a substitute for Grist backup or use independently initialized allocators on multiple hosts.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -167,8 +167,9 @@ Schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated S
 | `GET /api/parts/scope-targets` | Active Product, Product Model and Model Code targets plus maintained shortcodes. |
 | `GET /api/parts/preview?scope=&target_id=&description=&variant=&exclude_id=` | Server-generated name preview and normalized collision status. |
 | `POST /api/parts/shortcodes` | Create/update a scope shortcode with actor, reason and `Idempotency-Key`. |
-| `POST /api/parts` | Create stable UUID + permanent number, generated metadata/alias and Rev A in Grist. Actor comes from trusted request context; reason and `Idempotency-Key` are required. |
-| `GET /api/parts/{part_id}` | Stable Part detail with metadata/alias/mapping/lifecycle history and joined line, child, drawing and purchase sections. |
+| `POST /api/parts` | Create stable UUID + permanent number, generated metadata/alias and Rev A in Grist. Optional `selectedProductId`, `selectedProductModelId` and `intendedModelCodeIds` save initial advisory sharing in the same recoverable Save. Actor comes from trusted request context; reason and `Idempotency-Key` are required. |
+| `GET /api/parts/{part_id}` | Stable Part detail with metadata/alias/mapping/lifecycle history, normalized `intendedSharing`, direct `usedIn` configuration selections, and joined line, child, drawing and purchase sections. |
+| `PUT /api/parts/{part_id}/intended-sharing` | Save the complete intended-code set with `expectedVersion`, `intendedModelCodeIds`, reason and `Idempotency-Key`; optional Product/Model filter IDs are validated against each code. |
 | `GET /api/parts/{part_id}/metadata-preview` | Proposed name/scope change and current reference fingerprint. |
 | `POST /api/parts/{part_id}/metadata` | Version-checked metadata change; preserves identity/number/A and records prior name as alias. |
 | `POST /api/parts/{part_id}/retire` | Audited retirement; never releases or reuses number/name reservations. |
@@ -193,13 +194,13 @@ Schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated S
 | `GET /api/model-codes/{code_id}/cost-policy` / `PUT /api/cost-snapshot-policies/{scope_type}` | Resolve or version the System → Product Model → Model Code reminder policy; Manual suppresses inheritance, and no schedule creates snapshots automatically. |
 | `POST /api/line-masters/{line_master_id}/process-rates` | Capture an explicitly sourced, dated, versioned process rate for Live Cost. |
 
-Mutating calls use stable idempotency keys; reusing a key with changed payload returns a conflict. After response loss, retry the identical key and payload. Inspect `PartRegistryRequest` and the relevant business table before manual recovery; do not allocate a second Part because a request timed out. One Grist `PartRegistryCoordinator` binds the configured host/local allocator. A different host/coordinator cannot take over automatically.
+Mutating calls use stable idempotency keys; reusing a key with changed payload returns a conflict. After response loss, retry the identical key and payload. Inspect `PartRegistryRequest` and the relevant business table before manual recovery; do not allocate a second Part because a request timed out. One Grist `PartRegistryCoordinator` binds the configured host/local allocator. A different host/coordinator cannot take over automatically. Intended sharing is advisory: its save does not configure a code, assign quantities, create mappings or snapshots, or alter Part naming/identity/revision. The naming anchor remains a single independent Global/Product/Model/Code scope.
 
 ### Revision and compatibility boundaries
 
 New managed Parts use `ProductPart.EngineeringRevision=A` and a separate `PartRevision.RevisionLabel=A` baseline with Draft/Finalized status. The pre-existing numeric `PartRevision.Revision` field remains untouched as legacy/source evidence. Metadata version, source mapping version and drawing file version are not Part engineering revisions. Rev B+ cannot be created until the governed CR workflow and approval evidence exist.
 
-`PartRevisionLine` pins exact line revisions. `PartComponentRevision` pins parent/child revision plus quantity/UOM and occurrence sourcing route. MCL, Toolshop and CNC links are optional and may be mixed. Drawings are optional. Explicit per-code `CostingConfiguration`/`ConfigurationPartSelection` and disposable Live Cost are implemented; automatic Summary import/authority integration is not. `Used in` reports explicit configuration references and does not infer them from scope or source mappings.
+`PartRevisionLine` pins exact line revisions. `PartComponentRevision` pins parent/child revision plus quantity/UOM and occurrence sourcing route. MCL, Toolshop and CNC links are optional and may be mixed. Drawings are optional. `PartIntendedModelCode` records advisory sharing separately from explicit per-code `CostingConfiguration`/`ConfigurationPartSelection`. `Used in configurations` derives direct selections from current active published configuration revisions. Component/indirect usage is not included in this view. Automatic Summary import/authority integration is not implemented.
 
 ### Purchased-Part costing policy
 
@@ -209,6 +210,6 @@ Applied rate is net merchandise per costing UOM: deduct explicit discount, exclu
 
 ### Deployed schema and verification boundary
 
-The v9 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. It added ten configuration/rate/snapshot/policy/publication tables and one component-route column, with no type changes. Live production retains 1 legacy ProductPart, 1 legacy numeric PartRevision and 313 LineMaster rows, with 0 mapping reviews and 0 managed Part/purchase fixture rows. One coordinator row is bound. No legacy ownership or revision was silently migrated.
+The v9 base apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. It added ten configuration/rate/snapshot/policy/publication tables and one component-route column. The v10 apply used a separate verified native backup and added `PartIntendedSharingState`, `PartIntendedModelCode`, `PartIntendedSharingEvent` and `PartRegistryRequest.Payload`; no existing column type changed. Live production retains 1 legacy ProductPart, 1 legacy numeric PartRevision and 313 LineMaster rows, with 0 mapping reviews, 0 Part sharing rows and 0 managed Part/purchase fixtures. One coordinator row is bound. No legacy ownership or revision was silently migrated.
 
-An isolated temporary Grist document verified real API create/read-back/restart, metadata alias history, mapping, child quantity, process-line linkage, multiple vendors, current and historical purchase selection, configuration/policy persistence, Live Cost no-write, same-key snapshot recovery after an actual committed-row timeout, frozen historical reads and rate attribution. The test document was moved to Trash. Automatic Summary import/authority integration, CR approval and legacy identity migration are still open.
+Isolated temporary Grist documents verified real API create/read-back/restart, metadata alias history, mapping, child quantity, process-line linkage, multiple vendors, current and historical purchase selection, configuration/policy persistence, Live Cost no-write, same-key snapshot recovery after an actual committed-row timeout, frozen historical reads and rate attribution. The cascade browser document verified one Part with two intended codes, then an audited removal, while configuration usage stayed empty. Test documents were moved to Trash after readback. Automatic Summary import/authority integration, CR approval and legacy identity migration are still open.

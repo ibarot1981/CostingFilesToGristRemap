@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
-from app.part_identity import PartIdentityError
+from app.part_identity import PartIdentityError, request_fingerprint
 
 
 class MemoryGrist:
@@ -92,6 +93,153 @@ class GristPartRecoveryTests(unittest.TestCase):
         return registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
             description=description, variant=variant, expected_name=f"S1K — {description}" + (f" — {variant}" if variant else ""),
             actor="test operator", reason="isolated recovery test", request_key=request_key, revision_assertion="A")
+
+    def seed_model_codes(self, client):
+        client.tables["Product"] = [{"id": 17, "fields": {"Name": "Safari 1000", "Active": True}}]
+        client.tables["ProductModel"] = [{"id": 201, "fields": {"Product": 17, "ModelNumber": "S1KHF", "Name": "Safari 1000 HF", "Active": True}}]
+        client.tables["ProductModelCode"] = [
+            {"id": 301, "fields": {"ProductModel": 201, "Code": "HF-ELP", "Active": True}},
+            {"id": 302, "fields": {"ProductModel": 201, "Code": "HF-STD", "Active": True}},
+        ]
+
+    def share(self, registry, part, *, codes, version, key="sharing-1"):
+        return registry.save_intended_sharing(part_id=part["id"], code_ids=codes, expected_version=version,
+            actor="sharing reviewer", reason="Shared chassis design", request_key=key, product_id=17, model_id=201)
+
+    def test_intended_codes_are_normalized_audited_and_idempotent_without_configuration_writes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry)["part"]
+
+            saved = self.share(registry, part, codes=[302, 301], version=0)
+            self.assertEqual((saved["version"], saved["activeCodeIds"], saved["idempotent"]), (1, [301, 302], False))
+            self.assertEqual(len(client.tables["PartIntendedModelCode"]), 2)
+            self.assertEqual({row["fields"]["Status"] for row in client.tables["PartIntendedModelCode"]}, {"active"})
+            self.assertEqual(len(client.tables["PartIntendedSharingEvent"]), 2)
+            self.assertEqual(registry.intended_sharing(part["id"])["version"], 1)
+            self.assertEqual(len(registry.intended_sharing(part["id"])["items"]), 2)
+            self.assertFalse(client.tables.get("CostingConfiguration"))
+            self.assertFalse(client.tables.get("ConfigurationPartSelection"))
+            self.assertFalse(client.tables.get("CostSnapshot"))
+
+            replay = self.share(registry, part, codes=[301, 302], version=0)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(len(client.tables["PartIntendedSharingEvent"]), 2)
+            self.assertEqual(registry.get_part(part["id"])["partNumber"], part["partNumber"])
+            self.assertEqual(registry.get_part(part["id"])["metadataVersion"], 1)
+
+    def test_add_remove_readd_preserves_pair_and_appends_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry)["part"]
+            self.share(registry, part, codes=[301, 302], version=0, key="share-add")
+            self.share(registry, part, codes=[302], version=1, key="share-remove")
+            self.share(registry, part, codes=[301, 302], version=2, key="share-readd")
+            links = client.tables["PartIntendedModelCode"]
+            self.assertEqual(len(links), 2)
+            self.assertEqual({row["fields"]["Status"] for row in links}, {"active"})
+            self.assertEqual(len(client.tables["PartIntendedSharingEvent"]), 4)
+            self.assertEqual(registry.intended_sharing(part["id"])["version"], 3)
+            unchanged = registry.get_part(part["id"])
+            self.assertEqual((unchanged["partNumber"], unchanged["name"], unchanged["scope"], unchanged["metadataVersion"], unchanged["engineeringRevision"]),
+                             (part["partNumber"], part["name"], part["scope"], part["metadataVersion"], "A"))
+
+    def test_stale_set_and_reused_key_with_different_codes_conflict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry)["part"]
+            self.share(registry, part, codes=[301], version=0, key="same-key")
+            with self.assertRaises(PartIdentityError) as stale:
+                self.share(registry, part, codes=[302], version=0, key="stale-key")
+            self.assertEqual(stale.exception.code, "PART_INTENDED_SHARING_STALE")
+            with self.assertRaises(PartIdentityError) as conflict:
+                self.share(registry, part, codes=[302], version=0, key="same-key")
+            self.assertEqual(conflict.exception.code, "PART_REQUEST_CONFLICT")
+
+    def test_partial_link_write_recovers_after_registry_restart_without_duplicate_events(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "parts.sqlite3"
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, path)
+            part = self.create(registry)["part"]
+            client.lose_after_update_table = "PartIntendedModelCode"
+            with self.assertRaises(TimeoutError):
+                self.share(registry, part, codes=[301, 302], version=0, key="recover-share")
+            resumed = self.make_registry(client, path)
+            result = self.share(resumed, part, codes=[302, 301], version=0, key="recover-share")
+            self.assertEqual(result["version"], 1)
+            self.assertEqual(len(client.tables["PartIntendedModelCode"]), 2)
+            self.assertEqual(len(client.tables["PartIntendedSharingEvent"]), 2)
+            self.assertEqual(client.tables["PartRegistryRequest"][-1]["fields"]["Status"], "published")
+
+    def test_state_write_response_loss_recovers_from_complete_event_set(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "parts.sqlite3"
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, path)
+            part = self.create(registry)["part"]
+            client.create_table_records("PartIntendedSharingState", [{"fields": {
+                "SharingStateKey": part["id"], "ProductPart": part["gristRecordId"], "Version": 0,
+                "Fingerprint": request_fingerprint([]), "UpdatedAt": 1.0,
+            }}])
+            client.lose_after_update_table = "PartIntendedSharingState"
+            with self.assertRaises(TimeoutError):
+                self.share(registry, part, codes=[301, 302], version=0, key="recover-state")
+
+            restarted = self.make_registry(client, path)
+            recovered = self.share(restarted, part, codes=[302, 301], version=0, key="recover-state")
+            self.assertTrue(recovered["recovered"])
+            self.assertEqual(recovered["version"], 1)
+            self.assertEqual(len(client.tables["PartIntendedSharingEvent"]), 2)
+            self.assertEqual(client.tables["PartRegistryRequest"][-1]["fields"]["Status"], "published")
+
+    def test_pending_stale_request_is_not_reported_as_saved_after_another_edit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry)["part"]
+            self.share(registry, part, codes=[301], version=0, key="first-sharing-edit")
+
+            actor = "sharing reviewer"
+            reason = "Shared chassis design"
+            desired = [302]
+            fingerprint = request_fingerprint([part["id"], desired, 0, actor, reason])
+            payload = {"beforeCodeIds": [], "desiredCodeIds": desired, "partId": part["id"],
+                "expectedVersion": 0, "actor": actor, "reason": reason}
+            client.create_table_records("PartRegistryRequest", [{"fields": {
+                "RequestKey": "pending-stale-sharing", "RequestType": "save_intended_sharing",
+                "RequestFingerprint": fingerprint, "EntityUUID": part["id"], "Status": "publishing",
+                "Payload": json.dumps(payload, sort_keys=True), "StartedAt": 1.0, "UpdatedAt": 1.0,
+            }}])
+
+            with self.assertRaises(PartIdentityError) as stale:
+                self.share(registry, part, codes=desired, version=0, key="pending-stale-sharing")
+            self.assertEqual(stale.exception.code, "PART_INTENDED_SHARING_STALE")
+            self.assertEqual(registry.intended_sharing(part["id"])["items"][0]["id"], 301)
+            pending = next(row for row in client.tables["PartRegistryRequest"] if row["fields"]["RequestKey"] == "pending-stale-sharing")
+            self.assertEqual(pending["fields"]["Status"], "publishing")
+
+    def test_intended_code_must_be_active_and_inside_creation_filter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            with self.assertRaises(PartIdentityError) as error:
+                registry.validate_intended_model_codes([301], product_id=99)
+            self.assertEqual(error.exception.code, "PART_INTENDED_CONTEXT_INVALID")
+            client.tables["ProductModelCode"][0]["fields"]["Active"] = False
+            with self.assertRaises(PartIdentityError) as inactive:
+                registry.validate_intended_model_codes([301], product_id=17, model_id=201)
+            self.assertEqual(inactive.exception.code, "PART_INTENDED_CODE_INACTIVE")
 
     def rename(self, registry, part, *, request_key, description):
         target_id = part["scopeTargetId"]

@@ -40,6 +40,7 @@ REQUEST_TABLE = "PartRegistryRequest"
 MANAGED_TABLES = {
     "ProductPart", "PartMetadataVersion", "PartNameAlias", "PartScopeShortcode",
     "PartShortcodeHistory", "PartRevision", "PartMappingReview", "PartComponentRevision",
+    "PartIntendedSharingState", "PartIntendedModelCode", "PartIntendedSharingEvent",
     "PartRevisionLine", "PartDrawing", "Vendor", "PartPurchaseSpecification",
     "VendorPartMapping", "PartPurchaseRecord", "PurchasedPartCostEvidence", "AuditEvent", "PurchaseItem",
     "CostingConfiguration", "CostingConfigurationRevision", "ConfigurationPartSelection", "CostingProcessRate",
@@ -221,7 +222,7 @@ class GristPartRegistry:
         existing = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
         if existing:
             fields = existing.get("fields", {})
-            if fields.get("RequestFingerprint") != fingerprint:
+            if fields.get("RequestFingerprint") != fingerprint or fields.get("RequestType") != request_type:
                 raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different data.")
             return existing
         now = grist_datetime(utc_now())
@@ -483,6 +484,238 @@ class GristPartRegistry:
                 continue
             result.append(part)
         return sorted(result, key=lambda item: (item["scope"], item["scopeTarget"].casefold(), item["name"].casefold()))
+
+    def validate_intended_model_codes(self, code_ids: list[Any], *, product_id: Any = None, model_id: Any = None) -> list[int]:
+        """Validate active code references and the optional cascade filter on the server."""
+        if not isinstance(code_ids, list):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Codes must be submitted as a list.")
+        try:
+            normalized_ids = [int(value) for value in code_ids]
+        except (TypeError, ValueError):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Every intended Model Code must be a Grist record ID.")
+        if any(value <= 0 for value in normalized_ids) or len(set(normalized_ids)) != len(normalized_ids):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Code IDs must be positive and unique.")
+        try:
+            product_record_id = int(product_id) if product_id not in (None, "") else None
+            model_record_id = int(model_id) if model_id not in (None, "") else None
+        except (TypeError, ValueError):
+            raise PartIdentityError("PART_INTENDED_CONTEXT_INVALID", "Product and Product Model filters must reference Grist records.")
+        models = {int(row["id"]): row.get("fields", {}) for row in self._rows("ProductModel")}
+        products = {int(row["id"]): row.get("fields", {}) for row in self._rows("Product")}
+        codes = {int(row["id"]): row.get("fields", {}) for row in self._rows("ProductModelCode")}
+        if model_record_id is not None:
+            model = models.get(model_record_id, {})
+            if not model or not model.get("Active", True) or (product_record_id is not None and _ref(model.get("Product")) != product_record_id):
+                raise PartIdentityError("PART_INTENDED_CONTEXT_INVALID", "Choose an active Product Model under the selected Product.")
+        if product_record_id is not None and (product_record_id not in products or not products[product_record_id].get("Active", True)):
+            raise PartIdentityError("PART_INTENDED_CONTEXT_INVALID", "Choose an active Product for the intended-code filter.")
+        for code_id in normalized_ids:
+            code = codes.get(code_id)
+            model_id_for_code = _ref(code.get("ProductModel")) if code else None
+            model = models.get(model_id_for_code or -1, {})
+            product_for_code = _ref(model.get("Product"))
+            product = products.get(product_for_code or -1, {})
+            if (not code or not code.get("Active", True) or code.get("LegacySparesOnly")
+                    or not model or not model.get("Active", True)
+                    or not product or not product.get("Active", True)):
+                raise PartIdentityError("PART_INTENDED_CODE_INACTIVE", f"Model Code {code_id} is missing, inactive or reserved for legacy spares.")
+            if product_record_id is not None and product_for_code != product_record_id:
+                raise PartIdentityError("PART_INTENDED_CONTEXT_INVALID", f"Model Code {code_id} is outside the selected Product filter.")
+            if model_record_id is not None and model_id_for_code != model_record_id:
+                raise PartIdentityError("PART_INTENDED_CONTEXT_INVALID", f"Model Code {code_id} is outside the selected Product Model filter.")
+        return sorted(normalized_ids)
+
+    def _sharing_state(self, part: dict[str, Any]) -> dict[str, Any] | None:
+        return self._find(self._rows("PartIntendedSharingState"), "SharingStateKey", str(part["id"]))
+
+    def intended_sharing(self, part_id: str) -> dict[str, Any]:
+        part = self.get_part(part_id)
+        if not part:
+            raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
+        state_row = self._sharing_state(part)
+        state_fields = state_row.get("fields", {}) if state_row else {}
+        links = [row for row in self._rows("PartIntendedModelCode")
+                 if _ref(row.get("fields", {}).get("ProductPart")) == part["gristRecordId"]]
+        active = [row for row in links if str(row.get("fields", {}).get("Status") or "").casefold() == "active"]
+        active_ids = [_ref(row.get("fields", {}).get("ProductModelCode")) for row in active]
+        if None in active_ids or len(set(active_ids)) != len(active_ids):
+            raise PartIdentityError("PART_INTENDED_SHARING_CONFLICT", "Grist contains duplicate active Part/Model Code links; review is required before editing.")
+        if state_row:
+            actual_fp = request_fingerprint(sorted(active_ids))
+            if state_fields.get("Fingerprint") != actual_fp:
+                raise PartIdentityError("PART_INTENDED_SHARING_DRIFT", "The intended-sharing links changed outside the coordinated Part editor. Review the Grist rows before saving.")
+        elif links:
+            raise PartIdentityError("PART_INTENDED_SHARING_DRIFT", "Part/Model Code rows exist without a coordinated sharing version. Review the Grist rows before continuing.")
+        codes = {int(row["id"]): row.get("fields", {}) for row in self._rows("ProductModelCode")}
+        models = {int(row["id"]): row.get("fields", {}) for row in self._rows("ProductModel")}
+        products = {int(row["id"]): row.get("fields", {}) for row in self._rows("Product")}
+        items = []
+        for row in active:
+            fields = row.get("fields", {})
+            code_id = _ref(fields.get("ProductModelCode"))
+            code = codes.get(code_id or -1, {})
+            model_id = _ref(code.get("ProductModel"))
+            model = models.get(model_id or -1, {})
+            product_id = _ref(model.get("Product"))
+            items.append({"id": code_id, "code": code.get("Code") or "", "description": code.get("Description") or "",
+                "modelId": model_id, "model": " ".join(str(value) for value in (model.get("ModelNumber"), model.get("Name")) if value),
+                "productId": product_id, "product": products.get(product_id or -1, {}).get("Name") or "",
+                "linkKey": fields.get("IntendedModelCodeKey"), "version": fields.get("Version") or 1,
+                "createdAt": fields.get("CreatedAt"), "createdBy": fields.get("CreatedBy"), "createdReason": fields.get("CreatedReason"),
+                "updatedAt": fields.get("UpdatedAt"), "updatedBy": fields.get("UpdatedBy"), "updatedReason": fields.get("UpdatedReason")})
+        events = [row.get("fields", {}) for row in self._rows("PartIntendedSharingEvent")
+                  if _ref(row.get("fields", {}).get("ProductPart")) == part["gristRecordId"]]
+        for event in events:
+            code = codes.get(_ref(event.get("ProductModelCode")) or -1, {})
+            event["Code"] = code.get("Code") or ""
+        events.sort(key=lambda item: (str(item.get("OccurredAt") or ""), int(item.get("Version") or 0), str(item.get("SharingEventKey") or "")))
+        return {"status": "available", "version": int(state_fields.get("Version") or 0),
+            "fingerprint": state_fields.get("Fingerprint") or request_fingerprint([]), "items": sorted(items, key=lambda item: (item["product"].casefold(), item["model"].casefold(), item["code"].casefold())),
+            "history": events, "directOnly": True}
+
+    @_serialized
+    def save_intended_sharing(self, *, part_id: str, code_ids: list[Any], expected_version: int, actor: str,
+                              reason: str, request_key: str, product_id: Any = None, model_id: Any = None) -> dict[str, Any]:
+        self._verify_writer()
+        part = self.get_part(part_id)
+        if not part:
+            raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
+        if type(expected_version) is not int or expected_version < 0 or not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_INTENDED_SHARING_INPUT_INVALID", "A valid expected version, actor, reason and idempotency key are required.")
+        desired = self.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
+        fingerprint = request_fingerprint([part_id, desired, expected_version, actor.strip(), reason.strip()])
+        state_row = self._sharing_state(part)
+        state = state_row.get("fields", {}) if state_row else {"Version": 0, "Fingerprint": request_fingerprint([])}
+        current_version = int(state.get("Version") or 0)
+        request = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
+        if request:
+            fields = request.get("fields", {})
+            if fields.get("RequestType") != "save_intended_sharing" or fields.get("RequestFingerprint") != fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different intended-sharing data.")
+            if fields.get("Status") == "published":
+                try:
+                    result = json.loads(fields.get("Result") or "{}")
+                except (TypeError, ValueError):
+                    result = {}
+                if result:
+                    return {**result, "idempotent": True}
+        else:
+            if current_version != expected_version:
+                raise PartIdentityError("PART_INTENDED_SHARING_STALE", "Intended sharing changed since this editor loaded it. Reload before saving.")
+            part_links = [row for row in self._rows("PartIntendedModelCode")
+                          if _ref(row.get("fields", {}).get("ProductPart")) == part["gristRecordId"]]
+            active_rows = [row for row in part_links
+                           if _ref(row.get("fields", {}).get("ProductPart")) == part["gristRecordId"]
+                           and str(row.get("fields", {}).get("Status") or "").casefold() == "active"]
+            before = sorted(_ref(row.get("fields", {}).get("ProductModelCode")) for row in active_rows)
+            if None in before or len(set(before)) != len(before) or state_row and request_fingerprint(before) != state.get("Fingerprint") or not state_row and part_links:
+                raise PartIdentityError("PART_INTENDED_SHARING_DRIFT", "The intended-sharing links changed outside the coordinated Part editor. Review the Grist rows before saving.")
+            now = grist_datetime(utc_now())
+            payload = {"beforeCodeIds": before, "desiredCodeIds": desired, "partId": part_id,
+                       "expectedVersion": expected_version, "actor": actor.strip(), "reason": reason.strip()}
+            self.client.create_table_records(REQUEST_TABLE, [{"fields": {"RequestKey": request_key, "RequestType": "save_intended_sharing",
+                "RequestFingerprint": fingerprint, "EntityUUID": part_id, "Status": "publishing", "Payload": json.dumps(payload, sort_keys=True),
+                "StartedAt": now, "UpdatedAt": now, "WriterHostId": self.host_id, "CoordinatorId": self.coordinator_id}}])
+            request = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
+            if not request or request.get("fields", {}).get("RequestFingerprint") != fingerprint:
+                raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the intended-sharing request journal.")
+            fields = request.get("fields", {})
+
+        try:
+            payload = json.loads(fields.get("Payload") or "{}")
+        except (TypeError, ValueError):
+            raise PartIdentityError("PART_INTENDED_SHARING_RECOVERY_REQUIRED", "The saved intended-sharing request has no readable recovery payload.")
+        if payload.get("partId") != part_id or payload.get("desiredCodeIds") != desired or payload.get("expectedVersion") != expected_version:
+            raise PartIdentityError("PART_REQUEST_CONFLICT", "The durable intended-sharing request payload does not match this retry.")
+        before = sorted(int(value) for value in payload.get("beforeCodeIds", []))
+        started_at = fields.get("StartedAt") or grist_datetime(utc_now())
+        changes = [(code_id, "remove") for code_id in before if code_id not in desired]
+        changes += [(code_id, "add") for code_id in desired if code_id not in before]
+        result_version = expected_version + (1 if changes else 0)
+
+        # A previous attempt may have committed the state token but lost its final
+        # acknowledgement. Prove the request's complete immutable event set before
+        # acknowledging it after the state has advanced; a merely stale pending
+        # request must never be reported as saved.
+        if current_version > expected_version:
+            expected_events = {}
+            for code_id, action in changes:
+                event_key = f"{part_id}:sharing:{request_key}:{code_id}"
+                expected_events[event_key] = (code_id, action, request_fingerprint([fingerprint, code_id, action]))
+            observed_events = {
+                str(row.get("fields", {}).get("SharingEventKey") or ""): row.get("fields", {})
+                for row in self._rows("PartIntendedSharingEvent")
+                if row.get("fields", {}).get("RequestKey") == request_key
+            }
+            complete_event_set = set(observed_events) == set(expected_events)
+            if complete_event_set:
+                for event_key, (code_id, action, event_fingerprint) in expected_events.items():
+                    event = observed_events[event_key]
+                    if (_ref(event.get("ProductPart")) != part["gristRecordId"]
+                            or _ref(event.get("ProductModelCode")) != code_id
+                            or event.get("Action") != action
+                            or int(event.get("Version") or 0) != result_version
+                            or event.get("RequestFingerprint") != event_fingerprint):
+                        complete_event_set = False
+                        break
+            if complete_event_set:
+                result = {"partId": part_id, "version": result_version, "activeCodeIds": desired,
+                          "fingerprint": request_fingerprint(desired), "recovered": True}
+                self._complete_request(request, result)
+                return {**result, "idempotent": True}
+            raise PartIdentityError("PART_INTENDED_SHARING_STALE", "This pending sharing request was superseded before its complete change set was saved. Reload before saving.")
+
+        if current_version != expected_version:
+            raise PartIdentityError("PART_INTENDED_SHARING_STALE", "Intended sharing changed while this request was pending. Reload before saving.")
+
+        for code_id, action in changes:
+            pair_key = f"{part_id}:{code_id}"
+            link = self._find(self._rows("PartIntendedModelCode"), "IntendedModelCodeKey", pair_key)
+            if action == "remove" and not link:
+                raise PartIdentityError("PART_INTENDED_SHARING_DRIFT", f"The intended link for Model Code {code_id} is missing during removal recovery.")
+            link_version = int((link or {}).get("fields", {}).get("Version") or 0) + 1
+            if not link:
+                self.client.create_table_records("PartIntendedModelCode", [{"fields": {"IntendedModelCodeKey": pair_key,
+                    "ProductPart": part["gristRecordId"], "ProductModelCode": code_id, "Status": "removed", "Version": 0,
+                    "CreatedAt": started_at, "CreatedBy": payload["actor"], "CreatedReason": payload["reason"],
+                    "CreateRequestKey": request_key, "CreateRequestFingerprint": fingerprint}}])
+                link = self._find(self._rows("PartIntendedModelCode"), "IntendedModelCodeKey", pair_key)
+            if not link:
+                raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the normalized Part/Model Code relationship.")
+            event_key = f"{part_id}:sharing:{request_key}:{code_id}"
+            event_fingerprint = request_fingerprint([fingerprint, code_id, action])
+            event_fields = {"SharingEventKey": event_key, "IntendedModelCode": int(link["id"]), "ProductPart": part["gristRecordId"],
+                "ProductModelCode": code_id, "Action": action, "Version": result_version, "Actor": payload["actor"],
+                "Reason": payload["reason"], "OccurredAt": started_at, "RequestKey": request_key, "RequestFingerprint": event_fingerprint}
+            self._ensure_keyed("PartIntendedSharingEvent", "SharingEventKey", event_key, event_fields)
+            desired_link_status = "active" if action == "add" else "removed"
+            link_fields = link.get("fields", {})
+            if not (link_fields.get("LastRequestKey") == request_key and link_fields.get("Status") == desired_link_status):
+                self.client.update_table_records("PartIntendedModelCode", [{"id": int(link["id"]), "fields": {
+                    "Status": desired_link_status, "Version": link_version,
+                    "UpdatedAt": started_at, "UpdatedBy": payload["actor"], "UpdatedReason": payload["reason"],
+                    "LastRequestKey": request_key, "LastRequestFingerprint": fingerprint}}])
+            confirmed_link = self._find(self._rows("PartIntendedModelCode"), "IntendedModelCodeKey", pair_key)
+            if not confirmed_link or confirmed_link.get("fields", {}).get("Status") != desired_link_status:
+                raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the intended-sharing relationship update.")
+
+        if current_version == expected_version and changes:
+            state_fields = {"SharingStateKey": part_id, "ProductPart": part["gristRecordId"], "Version": result_version,
+                "Fingerprint": request_fingerprint(desired), "UpdatedAt": started_at, "UpdatedBy": payload["actor"],
+                "UpdatedReason": payload["reason"], "LastRequestKey": request_key, "LastRequestFingerprint": fingerprint}
+            if state_row:
+                self.client.update_table_records("PartIntendedSharingState", [{"id": int(state_row["id"]), "fields": state_fields}])
+            else:
+                self.client.create_table_records("PartIntendedSharingState", [{"fields": state_fields}])
+        state_after = self._sharing_state(part) or {"fields": {"Version": 0, "Fingerprint": request_fingerprint([])}}
+        state_after_fields = state_after.get("fields", {})
+        if changes and (int(state_after_fields.get("Version") or 0) != result_version
+                        or state_after_fields.get("Fingerprint") != request_fingerprint(desired)):
+            raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the intended-sharing version and membership fingerprint.")
+        result = {"partId": part_id, "version": result_version, "activeCodeIds": desired,
+                  "fingerprint": request_fingerprint(desired), "recovered": bool(fields.get("Status") == "publishing" and current_version > expected_version)}
+        self._complete_request(request, result)
+        return {**result, "idempotent": fields.get("Status") == "published"}
 
     @_serialized
     def update_metadata(self, *, part_id: str, scope_type: str, target_id: str, target_label: str, description: str, variant: str,

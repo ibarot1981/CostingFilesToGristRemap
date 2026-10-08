@@ -146,6 +146,52 @@ class GristLiveCostService:
                 "uom": _fields(row).get("QuantityUOM"), "sourcingRoute": _fields(row).get("SourcingRoute") or "auto",
                 "label": _fields(row).get("OccurrenceLabel") or "", "optionGroup": _fields(row).get("OptionGroup") or ""} for row in config["selections"]]}}
 
+    def part_usage(self, part_id: str) -> dict[str, Any]:
+        """Report direct selections in each code's current published configuration.
+
+        Component expansion is intentionally not inferred here: these rows are
+        evidence of an explicit ConfigurationPartSelection only.
+        """
+        part = next((row for row in self._rows("ProductPart")
+                     if str(_fields(row).get("StablePartId") or "") == str(part_id)), None)
+        if not part:
+            raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
+        tables = self._read_inputs()
+        part_record_id = int(part["id"])
+        items = []
+        models = {int(row["id"]): _fields(row) for row in tables["ProductModel"]}
+        products = {int(row["id"]): _fields(row) for row in self._rows("Product")}
+        for code in tables["ProductModelCode"]:
+            code_fields = _fields(code)
+            if not code_fields.get("Active", True):
+                continue
+            code_id = int(code["id"])
+            model_id = ref_id(code_fields.get("ProductModel"))
+            model = models.get(model_id or -1, {})
+            product = products.get(ref_id(model.get("Product")) or -1, {})
+            if not model or not model.get("Active", True) or not product or not product.get("Active", True):
+                continue
+            config = self._configuration(tables, code_id)
+            if not config:
+                continue
+            for selection in config["selections"]:
+                selection_fields = _fields(selection)
+                if ref_id(selection_fields.get("ProductPart")) != part_record_id:
+                    continue
+                items.append({"modelCodeId": code_id, "modelCode": code_fields.get("Code") or "",
+                    "modelDescription": code_fields.get("Description") or "", "modelId": model_id,
+                    "model": " ".join(str(value) for value in (model.get("ModelNumber"), model.get("Name")) if value),
+                    "configurationId": config["record"].get("id"),
+                    "configurationVersion": _fields(config["record"]).get("Version"),
+                    "configurationRevisionId": config["revision"].get("id"),
+                    "selectionIdentity": selection_fields.get("SelectionIdentity") or selection_fields.get("SelectionKey"),
+                    "occurrenceLabel": selection_fields.get("OccurrenceLabel") or "", "quantity": selection_fields.get("Quantity"),
+                    "uom": selection_fields.get("QuantityUOM") or "", "sourcingRoute": selection_fields.get("SourcingRoute") or "auto",
+                    "direct": True})
+        return {"status": "available", "coverage": "direct_selections_only", "items": sorted(items,
+            key=lambda item: (item["modelCode"].casefold(), item["selectionIdentity"] or "")),
+            "message": "Direct Parts selected in current published configurations. Component/indirect usage is not included."}
+
     def save_configuration(self, code_id: str | int, payload: dict[str, Any], *, actor: str, request_key: str) -> dict[str, Any]:
         self.registry._verify_writer()
         try:

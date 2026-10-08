@@ -227,6 +227,17 @@ class LiveCostTests(unittest.TestCase):
         self.assertIsNone(result["totalCost"])
         self.assertEqual(self.service.snapshot_history(100)["total"], 0)
 
+    def test_part_usage_reports_only_direct_current_configuration_selections(self):
+        usage = self.service.part_usage(self.parent["id"])
+        self.assertEqual(usage["status"], "available")
+        self.assertEqual(usage["coverage"], "direct_selections_only")
+        self.assertEqual([(item["modelCode"], item["partId"] if "partId" in item else item["selectionIdentity"]) for item in usage["items"]],
+                         [("S1KHF", "main-actuator")])
+        # The purchased Part is a component of this assembly, but it is not a
+        # direct configuration selection and is therefore not mislabeled here.
+        self.assertEqual(self.service.part_usage(self.purchased["id"])["items"], [])
+        self.assertIn("not included", self.service.part_usage(self.parent["id"])["message"])
+
     def test_legacy_purchase_rate_evidence_endpoint_requires_snapshot(self):
         from app.web import save_part_purchase_rate_evidence
 

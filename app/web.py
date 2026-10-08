@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import csv
+import hashlib
 import io
 from datetime import datetime
 import os
@@ -344,7 +345,9 @@ def _part_scope_targets() -> dict[str, Any]:
               for item in repository.models.values() if item.active and item.product_id in repository.products and repository.products[item.product_id].active]
     codes = [{"id": item.id, "parentId": item.model_id, "label": item.code,
               "shortcode": stored.get(("model_code", item.id)), "active": item.active}
-             for item in repository.codes.values() if item.active and not item.legacy_spares_only and item.model_id in repository.models]
+             for item in repository.codes.values() if item.active and not item.legacy_spares_only and item.model_id in repository.models
+             and repository.models[item.model_id].active and repository.models[item.model_id].product_id in repository.products
+             and repository.products[repository.models[item.model_id].product_id].active]
     return {"scopes": [
         {"id": "global", "label": "Global", "target": {"id": "global", "label": "Safari Manufacturing", "shortcode": stored.get(("global", "global"))}},
         {"id": "product", "label": "Product", "targets": products},
@@ -391,7 +394,7 @@ def _legacy_part_payloads(repository: SafariRepository, rows: list[dict[str, Any
 
 
 def _part_http_error(exc) -> HTTPException:
-    status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE", "PART_SCHEMA_UNAVAILABLE", "PART_COORDINATOR_UNBOUND", "PART_WRITE_UNCONFIRMED", "PART_COORDINATOR_UNCONFIRMED", "PART_GRIST_REQUIRED"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED")) else 409
+    status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE", "PART_SCHEMA_UNAVAILABLE", "PART_COORDINATOR_UNBOUND", "PART_WRITE_UNCONFIRMED", "PART_COORDINATOR_UNCONFIRMED", "PART_GRIST_REQUIRED", "PART_CREATED_SHARING_PENDING"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED", "INACTIVE")) else 409
     return _error(status, exc.code, str(exc))
 
 
@@ -457,11 +460,37 @@ def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...),
         legacy = _legacy_part_rows(repository)
         registry = _part_registry()
         registry.sync_legacy_names(legacy)
-        return registry.create_part(scope_type=scope, target_id=target_id, target_label=target["label"],
+        actor = _request_actor(request)
+        reason = str(payload.get("reason") or "")
+        code_ids = payload.get("intendedModelCodeIds", [])
+        product_id = payload.get("selectedProductId")
+        model_id = payload.get("selectedProductModelId")
+        if not isinstance(code_ids, list):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Codes must be submitted as a list.")
+        if hasattr(registry, "validate_intended_model_codes"):
+            registry.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
+        elif code_ids:
+            raise PartIdentityError("PART_INTENDED_SHARING_REQUIRES_GRIST", "Intended sharing can be saved only when Safari Manufacturing Grist is the active Part store.")
+        result = registry.create_part(scope_type=scope, target_id=target_id, target_label=target["label"],
             description=str(payload.get("description") or ""), variant=str(payload.get("variant") or ""),
-            expected_name=str(payload.get("expectedName") or ""), actor=_request_actor(request),
-            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+            expected_name=str(payload.get("expectedName") or ""), actor=actor,
+            reason=reason, request_key=idempotency_key or "",
             revision_assertion=payload.get("engineeringRevision", payload.get("revision")))
+        if code_ids:
+            sharing_key = "part-create-intended:" + hashlib.sha256(str(idempotency_key or "").encode()).hexdigest()
+            try:
+                result["intendedSharing"] = registry.save_intended_sharing(part_id=result["part"]["id"], code_ids=code_ids,
+                    expected_version=0, actor=actor, reason=reason, request_key=sharing_key,
+                    product_id=product_id, model_id=model_id)
+            except PartIdentityError as exc:
+                if exc.code == "PART_REQUEST_CONFLICT":
+                    raise
+                raise PartIdentityError("PART_CREATED_SHARING_PENDING",
+                    f"Part {result['part']['partNumber']} ({result['part']['id']}) is saved. Intended sharing is still pending; retry this same Save so it can resume without creating another Part.") from exc
+            except Exception as exc:
+                raise PartIdentityError("PART_CREATED_SHARING_PENDING",
+                    f"Part {result['part']['partNumber']} ({result['part']['id']}) is saved. Intended sharing is still pending; retry this same Save so it can resume without creating another Part.") from exc
+        return result
     except PartIdentityError as exc:
         raise _part_http_error(exc)
 
@@ -569,17 +598,22 @@ def part_details(part_id: str) -> dict[str, Any]:
             components = features.components(part_id)
             drawings = features.drawings(part_id)
             purchases = features.purchase_detail(part_id)
+            intended_sharing = registry.intended_sharing(part_id)
+            used_in = _live_cost_service().part_usage(part_id)
             part["compositionStatus"] = part.get("revisionStatus") or "draft"
         else:
             process_lines = {"status": "partial" if mapped_sources else "unavailable", "items": mapped_sources,
                 "message": "Process line requirements are not pinned to stable Parts in this local preview."}
             components, drawings, purchases = [], [], {"specifications": [], "purchaseHistoryAvailable": False, "message": "Purchase capture requires Safari Grist."}
+            intended_sharing = {"status": "unavailable", "version": 0, "items": [], "history": []}
+            used_in = {"status": "unavailable", "coverage": "none", "items": [], "message": "Current configuration usage requires Safari Grist."}
         return {"part": part, "mappingHistory": part["mappingHistory"],
                 "processLines": process_lines,
                 "components": {"status": "available", "items": components, "message": "No component Parts are linked." if not components else None},
                 "purchases": purchases,
+                "intendedSharing": intended_sharing,
                 "drawings": {"status": "available" if drawings else "empty", "items": drawings, "message": "No drawings are linked to this revision." if not drawings else None},
-                "usedIn": {"status": "unavailable", "items": [], "message": "Explicit per-code configuration tables are not implemented; source mappings are not configuration usage."}}
+                "usedIn": used_in}
     if part_id.startswith("legacy:") and repository.adapter_name == "grist-safari":
         record_id = part_id.split(":", 1)[1]
         rows = _legacy_part_rows(repository)
@@ -595,6 +629,20 @@ def part_details(part_id: str) -> dict[str, Any]:
 @app.get("/api/parts/{part_id}/composition")
 def part_composition(part_id: str):
     return {"items": _part_features().components(part_id)}
+
+
+@app.put("/api/parts/{part_id}/intended-sharing")
+def save_part_intended_sharing(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.part_identity import PartIdentityError
+    registry = _part_registry()
+    if not hasattr(registry, "save_intended_sharing"):
+        raise _error(503, "PART_INTENDED_SHARING_REQUIRES_GRIST", "Intended sharing can be saved only when Safari Manufacturing Grist is the active Part store.")
+    try:
+        return registry.save_intended_sharing(part_id=part_id, code_ids=payload.get("intendedModelCodeIds", []),
+            expected_version=payload.get("expectedVersion"), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+            request_key=idempotency_key or "", product_id=payload.get("selectedProductId"), model_id=payload.get("selectedProductModelId"))
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
 
 
 @app.post("/api/parts/{part_id}/components")

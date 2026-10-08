@@ -12,6 +12,13 @@ type Attempt = { key: string; payload: Record<string, unknown> };
 type Register = { items: Part[]; legacyItems: Part[] };
 type TreeEntry = { id: string; parentId?: string; label: string; depth: number; kind: "group" | "target" | "part"; part?: Part; count?: number; expanded?: boolean; hasChildren?: boolean };
 
+function restoredCreateAttempt(): Attempt | null {
+  try {
+    const value = JSON.parse(sessionStorage.getItem("parts:create-attempt") || "null");
+    return value && typeof value.key === "string" && value.payload ? value as Attempt : null;
+  } catch { return null; }
+}
+
 const scopeLabels: Record<Scope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 const emptyRegister: Register = { items: [], legacyItems: [] };
 
@@ -22,18 +29,24 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(sessionStorage.getItem("parts:expanded") || "{}"); } catch { return {}; }
   });
+  const [createAttempt, setCreateAttempt] = useState<Attempt | null>(() => restoredCreateAttempt());
   const [selectedId, setSelectedId] = useState<string | null>(() => {
     const route = window.location.hash.match(/^#parts\/(.+)$/);
     return route ? decodeURIComponent(route[1]) : sessionStorage.getItem("parts:selected");
   });
-  const [mode, setMode] = useState<"selected" | "create" | "edit">("selected");
+  const [mode, setMode] = useState<"selected" | "create" | "edit">(() => createAttempt ? "create" : "selected");
   const [fullDetails, setFullDetails] = useState(Boolean(window.location.hash.match(/^#parts\//)));
   const [details, setDetails] = useState<any>(null);
-  const [scope, setScope] = useState<Scope>("global");
-  const [targetId, setTargetId] = useState("global");
-  const [description, setDescription] = useState("");
-  const [variant, setVariant] = useState("");
-  const [reason, setReason] = useState("");
+  const [scope, setScope] = useState<Scope>(() => (createAttempt?.payload.scope as Scope) || "global");
+  const [targetId, setTargetId] = useState(() => String(createAttempt?.payload.targetId || "global"));
+  const [description, setDescription] = useState(() => String(createAttempt?.payload.description || ""));
+  const [variant, setVariant] = useState(() => String(createAttempt?.payload.variant || ""));
+  const [reason, setReason] = useState(() => String(createAttempt?.payload.reason || ""));
+  const [filterProductId, setFilterProductId] = useState(() => String(createAttempt?.payload.selectedProductId || ""));
+  const [filterModelId, setFilterModelId] = useState(() => String(createAttempt?.payload.selectedProductModelId || ""));
+  const [intendedCodeIds, setIntendedCodeIds] = useState<string[]>(() => Array.isArray(createAttempt?.payload.intendedModelCodeIds) ? (createAttempt?.payload.intendedModelCodeIds as unknown[]).map(String) : []);
+  const [codeSearch, setCodeSearch] = useState("");
+  const [nameAnchorTouched, setNameAnchorTouched] = useState(Boolean(createAttempt));
   const [namePreview, setNamePreview] = useState<Preview | null>(null);
   const [shortcode, setShortcode] = useState("");
   const [shortcodeReason, setShortcodeReason] = useState("");
@@ -43,7 +56,6 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [createAttempt, setCreateAttempt] = useState<Attempt | null>(null);
   const [shortcodeAttempt, setShortcodeAttempt] = useState<Attempt | null>(null);
   const [metadataAttempt, setMetadataAttempt] = useState<Attempt | null>(null);
   const [retireAttempt, setRetireAttempt] = useState<Attempt | null>(null);
@@ -65,6 +77,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   useEffect(() => { void refresh(); }, []);
   useEffect(() => { sessionStorage.setItem("parts:search", query); }, [query]);
   useEffect(() => { sessionStorage.setItem("parts:expanded", JSON.stringify(expandedIds)); }, [expandedIds]);
+  useEffect(() => { if (createAttempt) sessionStorage.setItem("parts:create-attempt", JSON.stringify(createAttempt)); else sessionStorage.removeItem("parts:create-attempt"); }, [createAttempt]);
   useEffect(() => { if (selectedId) sessionStorage.setItem("parts:selected", selectedId); else sessionStorage.removeItem("parts:selected"); }, [selectedId]);
   useEffect(() => {
     if (!mappingReturn?.partId) return;
@@ -78,11 +91,14 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const targets = scope === "global" ? (scopeOption?.target ? [scopeOption.target] : []) : (scopeOption?.targets || []);
   const target = targets.find(item => item.id === targetId);
   const shortcodeMissing = Boolean(scopeOption && target && !target.shortcode);
+  const productTargets = scopes.find(item => item.id === "product")?.targets || [];
+  const modelTargets = scopes.find(item => item.id === "product_model")?.targets || [];
+  const codeTargets = scopes.find(item => item.id === "model_code")?.targets || [];
 
   useEffect(() => {
-    setTargetId(scope === "global" ? "global" : "");
+    setTargetId(current => scope === "global" ? "global" : !targets.length || targets.some(item => item.id === current) ? current : "");
     setNamePreview(null);
-  }, [scope]);
+  }, [scope, scopes]);
 
   useEffect(() => {
     if (mode !== "create" && mode !== "edit") return;
@@ -151,6 +167,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   function startCreate() {
     setError(""); setNotice(""); setSelectedId(null); setDetails(null); setMode("create"); setFullDetails(false);
     setDescription(""); setVariant(""); setReason(""); setScope("global"); setTargetId("global"); setNamePreview(null);
+    setFilterProductId(""); setFilterModelId(""); setIntendedCodeIds([]); setCodeSearch(""); setNameAnchorTouched(false);
     setCreateAttempt(null); setShortcodeAttempt(null); setMetadataAttempt(null); setRetireAttempt(null); setRetireReason(""); setEditShortcode(false); setShortcodeReason(""); setShortcode("");
     if (window.location.hash.startsWith("#parts/")) history.pushState(null, "", "#parts");
   }
@@ -188,8 +205,9 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   }
 
   async function savePart() {
-    if (!namePreview?.available) return;
-    const attempt = createAttempt || { key: crypto.randomUUID(), payload: { scope, targetId, description, variant, expectedName: namePreview.name, reason } };
+    if (!createAttempt && !namePreview?.available) return;
+    const attempt = createAttempt || { key: crypto.randomUUID(), payload: { scope, targetId, description, variant, expectedName: namePreview?.name || "", reason,
+      selectedProductId: filterProductId || null, selectedProductModelId: filterModelId || null, intendedModelCodeIds: [...intendedCodeIds] } };
     setCreateAttempt(attempt); setBusy(true); setError("");
     try {
       const result = await api.createManagedPart(attempt.payload, attempt.key);
@@ -198,6 +216,20 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
       await refresh(""); setQuery("");
     } catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
+  }
+
+  function changeFilterProduct(value: string) {
+    setFilterProductId(value); setFilterModelId(""); setCodeSearch("");
+    if (!nameAnchorTouched) { setScope(value ? "product" : "global"); setTargetId(value || "global"); }
+  }
+
+  function changeFilterModel(value: string) {
+    setFilterModelId(value); setCodeSearch("");
+    if (!nameAnchorTouched) {
+      if (value) { setScope("product_model"); setTargetId(value); }
+      else if (filterProductId) { setScope("product"); setTargetId(filterProductId); }
+      else { setScope("global"); setTargetId("global"); }
+    }
   }
 
   async function openCollision(collision: Preview["collision"][number]) {
@@ -255,7 +287,9 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const formLocked = busy || Boolean(createAttempt || shortcodeAttempt || metadataAttempt);
   const form = <section className="parts-form-card">
     <div><span className="eyebrow">{mode === "edit" ? "Reviewed metadata change" : "Guided creation"}</span><h2>{mode === "edit" ? "Change Part name or scope" : "Create a Part"}</h2><p>{mode === "edit" ? "The physical design identity stays fixed. This change creates a new metadata version." : "Create a stable Part identity first. Source assignments are saved separately in Part Mapping."}</p></div>
-    <label>Where is this Part intended to be shared?<select disabled={formLocked} value={scope} onChange={event => setScope(event.target.value as Scope)}>{scopes.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
+    {mode === "create" && <div className="parts-cascade-card"><h3>Intended Model Codes</h3><p>These codes record intended sharing only. They do not add this Part to configurations, set quantities or create costing history.</p><CascadeCodePicker scopes={scopes} productId={filterProductId} modelId={filterModelId} selectedIds={intendedCodeIds}
+      onProductChange={changeFilterProduct} onModelChange={changeFilterModel} onSelectedChange={setIntendedCodeIds} disabled={formLocked} restrictSelectionToContext/></div>}
+    <label>Name derives from<select disabled={formLocked} value={scope} onChange={event => { setNameAnchorTouched(true); setScope(event.target.value as Scope); }}>{scopes.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
     {scope !== "global" && <label>Scope target<select disabled={formLocked} value={targetId} onChange={event => setTargetId(event.target.value)}><option value="">Choose {scopeLabels[scope]}</option>{targets.map(item => <option key={item.id} value={item.id}>{item.label}{item.shortcode ? ` · ${item.shortcode}` : " · shortcode needed"}</option>)}</select></label>}
     {scope === "global" && <p className="parts-target-line">Safari Manufacturing · Global scope</p>}
     {target && <div className="parts-shortcode-box"><div><strong>Maintained shortcode</strong><span>{target.shortcode || "Not set for this target"}</span></div>
@@ -269,7 +303,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
     {mode === "create" && <div className="parts-readonly-facts"><span>Part number <strong>Allocated on Save</strong></span><span>Engineering revision <strong>Rev A</strong></span></div>}
     {mode === "edit" && selected && <div className="parts-readonly-facts"><span>Permanent number <strong>{selected.partNumber}</strong></span><span>Engineering revision <strong>Rev A · fixed until CR flow</strong></span></div>}
     <label>Why is this {mode === "edit" ? "metadata change" : "Part"} needed?<textarea value={reason} onChange={event => setReason(event.target.value)} rows={3} maxLength={2000} disabled={formLocked}/></label>
-    <div className="parts-form-actions"><button className="button" disabled={formLocked} onClick={() => { setMode("selected"); setCreateAttempt(null); setMetadataAttempt(null); setError(""); }}>{mode === "edit" ? "Cancel" : "Back to Parts"}</button><button className="button primary" disabled={formLocked || !namePreview?.available || !reason.trim()} onClick={() => void (mode === "edit" ? saveMetadata() : savePart())}>{createAttempt || metadataAttempt ? "Retry same request" : mode === "edit" ? "Save metadata version" : "Save Part"}</button></div>
+    <div className="parts-form-actions"><button className="button" disabled={busy || Boolean(createAttempt || metadataAttempt)} onClick={() => { setMode("selected"); setCreateAttempt(null); setMetadataAttempt(null); setError(""); }}>{mode === "edit" ? "Cancel" : "Back to Parts"}</button><button className="button primary" disabled={busy || (!createAttempt && (!namePreview?.available || !reason.trim()))} onClick={() => void (mode === "edit" ? saveMetadata() : savePart())}>{createAttempt || metadataAttempt ? "Retry same request" : mode === "edit" ? "Save metadata version" : "Save Part"}</button></div>
   </section>;
 
   return <main className="parts-page">
@@ -303,13 +337,14 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
           <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full Part details</button><button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
           {!fullDetails && <div className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></div>}
           {fullDetails && details ? <>
-            <div className="parts-detail-tabs" aria-label="Part detail sections">{["Overview", "Process lines", "Components", "Purchase details", "Drawings", "Used in", "History"].map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" })}>{label}</button>; })}</div>
+            <div className="parts-detail-tabs" aria-label="Part detail sections">{["Overview", "Intended sharing", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"].map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" })}>{label}</button>; })}</div>
             <div id="overview" className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></div>
+            <IntendedSharingSection part={details.part} state={details.intendedSharing} scopes={scopes} onSaved={reloadSelectedDetails}/>
             <ProcessLineSection partId={selected.id} state={details.processLines} onSaved={reloadSelectedDetails}/>
             <ComponentSection partId={selected.id} currentPart={selected} parts={allParts} state={details.components} partState={details.part} onOpen={openNestedPart} onSaved={reloadSelectedDetails}/>
             <PurchaseDetailSection partId={selected.id} state={details.purchases} onSaved={reloadSelectedDetails}/>
             <DrawingSection partId={selected.id} state={details.drawings} onSaved={reloadSelectedDetails}/>
-            <DetailSection id="used-in" title="Used in" icon={<Tags size={15}/>} state={details.usedIn}/>
+            <UsedInConfigurationsSection state={details.usedIn} intended={details.intendedSharing?.items || []}/>
             <div id="history" className="parts-section-card"><h3><History size={15}/> History</h3><h4>Engineering baseline</h4><p>Rev A · {details.part.compositionStatus || "draft"}. Finalized definitions are physically locked; later engineering revisions require the approved CR process.</p>{details.part.compositionStatus === "draft" && <FinalizeBaseline partId={selected.id} onSaved={reloadSelectedDetails}/>}<h4>Name and scope metadata</h4>{selected.metadataHistory?.map((item: any) => <article className="parts-history-item" key={`${item.part_id}:${item.version}`}><strong>Metadata v{item.version} · {item.display_name}</strong><span>{scopeLabels[item.scope_type as Scope] || item.scope_type} · {item.target_label} · {item.shortcode} · {item.occurred_at}</span><p>{item.description}{item.variant ? ` · ${item.variant}` : ""} · {item.actor} · {item.reason}</p></article>)}{selected.aliases.length > 0 && <p>Previous names searchable as aliases: {selected.aliases.join(" · ")}</p>}<h4>Lifecycle</h4>{details.part.lifecycleHistory?.length ? details.part.lifecycleHistory.map((item: any) => <article className="parts-history-item" key={item.event_id}><strong>{item.event_type} · {item.status}</strong><span>{item.occurred_at}</span><p>{item.actor} · {item.reason}</p></article>) : <p>No lifecycle changes recorded.</p>}<h4>Source and mapping audit</h4>{details.mappingHistory?.length ? details.mappingHistory.map((item: any, index: number) => <article className="parts-history-item" key={`${item.RequestKey}:${index}`}><strong>{item.SheetName} · row {item.SourceRow} · source mapping v{item.Version}</strong><span>{item.SourceHash} · association v{item.AssociationVersion} · {item.OccurredAt}</span><p>{item.Actor} · {item.Reason}</p></article>) : <p>No source mapping history is linked to this stable Part identity yet.</p>}{selected.status === "active" && <div className="parts-retire"><label>Reason for retirement<input value={retireReason} onChange={event => setRetireReason(event.target.value)} disabled={busy}/></label><button className="button" disabled={busy || !retireReason.trim()} onClick={() => void retire()}>{retireAttempt ? "Retry retirement" : "Retire Part"}</button></div>}</div>
           </> : <div className="parts-details-placeholder"><strong>Part summary</strong><span>Open full details for process lines, drawings, explicit code use and history.</span></div>}
         </>}
@@ -558,6 +593,115 @@ function PurchaseDetailSection({ partId, state, onSaved }: { partId: string; sta
 
 function DetailSection({ id, title, icon, state }: { id: string; title: string; icon: ReactNode; state: any }) {
   return <section id={id} className="parts-section-card"><h3>{icon}{title}</h3>{state?.status === "unavailable" ? <p className="parts-unavailable">{state.message}</p> : state?.items?.length ? <div className="parts-linked-items">{state.items.map((item: any, index: number) => <article key={item.id || index}><div><strong>{item.name || item.label || item.sheet || `Record ${index + 1}`}</strong>{item.description && <small>{item.description}</small>}{item.sourceHash && <small>Source {item.sourceHash} · mapping v{item.mappingVersion} · association v{item.associationVersion}</small>}{item.actor && <small>{item.actor} · {item.reason}</small>}</div><span>{item.revision ? `Rev ${item.revision}` : item.version || (item.row ? `row ${item.row}` : "Available")}</span></article>)}</div> : <p>No {title.toLowerCase()} are linked to this Part.</p>}{state?.message && state.status !== "unavailable" && <p className="parts-unavailable">{state.message}</p>}</section>;
+}
+
+function CascadeCodePicker({ scopes, productId, modelId, selectedIds, onProductChange, onModelChange, onSelectedChange, disabled = false, restrictSelectionToContext = false }:
+  { scopes: ScopeOption[]; productId: string; modelId: string; selectedIds: string[]; onProductChange: (value: string) => void; onModelChange: (value: string) => void; onSelectedChange: (value: string[]) => void; disabled?: boolean; restrictSelectionToContext?: boolean }) {
+  const [search, setSearch] = useState("");
+  const products = scopes.find(item => item.id === "product")?.targets || [];
+  const models = (scopes.find(item => item.id === "product_model")?.targets || []).filter(item => !productId || item.parentId === productId);
+  const codes = scopes.find(item => item.id === "model_code")?.targets || [];
+  const modelById = new Map((scopes.find(item => item.id === "product_model")?.targets || []).map(item => [item.id, item]));
+  const allowedModelIds = new Set(models.filter(item => !modelId || item.id === modelId).map(item => item.id));
+  const visible = productId ? codes.filter(code => allowedModelIds.has(code.parentId || "")
+    && `${code.label} ${modelById.get(code.parentId || "")?.label || ""}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())) : [];
+  const selectedById = new Map(codes.map(code => [code.id, code]));
+  const groups = new Map<string, Target[]>();
+  visible.forEach(code => { const model = modelById.get(code.parentId || ""); const key = model?.id || "unknown"; groups.set(key, [...(groups.get(key) || []), code]); });
+
+  function changeProduct(value: string) {
+    if (restrictSelectionToContext) {
+      const allowedModels = new Set((scopes.find(item => item.id === "product_model")?.targets || []).filter(item => item.parentId === value).map(item => item.id));
+      const allowedCodes = new Set(codes.filter(code => allowedModels.has(code.parentId || "")).map(code => code.id));
+      const removed = selectedIds.filter(id => !allowedCodes.has(id));
+      if (removed.length && !window.confirm(`Changing Product filters will remove ${removed.length} selected Model Code(s) from this new Part. Continue?`)) return;
+      if (removed.length) onSelectedChange(selectedIds.filter(id => allowedCodes.has(id)));
+    }
+    onProductChange(value);
+  }
+  function changeModel(value: string) {
+    if (restrictSelectionToContext && value) {
+      const allowedCodes = new Set(codes.filter(code => code.parentId === value).map(code => code.id));
+      const removed = selectedIds.filter(id => !allowedCodes.has(id));
+      if (removed.length && !window.confirm(`Changing Product Model filters will remove ${removed.length} selected Model Code(s) outside this Model from the new Part. Continue?`)) return;
+      if (removed.length) onSelectedChange(selectedIds.filter(id => allowedCodes.has(id)));
+    }
+    onModelChange(value);
+  }
+  function toggleCode(id: string, checked: boolean) {
+    onSelectedChange(checked ? [...new Set([...selectedIds, id])] : selectedIds.filter(value => value !== id));
+  }
+
+  return <div className="parts-cascade-controls">
+    <div className="parts-cascade-filters">
+      <label>Product filter<select aria-label="Intended sharing Product filter" value={productId} disabled={disabled} onChange={event => changeProduct(event.target.value)}><option value="">Choose a Product</option>{products.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+      <label>Product Model filter · optional<select aria-label="Intended sharing Product Model filter" value={modelId} disabled={disabled || !productId} onChange={event => changeModel(event.target.value)}><option value="">All Models under this Product</option>{models.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+    </div>
+    <div className="parts-selected-code-summary" aria-live="polite"><strong>{selectedIds.length} intended Model Code{selectedIds.length === 1 ? "" : "s"}</strong><span>Choose codes explicitly; no descendants are selected automatically.</span></div>
+    {selectedIds.length > 0 && <div className="parts-code-chips" aria-label="Selected intended Model Codes">{selectedIds.map(id => { const code = selectedById.get(id); const model = code ? modelById.get(code.parentId || "") : null; return <button type="button" key={id} disabled={disabled} aria-label={`Remove ${code?.label || id}`} onClick={() => toggleCode(id, false)}>{code?.label || `Code ${id}`} · {model?.label || "unknown Model"} ×</button>; })}</div>}
+    <label className="parts-code-search">Search Model Codes<input aria-label="Search intended Model Codes" value={search} onChange={event => setSearch(event.target.value)} disabled={disabled || !productId} placeholder="Code or Model name"/></label>
+    <div className="parts-cascade-actions"><button type="button" className="button ghost" disabled={disabled || !visible.length} onClick={() => onSelectedChange([...new Set([...selectedIds, ...visible.map(item => item.id)])])}>Select visible</button><button type="button" className="button ghost" disabled={disabled || !selectedIds.length} onClick={() => onSelectedChange([])}>Clear selection</button></div>
+    {productId ? <div className="parts-code-options" aria-label="Available intended Model Codes">{[...groups.entries()].map(([groupId, items]) => <fieldset key={groupId}><legend>{modelById.get(groupId)?.label || "Model"}</legend>{items.map(code => <label key={code.id} className="parts-code-option"><input type="checkbox" checked={selectedIds.includes(code.id)} disabled={disabled} onChange={event => toggleCode(code.id, event.target.checked)}/><span><strong>{code.label}</strong><small>{modelById.get(code.parentId || "")?.label}</small></span></label>)}</fieldset>)}{!visible.length && <p>No active Model Codes match these filters.</p>}</div> : <p className="parts-cascade-empty">Choose one Product to browse its Models and Model Codes.</p>}
+  </div>;
+}
+
+function IntendedSharingSection({ part, state, scopes, onSaved }: { part: Part; state: any; scopes: ScopeOption[]; onSaved: () => Promise<void> }) {
+  const initialIds = (state?.items || []).map((item: any) => String(item.id));
+  const [selectedIds, setSelectedIds] = useState<string[]>(initialIds);
+  const [version, setVersion] = useState(Number(state?.version || 0));
+  const [productId, setProductId] = useState("");
+  const [modelId, setModelId] = useState("");
+  const [reason, setReason] = useState("");
+  const [attempt, setAttempt] = useState<Attempt | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { setSelectedIds((state?.items || []).map((item: any) => String(item.id))); setVersion(Number(state?.version || 0)); setAttempt(null); setReason(""); }, [part.id, state?.version, (state?.items || []).map((item: any) => item.id).join(",")]);
+  const codeTargets = scopes.find(item => item.id === "model_code")?.targets || [];
+  const currentLinks = state?.items || [];
+  const allModels = scopes.find(item => item.id === "product_model")?.targets || [];
+  const selectedLinks = selectedIds.map(id => {
+    const saved = currentLinks.find((item: any) => String(item.id) === id);
+    if (saved) return saved;
+    const code = codeTargets.find(item => item.id === id);
+    const model = code ? allModels.find(item => item.id === code.parentId) : null;
+    return code ? { ...code, modelId: model?.id, productId: model?.parentId } : null;
+  }).filter(Boolean);
+  const outsideScope = selectedLinks.filter((item: any) => part.scope === "product" ? String(item.productId) !== part.scopeTargetId
+    : part.scope === "product_model" ? String(item.modelId) !== part.scopeTargetId
+      : part.scope === "model_code" ? String(item.id) !== part.scopeTargetId : false);
+  function changeEditorProduct(value: string) {
+    setProductId(value);
+    setModelId("");
+  }
+  async function save() {
+    const payload = { expectedVersion: version, intendedModelCodeIds: [...selectedIds], reason };
+    const next = attempt || { key: crypto.randomUUID(), payload };
+    setAttempt(next); setBusy(true); setError("");
+    try { await api.savePartIntendedSharing(part.id, next.payload, next.key); setAttempt(null); setReason(""); await onSaved(); }
+    catch (cause) { setError(String(cause)); }
+    finally { setBusy(false); }
+  }
+  return <section id="intended-sharing" className="parts-section-card"><h3><Tags size={15}/> Intended sharing</h3>
+    <p>Advisory links only. Saving these codes does not configure the Part, assign quantities or create costing history. Membership changes preserve its name, number, scope, Rev A, composition and snapshots.</p>
+    {state?.status === "unavailable" ? <p className="parts-unavailable">{state.message || "Intended-sharing records are unavailable."}</p> : <>
+      <CascadeCodePicker scopes={scopes} productId={productId} modelId={modelId} selectedIds={selectedIds} onProductChange={changeEditorProduct} onModelChange={setModelId} onSelectedChange={setSelectedIds} disabled={busy}/>
+      {outsideScope.length > 0 && <p className="parts-validation warning">{outsideScope.length} intended code(s) are outside this Part's {part.scope} naming scope. This advisory is allowed and does not rename the Part.</p>}
+      <label className="parts-sharing-reason">Why is intended sharing changing?<textarea value={reason} rows={2} maxLength={2000} disabled={busy} onChange={event => setReason(event.target.value)}/></label>
+      {error && <p className="parts-error" role="alert">{error}{attempt && <small>Retry uses the original request key and selected codes.</small>}</p>}
+      <div className="parts-capture-actions"><button className="button primary" disabled={busy || (!attempt && !reason.trim())} onClick={() => void save()}>{busy ? "Saving intended sharing…" : attempt ? "Retry same sharing request" : "Save intended sharing"}</button><span>Sharing version {version} · {selectedIds.length} selected</span></div>
+    </>}
+    <h4>Current intended codes</h4>{currentLinks.length ? <div className="parts-linked-items">{currentLinks.map((item: any) => <article key={item.id}><div><strong>{item.code}</strong><small>{item.product} · {item.model}</small><small>{item.createdBy} · {item.createdReason}</small></div><span>Intended</span></article>)}</div> : <p>No intended Model Codes are linked to this Part.</p>}
+    <h4>Sharing change history</h4>{state?.history?.length ? <div className="parts-linked-items">{state.history.map((item: any, index: number) => <article key={item.SharingEventKey || index}><div><strong>{item.Action === "add" ? "Added" : "Removed"} · {item.Code || `Model Code ${item.ProductModelCode}`}</strong><small>{item.OccurredAt} · version {item.Version}</small><small>{item.Actor} · {item.Reason}</small></div></article>)}</div> : <p>No sharing changes recorded.</p>}
+  </section>;
+}
+
+function UsedInConfigurationsSection({ state, intended }: { state: any; intended: any[] }) {
+  const intendedIds = new Set(intended.map(item => String(item.id)));
+  return <section id="used-in-configurations" className="parts-section-card"><h3><Tags size={15}/> Used in configurations</h3>
+    <p>Actual usage comes from direct selections in current published costing configurations. Intended sharing and source mappings are not actual usage.</p>
+    {state?.status === "unavailable" ? <p className="parts-unavailable">{state.message}</p> : state?.items?.length ? <div className="parts-linked-items">{state.items.map((item: any, index: number) => <article key={`${item.configurationId}:${item.selectionIdentity}:${index}`}><div><strong>{item.model} · {item.modelCode}</strong><small>{item.occurrenceLabel || item.selectionIdentity} · {item.quantity} {item.uom} · route {item.sourcingRoute}</small><small>Configuration v{item.configurationVersion} · current revision record {item.configurationRevisionId}</small>{!intendedIds.has(String(item.modelCodeId)) && <small className="parts-out-of-scope-note">Configured directly; no intended-sharing link is recorded.</small>}</div><span>Direct selection</span></article>)}</div> : <p>This Part is not selected directly in any current published configuration.</p>}
+    {state?.message && <p className="parts-unavailable">{state.message}</p>}
+  </section>;
 }
 
 function ConversionCapture({ partId, specificationId, onSaved }: { partId: string; specificationId: number; onSaved: () => Promise<void> }) {
