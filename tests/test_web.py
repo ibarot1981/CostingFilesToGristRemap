@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from collections import OrderedDict
+from datetime import date
 from pathlib import Path
 from unittest import mock
 from zipfile import ZipFile
@@ -206,6 +207,30 @@ class WebTests(unittest.TestCase):
         self.assertEqual((formula["value"], formula["kind"]), (3, "formula"))
         self.assertEqual(formula["formula"], "of:=SUM([file:///C:/rates.ods#Sheet1.A1])")
         self.assertEqual((value["value"], value["kind"], value["formula"]), (7, "value", None))
+
+    def test_preview_preserves_malformed_typed_date_as_text(self) -> None:
+        import app.web as web
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "material-rates.ods"
+            save_data(str(workbook_path), OrderedDict([("Rates", [["Material", "Latest rate date"], ["MS", date(2026, 7, 10)]])]))
+            with ZipFile(workbook_path) as source:
+                entries = [(item.filename, source.read(item.filename)) for item in source.infolist()]
+            date_value = b'office:date-value="2026-07-10"'
+            self.assertTrue(any(name == "content.xml" and date_value in data for name, data in entries))
+            with ZipFile(workbook_path, "w") as target:
+                for name, data in entries:
+                    if name == "content.xml":
+                        data = data.replace(date_value, b'office:date-value="20206-07-10"', 1)
+                    target.writestr(name, data)
+
+            with mock.patch.dict(os.environ, {"COSTING_ROOT": str(root)}, clear=False):
+                result = web.preview("material-rates.ods", sheet="Rates")
+
+        self.assertEqual(result["sheets"], ["Rates"])
+        self.assertEqual(result["cells"][1][1]["value"], "20206-07-10")
+        self.assertTrue(result["readOnly"])
 
     def test_corrupt_and_encrypted_ods_return_typed_errors(self) -> None:
         import app.web as web
