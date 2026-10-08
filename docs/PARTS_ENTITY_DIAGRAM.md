@@ -63,7 +63,7 @@ erDiagram
 | `PartIntendedSharingEvent` | Append-only add/remove evidence with Part, Model Code, batch version, actor, reason, time and durable request fingerprint. |
 | `PartScopeShortcode`, `PartShortcodeHistory` | Maintained Global/Product/Product Model/Model Code naming prefixes and audited changes. |
 | `PartRevision` | Existing table extended with explicit `RevisionLabel`, baseline status/hash, finalization evidence and request key. Managed baseline is A; legacy numeric `Revision` evidence is not relabelled. Finalized definitions are locked. |
-| `PartMappingReview` | Source assignments reference `ProductPart`, stable UUID, exact engineering revision and metadata version/name used, plus workbook/hash/association/group/sheet/row/reviewer/reason/time/retry evidence. |
+| `PartMappingReview` | Append-only source-row decisions reference the canonical Part/stable UUID, exact engineering revision and metadata version/name used, plus workbook/hash, association, source group/sheet/row, mapping description, reviewer/reason/time and idempotent request evidence. The v2 grouping policy is sheet plus Machine Piece Description for MCL/Toolshop or Part Category for CNC; old description-only rows remain visible for explicit review. |
 | `PartComponentRevision` | Parent and child `PartRevision`, positive quantity and UOM, lifecycle/audit and idempotency fields. Cycles are rejected. |
 | `PartRevisionLine` | Exact Part baseline to `LineMaster`/`LineRevision`/source observation, process type, quantity per Part and unit. MCL, Toolshop and CNC are optional and mixable. |
 | `PartDrawing` | Optional revision-specific file path or external URL, drawing identity, file version/hash and audit. |

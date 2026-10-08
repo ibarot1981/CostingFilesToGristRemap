@@ -23,6 +23,7 @@ function apiError(payload: any, status: number): Error {
 
 export const api = {
   parts: (search = "", scope = "", targetId = "") => get<any>(`/api/parts?${new URLSearchParams({ search, scope, target_id: targetId })}`),
+  searchParts: (query = "", offset = 0, limit = 30, path = "") => get<any>(`/api/parts/search?${new URLSearchParams({ query, offset: String(offset), limit: String(limit), path })}`),
   partScopeTargets: () => get<any>("/api/parts/scope-targets"),
   partNamePreview: (scope: string, targetId: string, description: string, variant: string, excludeId = "") => get<any>(`/api/parts/preview?${new URLSearchParams({ scope, target_id: targetId, description, variant, exclude_id: excludeId })}`),
   createManagedPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, { "Idempotency-Key": key }),

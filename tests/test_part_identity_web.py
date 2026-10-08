@@ -98,9 +98,13 @@ class PartIdentityWebTests(unittest.TestCase):
              mock.patch.object(web, "_processing_context", return_value=(self.repository, "file:pilot.ods", association, "hash-a")), \
              mock.patch("app.processing.processing_detail", return_value={"state": "associated"}):
             detail = web.part_mappings("pilot.ods")
-            self.assertEqual(detail["parts"][0]["id"], part["id"])
+            self.assertEqual(detail["parts"], [])
             self.assertTrue(detail["scopeAdvisoryOnly"])
-            self.assertEqual(detail["parts"][0]["outOfScopeCodes"], [{"id": "code-2", "code": "S1KHDSEP"}])
+            with mock.patch.object(self.repository, "current_association", return_value=association), \
+                 mock.patch.object(web, "_part_scope_warnings", return_value=[{"id": "code-2", "code": "S1KHDSEP"}]):
+                page = web.part_search(query="Shaft", offset=0, limit=30, path="pilot.ods")
+            self.assertEqual(page["items"][0]["id"], part["id"])
+            self.assertEqual(page["items"][0]["outOfScopeCodes"], [{"id": "code-2", "code": "S1KHDSEP"}])
             saved = web.save_part_mappings(request, {"path": "pilot.ods", "expectedHash": "hash-a", "expectedVersion": 0,
                 "expectedAssociationKey": "association-1", "expectedAssociationVersion": 1,
                 "decisions": {groups[0]["key"]: part["id"]}, "reason": "Assign reviewed source rows"}, "mapping-save")

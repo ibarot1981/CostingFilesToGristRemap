@@ -14,6 +14,20 @@ from app.part_identity import PartIdentityError
 
 PART_SHEETS = {"5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"}
 MAPPING_TABLE = "PartMappingReview"
+MAPPING_POLICY_VERSION = "part-source-labels-v2"
+MAPPING_LABEL_FIELD = {
+    "5. Material Cut List Price": "product_part_name",
+    "Tool Shop Items": "product_part_name",
+    "CNC Cut List": "part_category",
+}
+
+
+class PartSourceGroups(list):
+    """List-compatible source groups carrying extraction diagnostics for the API."""
+
+    def __init__(self, groups=(), diagnostics=None):
+        super().__init__(groups)
+        self.diagnostics = diagnostics or {}
 
 
 class PartConflict(ValueError):
@@ -139,6 +153,9 @@ def list_parts(store) -> list[dict[str, Any]]:
         fields = row["fields"]
         stable_id = str(fields.get("StablePartId") or "")
         identity_id = stable_id or str(row["id"])
+        for label in fields.get("Aliases") or []:
+            if label and str(label) not in aliases_by_part.setdefault(identity_id, []):
+                aliases_by_part[identity_id].append(str(label))
         try:
             record_id = int(row["id"])
         except (TypeError, ValueError):
@@ -150,6 +167,8 @@ def list_parts(store) -> list[dict[str, Any]]:
             "name": name, "status": fields.get("Status"), "aliases": aliases_by_part.get(identity_id, []),
             "selectable": bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"} and fields.get("PublishStatus", "published") == "published",
             "duplicateName": duplicate, "partNumber": fields.get("PartNumber"),
+            "description": str(fields.get("Description") or fields.get("PartDescription") or ""),
+            "variant": str(fields.get("DesignVariant") or fields.get("Variant") or ""),
             "engineeringRevision": fields.get("EngineeringRevision"), "scope": fields.get("ScopeType"),
             "scopeTarget": fields.get("ScopeTargetLabel") or fields.get("ScopeTarget"), "scopeTargetId": fields.get("ScopeTargetId"), "stableIdentity": bool(fields.get("StablePartId")),
             "stablePartId": stable_id or None, "partRevisionRecordId": fields.get("CurrentPartRevision"),
@@ -157,18 +176,54 @@ def list_parts(store) -> list[dict[str, Any]]:
     return result
 
 
-def source_groups(process_lists: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def source_groups(process_lists: dict[str, list[dict[str, Any]]], *, sheet_diagnostics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
-    for sheet in sorted(PART_SHEETS):
+    for sheet in ("5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"):
         for row in process_lists.get(sheet, []):
             if row.get("status") != "active":
                 continue
-            description = str(row.get("fields", {}).get("product_part_name") or "").strip()
+            label_field = MAPPING_LABEL_FIELD[sheet]
+            raw_description = row.get("fields", {}).get(label_field)
+            description = "" if raw_description is None else str(raw_description)
+            blank = not description.strip()
             number = int(row["source_row"])
-            key = "description:" + fingerprint(description) if description else "blank:" + fingerprint([sheet, number])
-            group = groups.setdefault(key, {"key": key, "description": description, "blankDescription": not description, "rows": []})
-            group["rows"].append({"sheet": sheet, "row": number})
-    return list(groups.values())
+            key = f"{MAPPING_POLICY_VERSION}:" + fingerprint([sheet, "blank", number] if blank else [sheet, description])
+            legacy_description = str(row.get("fields", {}).get("product_part_name") or "").strip()
+            legacy_key = "description:" + fingerprint(legacy_description) if legacy_description else "blank:" + fingerprint([sheet, number])
+            group = groups.setdefault(key, {"key": key, "mappingPolicyVersion": MAPPING_POLICY_VERSION,
+                "sheet": sheet, "labelField": label_field, "description": description,
+                "blankDescription": blank, "rows": [], "legacyGroupKeys": set()})
+            group["rows"].append({"sheet": sheet, "row": number, "fields": row.get("fields", {}),
+                "sourceHeaders": row.get("source_headers", {}), "sourceHeaderCells": row.get("source_header_cells", {}),
+                "sourceCells": row.get("source_cells", {}), "headerRow": row.get("header_row"),
+                "availableFields": row.get("available_fields", [])})
+            group["legacyGroupKeys"].add(legacy_key)
+    for group in groups.values():
+        diagnostic = (sheet_diagnostics or {}).get(group["sheet"], {})
+        group["sourceDiagnostic"] = diagnostic
+        group["legacyGroupKeys"] = sorted(group["legacyGroupKeys"])
+        group["evidenceFingerprint"] = fingerprint([
+            [row["sheet"], row["row"], row["fields"], row["sourceHeaders"], row["sourceHeaderCells"], row["sourceCells"]]
+            for row in group["rows"]
+        ])
+    return PartSourceGroups(groups.values(), sheet_diagnostics)
+
+
+def search_parts(store, *, query: str = "", offset: int = 0, limit: int = 50) -> dict[str, Any]:
+    """Search canonical Parts and aliases, returning a bounded stable page."""
+    wanted = name_key(query)
+    matches = []
+    for part in list_parts(store):
+        if not part.get("selectable") or part.get("duplicateName"):
+            continue
+        searchable = name_key(" ".join(str(value or "") for value in (
+            part.get("id"), part.get("partNumber"), part.get("name"), part.get("description"),
+            part.get("variant"), *(part.get("aliases") or []))))
+        if not wanted or wanted in searchable:
+            matches.append(part)
+    matches.sort(key=lambda part: (str(part.get("partNumber") or "").casefold(), str(part.get("name") or "").casefold(), part["id"]))
+    return {"items": matches[offset:offset + limit], "total": len(matches), "offset": offset,
+        "limit": limit, "hasMore": offset + limit < len(matches)}
 
 
 def _history(store, file_id: str):
@@ -203,6 +258,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
     for row in current:
         by_group.setdefault(row["fields"]["GroupKey"], []).append(row)
     resolved = []
+    resolved_parts: dict[str, dict[str, Any]] = {}
     for group in groups:
         candidates = by_group.get(group["key"], [])
         version = max((row["fields"]["Version"] for row in candidates), default=0)
@@ -212,11 +268,60 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         actual = {(row["SheetName"], int(row["SourceRow"])) for row in latest}
         part = next((part for part in parts if len(refs) == 1 and part["id"] in refs), None)
         valid = bool(part and part["selectable"] and not part["duplicateName"] and expected == actual)
-        resolved.append({**group, "part": part if valid else None, "reviewed": valid, "version": version})
+        if valid and part:
+            resolved_parts[part["id"]] = part
+        # Older reviews grouped by description alone and used Plate Part to Cut on CNC.
+        # Keep them immutable and visible as review evidence; never apply them to the new
+        # sheet-scoped identity without an explicit new Save.
+        source_refs = {(row["sheet"], row["row"]) for row in group["rows"]}
+        prior_rows = [row["fields"] for row in history
+            if (row["fields"].get("SheetName"), int(row["fields"].get("SourceRow") or 0)) in source_refs
+            and (row["fields"].get("GroupKey") != group["key"]
+                or row["fields"].get("SourceHash") != source_hash
+                or not association or row["fields"].get("AssociationKey") != association.id
+                or row["fields"].get("AssociationVersion") != association.version)]
+        prior_rows.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or "")))
+        # Old groups may have spanned several sheets or several current groups.
+        # Resolve their latest decision independently for each source coordinate;
+        # slicing the last N records can accidentally borrow a neighboring row's
+        # Part when history was interleaved across groups.
+        latest_by_source: dict[tuple[str, int], dict[str, Any]] = {}
+        for prior in prior_rows:
+            coordinate = (str(prior.get("SheetName") or ""), int(prior.get("SourceRow") or 0))
+            if coordinate in source_refs:
+                latest_by_source[coordinate] = prior
+        latest_prior_rows = list(latest_by_source.values())
+        prior_ids = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")))
+            for row in latest_prior_rows if row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")}
+        all_coordinates_reviewed = source_refs.issubset(latest_by_source)
+        all_coordinates_agree = bool(latest_prior_rows) and len(prior_ids) == 1 and all(
+            bool(row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")) for row in latest_prior_rows)
+        prior_part = next((candidate for candidate in parts if all_coordinates_reviewed and all_coordinates_agree
+            and len(prior_ids) == 1 and candidate["id"] in prior_ids), None)
+        prior_evidence = None
+        if latest_prior_rows:
+            sample = max(latest_prior_rows, key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or "")))
+            prior_evidence = {"partNumber": ((prior_part or {}).get("partNumber") or sample.get("PartNumberUsed")) if all_coordinates_agree else None,
+                "name": ((prior_part or {}).get("name") or sample.get("NameUsed")) if all_coordinates_agree else None,
+                "sourceDescription": sample.get("SourceDescription") or "", "version": sample.get("Version"),
+                "sourceChanged": sample.get("SourceHash") != source_hash,
+                "associationChanged": bool(association and (sample.get("AssociationKey") != association.id
+                    or sample.get("AssociationVersion") != association.version)), "requiresReview": True,
+                "previousRowsReviewed": len(latest_prior_rows), "currentRows": len(source_refs),
+                "previousRowsAgree": all_coordinates_reviewed and all_coordinates_agree}
+        if prior_part:
+            resolved_parts[prior_part["id"]] = prior_part
+        explicit_unassigned = bool(latest and all(not str(value or "") for value in refs)
+            and expected == actual and len(latest) == len(expected))
+        resolved.append({**group, "part": part if valid else None, "reviewed": valid, "version": version,
+            "explicitlyUnassigned": explicit_unassigned, "previousAssignment": prior_evidence,
+            "needsCompatibilityReview": bool(prior_evidence and not valid)})
     return {"fileId": file_id, "sourceHash": source_hash, "sourceBasis": "saved_workbook",
             "associationKey": association.id if association else "", "associationVersion": association.version if association else 0,
             "version": max((int(row["fields"]["Version"]) for row in history), default=0),
-            "schemaAvailable": store.available, "legacyHistoryAvailable": getattr(store, "legacy_history_available", True), "parts": parts, "groups": resolved,
+            "schemaAvailable": store.available, "legacyHistoryAvailable": getattr(store, "legacy_history_available", True),
+            "mappingPolicyVersion": MAPPING_POLICY_VERSION, "sourceSheets": getattr(groups, "diagnostics", {}),
+            "parts": list(resolved_parts.values()), "groups": resolved,
             "unresolvedGroups": sum(not group["reviewed"] for group in resolved), "authorityChanged": False,
             "history": [{**row["fields"], "OccurredAt": datetime_text(row["fields"].get("OccurredAt"))} for row in history]}
 
@@ -245,30 +350,39 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             raise PartConflict("PART_REVIEW_STALE", "The workbook or mapping version changed; reload the review")
         if not association or association.id != expected_association or association.version != expected_association_version:
             raise PartConflict("PART_ASSOCIATION_STALE", "The saved association changed; reload the review")
-        parts = {part["id"]: part for part in detail["parts"]}
+        # Validate new choices against the complete canonical registry even though
+        # GET mapping responses only return Parts already attached to visible groups.
+        parts = {part["id"]: part for part in list_parts(store)}
         known = {group["key"]: group for group in groups}
         if set(decisions) - set(known):
             raise PartConflict("PART_GROUP_UNKNOWN", "A selected source group is no longer available")
         for part_id in decisions.values():
+            if not part_id:
+                continue
             part = parts.get(part_id)
             if not part or not part["selectable"] or part["duplicateName"]:
                 raise PartConflict("PART_SELECTION_INVALID", "Select a canonical Part with an unambiguous name")
         version = detail["version"] + 1
         rows = []
         for key, part_id in sorted(decisions.items()):
+            diagnostic = known[key].get("sourceDiagnostic", {})
+            if diagnostic and diagnostic.get("status") not in {None, "ok"}:
+                raise PartConflict("PART_SOURCE_LABEL_UNAVAILABLE", "The source Part label column is missing or ambiguous; resolve its header before saving this group")
             for source in known[key]["rows"]:
+                selected = parts.get(part_id) if part_id else None
                 rows.append({"ReviewKey": "part-review:" + fingerprint([request_key, key, source]),
                              "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
                              "AssociationVersion": association.version, "GroupKey": key,
                              "SheetName": source["sheet"], "SourceRow": source["row"],
                              "SourceDescription": known[key]["description"],
-                             "ProductPart": int(parts[part_id]["gristRecordId"]) if parts[part_id].get("gristRecordId") is not None else (None if parts[part_id].get("stableIdentity") else int(part_id)),
-                             "StablePartId": part_id if parts[part_id].get("stableIdentity") and parts[part_id].get("gristRecordId") is not None else "",
-                             "PartIdentity": part_id if parts[part_id].get("stableIdentity") and parts[part_id].get("gristRecordId") is None else None,
-                             "PartRevision": _grist_ref(parts[part_id].get("partRevisionRecordId")) if parts[part_id].get("gristRecordId") is not None else None,
-                             "PartMetadataVersion": _grist_ref(parts[part_id].get("partMetadataRecordId")) if parts[part_id].get("gristRecordId") is not None else None,
-                             "PartNumberUsed": str(parts[part_id].get("partNumber") or ""),
-                             "NameUsed": str(parts[part_id].get("name") or ""),
+                             "ProductPart": (int(selected["gristRecordId"]) if selected and selected.get("gristRecordId") is not None
+                                else (None if not selected or selected.get("stableIdentity") else int(part_id))),
+                             "StablePartId": part_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is not None else "",
+                             "PartIdentity": part_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is None else None,
+                             "PartRevision": _grist_ref(selected.get("partRevisionRecordId")) if selected and selected.get("gristRecordId") is not None else None,
+                             "PartMetadataVersion": _grist_ref(selected.get("partMetadataRecordId")) if selected and selected.get("gristRecordId") is not None else None,
+                             "PartNumberUsed": str(selected.get("partNumber") or "") if selected else "",
+                             "NameUsed": str(selected.get("name") or "") if selected else "",
                              "Version": version, "Actor": actor, "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
                              "RequestKey": request_key, "RequestFingerprint": payload_hash})
         for row in rows:

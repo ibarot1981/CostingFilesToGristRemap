@@ -221,10 +221,11 @@ def _processing_context(path: str):
 
 def _part_context(path: str):
     from app.part_mapping import PartConflict, source_groups
-    from app.milestone2 import _configured_process_lines
+    from app.milestone2 import _configured_process_lines, part_mapping_source_diagnostics
     repository, file_id, association, source_hash = _processing_context(path)
     try:
-        groups = source_groups(_configured_process_lines(read_ods(_resolve_preview_workbook(path))))
+        document = read_ods(_resolve_preview_workbook(path))
+        groups = source_groups(_configured_process_lines(document), sheet_diagnostics=part_mapping_source_diagnostics(document))
     except (OSError, KeyError, ValueError, BadZipFile, ET.ParseError) as exc:
         raise _error(422, "PART_SOURCE_UNAVAILABLE", str(exc))
     if sha256_file(_resolve_preview_workbook(path)) != source_hash:
@@ -433,6 +434,27 @@ def part_name_preview(scope: str, target_id: str, description: str, variant: str
         return result
     except PartIdentityError as exc:
         raise _part_http_error(exc)
+
+
+@app.get("/api/parts/search")
+def part_search(query: str = "", offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100), path: str = "") -> dict[str, Any]:
+    """Bounded canonical Part lookup for Part Mapping and other pickers."""
+    from app.part_mapping import PartConflict, search_parts
+    repository = _get_repository()
+    try:
+        page = search_parts(_part_mapping_store(repository), query=query, offset=offset, limit=limit)
+        if path:
+            try:
+                association = repository.current_association(f"file:{path.casefold()}")
+            except Exception:
+                association = None
+            for part in page["items"]:
+                part["outOfScopeCodes"] = _part_scope_warnings(repository, association, part)
+        return page
+    except PartConflict as exc:
+        raise _error(409, exc.code, str(exc))
+    except GristError as exc:
+        raise _error(503, "PART_DATABASE_UNAVAILABLE", "Canonical Part search could not read Safari Manufacturing Grist.") from exc
 
 
 @app.post("/api/parts/shortcodes")

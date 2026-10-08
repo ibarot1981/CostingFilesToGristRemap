@@ -22,7 +22,7 @@ function restoredCreateAttempt(): Attempt | null {
 const scopeLabels: Record<Scope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 const emptyRegister: Register = { items: [], legacyItems: [] };
 
-export function PartsView({ mappingReturn = null, onReturnToMapping }: { mappingReturn?: { path: string; groupKey: string; partId: string | null } | null; onReturnToMapping?: (partId: string | null) => void }) {
+export function PartsView({ mappingReturn = null, onReturnToMapping }: { mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
   const [query, setQuery] = useState(() => sessionStorage.getItem("parts:search") || "");
@@ -327,7 +327,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
       <div className="panel-footer"><Archive size={15}/><div><strong>Permanent identity</strong><span>Retired numbers remain reserved</span></div></div>
     </aside>
     <section className="parts-work-panel">
-      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed identity, generated names, metadata history and Rev A.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
+      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed identity, generated names, metadata history and Rev A.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "view" ? mappingReturn.partId : selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
       {error && <div className="parts-error" role="alert">{error}{(createAttempt || shortcodeAttempt || metadataAttempt || retireAttempt) && <small>Retry uses the original request key and payload.</small>}</div>}
       {notice && <p className="parts-notice" role="status"><Check size={14}/>{notice}</p>}
       {mode === "create" || mode === "edit" ? form : selected ? <>

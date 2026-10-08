@@ -411,6 +411,8 @@ def _configured_active_status(value: Any, inactive_values: Iterable[str]) -> str
     folded = _string(value).strip().casefold()
     if folded in {item.strip().casefold() for item in inactive_values}:
         return "historical"
+    if folded in {"yes", "y", "true", "1", "active", "in use", "used"}:
+        return "active"
     return "unexpected"
 
 
@@ -457,6 +459,10 @@ def _configured_process_lines(document: OdsDocument) -> dict[str, list[dict[str,
         effective_identity = tuple(name for name in identity_fields if name in field_columns)
         if not effective_identity:
             continue
+        source_headers = {name: _string(sheet.cell(header, column).value).strip()
+            for name, column in field_columns.items()}
+        source_header_cells = {name: sheet.cell(header, column).coordinate
+            for name, column in field_columns.items()}
         rows: list[dict[str, Any]] = []
         for row_number, _ in sheet.nonempty_rows():
             if row_number <= header:
@@ -481,11 +487,53 @@ def _configured_process_lines(document: OdsDocument) -> dict[str, list[dict[str,
                 "identity_fields": list(effective_identity),
                 "identity_values": identity,
                 "fields": {name: _json_value(value) for name, value in values.items()},
+                "source_headers": source_headers,
+                "source_header_cells": source_header_cells,
+                "header_row": header,
+                "available_fields": sorted(field_columns),
                 "source_cells": {name: _semantic_cell_evidence(cell) for name, cell in cells.items()},
                 "cost_value": _json_value(values.get("amount")),
                 "cr_reference": _string(values.get("cr_log")).strip() or None,
             })
         result[sheet_name] = rows
+    return result
+
+
+def part_mapping_source_diagnostics(document: OdsDocument) -> dict[str, dict[str, Any]]:
+    """Report the source label header selected for each Part Mapping sheet."""
+    config = load_app_config(_SEMANTIC_CONFIG_PATH)
+    label_fields = {
+        "5. Material Cut List Price": "product_part_name",
+        "Tool Shop Items": "product_part_name",
+        "CNC Cut List": "part_category",
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for sheet_name, label_field in label_fields.items():
+        sheet = document.sheets.get(sheet_name)
+        if sheet is None:
+            result[sheet_name] = {"present": False, "status": "sheet_missing", "labelField": label_field,
+                "labelHeader": None, "labelHeaderCell": None, "ambiguousLabelHeaders": [], "headerRow": None}
+            continue
+        aliases = config.supported_sheets[sheet_name].aliases
+        try:
+            header = _find_configured_header(sheet, aliases, config.supported_sheets[sheet_name].header_row)
+        except ValueError:
+            result[sheet_name] = {"present": True, "status": "header_missing", "labelField": label_field,
+                "labelHeader": None, "labelHeaderCell": None, "ambiguousLabelHeaders": [], "headerRow": None}
+            continue
+        label_aliases = {" ".join(alias.casefold().split()) for alias in aliases.get(label_field, [])}
+        # Scan header cells directly so duplicate columns with identical text are
+        # still reported as ambiguous (the general alias map is intentionally lossy).
+        distinct = [(_string(cell.value).strip(), column) for column, cell in sheet.rows.get(header, {}).items()
+            if " ".join(_string(cell.value).casefold().split()) in label_aliases]
+        selected = distinct[0] if distinct else None
+        result[sheet_name] = {"present": True, "status": "ok" if selected else "label_column_missing",
+            "labelField": label_field, "labelHeader": selected[0] if selected else None,
+            "labelHeaderCell": sheet.cell(header, selected[1]).coordinate if selected else None,
+            "ambiguousLabelHeaders": [label for label, _ in distinct] if len(distinct) > 1 else [],
+            "headerRow": header}
+        if len(distinct) > 1:
+            result[sheet_name]["status"] = "label_column_ambiguous"
     return result
 
 

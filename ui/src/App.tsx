@@ -17,7 +17,7 @@ import type { AssociationValidation, CatalogSummary, ExplorerItem, MappedFile, M
 
 type TreeMap = Record<string, ExplorerItem[]>;
 type ExplorerSearch = { tree: TreeMap; total: number; itemCount: number; source?: "filesystem" | "cached-report" };
-type PartMappingReturn = { path: string; groupKey: string; partId: string | null };
+type PartMappingReturn = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string };
 const emptyValidation: AssociationValidation = { valid: false, errors: [], warnings: [] };
 
 export function App() {
@@ -230,7 +230,7 @@ export function App() {
     : view === "live-cost" ? <LiveCostView products={products}/>
     : view === "preview" ? <main className="workbook-preview-tab"><PreviewPanel selectedFile={selectedFile} preview={preview} previewing={previewing} refreshing={refreshingPreview} refreshExternalLinks={() => void refreshExternalLinks()} chooseSheet={(sheet) => void chooseSheet(sheet)} summary={null}/></main>
     : view === "parts" ? <PartsView mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setView("mapping"); }}/>
-    : view === "mapping" ? <PartMappingView path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId }); setView("parts"); }}/>
+    : view === "mapping" ? <PartMappingView path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId, mode = "select", context = {}) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId, mode, ...context }); setView("parts"); }}/>
     : view === "normalized" ? <NormalizedView selectedPath={selectedFile?.relative_path || ""} onReconcile={() => setView("costing")}/>
     : view === "costing" ? <CostingReviewView selectedPath={selectedFile?.relative_path || ""} selectedName={selectedFile?.name || ""}/>
     : view === "reconciliation" ? <ReconciliationView products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>

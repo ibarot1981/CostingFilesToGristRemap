@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest import mock
 from fastapi import HTTPException
 from starlette.requests import Request
-from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, source_groups, list_parts, mapping_detail, save_mapping, attach_mapping_evidence
+from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, source_groups, list_parts, search_parts, mapping_detail, save_mapping, attach_mapping_evidence, fingerprint, MAPPING_POLICY_VERSION
 from test_grist_repository import FakeGristClient
 
 
@@ -42,6 +42,114 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(self.detail()["unresolvedGroups"], 3)
         self.assertEqual(self.store.tables["PartMappingReview"], [])
 
+    def test_group_identity_is_sheet_and_mapping_label_with_source_details(self):
+        groups = source_groups({
+            "5. Material Cut List Price": [{"status": "active", "source_row": 10,
+                "fields": {"product_part_name": "Shaft", "material_to_cut": "MS", "qty": "2"},
+                "source_headers": {"product_part_name": "Machine Piece Description"}, "source_header_cells": {"product_part_name": "A8"}, "available_fields": ["product_part_name", "material_to_cut", "qty"]}],
+            "Tool Shop Items": [{"status": "active", "source_row": 10, "fields": {"product_part_name": "Shaft", "material_to_cut": "Tool Steel"}}],
+            "CNC Cut List": [
+                {"status": "active", "source_row": 10, "fields": {"product_part_name": "Plate 1", "part_category": "Shaft", "length": "120", "width": "8", "thickness": "3", "qty": "2"}},
+                {"status": "active", "source_row": 11, "fields": {"product_part_name": "Plate 2", "part_category": "", "length": "80"}},
+            ]
+        }, sheet_diagnostics={"CNC Cut List": {"status": "ok", "labelHeader": "Part Category"}})
+        self.assertEqual(len(groups), 4)
+        self.assertEqual([group["sheet"] for group in groups], ["5. Material Cut List Price", "Tool Shop Items", "CNC Cut List", "CNC Cut List"])
+        self.assertEqual([group["description"] for group in groups], ["Shaft", "Shaft", "Shaft", ""])
+        self.assertEqual(groups[2]["labelField"], "part_category")
+        self.assertEqual(groups[2]["rows"][0]["fields"]["product_part_name"], "Plate 1")
+        self.assertEqual(groups[2]["rows"][0]["fields"]["length"], "120")
+        self.assertEqual(groups[0]["rows"][0]["sourceHeaders"]["product_part_name"], "Machine Piece Description")
+        self.assertEqual(groups[0]["mappingPolicyVersion"], MAPPING_POLICY_VERSION)
+        self.assertNotEqual(groups[0]["key"], groups[1]["key"])
+
+    def test_old_cross_sheet_and_cnc_identity_rows_are_reviewed_not_carried_forward(self):
+        self.create(name="Frame Part")
+        groups = source_groups({"CNC Cut List": [{"status": "active", "source_row": 44,
+            "fields": {"product_part_name": "Plate Flange", "part_category": "Bracket", "material_to_cut": "MS"}}]})
+        legacy_key = "description:" + fingerprint("Plate Flange")
+        fields = {"ReviewKey": "old-review", "FileKey": "file:pilot.ods", "SourceHash": "hash1",
+            "AssociationKey": "association-1", "AssociationVersion": 1, "GroupKey": legacy_key,
+            "SheetName": "CNC Cut List", "SourceRow": 44, "SourceDescription": "Plate Flange", "ProductPart": 1,
+            "Version": 1, "Actor": "Irshad", "Reason": "Previous review", "OccurredAt": "2026-10-01T00:00:00Z",
+            "RequestKey": "old-request", "RequestFingerprint": "old-fingerprint", "RequestRowCount": 1,
+            "PartNumberUsed": "SM-P-000009", "NameUsed": "Frame Part"}
+        self.store.append("PartMappingReview", [fields])
+        result = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1", association=self.association, groups=groups)
+        self.assertFalse(result["groups"][0]["reviewed"])
+        self.assertTrue(result["groups"][0]["needsCompatibilityReview"])
+        self.assertEqual(result["groups"][0]["previousAssignment"]["name"], "Frame Part")
+        self.assertIsNone(result["groups"][0]["part"])
+
+    def test_split_legacy_group_uses_each_source_rows_latest_prior_assignment(self):
+        self.create(name="Bracket Part", part_key="bracket-part")
+        self.create(name="Frame Part", part_key="frame-part")
+        groups = source_groups({"CNC Cut List": [
+            {"status": "active", "source_row": 44, "fields": {"product_part_name": "Shared legacy label", "part_category": "Bracket"}},
+            {"status": "active", "source_row": 45, "fields": {"product_part_name": "Shared legacy label", "part_category": "Frame"}},
+        ]})
+        request_fields = []
+        for row, part_id, part_number, name in ((44, 1, "SM-P-000001", "Bracket Part"), (45, 2, "SM-P-000002", "Frame Part")):
+            request_fields.append({"ReviewKey": f"old-{row}", "FileKey": "file:pilot.ods", "SourceHash": "hash1",
+                "AssociationKey": "association-1", "AssociationVersion": 1,
+                "GroupKey": "description:" + fingerprint("Shared legacy label"), "SheetName": "CNC Cut List", "SourceRow": row,
+                "SourceDescription": "Shared legacy label", "ProductPart": part_id, "Version": 1,
+                "Actor": "Irshad", "Reason": "Previous review", "OccurredAt": "2026-10-01T00:00:00Z",
+                "RequestKey": "old-request", "RequestFingerprint": "old-fingerprint", "RequestRowCount": 2,
+                "PartNumberUsed": part_number, "NameUsed": name})
+        self.store.append("PartMappingReview", request_fields)
+        result = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1", association=self.association, groups=groups)
+        self.assertEqual(result["groups"][0]["previousAssignment"]["name"], "Bracket Part")
+        self.assertEqual(result["groups"][1]["previousAssignment"]["name"], "Frame Part")
+        self.assertTrue(all(group["needsCompatibilityReview"] for group in result["groups"]))
+
+    def test_merged_current_group_marks_disagreeing_legacy_row_assignments(self):
+        self.create(name="Plate A Part", part_key="plate-a")
+        self.create(name="Plate B Part", part_key="plate-b")
+        groups = source_groups({"CNC Cut List": [
+            {"status": "active", "source_row": 46, "fields": {"product_part_name": "Plate A", "part_category": "Shared category"}},
+            {"status": "active", "source_row": 47, "fields": {"product_part_name": "Plate B", "part_category": "Shared category"}},
+        ]})
+        old_rows = []
+        for row, part_id, name in ((46, 1, "Plate A Part"), (47, 2, "Plate B Part")):
+            old_rows.append({"ReviewKey": f"old-merge-{row}", "FileKey": "file:pilot.ods", "SourceHash": "hash1",
+                "AssociationKey": "association-1", "AssociationVersion": 1,
+                "GroupKey": "description:" + fingerprint("Plate " + ("A" if row == 46 else "B")),
+                "SheetName": "CNC Cut List", "SourceRow": row, "SourceDescription": "Plate " + ("A" if row == 46 else "B"),
+                "ProductPart": part_id, "Version": row - 45, "Actor": "Irshad", "Reason": "Previous review",
+                "OccurredAt": f"2026-10-0{row - 45}T00:00:00Z", "RequestKey": f"old-merge-request-{row}",
+                "RequestFingerprint": f"old-fingerprint-{row}", "RequestRowCount": 1,
+                "PartNumberUsed": f"SM-P-00000{part_id}", "NameUsed": name})
+        self.store.append("PartMappingReview", old_rows)
+        result = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1", association=self.association, groups=groups)
+        previous = result["groups"][0]["previousAssignment"]
+        self.assertFalse(previous["previousRowsAgree"])
+        self.assertIsNone(previous["partNumber"])
+        self.assertIsNone(result["groups"][0]["part"])
+
+    def test_explicit_clear_is_append_only_and_audited(self):
+        self.create(); self.save()
+        first = self.detail()
+        self.assertTrue(first["groups"][0]["reviewed"])
+        cleared = self.save(decisions={self.groups[0]["key"]: ""}, expected_version=1, request_key="clear-shaft")
+        result = self.detail()
+        self.assertEqual(cleared["savedRows"], 2)
+        self.assertTrue(result["groups"][0]["explicitlyUnassigned"])
+        self.assertFalse(result["groups"][0]["reviewed"])
+        self.assertEqual(len(result["history"]), 4)
+        self.assertTrue(all(row["fields"].get("Reason") for row in self.store.tables["PartMappingReview"]))
+
+    def test_bounded_part_search_matches_current_identity_and_alias(self):
+        self.store.append("ProductPart", [
+            {"PartKey": "part-a", "DisplayName": "S1KHF — Chassis", "PartNumber": "SM-P-000001", "Description": "Main frame", "DesignVariant": "Standard", "Aliases": ["Old Frame Name"], "Status": "canonical"},
+            {"PartKey": "part-b", "DisplayName": "S1KHF — Bracket", "PartNumber": "SM-P-000002", "Description": "Support", "Status": "canonical"},
+        ])
+        page = search_parts(self.store, query="Old Frame", offset=0, limit=1)
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(page["items"][0]["partNumber"], "SM-P-000001")
+        number_page = search_parts(self.store, query="SM-P-000002", offset=0, limit=1)
+        self.assertEqual(number_page["items"][0]["name"], "S1KHF — Bracket")
+
     def test_legacy_duplicates_and_unallocated_parts_are_not_selectable(self):
         self.create()
         self.create(name="  ＤＲＩＶＥ   shaft  ", part_key="duplicate-part")
@@ -61,7 +169,11 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["fields"]["ProductPart"], 1)
         self.assertEqual(rows[0]["fields"]["Actor"], "Irshad")
         self.assertEqual(self.detail()["unresolvedGroups"], 2)
-        self.assertEqual(self.detail(source_hash="hash2")["unresolvedGroups"], 3)
+        changed_source = self.detail(source_hash="hash2")
+        self.assertEqual(changed_source["unresolvedGroups"], 3)
+        self.assertTrue(changed_source["groups"][0]["previousAssignment"]["sourceChanged"])
+        changed_association = self.detail(association=SimpleNamespace(id="association-1", version=2))
+        self.assertTrue(changed_association["groups"][0]["previousAssignment"]["associationChanged"])
         self.assertTrue(self.save()["idempotent"])
         for overrides in ({"expected_hash": "old"}, {"expected_version": 0}, {"expected_version": 1, "expected_association_version": 2}):
             with self.assertRaises(PartConflict):
