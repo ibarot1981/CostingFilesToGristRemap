@@ -99,6 +99,7 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
         return {"status": "review_required", "rate": None, "reason": "The costing as-of date is invalid.", "ratePolicy": RATE_POLICY}
     spec_key = str(specification.get("SpecificationKey") or "")
     spec_id = str(specification.get("recordId") or "")
+    spec_part = _ref(specification.get("ProductPart"))
     revision_ref = _ref(specification.get("PartRevision"))
     costing_uom = str(specification.get("CostingUOM") or "").strip()
     costing_currency = str(specification.get("CostingCurrency") or "").strip().upper()
@@ -109,13 +110,17 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
         if (_ref(row.get("PartPurchaseSpecification")) != spec_id
                 and str(row.get("PartPurchaseSpecificationKey") or "") != spec_key):
             continue
+        if spec_part and _ref(row.get("ProductPart")) != spec_part:
+            continue
         if revision_ref and _ref(row.get("PartRevision")) != revision_ref:
             continue
         eligible_status = str(row.get("Status", "")).casefold() in ELIGIBLE_STATUSES
         eligible_type = str(row.get("RecordType", "")).casefold() in ELIGIBLE_TYPES
+        is_correction = (str(row.get("RecordType", "")).casefold() in {"return", "reversal", "void", "correction"}
+                         or bool(row.get("ReversesRecord")) or bool(row.get("SupersedesRecord")))
         transaction_at = _date(row.get("TransactionAt"))
-        if eligible_status and eligible_type and not transaction_at:
-            return {"status": "review_required", "rate": None, "reason": "An eligible actual purchase is missing a valid transaction date/time, so the latest purchase cannot be established.", "purchaseRecordId": str(source.get("id") or row.get("PurchaseRecordKey") or ""), "ratePolicy": RATE_POLICY}
+        if eligible_status and (eligible_type or is_correction) and not transaction_at:
+            return {"status": "review_required", "rate": None, "reason": "An eligible purchase or correction is missing a valid transaction date/time, so effective purchase history cannot be established.", "purchaseRecordId": str(source.get("id") or row.get("PurchaseRecordKey") or ""), "ratePolicy": RATE_POLICY}
         if not transaction_at or (as_of_date and transaction_at > as_of_date):
             continue
         material = {**row, "_record_id": str(source.get("id") or row.get("PurchaseRecordKey") or ""), "_transaction_at": transaction_at}
@@ -126,23 +131,44 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
         return {"status": "unavailable", "rate": None, "reason": "No eligible actual purchase exists on or before the selected as-of date.", "asOf": as_of_date.isoformat() if as_of_date else None, "ratePolicy": RATE_POLICY}
 
     # Honor effective reversals/supersessions only as of the calculation date.
-    aliases: dict[str, str] = {}
+    alias_targets: dict[str, set[str]] = {}
     for row in all_for_spec:
         for alias in (row.get("PurchaseRecordKey"), row.get("TransactionKey")):
             if alias:
-                aliases[str(alias)] = row["_record_id"]
-        aliases[row["_record_id"]] = row["_record_id"]
+                alias_targets.setdefault(str(alias), set()).add(row["_record_id"])
+        alias_targets.setdefault(row["_record_id"], set()).add(row["_record_id"])
     index = {row["_record_id"]: row for row in eligible}
     invalidated: set[str] = set()
     for row in all_for_spec:
-        if str(row.get("RecordType", "")).casefold() not in {"return", "reversal", "void", "correction"} and not row.get("ReversesRecord") and not row.get("SupersedesRecord"):
-            continue
+        reversal_type = str(row.get("RecordType", "")).casefold() in {"return", "reversal", "void", "correction"}
         raw_reference = row.get("ReversesRecord") or row.get("SupersedesRecord")
-        reference = _ref(raw_reference)
-        reference = aliases.get(reference, reference) if reference else ""
-        reference = reference or aliases.get(str(raw_reference or ""), str(raw_reference or ""))
-        if reference and reference in index:
-            invalidated.add(reference)
+        if not reversal_type and not raw_reference:
+            continue
+        # Corrections only become effective after they are posted/completed and
+        # their transaction date is within the requested as-of window.
+        if str(row.get("Status", "")).casefold() not in ELIGIBLE_STATUSES:
+            continue
+        reference_value = _ref(raw_reference) or str(raw_reference or "").strip()
+        targets = alias_targets.get(reference_value, set())
+        if len(targets) != 1:
+            return {"status": "review_required", "rate": None,
+                    "reason": "An effective posted correction does not identify exactly one purchase transaction in the same Part specification.",
+                    "purchaseRecordId": row["_record_id"], "ratePolicy": RATE_POLICY}
+        reference = next(iter(targets))
+        original = index.get(reference)
+        if not original:
+            return {"status": "review_required", "rate": None,
+                    "reason": "An effective posted correction references evidence that is not an eligible purchase for the same Part revision and specification.",
+                    "purchaseRecordId": row["_record_id"], "ratePolicy": RATE_POLICY}
+        original_part, correction_part = _ref(original.get("ProductPart")), _ref(row.get("ProductPart"))
+        if (original_part and correction_part and original_part != correction_part
+                or _ref(original.get("PartPurchaseSpecification")) not in (None, _ref(row.get("PartPurchaseSpecification")))
+                or _ref(original.get("PartRevision")) not in (None, _ref(row.get("PartRevision")))
+                or original.get("_record_id") == row.get("_record_id")):
+            return {"status": "review_required", "rate": None,
+                    "reason": "Correction and referenced purchase do not share one Part, specification, revision and distinct transaction.",
+                    "purchaseRecordId": row["_record_id"], "ratePolicy": RATE_POLICY}
+        invalidated.add(reference)
     eligible = [row for row in eligible if row["_record_id"] not in invalidated]
     if not eligible:
         return {"status": "unavailable", "rate": None, "reason": "All eligible purchase evidence is reversed or superseded as of this date.", "asOf": as_of_date.isoformat() if as_of_date else None, "ratePolicy": RATE_POLICY}

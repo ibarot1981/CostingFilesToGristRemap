@@ -1,6 +1,8 @@
 # Parts entity model — deployed Grist schema and remaining gates
 
-**Status, 7 October 2026:** schema `safari-parts-grist-2026-10-07.v8` is applied to the validated Safari Manufacturing document. Canonical Part business data is Grist-backed. This diagram distinguishes deployed Parts records from future per-code configuration. Companion review: `PARTS_IMPLEMENTATION_REVIEW.md`; visual companion: `parts-entity-diagram.html`.
+Updated costing direction (D070): canonical Parts and rates feed disposable Live Cost; only explicit Save Cost Snapshot freezes Part occurrences, metadata versions, quantities, lines and rate evidence. The old cost-run evidence endpoint now returns 410; new frozen evidence belongs to `CostSnapshotRateEvidence`. Live viewing persists no history. See [live/snapshot requirements and normalized relationships](LIVE_COST_AND_SNAPSHOT_REQUIREMENTS.md) and [visual model](live-cost-snapshot-model.html).
+
+**Status, 8 October 2026:** schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated Safari Manufacturing document. Canonical Part business data, explicit Model Code configuration and normalized Cost Snapshots are Grist-backed. Automatic Summary import/authority integration, CR approval and legacy classification remain later gates. Companion review: `PARTS_IMPLEMENTATION_REVIEW.md`; visual companion: `parts-entity-diagram.html`.
 
 ## Deployed relationship model
 
@@ -34,6 +36,9 @@ erDiagram
     PartRevision ||--o{ PurchasedPartCostEvidence : costed_revision
     Vendor ||--o{ PartPurchaseRecord : transaction_vendor
     PartRegistryCoordinator ||--o{ PartRegistryRequest : single_writer_retries
+    CostSnapshotLine ||--o{ CostSnapshotRateEvidence : frozen_rate_provenance
+    PartPurchaseRecord o|--o{ CostSnapshotRateEvidence : selected_actual_purchase
+    CostingProcessRate o|--o{ CostSnapshotRateEvidence : selected_process_rate
 ```
 
 `PartComponentRevision` has two references to `PartRevision`: the parent baseline and the pinned child baseline. `PartRevisionLine` references an exact `LineRevision`; line ownership and source observations remain separately stored in `LineMaster`, `LineRevision`, `LineDetail`, `SourceLineObservation` and `SourceLineMapping`. A reviewed source mapping does not itself create configuration usage.
@@ -54,11 +59,11 @@ erDiagram
 | `Vendor`, `PartPurchaseSpecification`, `VendorPartMapping` | Canonical supplier, purchased Part/revision specification, optional `PurchaseItem`, and reviewed SKU equivalence. Multiple vendors can supply the same Part. |
 | `PartPurchaseRecord` | Immutable actual transaction evidence: vendor, transaction/date/line, quantity/UOM, currency, extended merchandise amount, discount/charges, status, actor/reason, idempotency, reversal/supersession. |
 | `PartPurchaseUnitConversion`, `PartPurchaseCurrencyConversion` | Explicit reviewed/evidenced conversions. Currency evidence is dated. No implicit pack or FX conversion. |
-| `PurchasedPartCostEvidence` | Persists the as-of selection, purchase/vendor/specification/revision, normalized quantity/UOM/currency, base price, discount, applied rate and calculation status against supplied cost-run/configuration keys. |
+| `PurchasedPartCostEvidence` | Legacy table retained for compatibility; the old write API is HTTP 410. New rate evidence is written to `CostSnapshotRateEvidence` only when a snapshot is explicitly saved. |
 | `PartRegistryCoordinator`, `PartRegistryRequest` | One bound writer host and durable request fingerprint/result/retry state in Grist. The SQLite journal only serializes this host and reserves monotonic numbers. |
 | `AuditEvent`, `PurchaseItem` | Existing common audit and procurement catalog tables reused; neither is a competing Part master. |
 
-The v8 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. The production Safari document currently reads: 1 legacy `ProductPart`, 1 legacy numeric `PartRevision`, 313 `LineMaster`, 0 `PartMappingReview`, 0 managed Part/purchase fixture rows, and 1 `PartRegistryCoordinator`. No production Part or purchase business fixture was fabricated. An isolated temporary Grist document verified writes/read-back and restart; synthetic data was not transferred to production and the test document was moved to Grist Trash.
+The v9 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. It created ten configuration/rate/snapshot/policy/journal tables and added `PartComponentRevision.SourcingRoute`; no type changed. Existing production row counts remained: 1 legacy `ProductPart`, 1 legacy numeric `PartRevision`, 313 `LineMaster`, 0 `PartMappingReview`, 0 `PartRegistryRequest`, 1 `PartRegistryCoordinator`, and 1 workbook `CostingSnapshot`. No production Part, purchase or costing fixture was fabricated. An isolated temporary Grist document verified the new persistence and recovery paths, then was moved to Grist Trash. Backup: `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-live-cost-20261008T063022Z.grist`; SHA-256 `09d732cfe016d0e4a2f61a7886c6b73f581355a5698c51b5d77d8d4e78acea6f`.
 
 ## Identity, naming and composition rules
 
@@ -75,10 +80,30 @@ The v8 apply was additive after a native `.grist` backup passed SHA-256 and SQLi
 
 One physically equivalent purchased item has one canonical Part identity regardless of vendor. Only reviewed vendor-SKU mappings can contribute actual purchase records. The resolver in `app/purchased_parts.py` selects by transaction timestamp across all vendors, optionally bounded by an `as_of` time; record-entry order and vendor preference do not decide the rate.
 
-Eligible actuals are posted/completed purchases. Quotes, drafts, voids, returns and reversals are excluded. Repeated transaction lines are idempotent; conflicting duplicates or different rates tied at the latest timestamp block a unique result. Rate basis is net merchandise per costing unit: explicit discount is deducted; tax, freight and other charges are excluded. Unit/currency changes require explicit approved conversion evidence. An incomparable newest eligible record is unavailable/review-needed rather than skipped in favor of an older rate. Missing history is unavailable, not zero. Historical costing must retain the selected `PurchasedPartCostEvidence`; later purchases do not alter earlier evidence.
+Eligible actuals are posted/completed purchases. Quotes, drafts, voids, returns and reversals are excluded. Repeated transaction lines are idempotent; conflicting duplicates or different rates tied at the latest timestamp block a unique result. Rate basis is net merchandise per costing unit: explicit discount is deducted; tax, freight and other charges are excluded. Unit/currency changes require explicit approved conversion evidence. An incomparable newest eligible record is unavailable/review-needed rather than skipped in favor of an older rate. Missing history is unavailable, not zero. Live rate reads are pure; explicit snapshots store selected purchase evidence in `CostSnapshotRateEvidence`. `PurchasedPartCostEvidence` is retained as a legacy table and receives no new records through the deprecated HTTP 410 API.
 
 This does not change the existing `MaterialRateLog` behavior (latest entered matching row, otherwise Default Material rate). Purchased-Part actual purchase history remains separate from Material pricing.
 
-## Deferred work
+## Implemented costing and remaining gates
 
-`CostingConfiguration` → `CostingConfigurationRevision` → `ConfigurationPartSelection` remains the explicit future model for actual Model Code usage and is not implemented by this Part slice. Automatic Summary extraction and full cost-run integration are also deferred; the shared resolver, Part detail display and cost-evidence persistence interface exist, but the current costing engine does not consume purchased-Part selections end to end. The CR approval workflow and reviewed classification/migration of legacy Part identities and numeric revisions are not implemented. These limitations are shown in `Used in` and the API/UI and do not imply costing completion or authority cutover.
+`CostingConfiguration` → `CostingConfigurationRevision` → `ConfigurationPartSelection` is implemented as explicit per-Model-Code usage; broad scope and source mapping are never inferred as a BOM. Disposable Live Cost consumes explicit configurations, manufacturing requirements, purchased specifications and sourced process rates. Only explicit Save writes normalized `CostSnapshot`, `CostSnapshotPart`, `CostSnapshotLine` and `CostSnapshotRateEvidence` rows; history verifies its checksum and reads frozen data only. `CostSnapshotPolicy` implements inherited reminders, not automatic saves. Automatic Summary extraction/authority integration remains deferred, as do CR approval and reviewed classification/migration of legacy Part identities/numeric revisions. These gates do not imply costing completion or authority cutover.
+
+## Live Cost and Cost Snapshot relationships (D070)
+
+```mermaid
+erDiagram
+    ProductModelCode ||--|| CostingConfiguration : current_configuration
+    CostingConfiguration ||--|{ CostingConfigurationRevision : versions
+    CostingConfigurationRevision ||--|{ ConfigurationPartSelection : selects_occurrences
+    ProductPart ||--o{ ConfigurationPartSelection : canonical_part
+    ProductModelCode ||--o{ CostSnapshot : explicit_save
+    CostSnapshot ||--|{ CostSnapshotPart : freezes_occurrences
+    CostSnapshot ||--|{ CostSnapshotLine : freezes_cost_lines
+    CostSnapshotPart ||--o{ CostSnapshotLine : occurrence_context
+    CostSnapshotLine ||--o{ CostSnapshotRateEvidence : freezes_selected_rate
+    CostSnapshot ||--o{ CostSnapshotPublication : resumable_publication
+    ProductModel o|--o{ CostSnapshotPolicy : model_override
+    ProductModelCode o|--o{ CostSnapshotPolicy : code_override
+```
+
+Schema definitions are in `app/schema.py`. Snapshot rows store scalar frozen values alongside canonical references. `CostSnapshotPublication` holds retry state, not a serialized calculation blob. A direct edit by an authorized Grist table writer is outside application immutability controls; the application detects altered normalized rows through the saved checksum and refuses the historical read.

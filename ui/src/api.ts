@@ -7,8 +7,8 @@ async function get<T>(path: string): Promise<T> {
   return payload;
 }
 
-async function send<T>(path: string, body: unknown, headers: Record<string, string> = {}): Promise<T> {
-  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+async function send<T>(path: string, body: unknown, headers: Record<string, string> = {}, method = "POST"): Promise<T> {
+  const response = await fetch(path, { method, headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
   const payload = await response.json();
   if (!response.ok) throw apiError(payload, response.status);
   return payload;
@@ -43,6 +43,17 @@ export const api = {
   addPartUnitConversion: (id: string, specId: number, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-specifications/${specId}/unit-conversions`, payload, { "Idempotency-Key": key }),
   addPartCurrencyConversion: (id: string, specId: number, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-specifications/${specId}/currency-conversions`, payload, { "Idempotency-Key": key }),
   partPurchaseRate: (id: string, asOf = "") => get<any>(`/api/parts/${encodeURIComponent(id)}/purchase-rate${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ""}`),
+  partsForConfiguration: (search = "") => get<any>(`/api/parts?${new URLSearchParams({ search, include_retired: "false" })}`),
+  costingConfiguration: (codeId: string) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/costing-configuration`),
+  saveCostingConfiguration: (codeId: string, payload: unknown, key: string) => send<any>(`/api/model-codes/${encodeURIComponent(codeId)}/costing-configuration`, payload, { "Idempotency-Key": key }, "PUT"),
+  liveCost: (codeId: string) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/live-cost`),
+  costSnapshots: (codeId: string, offset = 0, limit = 25) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/cost-snapshots?offset=${offset}&limit=${limit}`),
+  saveCostSnapshot: (codeId: string, payload: unknown, key: string) => send<any>(`/api/model-codes/${encodeURIComponent(codeId)}/cost-snapshots`, payload, { "Idempotency-Key": key }),
+  costSnapshot: (key: string, offset = 0, limit = 100) => get<any>(`/api/cost-snapshots/${encodeURIComponent(key)}?offset=${offset}&limit=${limit}`),
+  compareCosts: (codeId: string, payload: unknown) => send<any>(`/api/model-codes/${encodeURIComponent(codeId)}/cost-comparisons`, payload),
+  costPolicy: (codeId: string) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/cost-policy`),
+  saveCostPolicy: (scope: string, payload: unknown, key: string) => send<any>(`/api/cost-snapshot-policies/${encodeURIComponent(scope)}`, payload, { "Idempotency-Key": key }, "PUT"),
+  recordProcessRate: (lineMasterId: number, payload: unknown, key: string) => send<any>(`/api/line-masters/${lineMasterId}/process-rates`, payload, { "Idempotency-Key": key }),
   savePartPurchaseRateEvidence: (id: string, payload: unknown) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-rate-evidence`, payload),
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),

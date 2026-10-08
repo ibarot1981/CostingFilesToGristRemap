@@ -1,5 +1,7 @@
 # Phase 0 API and schema contract
 
+> Owner scope update D070, 8 October 2026: Live Cost, explicit normalized Cost Snapshots, policy inheritance and attributable comparisons are implemented in application code and the v9 schema. Ordinary live viewing persists no costing history/evidence. Existing source-workbook CostingSnapshot remains separate.
+
 All JSON errors have a stable `detail.code` and `detail.message`.
 
 | Endpoint | Purpose |
@@ -155,9 +157,9 @@ POST /api/parts/mappings requires path, decisions (group-key to Part-record-ID s
 
 Schema safari-part-review-2026-10-05.v7 adds PartMappingReview and ProductPart NameKey/CreatedActor/CreatedReason/CreatedAt/CreateRequestKey/CreateFingerprint. Current reviewed mappings reduce costing-review.processing_evidence.partRowsRequiringReview; partMapping reports version, schema availability, reviewed row count and unresolved groups. No assignment silently changes accepted line masters, configuration or costing authority.
 
-## Grist-backed Parts API and schema — 7 October 2026
+## Grist-backed Parts API and schema — 8 October 2026
 
-Schema `safari-parts-grist-2026-10-07.v8` extends the existing `ProductPart`, `PartRevision`, `PartMappingReview` and `PartComponentRevision` tables and defines typed metadata, alias, shortcode, line, drawing, vendor, purchase, evidence and coordinator/request tables. The business records are canonical in the validated Safari Manufacturing Grist document. The local `SAFARI_PART_DATABASE_PATH` SQLite file is a single-host reservation, serialization and recovery journal only. Do not copy a local DB as a substitute for Grist backup or use independently initialized allocators on multiple hosts.
+Schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated Safari Manufacturing Grist document. It extends the existing Part tables, including `PartComponentRevision.SourcingRoute`, and adds explicit configuration, process-rate, snapshot, evidence, policy and publication-journal tables. The business records are canonical in Grist. The local `SAFARI_PART_DATABASE_PATH` SQLite file is a single-host reservation, serialization and recovery journal only. Do not copy a local DB as a substitute for Grist backup or use independently initialized allocators on multiple hosts.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -182,7 +184,14 @@ Schema `safari-parts-grist-2026-10-07.v8` extends the existing `ProductPart`, `P
 | `POST /api/parts/{part_id}/purchase-specifications/{specification_id}/unit-conversions` | Add an explicit, reasoned and evidenced UOM conversion. |
 | `POST /api/parts/{part_id}/purchase-specifications/{specification_id}/currency-conversions` | Add an explicit dated currency conversion with source evidence. |
 | `GET /api/parts/{part_id}/purchase-rate?as_of=` | Show current or as-of rate resolution, vendor equivalents, transaction history and explicit unavailable/conflict state. |
-| `POST /api/parts/{part_id}/purchase-rate-evidence` | Resolve and persist deterministic `PurchasedPartCostEvidence` when cost-run and configuration-selection keys are both supplied. The evidence records the resolver actor, applied rate/status and policy reason. This is an interface; the full Summary costing consumer is deferred. |
+| `POST /api/parts/{part_id}/purchase-rate-evidence` | Returns HTTP 410 `SNAPSHOT_REQUIRED`; rate inspection cannot write evidence. |
+| `GET /api/model-codes/{code_id}/costing-configuration` / `PUT ...` | Read or publish an explicit, versioned Part-occurrence configuration for one Model Code. Source mappings and workbook baselines are not inferred as a BOM. |
+| `GET /api/model-codes/{code_id}/live-cost` | Disposable current calculation with manifest, stable line/occurrence identity, rate provenance and unresolved warnings. This path writes no history or purchase evidence. |
+| `GET /api/model-codes/{code_id}/cost-snapshots` / `POST ...` | List completed history or explicitly save a reviewed, complete Live Cost result as normalized Grist rows. Publishing rows are hidden; exact retries resume the same frozen payload. |
+| `GET /api/cost-snapshots/{snapshot_key}` | Read frozen header, Part occurrences, lines and evidence only; verifies the saved row checksum and never resolves current rates. |
+| `POST /api/model-codes/{code_id}/cost-comparisons` | Compare Live to last/selected snapshot or two snapshots for that code. Returns quantity/configuration, rate, structural and residual impact with documented Q×R attribution. |
+| `GET /api/model-codes/{code_id}/cost-policy` / `PUT /api/cost-snapshot-policies/{scope_type}` | Resolve or version the System → Product Model → Model Code reminder policy; Manual suppresses inheritance, and no schedule creates snapshots automatically. |
+| `POST /api/line-masters/{line_master_id}/process-rates` | Capture an explicitly sourced, dated, versioned process rate for Live Cost. |
 
 Mutating calls use stable idempotency keys; reusing a key with changed payload returns a conflict. After response loss, retry the identical key and payload. Inspect `PartRegistryRequest` and the relevant business table before manual recovery; do not allocate a second Part because a request timed out. One Grist `PartRegistryCoordinator` binds the configured host/local allocator. A different host/coordinator cannot take over automatically.
 
@@ -190,16 +199,16 @@ Mutating calls use stable idempotency keys; reusing a key with changed payload r
 
 New managed Parts use `ProductPart.EngineeringRevision=A` and a separate `PartRevision.RevisionLabel=A` baseline with Draft/Finalized status. The pre-existing numeric `PartRevision.Revision` field remains untouched as legacy/source evidence. Metadata version, source mapping version and drawing file version are not Part engineering revisions. Rev B+ cannot be created until the governed CR workflow and approval evidence exist.
 
-`PartRevisionLine` pins exact line revisions. `PartComponentRevision` pins parent/child revision plus quantity/UOM. MCL, Toolshop and CNC links are optional and may be mixed. Drawings are optional. Per-code `CostingConfiguration`/`ConfigurationPartSelection` and automatic Summary costing are not implemented; `Used in` must not infer configuration from scope or source mappings.
+`PartRevisionLine` pins exact line revisions. `PartComponentRevision` pins parent/child revision plus quantity/UOM and occurrence sourcing route. MCL, Toolshop and CNC links are optional and may be mixed. Drawings are optional. Explicit per-code `CostingConfiguration`/`ConfigurationPartSelection` and disposable Live Cost are implemented; automatic Summary import/authority integration is not. `Used in` reports explicit configuration references and does not infer them from scope or source mappings.
 
 ### Purchased-Part costing policy
 
 Select the latest eligible posted/completed actual purchase by transaction timestamp across all reviewed vendors for the same canonical Part specification/revision. `RecordedAt` is audit only; a backdated purchase does not displace a later transaction. Quotes, drafts, voids, returns and reversed purchases are excluded. Identical transaction/line replay collapses idempotently; contradictory duplicate payloads and different-rate ties at the latest timestamp produce a visible conflict.
 
-Applied rate is net merchandise per costing UOM: deduct explicit discount, exclude tax/freight/other charges. Use explicit reviewed UOM conversion and dated currency conversion evidence. If the newest eligible transaction is incomparable, return unavailable/review-needed; do not choose an older rate. No eligible history returns unavailable, never zero or MaterialRateLog/default fallback. Persist selected record/vendor/date/rate/cost basis to `PurchasedPartCostEvidence` so newer purchases do not mutate historical results. Existing MaterialRateLog behavior remains unchanged.
+Applied rate is net merchandise per costing UOM: deduct explicit discount, exclude tax/freight/other charges. Use explicit reviewed UOM conversion and dated currency conversion evidence. If the newest eligible transaction is incomparable, return unavailable/review-needed; do not choose an older rate. No eligible history returns unavailable, never zero or MaterialRateLog/default fallback. Read-only rate resolution does not write evidence. Explicit Save Cost Snapshot persists the selected record/vendor/date/rate/cost basis in `CostSnapshotRateEvidence`; historical detail does not resolve a newer purchase. Existing MaterialRateLog behavior remains unchanged.
 
 ### Deployed schema and verification boundary
 
-The v8 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. Live production retains 1 legacy ProductPart, 1 legacy numeric PartRevision and 313 LineMaster rows, with 0 mapping reviews and 0 managed Part/purchase fixture rows. One coordinator row is bound. No legacy ownership or revision was silently migrated.
+The v9 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. It added ten configuration/rate/snapshot/policy/publication tables and one component-route column, with no type changes. Live production retains 1 legacy ProductPart, 1 legacy numeric PartRevision and 313 LineMaster rows, with 0 mapping reviews and 0 managed Part/purchase fixture rows. One coordinator row is bound. No legacy ownership or revision was silently migrated.
 
-An isolated temporary Grist document verified real API create/read-back/restart, metadata alias history, mapping, child quantity, process-line linkage, multiple vendors, current and historical purchase selection, and persisted cost evidence. Its synthetic records remained isolated; the document was moved to Trash after the check. Full Model Code configuration, Summary costing integration, CR approval and legacy identity migration are still open.
+An isolated temporary Grist document verified real API create/read-back/restart, metadata alias history, mapping, child quantity, process-line linkage, multiple vendors, current and historical purchase selection, configuration/policy persistence, Live Cost no-write, same-key snapshot recovery after an actual committed-row timeout, frozen historical reads and rate attribution. The test document was moved to Trash. Automatic Summary import/authority integration, CR approval and legacy identity migration are still open.

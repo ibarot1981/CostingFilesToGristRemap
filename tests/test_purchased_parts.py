@@ -116,6 +116,24 @@ class PurchasedPartRateTests(unittest.TestCase):
                             RecordType="correction", SupersedesRecord="purchase:1")
         self.assertEqual(self.resolve([original, reversal])["status"], "unavailable")
 
+    def test_only_posted_effective_reversals_apply_within_as_of_window(self):
+        original = purchase(1, 101, "A-1", "2026-01-01T10:00:00Z", 10)
+        draft_return = purchase(2, 101, "A-2", "2026-02-01T10:00:00Z", 10,
+                                RecordType="return", Status="draft", ReversesRecord=1)
+        voided_return = purchase(3, 101, "A-3", "2026-02-02T10:00:00Z", 10,
+                                 RecordType="return", Status="void", ReversesRecord=1)
+        future_return = purchase(4, 101, "A-4", "2026-04-01T10:00:00Z", 10,
+                                 RecordType="return", Status="posted", ReversesRecord=1)
+        self.assertEqual(self.resolve([original, draft_return, voided_return])["rate"], 10)
+        self.assertEqual(self.resolve([original, future_return], as_of="2026-03-01T00:00:00Z")["rate"], 10)
+        self.assertEqual(self.resolve([original, future_return])["status"], "unavailable")
+
+    def test_effective_correction_with_wrong_reference_is_review_required(self):
+        original = purchase(1, 101, "A-1", "2026-01-01T10:00:00Z", 10)
+        corrupt = purchase(2, 101, "A-2", "2026-02-01T10:00:00Z", 10,
+                           RecordType="correction", Status="completed", SupersedesRecord="missing-row")
+        self.assertEqual(self.resolve([original, corrupt])["status"], "review_required")
+
     def test_missing_history_and_invalid_dates_are_explicit(self):
         self.assertEqual(self.resolve([])["status"], "unavailable")
         row = purchase(1, 101, "A-1", "not-a-date", 10)

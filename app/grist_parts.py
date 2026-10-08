@@ -42,6 +42,8 @@ MANAGED_TABLES = {
     "PartShortcodeHistory", "PartRevision", "PartMappingReview", "PartComponentRevision",
     "PartRevisionLine", "PartDrawing", "Vendor", "PartPurchaseSpecification",
     "VendorPartMapping", "PartPurchaseRecord", "PurchasedPartCostEvidence", "AuditEvent", "PurchaseItem",
+    "CostingConfiguration", "CostingConfigurationRevision", "ConfigurationPartSelection", "CostingProcessRate",
+    "CostSnapshot", "CostSnapshotPart", "CostSnapshotLine", "CostSnapshotRateEvidence", "CostSnapshotPolicy", "CostSnapshotPublication",
 }
 
 
@@ -173,6 +175,24 @@ class GristPartRegistry:
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.client.fetch_table_records_with_ids(table)
 
+    def shortcodes(self) -> list[dict[str, Any]]:
+        """Return maintained scope shortcodes in the common identity-store shape."""
+        result = []
+        for row in self._rows("PartScopeShortcode"):
+            fields = row.get("fields", {})
+            scope_type = str(fields.get("ScopeType") or "").strip()
+            target_id = str(fields.get("ScopeTargetId") or "").strip()
+            if (not scope_type or not target_id) and ":" in str(fields.get("ScopeKey") or ""):
+                scope_key_type, _, scope_key_target = str(fields.get("ScopeKey") or "").partition(":")
+                scope_type = scope_type or scope_key_type
+                target_id = target_id or scope_key_target
+            shortcode = str(fields.get("Shortcode") or "").strip()
+            if scope_type and target_id and shortcode:
+                result.append({"scope_type": scope_type, "target_id": target_id,
+                               "target_label": str(fields.get("ScopeTargetLabel") or ""),
+                               "shortcode": shortcode, "version": int(fields.get("Version") or 1)})
+        return sorted(result, key=lambda item: (item["scope_type"], item["target_label"].casefold(), item["target_id"]))
+
     @staticmethod
     def _find(rows: list[dict[str, Any]], field: str, value: str) -> dict[str, Any] | None:
         found = [row for row in rows if str(row.get("fields", {}).get(field) or "") == value]
@@ -183,6 +203,13 @@ class GristPartRegistry:
     def _ensure_keyed(self, table: str, key_field: str, key: str, fields: dict[str, Any]) -> dict[str, Any]:
         row = self._find(self._rows(table), key_field, key)
         if row:
+            expected_request = str(fields.get("RequestKey") or "")
+            actual_fields = row.get("fields", {})
+            if expected_request and str(actual_fields.get("RequestKey") or "") != expected_request:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", f"The existing {table} row belongs to a different request.")
+            expected_fingerprint = str(fields.get("RequestFingerprint") or "")
+            if expected_fingerprint and str(actual_fields.get("RequestFingerprint") or "") != expected_fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", f"The existing {table} row has a different request fingerprint.")
             return row
         self.client.create_table_records(table, [{"fields": fields}])
         row = self._find(self._rows(table), key_field, key)
@@ -476,6 +503,11 @@ class GristPartRegistry:
             return {"part": self.get_part(part_id), "idempotent": True}
         next_version = expected_version + 1
         pending_metadata = self._find(self._rows("PartMetadataVersion"), "MetadataKey", f"{part_id}:metadata:{next_version}")
+        if pending_metadata:
+            pending_fields = pending_metadata.get("fields", {})
+            if (str(pending_fields.get("RequestKey") or "") != request_key
+                    or str(pending_fields.get("RequestFingerprint") or "") != fingerprint):
+                raise PartIdentityError("PART_METADATA_PUBLICATION_CONFLICT", "This metadata version is already being published by a different request. Retry its original request or reload the Part.")
         if int(part["metadataVersion"]) != expected_version and not pending_metadata:
             raise PartIdentityError("PART_METADATA_STALE", "Part metadata changed; reload before saving.")
         current_usage = self.usage_evidence(part_id)
@@ -504,12 +536,18 @@ class GristPartRegistry:
         previous_alias = self._find(self._rows("PartNameAlias"), "AliasKey", f"{part_id}:name:{normalized_name(part['name'])}")
         if previous_alias and previous_alias.get("fields", {}).get("AliasKey") != alias_key:
             self.client.update_table_records("PartNameAlias", [{"id": int(previous_alias["id"]), "fields": {"IsCurrent": False}}])
-        current_alias = self._ensure_keyed("PartNameAlias", "AliasKey", alias_key, {
-            "AliasKey": alias_key, "ProductPart": int(row["id"]), "MetadataVersion": int(meta["id"]),
-            "DisplayName": expected_name, "NameKey": normalized_name(expected_name), "IsCurrent": True, "CreatedAt": now,
-            "Actor": actor, "Reason": reason.strip(), "RequestKey": request_key})
-        if current_alias.get("fields", {}).get("MetadataVersion") != int(meta["id"]) or not current_alias.get("fields", {}).get("IsCurrent"):
-            self.client.update_table_records("PartNameAlias", [{"id": int(current_alias["id"]), "fields": {"MetadataVersion": int(meta["id"]), "IsCurrent": True}}])
+        current_alias = self._find(self._rows("PartNameAlias"), "AliasKey", alias_key)
+        if current_alias:
+            if _ref(current_alias.get("fields", {}).get("ProductPart")) != int(row["id"]):
+                raise PartIdentityError("PART_ALIAS_CONFLICT", "The requested name alias belongs to a different canonical Part.")
+            self.client.update_table_records("PartNameAlias", [{"id": int(current_alias["id"]), "fields": {
+                "MetadataVersion": int(meta["id"]), "DisplayName": expected_name, "NameKey": normalized_name(expected_name), "IsCurrent": True}}])
+            current_alias = next((item for item in self._rows("PartNameAlias") if int(item.get("id", -1)) == int(current_alias["id"])), current_alias)
+        else:
+            current_alias = self._ensure_keyed("PartNameAlias", "AliasKey", alias_key, {
+                "AliasKey": alias_key, "ProductPart": int(row["id"]), "MetadataVersion": int(meta["id"]),
+                "DisplayName": expected_name, "NameKey": normalized_name(expected_name), "IsCurrent": True, "CreatedAt": now,
+                "Actor": actor, "Reason": reason.strip(), "RequestKey": request_key})
         self.client.update_table_records("ProductPart", [{"id": int(row["id"]), "fields": {"DisplayName": expected_name,
             "NameKey": normalized_name(expected_name), "ScopeType": scope_type, "ScopeTargetId": target_id,
             "ScopeTargetLabel": target_label.strip(), "ScopeProduct": target_fields["ScopeProduct"], "ScopeProductModel": target_fields["ScopeProductModel"],
@@ -518,6 +556,17 @@ class GristPartRegistry:
             "EntityType": "ProductPart", "EntityId": part_id, "Reason": reason.strip(), "Payload": json.dumps({"metadataVersion": version}, sort_keys=True),
             "RequestKey": request_key, "RequestFingerprint": fingerprint})
         updated = self.get_part(part_id)
+        confirmed_meta = self._find(self._rows("PartMetadataVersion"), "MetadataKey", f"{part_id}:metadata:{version}")
+        confirmed_alias = self._find(self._rows("PartNameAlias"), "AliasKey", alias_key)
+        master_row = self._find(self._rows("ProductPart"), "StablePartId", part_id)
+        if (not confirmed_meta or not confirmed_alias or not master_row
+                or str(master_row.get("fields", {}).get("DisplayName") or "") != expected_name
+                or _ref(master_row.get("fields", {}).get("CurrentMetadataVersion")) != int(confirmed_meta["id"])
+                or str(confirmed_meta.get("fields", {}).get("DisplayName") or "") != expected_name
+                or str(confirmed_alias.get("fields", {}).get("DisplayName") or "") != expected_name
+                or _ref(confirmed_alias.get("fields", {}).get("MetadataVersion")) != int(confirmed_meta["id"])
+                or not confirmed_alias.get("fields", {}).get("IsCurrent")):
+            raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm matching Part, metadata version and current alias values.")
         self._complete_request(request, {"part": updated})
         return {"part": updated, "idempotent": False}
 
@@ -640,11 +689,11 @@ class GristPartFeatures:
                 "childPartNumber": child_fields.get("PartNumber"), "childName": child_fields.get("DisplayName"),
                 "childRevisionId": child_revision_id, "childRevisionLabel": child_revision.get("RevisionLabel") or child_revision.get("Revision"),
                 "quantity": fields.get("Quantity"), "uom": fields.get("QuantityUOM"), "status": fields.get("ComponentStatus") or fields.get("Status"),
-                "reason": fields.get("Reason"), "actor": fields.get("Actor")})
+                "sourcingRoute": fields.get("SourcingRoute") or "auto", "reason": fields.get("Reason"), "actor": fields.get("Actor")})
         return result
 
     @_serialized
-    def add_component(self, *, parent_part_id: str, child_part_id: str, quantity: float, uom: str, actor: str, reason: str, request_key: str):
+    def add_component(self, *, parent_part_id: str, child_part_id: str, quantity: float, uom: str, actor: str, reason: str, request_key: str, sourcing_route: str = "auto"):
         self.registry._verify_writer()
         parent, child = self._part(parent_part_id), self._part(child_part_id)
         if parent_part_id == child_part_id:
@@ -653,8 +702,9 @@ class GristPartFeatures:
             value = float(quantity)
         except (TypeError, ValueError):
             value = 0
-        if not math.isfinite(value) or value <= 0 or not uom.strip() or not actor.strip() or not reason.strip() or not request_key.strip():
-            raise PartIdentityError("PART_COMPONENT_INPUT_INVALID", "Component quantity must be positive, with a unit, actor and reason.")
+        sourcing_route = str(sourcing_route or "auto").casefold()
+        if not math.isfinite(value) or value <= 0 or not uom.strip() or not actor.strip() or not reason.strip() or not request_key.strip() or sourcing_route not in {"auto", "make", "buy"}:
+            raise PartIdentityError("PART_COMPONENT_INPUT_INVALID", "Component quantity must be positive, with a unit, actor, reason and auto/make/buy sourcing route.")
         parent_revision = self.registry.current_revision(parent_part_id)
         self._revision_is_draft(parent_revision)
         parent_revision_id, child_revision_id = int(parent_revision["id"]), int(child["revisionRecordId"])
@@ -677,10 +727,10 @@ class GristPartFeatures:
             visited.add(current)
             pending.extend(adjacency.get(current, ()))
         key = f"{parent_revision_id}:{child_revision_id}:{request_key}"
-        fingerprint = request_fingerprint([parent_part_id, child_part_id, value, uom.strip(), actor.strip(), reason.strip()])
+        fingerprint = request_fingerprint([parent_part_id, child_part_id, value, uom.strip(), sourcing_route, actor.strip(), reason.strip()])
         saved = self.registry._ensure_keyed("PartComponentRevision", "ComponentKey", key, {
             "ComponentKey": key, "ParentRevision": parent_revision_id, "ChildRevision": child_revision_id,
-            "Quantity": value, "QuantityUOM": uom.strip(), "Status": "active", "ComponentStatus": "active",
+            "Quantity": value, "QuantityUOM": uom.strip(), "SourcingRoute": sourcing_route, "Status": "active", "ComponentStatus": "active",
             "Actor": actor.strip(), "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
             "RequestKey": request_key, "RequestFingerprint": fingerprint})
         if saved.get("fields", {}).get("RequestFingerprint") != fingerprint:
@@ -706,9 +756,8 @@ class GristPartFeatures:
                 "RequestKey": request_key, "RequestFingerprint": definition_hash})
             return {"part": part, "revision": fields, "idempotent": True}
         self._revision_is_draft(revision)
-        physical = {"components": self.components(part_id), "lines": [row.get("fields", {}) for row in self.registry._rows("PartRevisionLine") if _ref(row.get("fields", {}).get("PartRevision")) == int(revision["id"])],
-                    "drawings": [row.get("fields", {}) for row in self.registry._rows("PartDrawing") if _ref(row.get("fields", {}).get("PartRevision")) == int(revision["id"])]}
-        definition_hash = request_fingerprint(physical)
+        physical = self._physical_closure(int(revision["id"]), set())
+        definition_hash = str(physical["definitionHash"])
         occurred = grist_datetime(utc_now())
         self.client.update_table_records("PartRevision", [{"id": int(revision["id"]), "fields": {"Status": "finalized", "BaselineStatus": "finalized",
             "DefinitionHash": definition_hash, "FinalizedAt": occurred, "FinalizedBy": actor.strip(), "FinalizationReason": reason.strip(),
@@ -721,6 +770,61 @@ class GristPartFeatures:
         if check.get("fields", {}).get("DefinitionHash") != definition_hash or check.get("fields", {}).get("BaselineStatus") != "finalized":
             raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the finalized Rev A baseline.")
         return {"part": self._part(part_id), "revision": check.get("fields", {}), "idempotent": False}
+
+    def _physical_closure(self, revision_id: int, visiting: set[int]) -> dict[str, Any]:
+        """Build a physical-only immutable closure, excluding mutable Part metadata and vendor terms."""
+        if revision_id in visiting:
+            raise PartIdentityError("PART_COMPONENT_CYCLE", "A recursive Part composition cycle prevents finalization.")
+        revision = next((row for row in self.registry._rows("PartRevision") if int(row.get("id", -1)) == revision_id), None)
+        if not revision:
+            raise PartIdentityError("PART_COMPONENT_INVALID", "A referenced child engineering revision no longer exists.")
+        fields = revision.get("fields", {})
+        is_finalized = str(fields.get("BaselineStatus") or fields.get("Status") or "draft").casefold() == "finalized"
+        if visiting and not is_finalized:
+            raise PartIdentityError("PART_CHILD_REVISION_DRAFT", "Finalize each child Part's physical Rev A baseline before finalizing its consuming assembly.")
+        next_visiting = set(visiting)
+        next_visiting.add(revision_id)
+        components = []
+        for row in self.registry._rows("PartComponentRevision"):
+            component = row.get("fields", {})
+            if (_ref(component.get("ParentRevision")) != revision_id
+                    or str(component.get("ComponentStatus") or component.get("Status") or "active").casefold() in {"void", "removed", "inactive"}):
+                continue
+            child_id = _ref(component.get("ChildRevision"))
+            child_closure = self._physical_closure(child_id, next_visiting) if child_id else None
+            components.append({"componentKey": component.get("ComponentKey"), "childRevision": child_id,
+                "childDefinitionHash": (child_closure or {}).get("definitionHash"), "quantity": component.get("Quantity"),
+                "uom": component.get("QuantityUOM"), "status": component.get("ComponentStatus") or component.get("Status")})
+        lines = []
+        masters = {int(row["id"]): row.get("fields", {}) for row in self.registry._rows("LineMaster")}
+        line_revisions = {int(row["id"]): row.get("fields", {}) for row in self.registry._rows("LineRevision")}
+        for row in self.registry._rows("PartRevisionLine"):
+            line = row.get("fields", {})
+            if _ref(line.get("PartRevision")) != revision_id or str(line.get("Status") or "active").casefold() in {"void", "removed", "inactive"}:
+                continue
+            master_id, line_revision_id = _ref(line.get("LineMaster")), _ref(line.get("LineRevision"))
+            lines.append({"revisionLineKey": line.get("RevisionLineKey"), "lineMasterKey": masters.get(master_id, {}).get("LineKey"),
+                "physicalSignature": line_revisions.get(line_revision_id, {}).get("PhysicalSignature"),
+                "processType": line.get("ProcessType"), "quantityPerPart": line.get("QuantityPerPart"), "quantityUOM": line.get("QuantityUOM")})
+        drawings = [{key: drawing.get(key) for key in ("DrawingIdentity", "LinkType", "FileVersion", "ContentHash", "Status")}
+                    for row in self.registry._rows("PartDrawing")
+                    for drawing in [row.get("fields", {})]
+                    if _ref(drawing.get("PartRevision")) == revision_id and str(drawing.get("Status") or "active").casefold() not in {"void", "removed", "inactive"}]
+        specifications = [{key: spec.get(key) for key in ("SpecificationCode", "Manufacturer", "ManufacturerPartNumber", "Description", "Attributes", "CostingUOM", "CostingCurrency", "PurchaseItem")}
+                          for row in self.registry._rows("PartPurchaseSpecification")
+                          for spec in [row.get("fields", {})]
+                          if _ref(spec.get("PartRevision")) == revision_id and str(spec.get("Status") or "active").casefold() == "active"]
+        from app.part_identity import request_fingerprint
+        definition = {"revisionLabel": fields.get("RevisionLabel") or fields.get("Revision"),
+            "components": sorted(components, key=lambda item: str(item["componentKey"])),
+            "lines": sorted(lines, key=lambda item: str(item["revisionLineKey"])),
+            "drawings": sorted(drawings, key=lambda item: str(item["DrawingIdentity"])),
+            "purchaseSpecifications": sorted(specifications, key=lambda item: str(item["SpecificationCode"]))}
+        definition["definitionHash"] = request_fingerprint(definition)
+        recorded_hash = str(fields.get("DefinitionHash") or "")
+        if is_finalized and recorded_hash and recorded_hash != definition["definitionHash"]:
+            raise PartIdentityError("PART_FINALIZED_DEFINITION_DRIFT", "A finalized Part's physical definition no longer matches its immutable baseline.")
+        return definition
 
     @_serialized
     def link_process_line(self, *, part_id: str, line_master_id: int, line_revision_id: int, quantity: float = 1,
@@ -862,6 +966,7 @@ class GristPartFeatures:
                                       actor: str, reason: str, request_key: str):
         self.registry._verify_writer()
         part = self._part(part_id)
+        self._revision_is_draft(self.registry.current_revision(part_id))
         if not code.strip() or not costing_uom.strip() or not currency.strip() or not actor.strip() or not reason.strip() or not request_key.strip():
             raise PartIdentityError("PART_PURCHASE_SPEC_INPUT_INVALID", "Specification code, costing unit/currency, actor and reason are required.")
         key = f"spec:{part_id}:{request_key}"
@@ -975,9 +1080,12 @@ class GristPartFeatures:
                 or str(mapping.get("fields", {}).get("Status") or "").casefold() != "reviewed"):
             raise PartIdentityError("PART_PURCHASE_LINK_INVALID", "Purchase record must link to this Part's specification and a reviewed vendor mapping.")
         try:
-            at = datetime.fromisoformat(transaction_at.replace("Z", "+00:00"))
+            from app.purchased_parts import _date
+            at = _date(transaction_at)
             numbers = [float(quantity), float(extended_amount), float(discount_amount), float(tax_amount), float(freight_amount), float(other_charges)]
         except (TypeError, ValueError):
+            raise PartIdentityError("PART_PURCHASE_INPUT_INVALID", "Purchase date and monetary values must be valid.")
+        if at is None:
             raise PartIdentityError("PART_PURCHASE_INPUT_INVALID", "Purchase date and monetary values must be valid.")
         if at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
@@ -993,20 +1101,37 @@ class GristPartFeatures:
         vendor_id = _ref(map_fields.get("Vendor"))
         transaction_identity = (vendor_id, transaction_key.strip().casefold(), transaction_line_key.strip().casefold())
         fingerprint = request_fingerprint([part_id, specification_id, mapping_id, *transaction_identity, record_type, status, at.isoformat(), document_reference, numbers, quantity_uom, currency.upper(), actor, reason, reverses_record_id, supersedes_record_key])
+        # A request key identifies one immutable write operation. Check it before
+        # transaction deduplication so exact retries return their saved row and
+        # changed payloads fail as request conflicts, including after a timeout.
+        existing_request = self.registry._find(self.registry._rows("PartPurchaseRecord"), "RequestKey", request_key)
+        if existing_request:
+            if existing_request.get("fields", {}).get("RequestFingerprint") != fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This purchase request key was already used with different evidence.")
+            return {"purchase": existing_request.get("fields", {}), "id": existing_request.get("id"), "idempotent": True}
         if reverses_record_id is not None:
             original = next((row for row in self.registry._rows("PartPurchaseRecord") if int(row.get("id", -1)) == int(reverses_record_id)), None)
-            if not original or _ref(original.get("fields", {}).get("PartPurchaseSpecification")) != int(specification_id):
-                raise PartIdentityError("PART_PURCHASE_REVERSAL_INVALID", "A reversal must reference an existing purchase record for this specification.")
+            original_fields = original.get("fields", {}) if original else {}
+            if (not original or _ref(original_fields.get("PartPurchaseSpecification")) != int(specification_id)
+                    or _ref(original_fields.get("ProductPart")) != part["gristRecordId"]
+                    or _ref(original_fields.get("PartRevision")) != part["revisionRecordId"]
+                    or (vendor_id and _ref(original_fields.get("Vendor")) != vendor_id)):
+                raise PartIdentityError("PART_PURCHASE_REVERSAL_INVALID", "A reversal must reference an existing purchase record for this Part, specification, revision and vendor transaction.")
         if supersedes_record_key:
             original = self.registry._find(self.registry._rows("PartPurchaseRecord"), "PurchaseRecordKey", supersedes_record_key)
-            if not original or _ref(original.get("fields", {}).get("PartPurchaseSpecification")) != int(specification_id):
-                raise PartIdentityError("PART_PURCHASE_REVERSAL_INVALID", "A superseding record must identify an existing purchase record for this specification.")
+            original_fields = original.get("fields", {}) if original else {}
+            if (not original or _ref(original_fields.get("PartPurchaseSpecification")) != int(specification_id)
+                    or _ref(original_fields.get("ProductPart")) != part["gristRecordId"]
+                    or _ref(original_fields.get("PartRevision")) != part["revisionRecordId"]
+                    or (vendor_id and _ref(original_fields.get("Vendor")) != vendor_id)):
+                raise PartIdentityError("PART_PURCHASE_REVERSAL_INVALID", "A superseding record must identify an existing transaction for this Part, specification, revision and vendor.")
         for old in self.registry._rows("PartPurchaseRecord"):
             f = old.get("fields", {})
             identity = (_ref(f.get("Vendor")), str(f.get("TransactionKey") or "").casefold(), str(f.get("TransactionLineKey") or "").casefold())
             if identity == transaction_identity:
                 try:
-                    old_at = datetime.fromisoformat(str(f.get("TransactionAt")).replace("Z", "+00:00"))
+                    from app.purchased_parts import _date
+                    old_at = _date(f.get("TransactionAt"))
                     old_numbers = [float(f.get(key) or 0) for key in ("Quantity", "ExtendedAmount", "DiscountAmount", "TaxAmount", "FreightAmount", "OtherCharges")]
                 except (TypeError, ValueError):
                     old_at, old_numbers = None, []
@@ -1023,11 +1148,6 @@ class GristPartFeatures:
                 if same_evidence:
                     return {"purchase": f, "id": old.get("id"), "idempotent": True}
                 raise PartIdentityError("PART_PURCHASE_DUPLICATE_CONFLICT", "This actual vendor transaction line already exists with different evidence; use a correction/reversal record.")
-        existing_request = self.registry._find(self.registry._rows("PartPurchaseRecord"), "RequestKey", request_key)
-        if existing_request:
-            if existing_request.get("fields", {}).get("RequestFingerprint") != fingerprint:
-                raise PartIdentityError("PART_REQUEST_CONFLICT", "This purchase request key was already used with different evidence.")
-            return {"purchase": existing_request.get("fields", {}), "id": existing_request.get("id"), "idempotent": True}
         record_key = f"purchase:{request_key}"
         fields = {"PurchaseRecordKey": record_key, "VendorPartMapping": int(mapping_id), "PartPurchaseSpecification": int(specification_id),
             "ProductPart": part["gristRecordId"], "PartRevision": part["revisionRecordId"], "Vendor": vendor_id,
@@ -1043,7 +1163,6 @@ class GristPartFeatures:
             raise PartIdentityError("PART_REQUEST_CONFLICT", "This purchase request key was already used with different evidence.")
         return {"purchase": row.get("fields", {}), "id": row.get("id"), "idempotent": False}
 
-    @_serialized
     def purchase_detail(self, part_id: str, *, as_of: str | None = None, cost_run_key: str = "", configuration_selection_key: str = ""):
         from app.purchased_parts import resolve_purchased_part_rate
         part = self._part(part_id)
@@ -1065,23 +1184,6 @@ class GristPartFeatures:
                         row["fields"] = row_fields
             rate = resolve_purchased_part_rate(specification, purchases, unit_conversions=[row.get("fields", {}) for row in units if _ref(row.get("fields", {}).get("PartPurchaseSpecification")) == int(source["id"])],
                 currency_conversions=[row.get("fields", {}) for row in currencies if _ref(row.get("fields", {}).get("PartPurchaseSpecification")) == int(source["id"])], as_of=as_of)
-            if cost_run_key and configuration_selection_key:
-                self.registry._verify_writer()
-                evidence_key = request_fingerprint([cost_run_key, configuration_selection_key, as_of, rate.get("status"), rate.get("purchaseRecordId"), rate.get("transactionAt"), rate.get("rate")])
-                purchase_row = next((row for row in purchases if str(row.get("id")) == str(rate.get("purchaseRecordId")) or str(row.get("fields", {}).get("PurchaseRecordKey")) == str(rate.get("purchaseRecordId"))), None)
-                self.registry._ensure_keyed("PurchasedPartCostEvidence", "EvidenceKey", evidence_key, {
-                        "EvidenceKey": evidence_key, "CostRunKey": cost_run_key, "ConfigurationSelectionKey": configuration_selection_key,
-                        "ProductPart": part["gristRecordId"], "PartRevision": part["revisionRecordId"], "PartPurchaseSpecification": int(source["id"]),
-                        "PurchaseRecord": int(purchase_row["id"]) if purchase_row else None,
-                        "Vendor": _ref(purchase_row.get("fields", {}).get("Vendor")) if purchase_row else None,
-                        "AsOfDate": grist_datetime(as_of) if as_of else None,
-                        "TransactionAt": grist_datetime(rate["transactionAt"]) if rate.get("transactionAt") else None,
-                        "PurchaseQuantity": rate.get("purchaseQuantity"), "PurchaseUOM": rate.get("purchaseUOM"),
-                        "NormalizedQuantity": rate.get("normalizedQuantity"), "CostingUOM": rate.get("uom") or fields.get("CostingUOM"),
-                        "Currency": rate.get("currency") or fields.get("CostingCurrency"), "BaseUnitPrice": rate.get("baseUnitPrice"),
-                        "DiscountPerUnit": rate.get("discountPerUnit"), "AppliedUnitRate": rate.get("rate"), "RatePolicy": rate["ratePolicy"], "ResolutionStatus": rate["status"], "Reason": rate["reason"],
-                        "Actor": "costing-resolver", "OccurredAt": grist_datetime(utc_now()), "RequestKey": evidence_key, "RequestFingerprint": evidence_key})
-                rate["evidenceKey"] = evidence_key
             spec_mappings = [row for row in mappings if _ref(row.get("fields", {}).get("PartPurchaseSpecification")) == int(source["id"])]
             spec_purchases = [row.get("fields", {}) for row in purchases if _ref(row.get("fields", {}).get("PartPurchaseSpecification")) == int(source["id"])]
             spec_results.append({"specification": {"id": source.get("id"), **fields}, "rate": rate,

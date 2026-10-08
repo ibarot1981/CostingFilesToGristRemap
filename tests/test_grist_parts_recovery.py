@@ -22,6 +22,9 @@ class MemoryGrist:
         self.next_id = 2
         self.lock = threading.Lock()
         self.lose_next_metadata_response = False
+        self.lose_next_purchase_response = False
+        self.lose_after_create_table = ""
+        self.lose_after_update_table = ""
 
     def validate_safari_write_target(self):
         return None
@@ -42,14 +45,26 @@ class MemoryGrist:
             if table == "PartMetadataVersion" and self.lose_next_metadata_response:
                 self.lose_next_metadata_response = False
                 raise TimeoutError("simulated lost response after Grist committed the row")
+            if table == "PartPurchaseRecord" and self.lose_next_purchase_response:
+                self.lose_next_purchase_response = False
+                raise TimeoutError("simulated lost response after Grist committed the purchase")
+            if table == self.lose_after_create_table:
+                self.lose_after_create_table = ""
+                raise TimeoutError(f"simulated lost response after Grist committed {table}")
             return {"records": created}
 
     def update_table_records(self, table, updates):
+        should_fail = False
         with self.lock:
             rows = self.tables.setdefault(table, [])
             for update in updates:
                 target = next(row for row in rows if row["id"] == update["id"])
                 target["fields"].update(deepcopy(update["fields"]))
+            should_fail = table == self.lose_after_update_table
+            if should_fail:
+                self.lose_after_update_table = ""
+        if should_fail:
+            raise TimeoutError(f"simulated lost response after Grist updated {table}")
 
 
 class GristPartRecoveryTests(unittest.TestCase):
@@ -60,10 +75,32 @@ class GristPartRecoveryTests(unittest.TestCase):
         registry._verify_writer = lambda: None
         return registry
 
+    def test_grist_scope_shortcodes_use_the_shared_target_lookup_shape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            client.tables["PartScopeShortcode"].append({"id": 2, "fields": {
+                "ScopeKey": "model_code:203", "ScopeTargetLabel": "S500 EMS", "Shortcode": "S500E",
+                "Version": 2,
+            }})
+            registry = self.make_registry(client, Path(temp) / "parts-journal.sqlite3")
+            self.assertEqual(registry.shortcodes(), [
+                {"scope_type": "model_code", "target_id": "203", "target_label": "S500 EMS", "shortcode": "S500E", "version": 2},
+                {"scope_type": "product", "target_id": "17", "target_label": "Safari 1000", "shortcode": "S1K", "version": 1},
+            ])
+
     def create(self, registry, *, request_key="create-one", description="Chassis", variant="Standard"):
         return registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
             description=description, variant=variant, expected_name=f"S1K — {description}" + (f" — {variant}" if variant else ""),
             actor="test operator", reason="isolated recovery test", request_key=request_key, revision_assertion="A")
+
+    def rename(self, registry, part, *, request_key, description):
+        target_id = part["scopeTargetId"]
+        preview = registry.preview(scope_type=part["scope"], target_id=target_id, description=description, variant=part["variant"])
+        return registry.update_metadata(part_id=part["id"], scope_type=part["scope"], target_id=target_id,
+            target_label=part["scopeTarget"], description=description, variant=part["variant"],
+            expected_version=part["metadataVersion"], expected_name=preview["name"],
+            expected_usage_fingerprint=registry.usage_evidence(part["id"])["fingerprint"], actor="reviewer",
+            reason="metadata history test", request_key=request_key)
 
     def test_grist_partial_publication_recovers_without_duplicates_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -175,13 +212,105 @@ class GristPartRecoveryTests(unittest.TestCase):
             self.assertEqual((current["vendorId"], current["rate"]), (str(vendor_a), 14))
             self.assertEqual(registry.get_part(purchased_child["id"])["partNumber"], purchased_child["partNumber"])
             self.assertEqual(registry.get_part(purchased_child["id"])["engineeringRevision"], "A")
-            self.assertTrue(client.tables["PurchasedPartCostEvidence"])
+            self.assertFalse(client.tables.get("PurchasedPartCostEvidence"))
 
+            with self.assertRaises(PartIdentityError) as open_child:
+                features.finalize_revision(part_id=parent["id"], actor="reviewer", reason="baseline reviewed", request_key="finalize-parent-too-early")
+            self.assertEqual(open_child.exception.code, "PART_CHILD_REVISION_DRAFT")
+            features.finalize_revision(part_id=purchased_child["id"], actor="reviewer", reason="purchased Part baseline", request_key="finalize-child")
             features.finalize_revision(part_id=parent["id"], actor="reviewer", reason="baseline reviewed", request_key="finalize-parent")
+            original_definition = registry.current_revision(parent["id"])["fields"]["DefinitionHash"]
+            renamed_child = registry.get_part(purchased_child["id"])
+            self.rename(registry, renamed_child, request_key="rename-purchased-child", description="Bearing Set")
+            self.assertIn("Bearing Set", features.components(parent["id"])[0]["childName"])
+            self.assertEqual(registry.current_revision(parent["id"])["fields"]["DefinitionHash"], original_definition)
+            with self.assertRaises(PartIdentityError) as child_locked:
+                features.add_component(parent_part_id=purchased_child["id"], child_part_id=parent["id"], quantity=1,
+                    uom="each", actor="test operator", reason="post-finalization indirect change", request_key="late-child-component")
+            self.assertEqual(child_locked.exception.code, "PART_REVISION_LOCKED")
+            with self.assertRaises(PartIdentityError) as spec_locked:
+                features.create_purchase_specification(part_id=purchased_child["id"], code="SECOND", manufacturer="Maker",
+                    manufacturer_part_number="new", description="new physical identity", costing_uom="each", currency="INR",
+                    purchase_item_id=None, actor="buyer", reason="late physical spec", request_key="late-spec")
+            self.assertEqual(spec_locked.exception.code, "PART_REVISION_LOCKED")
             with self.assertRaises(PartIdentityError) as locked:
                 features.add_component(parent_part_id=parent["id"], child_part_id=purchased_child["id"], quantity=1,
                     uom="each", actor="test operator", reason="post-finalization edit", request_key="late-component")
             self.assertEqual(locked.exception.code, "PART_REVISION_LOCKED")
+
+    def test_different_rename_cannot_adopt_pending_metadata_and_originating_retry_recovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry)["part"]
+            client.lose_next_metadata_response = True
+            with self.assertRaises(TimeoutError):
+                self.rename(registry, part, request_key="rename-a", description="Frame A")
+            with self.assertRaises(PartIdentityError) as conflict:
+                self.rename(registry, part, request_key="rename-b", description="Frame B")
+            self.assertEqual(conflict.exception.code, "PART_METADATA_PUBLICATION_CONFLICT")
+            recovered = self.rename(registry, part, request_key="rename-a", description="Frame A")["part"]
+            self.assertEqual(recovered["name"], "S1K — Frame A — Standard")
+            self.assertEqual(client.tables["ProductPart"][0]["fields"]["CurrentMetadataVersion"], client.tables["PartMetadataVersion"][1]["id"])
+            self.assertEqual(client.tables["PartNameAlias"][-1]["fields"]["DisplayName"], recovered["name"])
+            originating = next(row for row in client.tables["PartRegistryRequest"] if row["fields"].get("RequestKey") == "rename-a")
+            self.assertEqual(originating["fields"]["Status"], "published")
+            self.rename(registry, recovered, request_key="rename-c", description="Frame C")
+            old_retry = self.rename(registry, part, request_key="rename-a", description="Frame A")
+            self.assertTrue(old_retry["idempotent"])
+            self.assertEqual(old_retry["part"]["name"], "S1K — Frame C — Standard")
+            self.assertEqual(len([row for row in client.tables["PartMetadataVersion"] if row["fields"].get("ProductPart") == client.tables["ProductPart"][0]["id"]]), 3)
+
+    def test_metadata_exact_retry_recovers_after_every_grist_publication_boundary(self):
+        for phase, table in (("create", "PartNameAlias"), ("create", "AuditEvent"),
+                             ("update", "ProductPart"), ("update", "PartRegistryRequest")):
+            with self.subTest(phase=phase, table=table), tempfile.TemporaryDirectory() as temp:
+                client = MemoryGrist()
+                registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+                part = self.create(registry)["part"]
+                if phase == "create":
+                    client.lose_after_create_table = table
+                else:
+                    client.lose_after_update_table = table
+                with self.assertRaises(TimeoutError):
+                    self.rename(registry, part, request_key="rename-recover", description="Frame Updated")
+                recovered = self.rename(registry, part, request_key="rename-recover", description="Frame Updated")["part"]
+                self.assertEqual(recovered["name"], "S1K — Frame Updated — Standard")
+                self.assertEqual(len(client.tables["PartMetadataVersion"]), 2)
+                self.assertEqual(len(client.tables["PartNameAlias"]), 2)
+                journal = next(row for row in client.tables["PartRegistryRequest"] if row["fields"].get("RequestKey") == "rename-recover")
+                self.assertEqual(journal["fields"]["Status"], "published")
+
+    def test_purchase_epoch_retry_conflict_and_cross_request_transaction_deduplication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part = self.create(registry, variant="")["part"]
+            features = GristPartFeatures(registry)
+            spec = features.create_purchase_specification(part_id=part["id"], code="BRG", manufacturer="Maker", manufacturer_part_number="6201",
+                description="Bearing", costing_uom="each", currency="INR", purchase_item_id=None, actor="buyer", reason="spec", request_key="spec")
+            vendor = features.create_vendor(name="Vendor A", actor="buyer", reason="approved", request_key="vendor")
+            mapping = features.create_vendor_mapping(specification_id=spec["id"], vendor_id=vendor["id"], sku="A-1", description="6201",
+                actor="reviewer", reason="matched", request_key="mapping")
+            client.lose_next_purchase_response = True
+            args = dict(part_id=part["id"], specification_id=spec["id"], mapping_id=mapping["id"], transaction_key="INV-1",
+                transaction_line_key="1", record_type="invoice", status="posted", transaction_at="2026-10-01T00:00:00Z",
+                document_reference="INV-1", quantity=1, quantity_uom="each", currency="INR", extended_amount=100,
+                discount_amount=0, tax_amount=0, freight_amount=0, other_charges=0, actor="buyer", reason="received", request_key="buy1")
+            with self.assertRaises(TimeoutError):
+                features.capture_purchase(**args)
+            self.assertIsInstance(client.tables["PartPurchaseRecord"][0]["fields"]["TransactionAt"], float)
+            saved_id = client.tables["PartPurchaseRecord"][0]["id"]
+            replay = features.capture_purchase(**args)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(replay["id"], saved_id)
+            with self.assertRaises(PartIdentityError) as changed:
+                features.capture_purchase(**{**args, "extended_amount": 101})
+            self.assertEqual(changed.exception.code, "PART_REQUEST_CONFLICT")
+            imported = features.capture_purchase(**{**args, "request_key": "buy2"})
+            self.assertTrue(imported["idempotent"])
+            self.assertEqual(imported["id"], replay["id"])
+            self.assertEqual(len(client.tables["PartPurchaseRecord"]), 1)
 
 
 if __name__ == "__main__":

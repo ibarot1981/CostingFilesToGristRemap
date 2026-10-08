@@ -255,6 +255,11 @@ def _part_features():
     return GristPartFeatures(registry)
 
 
+def _live_cost_service():
+    from app.live_cost import GristLiveCostService
+    return GristLiveCostService(_part_registry())
+
+
 def _legacy_part_rows(repository: SafariRepository) -> list[dict[str, Any]]:
     if repository.adapter_name != "grist-safari":
         return []
@@ -596,7 +601,7 @@ def part_composition(part_id: str):
 def add_part_component(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     return _part_features().add_component(parent_part_id=part_id, child_part_id=str(payload.get("childPartId") or ""),
         quantity=payload.get("quantity"), uom=str(payload.get("uom") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
-        request_key=idempotency_key or "")
+        request_key=idempotency_key or "", sourcing_route=str(payload.get("sourcingRoute") or "auto"))
 
 
 @app.post("/api/parts/{part_id}/finalize-revision")
@@ -701,10 +706,59 @@ def part_purchase_rate(part_id: str, as_of: str = ""):
     return _part_features().purchase_detail(part_id, as_of=as_of or None)
 
 
+@app.get("/api/model-codes/{code_id}/costing-configuration")
+def model_code_costing_configuration(code_id: str):
+    return _live_cost_service().get_configuration(code_id)
+
+
+@app.put("/api/model-codes/{code_id}/costing-configuration")
+def save_model_code_costing_configuration(code_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().save_configuration(code_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.get("/api/model-codes/{code_id}/live-cost")
+def model_code_live_cost(code_id: str):
+    return _live_cost_service().live_cost(code_id)
+
+
+@app.get("/api/model-codes/{code_id}/cost-snapshots")
+def model_code_cost_snapshots(code_id: str, offset: int = 0, limit: int = 25):
+    return _live_cost_service().snapshot_history(code_id, offset=offset, limit=limit)
+
+
+@app.post("/api/model-codes/{code_id}/cost-snapshots")
+def save_model_code_cost_snapshot(code_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().save_snapshot(code_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.post("/api/model-codes/{code_id}/cost-comparisons")
+def compare_model_code_cost(code_id: str, payload: dict[str, Any] = Body(...)):
+    return _live_cost_service().compare(code_id, payload)
+
+
+@app.get("/api/model-codes/{code_id}/cost-policy")
+def model_code_cost_policy(code_id: str):
+    return _live_cost_service().policy_state(code_id)
+
+
+@app.put("/api/cost-snapshot-policies/{scope_type}")
+def save_cost_snapshot_policy(scope_type: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().set_policy(scope_type, payload.get("scopeId"), payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.post("/api/line-masters/{line_master_id}/process-rates")
+def record_process_rate(line_master_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().record_process_rate(line_master_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.get("/api/cost-snapshots/{snapshot_key}")
+def get_cost_snapshot(snapshot_key: str, offset: int = 0, limit: int = 100):
+    return _live_cost_service().get_snapshot(snapshot_key, offset=offset, limit=limit)
+
+
 @app.post("/api/parts/{part_id}/purchase-rate-evidence")
 def save_part_purchase_rate_evidence(part_id: str, payload: dict[str, Any] = Body(...)):
-    return _part_features().purchase_detail(part_id, as_of=str(payload.get("asOf") or "") or None,
-        cost_run_key=str(payload.get("costRunKey") or ""), configuration_selection_key=str(payload.get("configurationSelectionKey") or ""))
+    raise _error(410, "SNAPSHOT_REQUIRED", "Purchase rate evidence is no longer written from a cost-run selection. Resolve the rate through the read-only purchase-rate endpoint, then use Save Cost Snapshot to persist frozen evidence.")
 
 
 @app.post("/api/parts/mappings")
