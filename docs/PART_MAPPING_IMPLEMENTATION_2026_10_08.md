@@ -32,3 +32,57 @@ The existing production mapping table remains unchanged by this verification. As
 - Older mapping rows without source sheet/row evidence cannot be matched safely and require a manual review from the immutable history.
 - This change does not create manufacturing composition, Model Code configuration or costing snapshots from a mapping. Those remain separate governed actions.
 - Existing project gates remain: automatic Summary import/authority integration and the approved Change Request flow are not implemented by Part Mapping.
+
+## Complete-prompt follow-up checkpoint — 8 October 2026
+
+The complete owner prompt adds the detailed Parts-detail, defect-matrix, visual-check and completion-report requirements that were cut off in the earlier pasted copy. The current implementation includes the mapping-policy fixes and the explicit Rev A baseline/reconciliation flow below. This is a checkpoint report, not a declaration that every requested verification is complete.
+
+### Mapping behavior and UI
+
+- Initial Part assignment is reason-free. Replacing or clearing a previously saved assignment requires a reason, based on persisted mapping history. An unchanged assignment confirmed against refreshed evidence records a source-context update without asking for a replacement reason. The backend enforces this, records an explicit action type, and stores the initial action with the audit text `Initial Part assignment`.
+- Batch save identifies the changed groups that need reasons; it permits initial assignments alongside changed assignments, keeps exact payload/idempotency evidence for retry, and preserves drafts when some groups save and others fail. A search query alone is not a selection; returning from Part browsing returns a draft selection.
+- Search results carry their producing query, display loading separately from empty results, cancel/deduplicate requests where supported and reject stale or out-of-order responses for keyboard and pointer selection.
+- Mapping groups default collapsed and retain expansion separately from source-detail expansion. Group state is keyed by workbook and sheet-scoped group identity and survives filtering, navigation, save and reload. Collapse preserves draft choices. Expand/collapse-all applies to displayed groups; hidden source-detail tables are not mounted while collapsed.
+- The Part detail view includes baseline status, workbook identity/hash, applicability/completeness, normalized accepted requirements, incoming comparisons and decisions, pending proposals, and revision lifecycle. Baseline, comparison, requirement, decision and proposal panels are collapsible.
+
+### Baselines and workbook comparisons
+
+An explicit Part Mapping processing panel lets the user classify each source family as Applicable or Confirmed not applicable. A missing/unreadable sheet or unmapped/incomplete applicable family cannot be treated as not applicable. Establishment gathers all accepted groups mapped to the Part from one workbook, validates current workbook and association evidence, writes normalized requirement and source provenance rows, then confirms the Rev A baseline pointer. The request is resumable and idempotent; requirements are not published as an established baseline during partial writes. Existing manual, purchase or component content is displayed and preserved; append requires explicit confirmation. Establishing the baseline leaves Rev A draft until the separate finalization action.
+
+Later workbooks save immutable observations and compare against the accepted revision. Quantity is exact, kilogram weight is compared to two decimals, and raw values/units remain provenance. Rates, costs and audit/descriptive-only fields remain evidence without defining an engineering difference. Missing family evidence blocks deletion inference. Unanchored material substitutions remain ambiguous until explicitly matched. Keep-baseline decisions retain discrepancies; CR proposals stay pending and do not mutate the accepted baseline, Part revision, configuration or historical snapshot; a different-Part decision returns a mapping draft. Decisions are tied to exact incoming evidence and baseline references.
+
+### Grist deployment and recovery evidence
+
+Schema `safari-part-baseline-reconciliation-grist-2026-10-08.v11` was applied additively to the validated Safari Manufacturing document. The pre-apply native `.grist` backup passed SQLite integrity validation and has SHA-256 `C9DE749F60003ECF130F91628F863E08936EF34AAD66190E28AB1385C502D7EF` at `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-bAPdkEDn7brbqTrfVsRmXZ-20261008T122759Z.grist`. The pre-apply plan had seven new tables, eight table extensions and zero type changes. The post-apply plan reported no pending schema changes.
+
+Production readback after apply: `ProductPart` 4, `PartRevision` 4, `LineMaster` 313, `PartMappingReview` 0, `PartRegistryRequest` 10, `PartRegistryCoordinator` 1, and `CostingSnapshot` 1. The v10 intended-sharing tables contained 3 state rows, 30 normalized Model Code links and 30 events. Every v11 baseline/comparison table remained empty. No production Part mapping or baseline fixture was written.
+
+A separate disposable Grist document verified a synthetic Part's baseline write and fresh-registry recovery after the Grist commit response was deliberately lost. Readback recovered the established Rev A pointer, one normalized revision line, one source observation, three family records and one detail requirement. A changed material was classified as ambiguous; an explicit row-to-baseline match persisted one decision while keeping Rev A unchanged, creating no proposal, and creating no `CostSnapshot`. The disposable document was moved to Grist Trash. This is real Grist API readback; local SQLite is used only for writer coordination/retry journaling.
+
+### Verification and measured performance
+
+- Full Python suite: 217 tests, 216 passed and one platform-specific skip.
+- UI suite: 40 tests passed across 9 files. TypeScript check, Vite production build and `git diff --check` passed.
+- An isolated current-code browser session opened the HF workbook and rendered the mapping page with 25 groups/100 active rows. Groups were collapsed by default; the baseline Part selector stayed unavailable until a saved mapping existed. The page-level workbook preview indicator remained in `Reading workbook…` during this check even though the mapping endpoint parsed the workbook. This DOM check does **not** satisfy the prompt’s visual review at normal and narrow widths or the full Parts-detail visual review.
+- Production API observations below are single local-environment samples, not timing guarantees. “Prior loop” is a replay of the known pre-fix access pattern against the current document, not a recorded historical benchmark.
+
+| Operation | Observed result |
+| --- | --- |
+| Parts register, optimized | 147.7 ms; 4 Grist reads (one each for ProductPart, PartRevision, PartMetadataVersion, PartNameAlias) |
+| Previous repeated register lookup pattern, replayed at N=3 | 424.7 ms; 13 reads |
+| Part details with request-scoped reuse | 3917.9 ms; 31 reads across 31 tables |
+| Same detail route with reuse bypassed | 5288.9 ms; 88 reads |
+| Part name preview with request-scoped reuse / bypassed | 84.9 ms / 130.3 ms; 3 / 4 reads |
+| Part search, cold / warm | 69.9 ms and 2 reads / 0.2 ms and 0 reads; warm result uses a bounded five-second document-keyed cache |
+| Mapping load, extraction cache cold / warm | 7287.4 ms and 18 reads / 912.4 ms and 16 reads |
+
+The mapping UI keeps views mounted across navigation, consumes confirmed targeted mapping responses and refreshes Part creation in the background after displaying the confirmed record. These are implementation observations, not separate timing measurements. The prompt’s separate timings for Part creation plus intended-sharing publication, a single mapping save, Parts↔Mapping navigation and post-save refresh have not yet been captured. The combined cold/warm mapping sample also includes local ODS and repository refresh/cache work, so it is not a controlled isolated workbook-parser benchmark.
+
+### Remaining work before calling the full prompt complete
+
+- Capture the four missing per-operation performance measurements above in a disposable document and isolate workbook-extraction timing from unrelated refresh work.
+- Inspect the rendered mapping and Part-detail UI at a normal desktop size and a narrower width on the current code, including the collapsible baseline/comparison sections.
+- Execute the full defect matrix against current code where it is not already covered by automated tests; tests alone do not replace live Grist readback or visual verification.
+- The approved CR workflow, automatic Summary import/costing-authority integration, and reviewed legacy Part identity/revision classification remain unimplemented project gates. No Part may be advanced beyond Rev A until approved CR control exists.
+
+No pull request has been merged or deployed. Continue this checkpoint on `codex/part-identity-foundation` and update the existing PR only with the remaining limits stated explicitly.

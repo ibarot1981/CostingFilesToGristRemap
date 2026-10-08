@@ -14,6 +14,7 @@ from pathlib import Path
 import socket
 import sqlite3
 from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import RLock
 from typing import Any
 from uuid import uuid4
@@ -85,6 +86,8 @@ class GristPartRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.host_id = socket.gethostname().strip().casefold()
         self._thread_lock = RLock()
+        self._read_scope: ContextVar[dict[str, list[dict[str, Any]]] | None] = ContextVar(
+            f"part-registry-read-scope-{id(self)}", default=None)
         self._initialize_journal()
         self.lock = _SQLiteJournalLock(self, self._thread_lock)
 
@@ -174,7 +177,28 @@ class GristPartRegistry:
             raise PartIdentityError("PART_COORDINATOR_UNBOUND", "Part writes are disabled until this shared local allocator is explicitly bound as Safari Grist's sole writer.")
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
+        scope = self._read_scope.get()
+        if scope is not None:
+            if table not in scope:
+                scope[table] = self.client.fetch_table_records_with_ids(table)
+            return scope[table]
         return self.client.fetch_table_records_with_ids(table)
+
+    def _invalidate_search_cache(self) -> None:
+        try:
+            from app.part_mapping import invalidate_part_search_cache
+            invalidate_part_search_cache(str(getattr(self.client, "doc_id", "")))
+        except ImportError:
+            return
+
+    @contextmanager
+    def read_scope(self):
+        """Reuse each Grist table response once during one read-only API request."""
+        token = self._read_scope.set({})
+        try:
+            yield
+        finally:
+            self._read_scope.reset(token)
 
     def shortcodes(self) -> list[dict[str, Any]]:
         """Return maintained scope shortcodes in the common identity-store shape."""
@@ -193,6 +217,18 @@ class GristPartRegistry:
                                "target_label": str(fields.get("ScopeTargetLabel") or ""),
                                "shortcode": shortcode, "version": int(fields.get("Version") or 1)})
         return sorted(result, key=lambda item: (item["scope_type"], item["target_label"].casefold(), item["target_id"]))
+
+    def canonical_part_records(self) -> list[dict[str, Any]]:
+        """Managed canonical rows from the same Grist ProductPart table.
+
+        Legacy ProductPart rows remain readable for mapping, but only records
+        carrying the managed identity keys are selectable canonical Parts.
+        """
+        return [row for row in self._rows("ProductPart")
+            if row.get("fields", {}).get("StablePartId") or row.get("fields", {}).get("PartKey")]
+
+    def mapping_records(self) -> list[dict[str, Any]]:
+        return self._rows("PartMappingReview")
 
     @staticmethod
     def _find(rows: list[dict[str, Any]], field: str, value: str) -> dict[str, Any] | None:
@@ -439,6 +475,7 @@ class GristPartRegistry:
             self.client.update_table_records(REQUEST_TABLE, [{"id": int(req["id"]), "fields": {"Status": "published", "UpdatedAt": grist_datetime(utc_now()), "Result": json.dumps(result, sort_keys=True)}}])
         with self._database() as db:
             db.execute("UPDATE part_registry_reservations SET status='published',result_json=?,updated_at=? WHERE request_key=?", (json.dumps(result, sort_keys=True), utc_now(), request_key))
+        self._invalidate_search_cache()
         return {"part": result, "idempotent": reservation.get("status") == "published"}
 
     def get_part(self, stable_id: str) -> dict[str, Any] | None:
@@ -461,18 +498,59 @@ class GristPartRegistry:
             "variant": meta.get("DesignVariant") or fields.get("DesignVariant") or "", "scope": scope_type, "scopeTargetId": target_id,
             "scopeTarget": target_label, "shortcode": meta.get("Shortcode", ""), "engineeringRevision": fields.get("EngineeringRevision") or "A",
             "revisionRecordId": rev_id, "metadataRecordId": meta_id, "revisionStatus": rev.get("BaselineStatus") or rev.get("Status") or "draft",
+            "manufacturingBaselineStatus": rev.get("ManufacturingBaselineStatus") or "not_established",
+            "manufacturingBaselineKey": rev.get("ManufacturingBaselineKey") or "",
+            "manufacturingBaselineSourceHash": rev.get("ManufacturingBaselineSourceHash") or "",
             "status": fields.get("Status") or "active", "publishStatus": fields.get("PublishStatus") or "", "metadataVersion": meta.get("Version") or fields.get("MetadataVersion") or 1,
             "createdAt": fields.get("CreatedAt"), "actor": fields.get("CreatedActor"), "reason": fields.get("CreatedReason"),
             "aliases": aliases, "legacy": False}
 
-    def list_parts(self, *, search: str = "", scope_type: str = "", target_id: str = "", include_retired: bool = True) -> list[dict[str, Any]]:
+    def list_parts(self, *, search: str = "", scope_type: str = "", target_id: str = "", include_retired: bool = True,
+                   source_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         query = normalized_name(search)
+        product_rows = source_rows if source_rows is not None else self._rows("ProductPart")
+        metadata_by_id = {int(row["id"]): row.get("fields", {}) for row in self._rows("PartMetadataVersion")}
+        revision_by_id = {int(row["id"]): row.get("fields", {}) for row in self._rows("PartRevision")}
+        aliases_by_part: dict[int, list[str]] = {}
+        for alias in self._rows("PartNameAlias"):
+            fields = alias.get("fields", {})
+            owner = _ref(fields.get("ProductPart"))
+            label = str(fields.get("DisplayName") or "")
+            if owner and label and not fields.get("IsCurrent"):
+                aliases_by_part.setdefault(owner, []).append(label)
         result = []
-        for row in self._rows("ProductPart"):
-            stable_id = str(row.get("fields", {}).get("StablePartId") or "")
+        for row in product_rows:
+            fields = row.get("fields", {})
+            stable_id = str(fields.get("StablePartId") or "")
             if not stable_id:
                 continue
-            part = self.get_part(stable_id)
+            try:
+                record_id = int(row["id"])
+            except (TypeError, ValueError):
+                continue
+            metadata_id = _ref(fields.get("CurrentMetadataVersion"))
+            revision_id = _ref(fields.get("CurrentPartRevision"))
+            meta = metadata_by_id.get(metadata_id, {}) if metadata_id else {}
+            revision = revision_by_id.get(revision_id, {}) if revision_id else {}
+            scope = str(meta.get("ScopeType") or fields.get("ScopeType") or "")
+            target = str(meta.get("ScopeTargetId") or fields.get("ScopeTargetId") or "")
+            name = str(meta.get("DisplayName") or fields.get("DisplayName") or "")
+            description = str(meta.get("Description") or fields.get("Description") or "")
+            variant = str(meta.get("DesignVariant") or fields.get("DesignVariant") or "")
+            aliases = aliases_by_part.get(record_id, [])
+            part = {"id": stable_id, "gristRecordId": record_id, "partNumber": fields.get("PartNumber"),
+                "name": name, "description": description, "variant": variant, "scope": scope,
+                "scopeTargetId": target, "scopeTarget": str(meta.get("ScopeTargetLabel") or fields.get("ScopeTargetLabel") or ""),
+                "shortcode": meta.get("Shortcode", ""), "engineeringRevision": fields.get("EngineeringRevision") or "A",
+                "revisionRecordId": revision_id, "metadataRecordId": metadata_id,
+                "revisionStatus": revision.get("BaselineStatus") or revision.get("Status") or "draft",
+                "manufacturingBaselineStatus": revision.get("ManufacturingBaselineStatus") or "not_established",
+                "manufacturingBaselineKey": revision.get("ManufacturingBaselineKey") or "",
+                "manufacturingBaselineSourceHash": revision.get("ManufacturingBaselineSourceHash") or "",
+                "status": fields.get("Status") or "active", "publishStatus": fields.get("PublishStatus") or "",
+                "metadataVersion": meta.get("Version") or fields.get("MetadataVersion") or 1,
+                "createdAt": fields.get("CreatedAt"), "actor": fields.get("CreatedActor"),
+                "reason": fields.get("CreatedReason"), "aliases": aliases, "legacy": False}
             if not part or (not include_retired and part["status"] == "retired"):
                 continue
             if scope_type and part["scope"] != scope_type:
@@ -801,6 +879,7 @@ class GristPartRegistry:
                 or not confirmed_alias.get("fields", {}).get("IsCurrent")):
             raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm matching Part, metadata version and current alias values.")
         self._complete_request(request, {"part": updated})
+        self._invalidate_search_cache()
         return {"part": updated, "idempotent": False}
 
     def usage_evidence(self, part_id: str):
@@ -859,6 +938,7 @@ class GristPartRegistry:
             "RequestFingerprint": fingerprint})
         updated = self.get_part(part_id)
         self._complete_request(request, {"part": updated})
+        self._invalidate_search_cache()
         return {"part": updated, "idempotent": False}
 
     def history(self, part_id: str):

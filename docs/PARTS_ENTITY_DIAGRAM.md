@@ -2,7 +2,7 @@
 
 Updated costing direction (D070): canonical Parts and rates feed disposable Live Cost; only explicit Save Cost Snapshot freezes Part occurrences, metadata versions, quantities, lines and rate evidence. The old cost-run evidence endpoint now returns 410; new frozen evidence belongs to `CostSnapshotRateEvidence`. Live viewing persists no history. See [live/snapshot requirements and normalized relationships](LIVE_COST_AND_SNAPSHOT_REQUIREMENTS.md) and [visual model](live-cost-snapshot-model.html).
 
-**Status, 8 October 2026:** schema v9 Live Cost/Snapshot base and schema `safari-part-intended-sharing-grist-2026-10-08.v10` are applied to the validated Safari Manufacturing document. Canonical Part business data, explicit Model Code configuration, normalized Cost Snapshots and intended-sharing relationships are Grist-backed. Automatic Summary import/authority integration, CR approval and legacy classification remain later gates. Companion review: `PARTS_IMPLEMENTATION_REVIEW.md`; visual companion: `parts-entity-diagram.html`.
+**Status, 8 October 2026:** schema v9 Live Cost/Snapshot base, v10 intended sharing, and v11 Rev A baseline/workbook reconciliation are applied additively to the validated Safari Manufacturing document. Canonical Part business data, explicit Model Code configuration, normalized Cost Snapshots, intended-sharing relationships, normalized Part requirements and workbook comparison evidence are Grist-backed. Automatic Summary import/authority integration, CR approval and legacy classification remain later gates. Companion review: `PARTS_IMPLEMENTATION_REVIEW.md`; visual companion: `parts-entity-diagram.html`.
 
 **Cascade update, 8 October 2026:** schema `safari-part-intended-sharing-grist-2026-10-08.v10` is also applied. It adds three normalized intended-sharing tables and `PartRegistryRequest.Payload`; intended sharing and actual configuration usage remain separate. See [implementation and verification record](PART_INTENDED_SHARING_IMPLEMENTATION.md).
 
@@ -15,6 +15,19 @@ erDiagram
     PartMetadataVersion ||--o{ PartNameAlias : generated_name
     PartScopeShortcode ||--o{ PartShortcodeHistory : shortcode_changes
     ProductPart ||--o{ PartRevision : engineering_baselines
+    PartRevision ||--o| PartBaselineProcessing : accepted_workbook_baseline
+    PartBaselineProcessing ||--o{ PartBaselineFamily : applicability_evidence
+    PartBaselineProcessing ||--o{ PartRevisionLine : publishes_normalized_requirements
+    PartBaselineProcessing ||--o{ SourceLineObservation : originating_rows
+    PartBaselineProcessing ||--o{ PartWorkbookComparison : comparison_anchor
+    PartWorkbookComparison ||--o{ PartComparisonFamily : incoming_completeness
+    PartWorkbookComparison ||--o{ PartRequirementDifference : classified_evidence
+    PartRequirementDifference ||--o{ PartWorkbookDecision : attributable_resolution
+    PartRequirementDifference o|--o{ PartRequirementDifference : resolved_correspondence
+    PartRevisionLine ||--o{ PartWorkbookDecision : matched_baseline_requirement
+    PartWorkbookComparison ||--o{ PartChangeProposal : pending_cr_proposal
+    PartBaselineProcessing ||--o{ PartChangeProposal : frozen_baseline_reference
+    PartRevision ||--o{ PartChangeProposal : proposed_against_revision
     ProductPart ||--o| PartIntendedSharingState : sharing_version
     ProductPart ||--o{ PartIntendedModelCode : advisory_links
     ProductModelCode ||--o{ PartIntendedModelCode : intended_for
@@ -47,7 +60,7 @@ erDiagram
     CostingProcessRate o|--o{ CostSnapshotRateEvidence : selected_process_rate
 ```
 
-`PartComponentRevision` has two references to `PartRevision`: the parent baseline and the pinned child baseline. `PartRevisionLine` references an exact `LineRevision`; line ownership and source observations remain separately stored in `LineMaster`, `LineRevision`, `LineDetail`, `SourceLineObservation` and `SourceLineMapping`. A reviewed source mapping does not itself create configuration usage.
+`PartComponentRevision` has two references to `PartRevision`: the parent baseline and the pinned child baseline. `PartRevisionLine` references an exact `LineRevision`; line ownership and source observations remain separately stored in `LineMaster`, `LineRevision`, `LineDetail`, `SourceLineObservation` and `SourceLineMapping`. `PartBaselineProcessing` records the one accepted originating workbook per Rev A, and only its normalized `PartRevisionLine` rows define workbook-derived requirements. `PartWorkbookComparison` and its immutable incoming `SourceLineObservation`/`PartRequirementDifference` rows compare later workbook evidence with that pinned baseline. Decisions are append-only; an explicit ambiguous-row match creates a new proposed modification linked to the original ambiguity while retaining both original observations. A reviewed source mapping does not itself create configuration usage.
 
 `PartIntendedModelCode` represents advisory code sharing, not a BOM or actual use. Its pair key preserves one row per Part/code across add/remove/re-add; `PartIntendedSharingEvent` is the immutable change history and `PartIntendedSharingState` carries the expected version and membership fingerprint. `ConfigurationPartSelection` remains the separate source of direct actual use.
 
@@ -64,6 +77,11 @@ erDiagram
 | `PartScopeShortcode`, `PartShortcodeHistory` | Maintained Global/Product/Product Model/Model Code naming prefixes and audited changes. |
 | `PartRevision` | Existing table extended with explicit `RevisionLabel`, baseline status/hash, finalization evidence and request key. Managed baseline is A; legacy numeric `Revision` evidence is not relabelled. Finalized definitions are locked. |
 | `PartMappingReview` | Append-only source-row decisions reference the canonical Part/stable UUID, exact engineering revision and metadata version/name used, plus workbook/hash, association, source group/sheet/row, mapping description, reviewer/reason/time and idempotent request evidence. The v2 grouping policy is sheet plus Machine Piece Description for MCL/Toolshop or Part Category for CNC; old description-only rows remain visible for explicit review. |
+| `PartBaselineProcessing`, `PartBaselineFamily` | One resumable, idempotent initial-baseline publication per Part Rev A, with workbook name/path/hash, association and mapping-policy evidence, processing identity, actor/time, completeness confirmations and explicit publication status. Partial rows remain `processing` or `ready_to_publish` until the revision pointer is confirmed; retries resume keyed normalized writes. |
+| `PartWorkbookComparison`, `PartComparisonFamily` | Immutable comparison header and per-family applicability/completeness record tied to the exact accepted baseline/revision and incoming workbook hash/association. Incomplete families remain visible and cannot produce deletions. |
+| `PartRequirementDifference` | Per-row Match/Add/Modify/Delete/Ambiguous/Incomplete source evidence. Links normalized baseline requirement and incoming `SourceLineObservation`; freezes raw values, exact engineering differences, source cells and mapping-group fingerprint. A resolved ambiguous match adds a linked modification record instead of changing the original ambiguity. |
+| `PartWorkbookDecision` | Append-only attributable decision on one exact difference: keep accepted baseline, propose a CR change, match one incoming row to a baseline line, or return a different-Part mapping draft. An explicit old-data classification is stored only when selected. |
+| `PartChangeProposal` | Pending proposal with comparison, accepted baseline and Rev A references, actor/reason and CR-required status. It does not alter requirements or increment revision. |
 | `PartComponentRevision` | Parent and child `PartRevision`, positive quantity and UOM, lifecycle/audit and idempotency fields. Cycles are rejected. |
 | `PartRevisionLine` | Exact Part baseline to `LineMaster`/`LineRevision`/source observation, process type, quantity per Part and unit. MCL, Toolshop and CNC are optional and mixable. |
 | `PartDrawing` | Optional revision-specific file path or external URL, drawing identity, file version/hash and audit. |
@@ -77,6 +95,8 @@ erDiagram
 The v9 apply was additive after a native `.grist` backup passed SHA-256 and SQLite integrity checks. It created ten configuration/rate/snapshot/policy/journal tables and added `PartComponentRevision.SourcingRoute`; no type changed. Existing production row counts remained: 1 legacy `ProductPart`, 1 legacy numeric `PartRevision`, 313 `LineMaster`, 0 `PartMappingReview`, 0 `PartRegistryRequest`, 1 `PartRegistryCoordinator`, and 1 workbook `CostingSnapshot`. No production Part, purchase or costing fixture was fabricated. An isolated temporary Grist document verified the new persistence and recovery paths, then was moved to Grist Trash. Backup: `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-live-cost-20261008T063022Z.grist`; SHA-256 `09d732cfe016d0e4a2f61a7886c6b73f581355a5698c51b5d77d8d4e78acea6f`.
 
 The additive v10 apply used a separate native `.grist` backup and added three sharing tables plus `PartRegistryRequest.Payload`; no existing field type changed. Production row counts remained unchanged, including zero rows in the three new sharing tables. No production Part, sharing, purchase or costing fixture was fabricated. v10 backup: `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-bAPdkEDn7brbqTrfVsRmXZ-20261008T073702Z.grist`; SHA-256 `87434603e7376b7c6f0d9bc05a414fa1449bce93438b27dd0d9d06518d017520`.
+
+Schema v11 adds these typed baseline, family, comparison, source-difference, decision and pending-proposal records, extends normalized line/source records with request and provenance fields, and adds explicit mapping action metadata. All additions are additive; no existing field type changed. The validated production apply had seven new tables, eight table extensions and zero type updates; the post-apply plan has no pending changes. The pre-apply native backup passed SQLite integrity validation; SHA-256 is `C9DE749F60003ECF130F91628F863E08936EF34AAD66190E28AB1385C502D7EF` at `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-bAPdkEDn7brbqTrfVsRmXZ-20261008T122759Z.grist`. Production readback after v11: ProductPart 4; PartRevision 4; LineMaster 313; PartMappingReview 0; PartRegistryRequest 10; PartRegistryCoordinator 1; CostingSnapshot 1. Intended-sharing state/link/event rows were 3/30/30. New v11 baseline/comparison tables were empty. No production mapping, baseline, purchase or costing fixture was created. A disposable Grist copy verified baseline write/recovery and an ambiguity decision; see the [implementation checkpoint and verification record](PART_MAPPING_IMPLEMENTATION_2026_10_08.md).
 
 ## Identity, naming and composition rules
 

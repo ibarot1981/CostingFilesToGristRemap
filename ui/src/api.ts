@@ -1,7 +1,7 @@
 import type { AssociationState, AssociationValidation, CatalogSummary, CostingReview, DirectoryProductMapping, ExplorerItem, MappedFile, ModelCode, Preview, Product, ProductModel, ReconciliationIssue } from "./types";
 
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path);
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(path, signal ? { signal } : undefined);
   const payload = await response.json();
   if (!response.ok) throw apiError(payload, response.status);
   return payload;
@@ -23,7 +23,7 @@ function apiError(payload: any, status: number): Error {
 
 export const api = {
   parts: (search = "", scope = "", targetId = "") => get<any>(`/api/parts?${new URLSearchParams({ search, scope, target_id: targetId })}`),
-  searchParts: (query = "", offset = 0, limit = 30, path = "") => get<any>(`/api/parts/search?${new URLSearchParams({ query, offset: String(offset), limit: String(limit), path })}`),
+  searchParts: (query = "", offset = 0, limit = 30, path = "", signal?: AbortSignal) => get<any>(`/api/parts/search?${new URLSearchParams({ query, offset: String(offset), limit: String(limit), path })}`, signal),
   partScopeTargets: () => get<any>("/api/parts/scope-targets"),
   partNamePreview: (scope: string, targetId: string, description: string, variant: string, excludeId = "") => get<any>(`/api/parts/preview?${new URLSearchParams({ scope, target_id: targetId, description, variant, exclude_id: excludeId })}`),
   createManagedPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, { "Idempotency-Key": key }),
@@ -59,6 +59,11 @@ export const api = {
   savePartPurchaseRateEvidence: (id: string, payload: unknown) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-rate-evidence`, payload),
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
+  partBaselineReview: (id: string, path: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/review?path=${encodeURIComponent(path)}`),
+  establishPartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/establish`, payload, {"Idempotency-Key": key}),
+  comparePartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/compare`, payload, {"Idempotency-Key": key}),
+  partManufacturingComparison: (key: string) => get<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}`),
+  decidePartManufacturingComparison: (key: string, payload: unknown, requestKey: string) => send<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}/decisions`, payload, {"Idempotency-Key": requestKey}),
   processingState: (path: string) => get<any>(`/api/processing/state?path=${encodeURIComponent(path)}`),
   changeProcessingState: (payload: unknown, key: string) => send<any>("/api/processing/state", payload, {"Idempotency-Key":key}),
   fileAssociation: (path: string) => get<import("./types").SavedAssociation>(`/api/explorer/association?path=${encodeURIComponent(path)}`),

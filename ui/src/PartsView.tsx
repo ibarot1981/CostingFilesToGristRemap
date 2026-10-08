@@ -6,7 +6,7 @@ import "./parts.css";
 type Scope = "global" | "product" | "product_model" | "model_code";
 type Target = { id: string; label: string; parentId?: string; shortcode?: string | null };
 type ScopeOption = { id: Scope; label: string; target?: Target; targets?: Target[] };
-type Part = { id: string; partNumber: string | null; name: string; description: string; variant: string; scope: string; scopeTargetId: string | null; scopeTarget: string; shortcode?: string; engineeringRevision: string | null; status: string; metadataVersion: number | null; aliases: string[]; legacy: boolean; createdAt?: string; actor?: string; reason?: string; legacyRevisionValues?: string[]; partKey?: string; ambiguousName?: boolean; metadataHistory?: any[]; lifecycleHistory?: any[] };
+type Part = { id: string; partNumber: string | null; name: string; description: string; variant: string; scope: string; scopeTargetId: string | null; scopeTarget: string; shortcode?: string; engineeringRevision: string | null; status: string; metadataVersion: number | null; manufacturingBaselineStatus?: string; aliases: string[]; legacy: boolean; createdAt?: string; actor?: string; reason?: string; legacyRevisionValues?: string[]; partKey?: string; ambiguousName?: boolean; metadataHistory?: any[]; lifecycleHistory?: any[] };
 type Preview = { name: string; available: boolean; collision: { source: string; id: string; number: string | null; status: string }[]; before?: any; after?: any; affectedSourceAssignments?: any[]; usageFingerprint?: string };
 type Attempt = { key: string; payload: Record<string, unknown> };
 type Register = { items: Part[]; legacyItems: Part[] };
@@ -22,7 +22,7 @@ function restoredCreateAttempt(): Attempt | null {
 const scopeLabels: Record<Scope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 const emptyRegister: Register = { items: [], legacyItems: [] };
 
-export function PartsView({ mappingReturn = null, onReturnToMapping }: { mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
+export function PartsView({ active = true, mappingReturn = null, onReturnToMapping }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
   const [query, setQuery] = useState(() => sessionStorage.getItem("parts:search") || "");
@@ -55,6 +55,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
+  const [registerRefreshing, setRegisterRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [shortcodeAttempt, setShortcodeAttempt] = useState<Attempt | null>(null);
   const [metadataAttempt, setMetadataAttempt] = useState<Attempt | null>(null);
@@ -62,19 +63,22 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
   const [previewRefresh, setPreviewRefresh] = useState(0);
   const previewGeneration = useRef(0);
   const detailsGeneration = useRef(0);
+  const hasLoadedRegister = useRef(false);
 
-  async function refresh(search = query) {
-    setLoading(true);
+  async function refresh(search = query, background = hasLoadedRegister.current) {
+    if (!hasLoadedRegister.current) setLoading(true);
+    else if (background) setRegisterRefreshing(true);
     setError("");
     try {
       const [targets, items] = await Promise.all([api.partScopeTargets(), api.parts(search)]);
       setScopes(targets.scopes || []);
       setRegister(items);
+      hasLoadedRegister.current = true;
     } catch (cause) { setError(String(cause)); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setRegisterRefreshing(false); }
   }
 
-  useEffect(() => { void refresh(); }, []);
+  useEffect(() => { if (active) void refresh(query, hasLoadedRegister.current); }, [active]);
   useEffect(() => { sessionStorage.setItem("parts:search", query); }, [query]);
   useEffect(() => { sessionStorage.setItem("parts:expanded", JSON.stringify(expandedIds)); }, [expandedIds]);
   useEffect(() => { if (createAttempt) sessionStorage.setItem("parts:create-attempt", JSON.stringify(createAttempt)); else sessionStorage.removeItem("parts:create-attempt"); }, [createAttempt]);
@@ -213,7 +217,9 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
       const result = await api.createManagedPart(attempt.payload, attempt.key);
       setCreateAttempt(null); setSelectedId(result.part.id); setMode("selected"); setFullDetails(false);
       setNotice(`Created ${result.part.partNumber} · ${result.part.name} · Rev A.`);
-      await refresh(""); setQuery("");
+      setQuery("");
+      setRegister(old => ({ ...old, items: [result.part, ...old.items.filter(item => item.id !== result.part.id)] }));
+      void refresh("", true);
     } catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
   }
@@ -312,6 +318,7 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
       <label className="tree-search"><Search size={14}/><input aria-label="Search Parts by number, name or alias" value={query} onChange={event => { setQuery(event.target.value); void refresh(event.target.value); }} placeholder="Search number, name or alias"/></label>
       <button className="parts-new-button" onClick={startCreate}><Plus size={15}/> New Part</button>
       {loading && <div className="parts-loading"><LoaderCircle className="spin" size={16}/>Loading Parts…</div>}
+      {registerRefreshing && !loading && <div className="parts-register-refresh" role="status"><LoaderCircle className="spin" size={14}/>Refreshing Part register from Grist; existing entries are the last confirmed read.</div>}
       <div className="parts-list-scroll" role="tree" aria-label="Parts by sharing scope and target">
         {tree.map((entry, index) => <button key={entry.id} type="button" role="treeitem" aria-level={entry.depth + 1}
           aria-expanded={entry.hasChildren ? Boolean(entry.expanded) : undefined} aria-selected={entry.part ? selectedId === entry.part.id && mode === "selected" : undefined}
@@ -335,10 +342,21 @@ export function PartsView({ mappingReturn = null, onReturnToMapping }: { mapping
         <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>{selected.legacy ? "Engineering revision unverified" : "Engineering revision · A"}</span></div></div>
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>
           <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full Part details</button><button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
-          {!fullDetails && <div className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></div>}
+          {!fullDetails && <div className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div><div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></div>}
           {fullDetails && details ? <>
-            <div className="parts-detail-tabs" aria-label="Part detail sections">{["Overview", "Intended sharing", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"].map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" })}>{label}</button>; })}</div>
-            <div id="overview" className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></div>
+            <div className="parts-detail-tabs" aria-label="Part detail sections">{["Overview", "Manufacturing baseline", "Intended sharing", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"].map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" })}>{label}</button>; })}</div>
+            <div id="overview" className="parts-section-card"><h3>Overview</h3><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div><div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></div>
+            <div id="manufacturing-baseline" className="parts-section-card"><h3>Manufacturing baseline</h3>
+              {details.manufacturingBaseline?.baseline ? <>
+                <p><strong>Status:</strong> {String(details.manufacturingBaseline.status || "established").replaceAll("_", " ")} · Rev {details.manufacturingBaseline.revisionLabel || "A"} · {details.manufacturingBaseline.revisionLifecycle || "draft"}</p>
+                <p><strong>Originating workbook:</strong> {details.manufacturingBaseline.baseline.WorkbookName} · {details.manufacturingBaseline.baseline.WorkbookPath}</p>
+                <p><strong>Workbook hash:</strong> <code>{details.manufacturingBaseline.sourceHash || details.manufacturingBaseline.baseline.SourceHash}</code></p>
+                <h4>Applicable source requirements</h4>
+                {details.manufacturingBaseline.families?.length ? <ul>{details.manufacturingBaseline.families.map((family: any) => <li key={family.FamilyKey}><strong>{family.Family}</strong> · {family.ApplicabilityStatus?.replaceAll("_", " ")} · {family.SourceEvidenceStatus?.replaceAll("_", " ")} · {family.RequirementCount || 0} requirements · complete {family.CompletenessConfirmed ? "yes" : "no"}</li>)}</ul> : <p>No family applicability records are available.</p>}
+                {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{item.family} · {item.physical?.item_name || item.physical?.plate_part || item.physical?.toolshop_detail || item.lineKey}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small></div><span>{item.revisionKey || "accepted"}</span></article>)}</div> : <p>This Rev A baseline contains no workbook-derived line requirements. Existing child or purchase requirements remain separate.</p>}
+                <p className="parts-help">Baseline publication does not finalize Rev A. Review the definition, then use the Engineering baseline control in History to finalize it. Future physical changes require the approved Change Request flow.</p>
+              </> : <p>{details.manufacturingBaseline?.message || "Manufacturing requirements are not yet established. Establish the initial baseline from a complete, explicitly mapped workbook in Part Mapping."}</p>}
+            </div>
             <IntendedSharingSection part={details.part} state={details.intendedSharing} scopes={scopes} onSaved={reloadSelectedDetails}/>
             <ProcessLineSection partId={selected.id} state={details.processLines} onSaved={reloadSelectedDetails}/>
             <ComponentSection partId={selected.id} currentPart={selected} parts={allParts} state={details.components} partState={details.part} onOpen={openNestedPart} onSaved={reloadSelectedDetails}/>

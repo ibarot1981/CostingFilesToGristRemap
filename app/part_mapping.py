@@ -4,6 +4,7 @@ from hashlib import sha256
 import json
 import sqlite3
 from threading import RLock
+from time import monotonic
 import unicodedata
 from typing import Any
 from app.domain import utc_now
@@ -20,6 +21,23 @@ MAPPING_LABEL_FIELD = {
     "Tool Shop Items": "product_part_name",
     "CNC Cut List": "part_category",
 }
+
+# Part searches happen on each debounced keystroke. Keep the combined registry
+# records briefly per Grist document; every mapping write bypasses this cache,
+# and Part mutations invalidate it. The UI receives the cache age so it never
+# labels this advisory search projection as a newly confirmed save.
+_SEARCH_RECORD_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+_SEARCH_RECORD_CACHE_LOCK = RLock()
+_SEARCH_RECORD_CACHE_TTL_SECONDS = 5.0
+
+
+def invalidate_part_search_cache(document_key: str | None = None) -> None:
+    with _SEARCH_RECORD_CACHE_LOCK:
+        if document_key is None:
+            _SEARCH_RECORD_CACHE.clear()
+        else:
+            for key in [key for key in _SEARCH_RECORD_CACHE if key[0] == str(document_key)]:
+                _SEARCH_RECORD_CACHE.pop(key, None)
 
 
 class PartSourceGroups(list):
@@ -95,24 +113,80 @@ class PartRegistryMappingStore:
         self.available = True
         self.legacy_history_available = True
         self.legacy_parts_available = True
+        self.document_key = str(getattr(getattr(identity_store, "client", None), "doc_id", ""))
+        self.search_cache_age_seconds = 0.0
+
+    def _same_grist_document(self) -> bool:
+        left = getattr(self.legacy_store, "client", None)
+        right = getattr(self.identity_store, "client", None)
+        left_doc = str(getattr(left, "doc_id", "") or "")
+        right_doc = str(getattr(right, "doc_id", "") or "")
+        return bool(left_doc and left_doc == right_doc)
+
+    @staticmethod
+    def _merge_record_rows(*collections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Combine compatible stores without duplicating the same Grist row."""
+        merged: dict[str, dict[str, Any]] = {}
+        anonymous = 0
+        for rows in collections:
+            for row in rows:
+                row_id = row.get("id")
+                fields = row.get("fields", {})
+                if row_id is not None:
+                    key = f"record:{row_id}"
+                else:
+                    key = str(fields.get("ReviewKey") or fields.get("PartKey") or fields.get("StablePartId") or "")
+                    if not key:
+                        anonymous += 1
+                        key = f"anonymous:{anonymous}"
+                # Later, managed rows take precedence when both readers return
+                # the same record ID with slightly different projections.
+                merged[key] = row
+        return list(merged.values())
 
     def legacy_part_records(self):
         rows = self.legacy_store.legacy_part_records() if hasattr(self.legacy_store, "legacy_part_records") else self.legacy_store.records("ProductPart")
         self.legacy_parts_available = getattr(self.legacy_store, "available", True)
         return rows
 
-    def records(self, table: str):
+    def records(self, table: str, *, fresh: bool = False):
+        cache_key = (self.document_key, table)
+        if table in {"ProductPart", "PartNameAlias"} and self.document_key and not fresh:
+            with _SEARCH_RECORD_CACHE_LOCK:
+                cached = _SEARCH_RECORD_CACHE.get(cache_key)
+                if cached and monotonic() - cached[0] <= _SEARCH_RECORD_CACHE_TTL_SECONDS:
+                    self.search_cache_age_seconds = max(self.search_cache_age_seconds, monotonic() - cached[0])
+                    return cached[1]
         if table == "ProductPart":
-            if hasattr(self.identity_store, "canonical_part_records"):
-                return [*self.legacy_part_records(), *self.identity_store.canonical_part_records()]
-            return self.legacy_part_records()
-        if table == MAPPING_TABLE:
+            if self._same_grist_document() and hasattr(self.identity_store, "_rows"):
+                # The managed and legacy identities share ProductPart in Grist.
+                # One full-table read already contains both; do not read it again
+                # through the repository's legacy adapter.
+                result = self.identity_store._rows("ProductPart")
+                self.legacy_parts_available = True
+            elif hasattr(self.identity_store, "canonical_part_records"):
+                result = self._merge_record_rows(self.legacy_part_records(), self.identity_store.canonical_part_records())
+            else:
+                result = self.legacy_part_records()
+        elif table == MAPPING_TABLE:
+            if self._same_grist_document() and hasattr(self.identity_store, "mapping_records"):
+                return self.identity_store.mapping_records()
             legacy = self.legacy_store.records(MAPPING_TABLE)
             self.legacy_history_available = getattr(self.legacy_store, "available", True)
             if hasattr(self.identity_store, "mapping_records"):
-                return [*legacy, *self.identity_store.mapping_records()]
+                return self._merge_record_rows(legacy, self.identity_store.mapping_records())
             return legacy
-        return self.legacy_store.records(table)
+        else:
+            result = self.legacy_store.records(table)
+        if table in {"ProductPart", "PartNameAlias"} and self.document_key:
+            with _SEARCH_RECORD_CACHE_LOCK:
+                _SEARCH_RECORD_CACHE[cache_key] = (monotonic(), result)
+                # Bound the process-wide cache even if tests or a multi-doc
+                # installation construct many registry clients.
+                while len(_SEARCH_RECORD_CACHE) > 48:
+                    oldest = min(_SEARCH_RECORD_CACHE, key=lambda key: _SEARCH_RECORD_CACHE[key][0])
+                    _SEARCH_RECORD_CACHE.pop(oldest, None)
+        return result
 
     def append(self, table: str, fields: list[dict[str, Any]]):
         if table == MAPPING_TABLE:
@@ -125,13 +199,20 @@ class PartRegistryMappingStore:
         raise PartConflict("PART_LEGACY_READ_ONLY", "Legacy Part masters are read-only; managed Part changes use the canonical Grist registry.")
 
 
-def list_parts(store) -> list[dict[str, Any]]:
-    rows = store.records("ProductPart")
+def _records(store, table: str, *, refresh: bool = False):
+    try:
+        return store.records(table, fresh=refresh)
+    except TypeError:
+        return store.records(table)
+
+
+def list_parts(store, *, refresh: bool = False) -> list[dict[str, Any]]:
+    rows = _records(store, "ProductPart", refresh=refresh)
     names: dict[str, list[str]] = {}
     aliases_by_part: dict[str, list[str]] = {}
     part_id_by_record = {str(row.get("id")): str(row.get("fields", {}).get("StablePartId") or row.get("id")) for row in rows}
     try:
-        alias_rows = store.records("PartNameAlias")
+        alias_rows = _records(store, "PartNameAlias", refresh=refresh)
     except (KeyError, GristError):
         alias_rows = []
     for alias in alias_rows:
@@ -223,7 +304,9 @@ def search_parts(store, *, query: str = "", offset: int = 0, limit: int = 50) ->
             matches.append(part)
     matches.sort(key=lambda part: (str(part.get("partNumber") or "").casefold(), str(part.get("name") or "").casefold(), part["id"]))
     return {"items": matches[offset:offset + limit], "total": len(matches), "offset": offset,
-        "limit": limit, "hasMore": offset + limit < len(matches)}
+        "limit": limit, "hasMore": offset + limit < len(matches),
+        "registryCacheAgeSeconds": round(float(getattr(store, "search_cache_age_seconds", 0.0)), 3),
+        "registryCacheMayBeStale": bool(getattr(store, "search_cache_age_seconds", 0.0))}
 
 
 def _history(store, file_id: str):
@@ -248,8 +331,15 @@ def _history(store, file_id: str):
     return rows
 
 
-def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]]):
-    parts = list_parts(store)
+def _group_records_by_key(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("GroupKey") or ""), []).append(row)
+    return grouped
+
+
+def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
+    parts = list_parts(store, refresh=refresh_parts)
     history = _history(store, file_id)
     current = [row for row in history if row["fields"].get("SourceHash") == source_hash
                and association and row["fields"].get("AssociationKey") == association.id
@@ -280,7 +370,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 or row["fields"].get("SourceHash") != source_hash
                 or not association or row["fields"].get("AssociationKey") != association.id
                 or row["fields"].get("AssociationVersion") != association.version)]
-        prior_rows.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or "")))
+        prior_rows.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or ""), str(row.get("RequestKey") or "")))
         # Old groups may have spanned several sheets or several current groups.
         # Resolve their latest decision independently for each source coordinate;
         # slicing the last N records can accidentally borrow a neighboring row's
@@ -301,6 +391,16 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         prior_evidence = None
         if latest_prior_rows:
             sample = max(latest_prior_rows, key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or "")))
+            latest_assigned_ids = sorted({str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")))
+                for row in latest_prior_rows if row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")})
+            # Reason requirements are based on the most recent persisted action
+            # for each source coordinate across hashes, associations and group
+            # policy versions. New source rows have no prior assignment and do
+            # not by themselves turn an initial assignment into a replacement.
+            prior_context_changed = any(row.get("SourceHash") != source_hash
+                or (association and (row.get("AssociationKey") != association.id
+                    or int(row.get("AssociationVersion") or 0) != int(association.version)))
+                or row.get("GroupKey") != group["key"] for row in latest_prior_rows)
             prior_evidence = {"partNumber": ((prior_part or {}).get("partNumber") or sample.get("PartNumberUsed")) if all_coordinates_agree else None,
                 "name": ((prior_part or {}).get("name") or sample.get("NameUsed")) if all_coordinates_agree else None,
                 "sourceDescription": sample.get("SourceDescription") or "", "version": sample.get("Version"),
@@ -308,7 +408,11 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 "associationChanged": bool(association and (sample.get("AssociationKey") != association.id
                     or sample.get("AssociationVersion") != association.version)), "requiresReview": True,
                 "previousRowsReviewed": len(latest_prior_rows), "currentRows": len(source_refs),
-                "previousRowsAgree": all_coordinates_reviewed and all_coordinates_agree}
+                "previousRowsAgree": all_coordinates_reviewed and all_coordinates_agree,
+                "assignedPartIds": latest_assigned_ids,
+                "hasPriorAssignment": bool(latest_assigned_ids),
+                "contextChanged": prior_context_changed,
+                "groupingPolicyChanged": any(row.get("GroupKey") != group["key"] for row in latest_prior_rows)}
         if prior_part:
             resolved_parts[prior_part["id"]] = prior_part
         explicit_unassigned = bool(latest and all(not str(value or "") for value in refs)
@@ -329,11 +433,17 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
 def save_mapping(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]],
                  decisions: dict[str, str], expected_hash: str, expected_version: int,
                  expected_association: str, expected_association_version: int,
-                 actor: str, reason: str, request_key: str, before_write=None):
-    if not decisions or not reason.strip() or not request_key.strip() or not actor.strip():
-        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one group and provide a review reason")
+                 actor: str, reason: str = "", group_reasons: dict[str, str] | None = None,
+                 request_key: str, before_write=None):
+    group_reasons = group_reasons or {}
+    if not decisions or not request_key.strip() or not actor.strip():
+        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one group and provide a request identity")
+    if set(group_reasons) - set(decisions):
+        raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify groups included in this save")
     payload_hash = fingerprint([file_id, expected_hash, expected_version, expected_association,
-                                expected_association_version, decisions, actor, reason.strip()])
+                                expected_association_version, decisions,
+                                {key: str(value or "").strip() for key, value in sorted(group_reasons.items())},
+                                reason.strip(), actor])
     with store.lock:
         all_rows = store.records(MAPPING_TABLE)
         replay = [row["fields"] for row in all_rows if row["fields"].get("RequestKey") == request_key]
@@ -342,8 +452,17 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             if len(replay) != expected_count or any(row.get("RequestFingerprint") != payload_hash for row in replay):
                 raise PartConflict("PART_REQUEST_CONFLICT", "This mapping request key has a different or incomplete saved payload")
             _history(store, file_id)
-            return {"idempotent": True, "version": replay[0]["Version"], "savedRows": len(replay)}
-        detail = mapping_detail(store, file_id=file_id, source_hash=source_hash, association=association, groups=groups)
+            assignments = {}
+            for key, records in _group_records_by_key(replay).items():
+                sample = records[0]
+                assignments[key] = {"actionType": sample.get("ActionType") or "legacy_review",
+                    "reason": sample.get("Reason") or "", "partId": sample.get("StablePartId") or sample.get("PartIdentity") or _record_ref(sample.get("ProductPart")) or None,
+                    "requiresUserReason": sample.get("ActionType") in {"replace_assignment", "clear_assignment"}}
+            return {"idempotent": True, "version": replay[0]["Version"], "savedRows": len(replay),
+                "assignments": assignments, "confirmedRows": replay, "sourceHash": source_hash,
+                "associationKey": association.id if association else "",
+                "associationVersion": association.version if association else 0}
+        detail = mapping_detail(store, file_id=file_id, source_hash=source_hash, association=association, groups=groups, refresh_parts=True)
         if not detail["schemaAvailable"]:
             raise PartConflict("PART_SCHEMA_UNAVAILABLE", "The Part review schema is unavailable")
         if expected_hash != source_hash or expected_version != detail["version"]:
@@ -352,7 +471,7 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             raise PartConflict("PART_ASSOCIATION_STALE", "The saved association changed; reload the review")
         # Validate new choices against the complete canonical registry even though
         # GET mapping responses only return Parts already attached to visible groups.
-        parts = {part["id"]: part for part in list_parts(store)}
+        parts = {part["id"]: part for part in list_parts(store, refresh=True)}
         known = {group["key"]: group for group in groups}
         if set(decisions) - set(known):
             raise PartConflict("PART_GROUP_UNKNOWN", "A selected source group is no longer available")
@@ -364,10 +483,37 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                 raise PartConflict("PART_SELECTION_INVALID", "Select a canonical Part with an unambiguous name")
         version = detail["version"] + 1
         rows = []
+        saved_actions: dict[str, dict[str, Any]] = {}
+        current_by_key = {item["key"]: item for item in detail["groups"]}
         for key, part_id in sorted(decisions.items()):
             diagnostic = known[key].get("sourceDiagnostic", {})
             if diagnostic and diagnostic.get("status") not in {None, "ok"}:
                 raise PartConflict("PART_SOURCE_LABEL_UNAVAILABLE", "The source Part label column is missing or ambiguous; resolve its header before saving this group")
+            current = current_by_key.get(key, {})
+            evidence = current.get("previousAssignment") or {}
+            previous_ids = set(evidence.get("assignedPartIds") or [])
+            if current.get("part"):
+                previous_ids.add(str(current["part"]["id"]))
+            selected_id = str(part_id or "")
+            replacing = bool(previous_ids and (not selected_id or any(prior != selected_id for prior in previous_ids)))
+            user_reason = str(group_reasons.get(key) or reason or "").strip()
+            if replacing and not user_reason:
+                action = "clear_assignment" if not selected_id else "replace_assignment"
+                description = "Cleared saved Part assignment" if not selected_id else "Replaced saved Part assignment"
+                raise PartConflict("PART_REVIEW_REASON_REQUIRED", f"{description} for {known[key]['description'] or key} requires a reason")
+            if not selected_id:
+                action_type = "clear_assignment" if replacing else "initial_unassigned"
+                audit_reason = user_reason if replacing else "Initial explicit unassigned review"
+            elif replacing:
+                action_type, audit_reason = "replace_assignment", user_reason
+            elif evidence.get("contextChanged"):
+                action_type, audit_reason = "context_reconfirmation", "Reconfirmed unchanged Part assignment against refreshed workbook or association evidence"
+            elif current.get("part") and current["part"]["id"] == selected_id:
+                action_type, audit_reason = "reconfirmation", "Reconfirmed existing Part assignment"
+            else:
+                action_type, audit_reason = "initial_assignment", "Initial Part assignment"
+            saved_actions[key] = {"actionType": action_type, "reason": audit_reason,
+                "requiresUserReason": replacing, "partId": selected_id or None}
             for source in known[key]["rows"]:
                 selected = parts.get(part_id) if part_id else None
                 rows.append({"ReviewKey": "part-review:" + fingerprint([request_key, key, source]),
@@ -383,7 +529,8 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                              "PartMetadataVersion": _grist_ref(selected.get("partMetadataRecordId")) if selected and selected.get("gristRecordId") is not None else None,
                              "PartNumberUsed": str(selected.get("partNumber") or "") if selected else "",
                              "NameUsed": str(selected.get("name") or "") if selected else "",
-                             "Version": version, "Actor": actor, "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
+                             "Version": version, "Actor": actor, "Reason": audit_reason, "ActionType": action_type,
+                             "MappingPolicyVersion": MAPPING_POLICY_VERSION, "OccurredAt": grist_datetime(utc_now()),
                              "RequestKey": request_key, "RequestFingerprint": payload_hash})
         for row in rows:
             if not (row.get("ProductPart") is None and row.get("PartIdentity")):
@@ -392,8 +539,14 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
         if before_write:
             before_write()
         store.append(MAPPING_TABLE, rows)
-        _history(store, file_id)
-        return {"idempotent": False, "version": version, "savedRows": len(rows)}
+        confirmed_history = _history(store, file_id)
+        confirmed_rows = [row["fields"] for row in confirmed_history if row["fields"].get("RequestKey") == request_key]
+        if len(confirmed_rows) != len(rows) or any(row.get("RequestFingerprint") != payload_hash for row in confirmed_rows):
+            raise PartConflict("PART_WRITE_UNCONFIRMED", "Grist did not confirm every source-row mapping record after Save")
+        return {"idempotent": False, "version": version, "savedRows": len(rows),
+            "assignments": saved_actions, "confirmedRows": confirmed_rows, "sourceHash": source_hash,
+            "associationKey": association.id if association else "",
+            "associationVersion": association.version if association else 0}
 
 
 def _record_ref(value: Any) -> str:

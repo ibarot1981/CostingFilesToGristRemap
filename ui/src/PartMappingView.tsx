@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { api } from "./api";
+import { PartBaselinePanel } from "./PartBaselinePanel";
 import "./partMapping.css";
 
-type Part = { id: string; name: string; description?: string; variant?: string; selectable: boolean; duplicateName: boolean; partNumber?: string | null; engineeringRevision?: string | null; outOfScopeCodes?: { id: string; code: string }[] };
+type Part = { id: string; name: string; description?: string; variant?: string; selectable: boolean; duplicateName: boolean; partNumber?: string | null; engineeringRevision?: string | null; legacy?: boolean; outOfScopeCodes?: { id: string; code: string }[] };
 type SourceRow = { sheet: string; row: number; fields: Record<string, unknown>; sourceHeaders: Record<string, string>; sourceHeaderCells: Record<string, string>; sourceCells: Record<string, { cell?: string }>; headerRow?: number; availableFields: string[] };
-type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: { partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number }; needsCompatibilityReview?: boolean; version: number };
+type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: { partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number; assignedPartIds?: string[]; hasPriorAssignment?: boolean; contextChanged?: boolean; groupingPolicyChanged?: boolean }; needsCompatibilityReview?: boolean; version: number };
 type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; unresolvedGroups: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; NameUsed?: string; PartNumberUsed?: string }[] };
 type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[] };
 type StaleDraft = { groupKey: string; sheet: string; description: string; rowCount: number; decision: string; part: Part | null; sourceHash: string; evidenceFingerprint: string; reason?: string };
-type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
+type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; groupReasons?: Record<string, string>; expandedGroups?: Record<string, boolean>; expandedSourceDetails?: Record<string, boolean>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
 type ReturnSelection = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string };
 type SheetFilter = "all" | "mcl" | "toolshop" | "cnc";
 type ReviewFilter = "all" | "needs-review" | "saved" | "unsaved";
@@ -53,16 +55,18 @@ function groupTitle(group: Group) {
   return group.blankDescription ? "Blank Part label · individual source row" : group.description;
 }
 
-export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSelectionConsumed }: { path: string; onOpenParts?: (groupKey: string, partId: string | null, mode?: "select" | "view", context?: Partial<ReturnSelection>) => void; returnSelection?: ReturnSelection | null; onReturnSelectionConsumed?: () => void }) {
+export function PartMappingView({ path, active = true, onOpenParts, returnSelection, onReturnSelectionConsumed }: { path: string; active?: boolean; onOpenParts?: (groupKey: string, partId: string | null, mode?: "select" | "view", context?: Partial<ReturnSelection>) => void; returnSelection?: ReturnSelection | null; onReturnSelectionConsumed?: () => void }) {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [decisions, setDecisions] = useState<Record<string, string>>({});
   const [draftParts, setDraftParts] = useState<Record<string, Part>>({});
   const [staleDrafts, setStaleDrafts] = useState<StaleDraft[]>([]);
   const [reason, setReason] = useState("");
+  const [groupReasons, setGroupReasons] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [sheetFilter, setSheetFilter] = useState<SheetFilter>("all");
   const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -87,6 +91,7 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
       if (sameEvidence && saved) {
         nextDecisions = saved.decisions || {};
         nextParts = saved.draftParts || {};
+        setGroupReasons(saved.groupReasons || {});
         setStaleDrafts(saved.staleDrafts || []);
         setReason(saved.reason || ""); setQuery(saved.query || "");
         setSheetFilter((saved.sheetFilter || "all") as SheetFilter); setReviewFilter((saved.reviewFilter || "all") as ReviewFilter);
@@ -97,10 +102,11 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
           const prior = saved.draftGroups?.find(group => group.groupKey === groupKey);
           return {groupKey, sheet:prior?.sheet || "Previous source sheet", description:prior?.description || "",
             rowCount:prior?.rowCount || 0, decision, part:saved.draftParts?.[groupKey] || null,
-            sourceHash:saved.sourceHash, evidenceFingerprint:prior?.evidenceFingerprint || "", reason:saved.reason || ""};
+            sourceHash:saved.sourceHash, evidenceFingerprint:prior?.evidenceFingerprint || "", reason:saved.groupReasons?.[groupKey] || saved.reason || ""};
         }) : [];
         setStaleDrafts([...(saved?.staleDrafts || []), ...heldDrafts]);
         setDecisions({}); setDraftParts({});
+        setGroupReasons({});
         setReason(saved?.reason || ""); setQuery(saved?.query || "");
         setSheetFilter((saved?.sheetFilter || "all") as SheetFilter); setReviewFilter((saved?.reviewFilter || "all") as ReviewFilter);
         // A timed-out save must keep its exact idempotency key and payload. Retrying
@@ -114,6 +120,11 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
               ? "The saved review version changed. Saved Grist assignments are current; no unsaved choices were reapplied."
               : "The workbook or association changed. Saved Grist assignments are shown for the current evidence; previous choices were not reapplied.");
         }
+      }
+      if (saved) {
+        const currentKeys = new Set(result.groups.map(group => group.key));
+        setExpandedGroups(Object.fromEntries(Object.entries(saved.expandedGroups || {}).filter(([key]) => currentKeys.has(key))));
+        setExpanded(Object.fromEntries(Object.entries(saved.expandedSourceDetails || {}).filter(([key]) => currentKeys.has(key))));
       }
       if (returnSelection?.path === path && returnSelection.mode === "select" && returnSelection.groupKey) {
         const target = result.groups.find(group => group.key === returnSelection.groupKey);
@@ -140,23 +151,29 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
     finally { if (revision === generation.current) setLoading(false); }
   }
 
+  const loadedPath = useRef("");
   useEffect(() => {
+    if (!active) return;
     const revision = ++generation.current;
-    setDetail(null); setDecisions({}); setDraftParts({}); setStaleDrafts([]); setReason(""); setNotice(""); setError(""); setBusy(false);
-    setMappingAttempt(null); setConfirmBatch(false); inFlight.current = false;
-    if (path) void load(revision);
+    const returningToSamePath = loadedPath.current === path && Boolean(detail);
+    if (!returningToSamePath) {
+      setDetail(null); setDecisions({}); setDraftParts({}); setStaleDrafts([]); setReason("");
+      setGroupReasons({}); setExpandedGroups({}); setExpanded({}); setNotice(""); setError(""); setBusy(false);
+      setMappingAttempt(null); setConfirmBatch(false); inFlight.current = false;
+    }
+    if (path) { loadedPath.current = path; void load(revision); }
     return () => { ++generation.current; };
-  }, [path]);
+  }, [path, active]);
 
   useEffect(() => {
     if (!detail || !path) return;
     const saved: Draft = { path, sourceHash: detail.sourceHash, version: detail.version, associationKey: detail.associationKey,
-      associationVersion: detail.associationVersion, decisions, draftParts, reason, query, sheetFilter, reviewFilter,
+      associationVersion: detail.associationVersion, decisions, draftParts, groupReasons, expandedGroups, expandedSourceDetails: expanded, reason, query, sheetFilter, reviewFilter,
       draftGroups: Object.keys(decisions).flatMap(groupKey => { const group = detail.groups.find(item => item.key === groupKey); return group ? [{groupKey,
         sheet:group.sheet, description:group.description, rowCount:group.rows.length, evidenceFingerprint:group.evidenceFingerprint}] : []; }),
       staleDrafts, scrollTop: tableScroll.current?.scrollTop || 0, mappingAttempt };
     sessionStorage.setItem(draftKey(path), JSON.stringify(saved));
-  }, [path, detail, decisions, draftParts, staleDrafts, reason, query, sheetFilter, reviewFilter, mappingAttempt]);
+  }, [path, detail, decisions, draftParts, groupReasons, expandedGroups, expanded, staleDrafts, reason, query, sheetFilter, reviewFilter, mappingAttempt]);
 
   function openParts(group: Group | null, partId: string | null, mode: "select" | "view") {
     if (!detail) return;
@@ -187,16 +204,35 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
     setDraftParts(old => ({ ...old, [group.key]: part }));
   }
 
+  function reasonRequired(group: Group, nextPartId: string | null | undefined) {
+    const priorIds = new Set<string>([
+      ...(group.part?.id ? [group.part.id] : []),
+      ...(group.previousAssignment?.assignedPartIds || []),
+    ]);
+    if (!priorIds.size) return false;
+    if (!nextPartId) return true;
+    return [...priorIds].some(id => id !== nextPartId);
+  }
+
+  function pendingReasonRequired(group: Group) {
+    return groupPending(group) && reasonRequired(group, decisions[group.key] || null);
+  }
+
   async function saveGroups(groupKeys: string[]) {
     if (!detail || !groupKeys.length || inFlight.current) return;
     let attempt = mappingAttempt;
     if (attempt) {
       if (attempt.groupKeys.join("\0") !== groupKeys.join("\0")) return;
     } else {
-      if (!reason.trim()) return;
       const payloadDecisions = Object.fromEntries(groupKeys.map(key => [key, decisions[key]]));
       if (Object.values(payloadDecisions).some(value => value === undefined)) return;
-      attempt = { key: crypto.randomUUID(), groupKeys: [...groupKeys], payload: { path, decisions: payloadDecisions, reason,
+      const needsReason = groupKeys.filter(key => {
+        const group = detail.groups.find(item => item.key === key);
+        return Boolean(group && reasonRequired(group, payloadDecisions[key] || null));
+      });
+      const payloadReasons = Object.fromEntries(needsReason.map(key => [key, groupReasons[key] || ""]));
+      if (needsReason.some(key => !String(payloadReasons[key] || "").trim())) return;
+      attempt = { key: crypto.randomUUID(), groupKeys: [...groupKeys], payload: { path, decisions: payloadDecisions, reasons: payloadReasons,
         expectedHash: detail.sourceHash, expectedVersion: detail.version, expectedAssociationKey: detail.associationKey,
         expectedAssociationVersion: detail.associationVersion } };
     }
@@ -208,30 +244,46 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
       const previousDetail = detail;
       const previousDecisions = decisions;
       const previousParts = draftParts;
-      const revision = generation.current;
-      const fresh = await api.partMappings(path) as Detail;
-      if (revision !== generation.current || requestRevision !== generation.current) return;
-      const sameSource = fresh.sourceHash === previousDetail.sourceHash && fresh.associationKey === previousDetail.associationKey
-        && fresh.associationVersion === previousDetail.associationVersion && fresh.version === result.version;
-      const byKey = new Map(fresh.groups.map(group => [group.key, group]));
+      const sameSource = result.sourceHash === previousDetail.sourceHash && result.associationKey === previousDetail.associationKey
+        && result.associationVersion === previousDetail.associationVersion;
       const retained: Record<string, string> = {};
       const retainedParts: Record<string, Part> = {};
+      const retainedReasons: Record<string, string> = {};
       const dropped: string[] = [];
       for (const [key, value] of Object.entries(previousDecisions)) {
         if (attempt.groupKeys.includes(key)) continue;
         const oldGroup = previousDetail.groups.find(group => group.key === key);
-        const newGroup = byKey.get(key);
-        if (sameSource && oldGroup && newGroup && oldGroup.evidenceFingerprint === newGroup.evidenceFingerprint) {
+        const newGroup = oldGroup;
+        if (sameSource && oldGroup && newGroup) {
           retained[key] = value;
           if (previousParts[key]) retainedParts[key] = previousParts[key];
+          if (groupReasons[key]) retainedReasons[key] = groupReasons[key];
         } else dropped.push(key);
       }
-      setDetail(fresh); setDecisions(retained); setDraftParts(retainedParts); setMappingAttempt(null);
+      const assignments = result.assignments || {};
+      const confirmedRows = result.confirmedRows || [];
+      const savedKeys = new Set(attempt.groupKeys);
+      const nextGroups = previousDetail.groups.map(group => {
+        if (!savedKeys.has(group.key)) return group;
+        const assignment = assignments[group.key] || {};
+        const partId = assignment.partId || null;
+        const part = partId ? (previousParts[group.key] || (group.part?.id === partId ? group.part : null)) : null;
+        return { ...group, part, reviewed: Boolean(partId), explicitlyUnassigned: !partId,
+          needsCompatibilityReview: false, previousAssignment: undefined, version: result.version };
+      });
+      const fresh: Detail = { ...previousDetail, sourceHash: result.sourceHash || previousDetail.sourceHash,
+        associationKey: result.associationKey || previousDetail.associationKey,
+        associationVersion: result.associationVersion || previousDetail.associationVersion,
+        version: result.version, groups: nextGroups,
+        unresolvedGroups: nextGroups.filter(group => !group.reviewed).length,
+        history: [...previousDetail.history, ...confirmedRows] };
+      setDetail(fresh); setDecisions(retained); setDraftParts(retainedParts); setGroupReasons(retainedReasons); setMappingAttempt(null);
       setStaleDrafts(old => old.filter(draft => !attempt.groupKeys.includes(draft.groupKey)));
       setReason(Object.keys(retained).length ? reason : "");
-      setNotice(`Saved ${result.savedRows} source-row assignment${result.savedRows === 1 ? "" : "s"} in review version ${result.version}.${dropped.length ? ` ${dropped.length} changed draft group(s) were cleared for review.` : ""}`);
+      setNotice(`Grist confirmed ${result.savedRows} source-row assignment${result.savedRows === 1 ? "" : "s"} in review version ${result.version}.${dropped.length ? ` ${dropped.length} changed draft group(s) were cleared for review.` : ""}`);
       sessionStorage.setItem(draftKey(path), JSON.stringify({ path, sourceHash: fresh.sourceHash, version: fresh.version,
         associationKey: fresh.associationKey, associationVersion: fresh.associationVersion, decisions: retained, draftParts: retainedParts,
+        groupReasons: retainedReasons, expandedGroups, expandedSourceDetails: expanded,
         draftGroups: Object.keys(retained).flatMap(groupKey => { const group = fresh.groups.find(item => item.key === groupKey); return group ? [{groupKey,
           sheet:group.sheet, description:group.description, rowCount:group.rows.length, evidenceFingerprint:group.evidenceFingerprint}] : []; }),
         staleDrafts: staleDrafts.filter(draft => !attempt.groupKeys.includes(draft.groupKey)), reason: Object.keys(retained).length ? reason : "", query, sheetFilter, reviewFilter,
@@ -267,7 +319,7 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
         } else if (before) {
           movedToReview.push({groupKey:key, sheet:before.sheet, description:before.description, rowCount:before.rows.length,
             decision, part:oldParts[key] || before.part, sourceHash:oldDetail.sourceHash,
-            evidenceFingerprint:before.evidenceFingerprint, reason});
+            evidenceFingerprint:before.evidenceFingerprint, reason:groupReasons[key] || reason});
         }
       }
       setDetail(fresh); setDecisions(nextDecisions); setDraftParts(nextParts);
@@ -286,7 +338,7 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
     if (!group) return;
     setDecisions(old => ({ ...old, [group.key]: stale.decision }));
     setDraftParts(old => stale.decision && stale.part ? ({ ...old, [group.key]: stale.part! }) : old);
-    if (stale.reason) setReason(old => old || stale.reason!);
+    if (stale.reason) setGroupReasons(old => ({ ...old, [group.key]: old[group.key] || stale.reason! }));
     setStaleDrafts(old => old.filter(item => item.groupKey !== stale.groupKey));
     setNotice(`Previous choice reopened for ${groupTitle(group)}. Confirm the displayed current source rows and save with a review reason.`);
   }
@@ -295,6 +347,8 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
   if (!path) return <main className="part-mapping"><h1>Part Mapping</h1><p>Select a costing workbook in Files to review its Parts.</p></main>;
 
   const allGroups = detail?.groups || [];
+  const baselineParts = [...new Map(allGroups.filter(group => group.reviewed && group.part && !group.part.legacy)
+    .map(group => [group.part!.id, group.part!])).values()];
   const pendingGroups = allGroups.filter(group => Object.prototype.hasOwnProperty.call(decisions, group.key));
   const visibleGroups = allGroups.filter(group => {
     if (sheetFilter !== "all" && familyFor(group.sheet) !== sheetFilter) return false;
@@ -311,13 +365,16 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
   const groupPending = (group: Group) => Object.prototype.hasOwnProperty.call(decisions, group.key);
   const selectedPartFor = (group: Group) => groupPending(group) ? (decisions[group.key] ? draftParts[group.key] : null) : group.part;
   const sourceStatus = (group: Group) => {
-    if (mappingAttempt?.groupKeys.includes(group.key)) return error ? "Failed · retry same request" : "Saving…";
-    if (groupPending(group)) return "Unsaved changes";
+    if (mappingAttempt?.groupKeys.includes(group.key)) return error ? "Failed" : "Saving";
+    if (groupPending(group)) return "Unsaved";
     if (group.reviewed) return "Saved";
-    if (group.needsCompatibilityReview) return "Needs review · older assignment";
-    if (group.explicitlyUnassigned) return "No Part assigned · saved with reason";
     return "Needs review";
   };
+  const requiredReasonGroups = pendingGroups.filter(pendingReasonRequired);
+  const displayedKeys = visibleGroups.map(group => group.key);
+  const canonicalSummary = (group: Group) => groupPending(group)
+    ? decisions[group.key] ? `Unsaved · ${formatPart(draftParts[group.key])}` : `Clear pending · ${formatPart(group.part)}`
+    : group.part ? formatPart(group.part) : "No Part selected";
   const perSheet = (family: SheetFilter) => {
     const matching = allGroups.filter(group => family === "all" || familyFor(group.sheet) === family);
     return { groups: matching.length, rows: matching.reduce((sum, group) => sum + group.rows.length, 0) };
@@ -327,7 +384,7 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
     <div className="part-heading"><div><span className="eyebrow">Safari Manufacturing · Source assignments</span><h1>Part Mapping</h1><p className="part-workbook">{path}</p></div><div className="workbench-actions"><button className="button" disabled={locked} onClick={() => openParts(null, null, "select")}>Browse / create Part</button><button className="button" disabled={busy || loading || (Boolean(mappingAttempt) && !canRefreshConflict)} onClick={() => canRefreshConflict ? void reviewCurrentEvidence() : void load(++generation.current)}>{canRefreshConflict ? "Review current source" : "Reload review"}</button></div></div>
     {error && <div role="alert" className="part-error-banner"><strong>{mappingAttempt ? "Save failed" : "Part Mapping could not load"}</strong><span>{error}</span>{mappingAttempt && <small>Selections and reason are retained. Retry sends the same request key and payload so a committed Grist save can be recovered safely.</small>}{canRefreshConflict && <button className="button" onClick={() => void reviewCurrentEvidence()}>Refresh and hold changed drafts for review</button>}</div>}
     {notice && <p role="status" className="part-notice">{notice}</p>}
-    {loading && <p role="status">Loading Part review…</p>}
+    {loading && <p role="status">{detail ? "Refreshing workbook and saved mapping evidence… Draft selections remain unconfirmed until this check completes." : "Loading Part review…"}</p>}
     {detail && <>
       <details className="part-review-details"><summary>Review details</summary><div><p>Workbook SHA-256 · <code>{detail.sourceHash}</code></p><p>Mapping policy · {detail.mappingPolicyVersion} · review version {detail.version} · saved workbook evidence</p>
         {!detail.schemaAvailable && <p role="alert">Part review storage is unavailable.</p>}
@@ -335,6 +392,8 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
         {!detail.associationKey && <p role="alert">Save a file association before saving Part assignments.</p>}
         {Object.entries(detail.sourceSheets || {}).map(([sheet, diagnostic]) => <p key={sheet}><strong>{sheet}:</strong> {diagnostic.status === "ok" ? `${diagnostic.labelField === "part_category" ? "Part Category" : "Machine Piece Description"} from ${diagnostic.labelHeader} at ${diagnostic.labelHeaderCell}` : diagnostic.status === "sheet_missing" ? "Sheet is not present in this workbook." : diagnostic.status === "header_missing" ? "A source header row was not found." : diagnostic.status === "label_column_ambiguous" ? `Multiple possible Part label columns were found: ${diagnostic.ambiguousLabelHeaders.join(", ")}.` : "The configured Part label column is missing; blank rows cannot be mapped by substitution."}</p>)}
       </div></details>
+      <PartBaselinePanel path={path} parts={baselineParts} groups={allGroups}
+        onUseDifferentPart={(groupKey, part) => { const target = allGroups.find(group => group.key === groupKey); if (target) selectPart(target, part); }}/>
       <section className="part-mapping-summary" aria-label="Mapping summary"><div><strong>{allGroups.filter(group => !group.reviewed && !groupPending(group)).length}</strong><span>groups needing review</span></div><div><strong>{pendingGroups.length}</strong><span>unsaved changes</span></div><div><strong>{totalRows}</strong><span>active source rows</span></div><div><strong>{detail.version}</strong><span>saved review version</span></div></section>
       <section className="part-mapping-toolbar" aria-label="Filter Part mappings">
         <label className="part-search-label">Search descriptions or source fields<input aria-label="Search descriptions or source fields" value={query} onChange={event => setQuery(event.target.value)} placeholder="Part description, material, row…"/></label>
@@ -343,6 +402,10 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
           <option value="all">All · {allGroups.length} groups</option><option value="needs-review">Needs review · {allGroups.filter(group => !group.reviewed && !groupPending(group)).length} groups</option>
           <option value="saved">Saved · {allGroups.filter(group => group.reviewed).length} groups</option><option value="unsaved">Unsaved changes · {pendingGroups.length} groups</option>
         </select></label>
+        <div className="part-group-expansion-actions" aria-label="Group expansion controls">
+          <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, true])) }))}>Expand all displayed</button>
+          <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, false])) }))}>Collapse all displayed</button>
+        </div>
       </section>
       {staleDrafts.length > 0 && <section className="part-stale-drafts" aria-label="Drafts held for source review"><h2>Drafts held for source review</h2><p>These choices were not applied after workbook, association or group evidence changed. Review each current source group before reopening its choice.</p>{staleDrafts.map(stale => {
         const current = allGroups.find(group => group.key === stale.groupKey);
@@ -350,9 +413,16 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
       })}</section>}
       <p className="part-counts"><strong>Showing {visibleGroups.length} of {allGroups.length} source groups</strong> · {visibleGroups.reduce((sum, group) => sum + group.rows.length, 0)} displayed source rows. Filters never discard hidden drafts.</p>
       <div className="part-source-table" ref={tableScroll} onScroll={() => { const draft = readDraft(path); if (draft && tableScroll.current) sessionStorage.setItem(draftKey(path), JSON.stringify({ ...draft, scrollTop: tableScroll.current.scrollTop })); }}>
-        {visibleGroups.length ? visibleGroups.map(group => <article className="part-source-group" key={group.key}>
-          <header className="part-group-heading"><div><span className="part-sheet-chip">{group.sheet}</span><h2>{groupTitle(group)}</h2><small>Source Part / category · {group.rows.length} row{group.rows.length === 1 ? "" : "s"} · mapping label from {group.labelField === "part_category" ? "Part Category" : "Machine Piece Description"}</small></div>
-            <span className={`part-state ${groupPending(group) ? "pending" : group.reviewed ? "saved" : "review"}`}>{sourceStatus(group)}</span></header>
+        {visibleGroups.length ? visibleGroups.map(group => {
+          const groupIsExpanded = Boolean(expandedGroups[group.key]);
+          const needsReason = pendingReasonRequired(group);
+          const groupReason = groupReasons[group.key] || "";
+          const blocker = !detail.schemaAvailable ? "Part review storage is unavailable; saving is blocked." : !detail.associationKey ? "Save a file association before assigning Parts." : group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" ? "Resolve the source label column before saving." : groupPending(group) ? "" : "Choose a Part from the search results before saving.";
+          return <article className={`part-source-group ${groupIsExpanded ? "is-expanded" : "is-collapsed"}`} key={group.key}>
+          <header className="part-group-heading"><button type="button" className="part-group-toggle" aria-expanded={groupIsExpanded} aria-controls={`part-group-content-${group.key}`} onClick={() => setExpandedGroups(old => ({ ...old, [group.key]: !Boolean(old[group.key]) }))}>
+              {groupIsExpanded ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}<span className="part-group-heading-copy"><span className="part-sheet-chip">{group.sheet}</span><strong>{groupTitle(group)}</strong><small>Source Part / category · {group.rows.length} row{group.rows.length === 1 ? "" : "s"} · {group.labelField === "part_category" ? "Part Category" : "Machine Piece Description"}</small><small className="part-canonical-summary">Canonical Part · {canonicalSummary(group)}</small></span>
+            </button><span className={`part-state state-${sourceStatus(group).toLowerCase()}`}>{sourceStatus(group)}</span></header>
+          {groupIsExpanded && <div id={`part-group-content-${group.key}`} className="part-group-content">
           {group.previousAssignment && !group.reviewed && <div className="part-compatibility-note" role="status"><strong>Older assignment needs review.</strong>{group.previousAssignment.previousRowsAgree === false
             ? " Previous row assignments differ or do not cover every current source row; review the source-row history before assigning this group."
             : <> The previous group used {group.previousAssignment.sourceDescription || "a different source label"}{group.previousAssignment.partNumber ? ` and ${group.previousAssignment.partNumber}` : ""}{group.previousAssignment.name ? ` · ${group.previousAssignment.name}` : ""}.</>} It remains in history and was not carried into this sheet-specific group.</div>}
@@ -366,24 +436,27 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
                 <button className="button" disabled={locked || !onOpenParts} onClick={() => openParts(group, decisions[group.key] || group.part?.id || null, "select")}>Browse / create Part</button>
                 {(group.part || decisions[group.key]) && <button className="button quiet" disabled={locked} onClick={() => selectPart(group, null)}>{group.part ? "Clear saved Part…" : "Clear selection"}</button>}
                 {groupPending(group) && <button className="button quiet" disabled={locked} onClick={() => { setDecisions(old => { const next = { ...old }; delete next[group.key]; return next; }); setDraftParts(old => { const next = { ...old }; delete next[group.key]; return next; }); }}>Revert draft</button>}
-                <button className="button primary" disabled={busy || loading || (Boolean(mappingAttempt) && !mappingAttempt?.groupKeys.includes(group.key)) || !detail.schemaAvailable || !detail.associationKey || Boolean(group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok") || (!mappingAttempt && (!groupPending(group) || !reason.trim()))}
+                {needsReason && <label className="part-group-reason">Reason for mapping change<input aria-label={`Reason for mapping change · ${groupTitle(group)}`} value={groupReason} disabled={locked} onChange={event => setGroupReasons(old => ({ ...old, [group.key]: event.target.value }))} placeholder="Required for replacement or clear"/></label>}
+                <button className="button primary" disabled={busy || loading || (Boolean(mappingAttempt) && !mappingAttempt?.groupKeys.includes(group.key)) || !detail.schemaAvailable || !detail.associationKey || Boolean(group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok") || (!mappingAttempt && (!groupPending(group) || (needsReason && !groupReason.trim())))}
                   onClick={() => void saveGroups(mappingAttempt?.groupKeys.includes(group.key) ? mappingAttempt.groupKeys : [group.key])}>{mappingAttempt?.groupKeys.includes(group.key) && error ? "Retry saving this mapping" : "Save this mapping"}</button>
               </div>
             </div>
             {(() => { const selectedPart = selectedPartFor(group); return selectedPart?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: this assignment remains saveable for {selectedPart.outOfScopeCodes.map(code => code.code).join(", ")}.</small> : null; })()}
-            {group.explicitlyUnassigned && <small className="part-unassigned-note">The last saved action explicitly cleared the Part with a review reason. Historical assignments remain above in History.</small>}
+            {group.explicitlyUnassigned && <small className="part-unassigned-note">The last saved action explicitly cleared the Part. Historical assignments remain in History.</small>}
+            {blocker && <small className="part-save-blocker">{blocker}</small>}
           </div>
-        </article>) : <div className="part-empty-state">No source groups match these filters.</div>}
+          </div>}
+        </article>}) : <div className="part-empty-state">No source groups match these filters.</div>}
       </div>
       {detail.history.length > 0 && <details className="part-history"><summary>Assignment history · {detail.history.length} source rows</summary>{detail.history.map(row => <p key={row.ReviewKey}><strong>v{row.Version} · {row.SheetName} row {row.SourceRow}</strong> · {row.SourceDescription || "Blank description"} · {row.PartNumberUsed || "No Part assigned"}{row.NameUsed ? ` · ${row.NameUsed}` : ""}<br/>{row.Actor} · {row.OccurredAt}<br/>{row.Reason}</p>)}</details>}
-      <div className="part-sticky-save" role="region" aria-label="Save Part mapping drafts"><div><strong>{pendingGroups.length} unsaved group{pendingGroups.length === 1 ? "" : "s"}</strong><span>{pendingGroups.reduce((sum, group) => sum + group.rows.length, 0)} source rows · hidden groups are included in batch confirmation</span></div>
-        <label>Review reason<input aria-label="Reason for these assignments" value={reason} disabled={locked} onChange={event => setReason(event.target.value)} placeholder="Why are these source rows assigned or cleared?"/></label>
-        <button className="button primary" disabled={busy || loading || (mappingAttempt ? false : (!detail.schemaAvailable || !detail.associationKey || !pendingGroups.length || !reason.trim()))} onClick={() => mappingAttempt ? void saveGroups(mappingAttempt.groupKeys) : setConfirmBatch(true)}>{mappingAttempt ? "Retry saving pending mappings" : "Save pending mappings"}</button>
+      <div className="part-sticky-save" role="region" aria-label="Save Part mapping drafts"><div><strong>{pendingGroups.length} unsaved group{pendingGroups.length === 1 ? "" : "s"}</strong><span>{pendingGroups.reduce((sum, group) => sum + group.rows.length, 0)} source rows · {requiredReasonGroups.length} changed group{requiredReasonGroups.length === 1 ? "" : "s"} need a reason</span></div>
+        <small>Initial assignments need no reason. Replacement and clear reasons appear beside each affected group.</small>
+        <button className="button primary" disabled={busy || loading || (mappingAttempt ? false : (!detail.schemaAvailable || !detail.associationKey || !pendingGroups.length || requiredReasonGroups.some(group => !(groupReasons[group.key] || "").trim())))} onClick={() => mappingAttempt ? void saveGroups(mappingAttempt.groupKeys) : setConfirmBatch(true)}>{mappingAttempt ? "Retry saving pending mappings" : "Save pending mappings"}</button>
       </div>
       {confirmBatch && <div className="part-modal-backdrop" role="presentation"><section className="part-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="part-confirm-title" aria-describedby="part-confirm-help">
         <h2 id="part-confirm-title">Save all pending mappings?</h2><p id="part-confirm-help">This includes every unsaved group, even groups hidden by the current filters. Review the full save scope below.</p>
-        <div className="part-confirm-list">{pendingGroups.map(group => <article key={group.key}><strong>{group.sheet} · {groupTitle(group)}</strong><span>{group.rows.length} source row{group.rows.length === 1 ? "" : "s"} · {decisions[group.key] ? formatPart(draftParts[group.key]) : "Clear saved Part assignment"}</span></article>)}</div>
-        <p><strong>Reason:</strong> {reason}</p><div className="part-confirm-actions"><button className="button" onClick={() => setConfirmBatch(false)}>Cancel</button><button className="button primary" disabled={locked} onClick={() => void saveGroups(pendingGroups.map(group => group.key))}>Confirm save {pendingGroups.length} groups</button></div>
+        <div className="part-confirm-list">{pendingGroups.map(group => { const needsReason = pendingReasonRequired(group); return <article key={group.key}><strong>{group.sheet} · {groupTitle(group)}</strong><span>{group.rows.length} source row{group.rows.length === 1 ? "" : "s"} · {decisions[group.key] ? formatPart(draftParts[group.key]) : "Clear saved Part assignment"} · {needsReason ? "Reason required" : "No reason required"}</span>{needsReason && <label>Reason for mapping change<input aria-label={`Batch mapping reason · ${groupTitle(group)}`} value={groupReasons[group.key] || ""} onChange={event => setGroupReasons(old => ({ ...old, [group.key]: event.target.value }))} placeholder="Why is this saved Part being replaced or cleared?" disabled={locked}/></label>}</article>; })}</div>
+        <div className="part-confirm-actions"><button className="button" onClick={() => setConfirmBatch(false)}>Cancel</button><button className="button primary" disabled={locked || requiredReasonGroups.some(group => !(groupReasons[group.key] || "").trim())} onClick={() => void saveGroups(pendingGroups.map(group => group.key))}>Confirm save {pendingGroups.length} groups</button></div>
       </section></div>}
     </>}
   </main>;
@@ -392,41 +465,52 @@ export function PartMappingView({ path, onOpenParts, returnSelection, onReturnSe
 function PartSearchCombobox({ group, selected, disabled, path, open, onOpen, onClose, onSelect }: { group: Group; selected: Part | null | undefined; disabled: boolean; path: string; open: boolean; onOpen: () => void; onClose: () => void; onSelect: (part: Part | null) => void }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Part[]>([]);
+  const [resultsFor, setResultsFor] = useState<string | null>(null);
   const [total, setTotal] = useState(0);
   const [activeIndex, setActiveIndex] = useState(0);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [cacheAge, setCacheAge] = useState(0);
   const generation = useRef(0);
   const input = useRef<HTMLInputElement>(null);
-  const options = results.filter(part => part.selectable && !part.duplicateName);
+  const currentResults = resultsFor === query && !loading;
+  const options = currentResults ? results.filter(part => part.selectable && !part.duplicateName) : [];
   useEffect(() => {
     if (!open) return;
     const request = ++generation.current;
+    const controller = new AbortController();
+    setLoading(true); setError(""); setResults([]); setResultsFor(null); setTotal(0); setCacheAge(0); setActiveIndex(0);
     const timer = window.setTimeout(async () => {
       try {
-        const result = await api.searchParts(query, 0, 30, path);
+        const result = await api.searchParts(query, 0, 30, path, controller.signal);
         if (request !== generation.current) return;
-        setResults(result.items || []); setTotal(result.total || 0); setError(""); setActiveIndex(0);
-      } catch (cause) { if (request === generation.current) { setResults([]); setTotal(0); setError(String(cause)); } }
+        setResults(result.items || []); setResultsFor(query); setTotal(result.total || 0); setCacheAge(Number(result.registryCacheAgeSeconds || 0)); setError(""); setActiveIndex(0);
+      } catch (cause) { if (request === generation.current && !controller.signal.aborted) { setResults([]); setResultsFor(query); setTotal(0); setError(String(cause)); } }
+      finally { if (request === generation.current && !controller.signal.aborted) setLoading(false); }
     }, query ? 180 : 0);
-    return () => { window.clearTimeout(timer); ++generation.current; };
+    return () => { window.clearTimeout(timer); controller.abort(); ++generation.current; };
   }, [open, query, path]);
   useEffect(() => { if (open) input.current?.focus(); }, [open]);
-  function choose(part: Part) { onSelect(part); setQuery(""); setResults([]); }
+  function choose(part: Part) {
+    if (disabled || !open || !currentResults || !part.selectable || part.duplicateName) return;
+    onSelect(part); setQuery(""); setResults([]); setResultsFor(null); setTotal(0);
+  }
   function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key === "ArrowDown") { event.preventDefault(); onOpen(); setActiveIndex(index => Math.min(options.length - 1, index + 1)); }
     else if (event.key === "ArrowUp") { event.preventDefault(); setActiveIndex(index => Math.max(0, index - 1)); }
-    else if (event.key === "Enter" && open && options[activeIndex]) { event.preventDefault(); choose(options[activeIndex]); }
+    else if (event.key === "Enter" && open) { event.preventDefault(); if (currentResults && options[activeIndex]) choose(options[activeIndex]); }
     else if (event.key === "Escape" && open) { event.preventDefault(); setQuery(""); onClose(); }
   }
   return <div className="part-combobox-wrap">
     <label className="part-combobox-label" htmlFor={`part-search-${group.key}`}>Canonical Part · permanent number, name, description, variant or previous alias</label>
-    <input ref={input} id={`part-search-${group.key}`} aria-label={`Part assignment for ${groupTitle(group)}`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls={`part-options-${group.key}`} aria-activedescendant={open && options[activeIndex] ? `part-option-${group.key}-${activeIndex}` : undefined}
-      value={open ? query : formatPart(selected)} placeholder="Search canonical Parts…" disabled={disabled} onFocus={onOpen} onClick={() => { if (!open) { setQuery(""); onOpen(); } }} onChange={event => { setQuery(event.target.value); if (!open) onOpen(); }} onKeyDown={onKeyDown} />
+    <input ref={input} id={`part-search-${group.key}`} aria-label={`Part assignment for ${groupTitle(group)}`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-busy={open && loading} aria-controls={`part-options-${group.key}`} aria-activedescendant={open && currentResults && options[activeIndex] ? `part-option-${group.key}-${activeIndex}` : undefined}
+      value={open ? query : formatPart(selected)} placeholder="Search canonical Parts…" disabled={disabled} onFocus={onOpen} onClick={() => { if (!open) { setQuery(""); onOpen(); } }} onChange={event => { setQuery(event.target.value); setResults([]); setResultsFor(null); setLoading(true); setError(""); setActiveIndex(0); if (!open) onOpen(); }} onKeyDown={onKeyDown} />
     {open && <div id={`part-options-${group.key}`} className="part-combobox-options" role="listbox" aria-label="Matching canonical Parts">
-      {error ? <div role="alert" className="part-search-error">{error}</div> : options.length ? options.map((part, index) => <button id={`part-option-${group.key}-${index}`} type="button" role="option" aria-selected={selected?.id === part.id || activeIndex === index} key={part.id} onMouseEnter={() => setActiveIndex(index)} onMouseDown={event => event.preventDefault()} onClick={() => choose(part)}>
+      {loading || !currentResults ? <div role="status" className="part-search-loading">Searching canonical Parts…</div> : error ? <div role="alert" className="part-search-error">{error}</div> : options.length ? options.map((part, index) => <button id={`part-option-${group.key}-${index}`} type="button" role="option" aria-selected={selected?.id === part.id || activeIndex === index} key={part.id} onMouseEnter={() => setActiveIndex(index)} onMouseDown={event => event.preventDefault()} onClick={() => choose(part)}>
         <strong>{formatPart(part)}</strong><span>{part.description || part.variant || "Canonical Safari Manufacturing Part"}</span>
       </button>) : <div className="part-search-empty">No unambiguous active Part matches this search.</div>}
-      {total > options.length && <small className="part-search-count">Showing {options.length} of {total} results. Type more to narrow the list.</small>}
+      {currentResults && !error && total > options.length && <small className="part-search-count">Showing {options.length} of {total} results. Type more to narrow the list.</small>}
+      {currentResults && !error && cacheAge > 0 && <small className="part-search-count">Search index read from Grist {cacheAge.toFixed(1)} seconds ago; Save rechecks current Part data.</small>}
     </div>}
   </div>;
 }
