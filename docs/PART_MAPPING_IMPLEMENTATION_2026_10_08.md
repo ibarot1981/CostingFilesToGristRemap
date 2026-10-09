@@ -62,7 +62,7 @@ A separate disposable Grist document verified a synthetic Part's baseline write 
 ### Verification and measured performance
 
 - Full Python suite: 218 tests, 217 passed and one platform-specific skip.
-- UI suite: 41 Vitest tests passed across 9 files, plus the 2 standalone mapped-files view-model tests. TypeScript check, Vite production build and `git diff --check` passed.
+- UI suite at this checkpoint: 42 Vitest tests passed across 10 files, plus the 2 standalone mapped-files view-model tests. TypeScript check, Vite production build and `git diff --check` passed.
 - An isolated current-code browser session opened the HF workbook and rendered 25 groups/100 active rows. Groups were collapsed by default; the baseline Part selector stayed unavailable until a saved mapping existed. Parts and Mapping were visually reviewed at 1366×900 and 823×900. The production Chassis detail and mapping page were read only. During one mapping view the adjacent workbook-preview indicator still showed `Reading workbook…` while the mapping endpoint had returned parsed rows; a prior browser check later showed the bounded preview loaded. The indicator’s timing remains an observed UI limitation, not a Grist persistence claim.
 - Production API observations below are single local-environment samples, not timing guarantees. “Prior loop” is a replay of the known pre-fix access pattern against the current document, not a recorded historical benchmark.
 
@@ -96,6 +96,8 @@ The Part Mapping page’s post-save endpoint projection was 100.3 ms and three H
 In one isolated-browser pass against the current production-backed read-only API, switching from Mapping to the already-loaded Parts detail took 608 ms to the next accessibility snapshot and issued two GETs (scope targets and the Parts register). Returning to Part Mapping took 543 ms to the next snapshot and issued one GET for mapping evidence. The app immediately reused the existing 25-group/100-row view and showed a revalidation indicator while that request completed; it did not blank the page or discard the current review. These are one-pass interaction samples and include browser accessibility-tree collection, not repeatable UI timing guarantees.
 
 The current Part detail uses native `<details>/<summary>` disclosures. Overview opens first; baseline, sharing, process lines, components, purchase details, drawings, actual-configuration use and history start collapsed. Keyboard-operable summaries expand individual sections, and the section shortcuts open the matching section before scrolling. Parts and Mapping were inspected in the isolated browser at 1366×900 and 823×900. The production Chassis detail and HF workbook mapping review were read only: no baseline, Part Mapping row, Part, or intended-sharing record was written.
+
+An App-level integration test now exercises the owner’s four-choice navigation scenario against a stateful API mock: it selects three Parts, creates the fourth Part from the mapping handoff and returns it to the initiating group, saves only the first group, collapses the remaining drafts, navigates through Parts and back, confirms those three selections and collapse states remain, then batch-saves only those groups against the incremented review version. The test confirms the UI request payloads and state transitions; its mock is not Grist persistence evidence. The separate disposable-Grist write/read-back evidence above remains the basis for the persistence claim.
 
 ### Remaining work before calling the full prompt complete
 
