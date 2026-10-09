@@ -14,11 +14,19 @@ async function send<T>(path: string, body: unknown, headers: Record<string, stri
   return payload;
 }
 
-function apiError(payload: any, status: number): Error {
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code = "", readonly retryDisposition = "retry_same_request", readonly detail: unknown = null) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function apiError(payload: any, status: number): ApiError {
   const detail = payload?.detail;
   const code = typeof detail?.code === "string" ? `${detail.code}: ` : "";
   const message = typeof detail?.message === "string" ? detail.message : typeof detail === "string" ? detail : `Request failed (${status})`;
-  return new Error(`${code}${message}`);
+  return new ApiError(`${code}${message}`, status, typeof detail?.code === "string" ? detail.code : "",
+    typeof detail?.retryDisposition === "string" ? detail.retryDisposition : "retry_same_request", detail);
 }
 
 export const api = {

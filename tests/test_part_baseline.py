@@ -5,11 +5,13 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+import json
 from threading import Barrier
 
 from app.grist_parts import GristPartRegistry
 from app.part_baseline import PartBaselineService
 from app.part_baseline import _family_confirmations, _raw_requirement
+from app.part_identity import PartIdentityError
 from app.part_mapping import MemoryPartStore, PartConflict, PartRegistryMappingStore, PartSourceGroups, mapping_detail, save_mapping
 from test_grist_parts_recovery import MemoryGrist
 
@@ -68,15 +70,22 @@ class PartBaselineIntegrationTests(unittest.TestCase):
 
     def save_rows(self, rows, source_hash, *, expected_version=None, request_key=None):
         groups = self.groups(rows)
+        detail = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash=source_hash,
+            association=self.association, groups=groups)
         if expected_version is None:
-            from app.part_mapping import mapping_detail
-            expected_version = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash=source_hash,
-                association=self.association, groups=groups)["version"]
+            expected_version = detail["version"]
+        group_reasons = {}
+        for group in detail.get("groups", []):
+            previous = group.get("previousAssignment") or {}
+            prior_ids = set(previous.get("assignedPartIds") or [])
+            current_id = str((group.get("part") or {}).get("id") or "")
+            if previous.get("hasPriorAssignment") and (not current_id or any(value != self.part["id"] for value in prior_ids)):
+                group_reasons[group["key"]] = "Isolated test mapping replacement"
         result = save_mapping(self.mapping_store, file_id="pilot.ods", source_hash=source_hash,
             association=self.association, groups=groups, decisions={"mcl:chassis": self.part["id"]},
             expected_hash=source_hash, expected_version=expected_version,
             expected_association=self.association.id, expected_association_version=self.association.version,
-            actor="mapping reviewer", request_key=request_key or f"map:{source_hash}")
+            actor="mapping reviewer", group_reasons=group_reasons, request_key=request_key or f"map:{source_hash}")
         return groups, result
 
     def family_choices(self, *, mcl_status="applicable", complete=True):
@@ -140,6 +149,22 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             expected_hash=source_hash, expected_association=self.association.id,
             expected_association_version=self.association.version, expected_mapping_version=mapping_result["version"],
             append_existing=append_existing)
+
+    def compare_rows(self, rows, *, source_hash, request_key):
+        groups, mapped = self.save_rows(rows, source_hash, request_key=f"map:{source_hash}")
+        result = self.service.compare(part_id=self.part["id"], file_id="pilot.ods", workbook_name=f"{source_hash}.ods",
+            workbook_path="C:/isolated/pilot.ods", source_hash=source_hash, association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=self.family_choices(), actor="comparison reviewer",
+            reason="Review current mapped source", request_key=request_key, expected_hash=source_hash,
+            expected_association=self.association.id, expected_association_version=self.association.version,
+            expected_mapping_version=mapped["version"])
+        return groups, mapped, result
+
+    def decision_context(self, groups, *, source_hash, association=None):
+        current_association = association or self.association
+        mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash=source_hash,
+            association=current_association, groups=groups, refresh_parts=True)
+        return {"fileId": "pilot.ods", "sourceHash": source_hash, "association": current_association, "mapping": mapping}
 
     def test_initial_assignment_needs_no_reason_and_baseline_writes_normalized_grist_records(self):
         rows = [source_row(10), source_row(11, quantity="1", dimension="5 x 25")]
@@ -235,6 +260,10 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.client.lose_after_create_table = "PartRevisionLine"
         with self.assertRaises(TimeoutError):
             self.service.establish(**kwargs)
+        changed_context = {**kwargs, "source_hash": "hash-changed-after-partial-write"}
+        with self.assertRaises(PartIdentityError) as recovery_required:
+            self.service.establish(**changed_context)
+        self.assertEqual(recovery_required.exception.code, "PART_BASELINE_RECOVERY_REQUIRED")
         review = self.service.review(part_id=self.part["id"], file_id="pilot.ods", workbook_path=kwargs["workbook_path"],
             source_hash="hash-recovery", association=self.association, groups=groups, mapping_store=self.mapping_store)
         self.assertEqual(review["baselineStatus"], "recovery_required")
@@ -413,6 +442,16 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         matched = PartBaselineService(self.registry).decide(**match_arguments)
         modification = next(row for row in matched["differences"] if row["DifferenceType"] == "proposed_modification")
         self.assertEqual(modification["BaselineRequirementKey"], baseline_ambiguity["BaselineRequirementKey"])
+        field_differences = json.loads(modification["FieldDifferences"])
+        self.assertEqual(field_differences, [{"field": "material", "baseline": "ms plate", "incoming": "aluminum"}])
+        incoming_values = json.loads(modification["IncomingValues"])
+        self.assertEqual(incoming_values["rawFields"]["material_to_cut"], "Aluminum")
+        self.assertEqual(incoming_values["physical"]["quantity"], "2")
+        self.assertEqual(incoming_values["physical"]["quantity_uom"], "nos")
+        self.assertEqual(incoming_values["physical"]["dimension"], "3 x 25")
+        self.assertEqual(incoming_values["physical"]["dimension_uom"], "mm")
+        self.assertEqual(incoming_values["physical"]["weight_kg"], "0.11")
+        self.assertEqual(incoming_values["physical"]["weight_uom"], "kg")
         self.assertIn("matched_correspondence", {row["Status"] for row in matched["differences"]
             if row["DifferenceType"] == "ambiguous_correspondence"})
         self.assertEqual(matched["comparison"]["AmbiguousCount"], 0)
@@ -421,6 +460,197 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             request_key="propose-substitution")
         self.assertEqual(proposal["comparison"]["ModificationCount"], 1)
         self.assertEqual(self.registry.get_part(self.part["id"])["engineeringRevision"], "A")
+        proposal_row = proposal["proposals"][0]
+        self.assertEqual(proposal_row["ProposedChangeCount"], 1)
+        linked_modification = next(row for row in proposal["differences"] if row["DifferenceKey"] == modification["DifferenceKey"])
+        self.assertEqual(json.loads(linked_modification["FieldDifferences"]), field_differences)
+        self.assertEqual(json.loads(linked_modification["IncomingValues"])["physical"]["material"], "aluminum")
+        self.assertEqual(proposal_row["WorkbookComparison"], linked_modification["WorkbookComparison"])
+        self.assertEqual(proposal_row["BaselineRevision"], proposal["comparison"]["BaselineRevision"])
+        self.assertEqual(proposal_row["RequestKey"], "propose-substitution")
+
+    def test_malformed_manual_match_evidence_is_recoverable_and_never_creates_a_proposal(self):
+        self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2")])
+        groups, _mapped, comparison = self.compare_rows([source_row(10, material="Aluminum", dimension="3 x 25", quantity="2")],
+            source_hash="hash-malformed-match", request_key="compare-malformed-match")
+        incoming = next(row for row in comparison["differences"]
+            if row["DifferenceType"] == "ambiguous_correspondence" and row.get("IncomingObservation"))
+        baseline = next(row for row in comparison["differences"]
+            if row["DifferenceType"] == "ambiguous_correspondence" and row.get("BaselineRevisionLine"))
+        saved_row = next(row for row in self.client.tables["PartRequirementDifference"]
+            if row["fields"].get("DifferenceKey") == incoming["DifferenceKey"])
+        counts_before = {table: len(self.client.tables.get(table, [])) for table in ("PartWorkbookDecision", "PartChangeProposal", "PartRequirementDifference")}
+        arguments = {"comparison_key": comparison["comparison"]["ComparisonKey"], "action": "match_correspondence",
+            "difference_keys": [incoming["DifferenceKey"]], "baseline_requirement_key": baseline["BaselineRequirementKey"],
+            "actor": "engineering reviewer", "reason": "Validate incoming evidence before matching", "request_key": "match-malformed"}
+        for request_key, bad_value in (("match-malformed-json", "{not valid JSON"),
+                                       ("match-missing-physical", json.dumps({"rawFields": {"qty": "2"}}))):
+            saved_row["fields"]["IncomingValues"] = bad_value
+            with self.subTest(request=request_key), self.assertRaises(Exception) as caught:
+                self.service.decide(**{**arguments, "request_key": request_key})
+            self.assertEqual(caught.exception.code, "PART_COMPARISON_EVIDENCE_INVALID")
+        self.assertEqual({table: len(self.client.tables.get(table, [])) for table in counts_before}, counts_before)
+        self.assertEqual(saved_row["fields"]["Status"], "pending_review")
+        self.assertFalse(any(row["fields"].get("RequestKey", "").startswith("match-") for row in self.client.tables["PartRegistryRequest"]))
+
+    def test_manual_match_preserves_multiple_legitimate_physical_changes(self):
+        self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2", weight="0.11")])
+        groups, _mapped, comparison = self.compare_rows([source_row(10, material="Aluminum", dimension="4 x 25", quantity="3", weight="0.22")],
+            source_hash="hash-changed-physical-evidence", request_key="compare-changed-physical-evidence")
+        incoming = next(row for row in comparison["differences"]
+            if row["DifferenceType"] == "ambiguous_correspondence" and row.get("IncomingObservation"))
+        baseline = next(row for row in comparison["differences"]
+            if row["DifferenceType"] == "ambiguous_correspondence" and row.get("BaselineRevisionLine"))
+        matched = self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action="match_correspondence",
+            difference_keys=[incoming["DifferenceKey"]], baseline_requirement_key=baseline["BaselineRequirementKey"],
+            actor="engineering reviewer", reason="Compare all changed physical values", request_key="match-changed-physical")
+        modification = next(row for row in matched["differences"] if row.get("ResolvedFromDifference") == incoming["id"])
+        values = json.loads(modification["FieldDifferences"])
+        by_field = {item["field"]: (item["baseline"], item["incoming"]) for item in values}
+        self.assertEqual(by_field["material"], ("ms plate", "aluminum"))
+        self.assertEqual(by_field["quantity"], ("2", "3"))
+        self.assertEqual(by_field["dimension"], ("3 x 25", "4 x 25"))
+        self.assertEqual(by_field["weight_kg"], ("0.11", "0.22"))
+        self.assertNotIn("quantity_uom", by_field)
+        self.assertNotIn("dimension_uom", by_field)
+        self.assertNotIn("weight_uom", by_field)
+        self.assertEqual(len(self.client.tables.get("PartChangeProposal", [])), 0)
+
+    def test_exact_decision_retries_recover_all_four_actions_without_duplicate_rows(self):
+        self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2"),
+            source_row(11, material="Copper", dimension="9 x 20", quantity="1")])
+        replacement = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
+            description="Separate Decision Part", variant="Standard", expected_name="S1K — Separate Decision Part — Standard",
+            actor="reviewer", reason="Isolated decision retry", request_key="create-decision-replacement", revision_assertion="A")["part"]
+        cases = [
+            ("keep_existing_baseline", [source_row(10, material="MS Plate", dimension="3 x 25", quantity="3"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")], "proposed_modification", "decision-retry-keep", "", ""),
+            ("propose_part_change", [source_row(10, material="MS Plate", dimension="3 x 25", quantity="2")], "proposed_deletion", "decision-retry-propose", "", ""),
+            ("match_correspondence", [source_row(10, material="Aluminum", dimension="3 x 25", quantity="2"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")], "ambiguous_correspondence", "decision-retry-match", "", ""),
+            ("use_different_part", [source_row(10, material="MS Plate", dimension="3 x 25", quantity="4"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")], "proposed_modification", "decision-retry-replacement", replacement["id"], ""),
+        ]
+        first_arguments = None
+        for action, rows, difference_type, request_key, replacement_id, requirement_key in cases:
+            groups, _mapped, comparison = self.compare_rows(rows, source_hash=f"hash-{request_key}", request_key=f"compare-{request_key}")
+            if action == "match_correspondence":
+                difference = next(row for row in comparison["differences"] if row["DifferenceType"] == difference_type and row.get("IncomingObservation"))
+                baseline = next(row for row in comparison["differences"] if row["DifferenceType"] == difference_type and row.get("BaselineRevisionLine"))
+                requirement_key = baseline["BaselineRequirementKey"]
+            else:
+                difference = next(row for row in comparison["differences"] if row["DifferenceType"] == difference_type)
+            request_payload = {"action": action, "differenceKeys": [difference["DifferenceKey"]],
+                "reason": f"Recover {action}", "oldData": False, "path": f"C:/isolated/{request_key}.ods",
+                "groupKey": difference.get("MappingGroupKey") or "",
+                "evidenceFingerprint": difference.get("MappingEvidenceFingerprint") or "",
+                "replacementPartId": replacement_id, "baselineRequirementKey": requirement_key}
+            context_state = {"source_hash": f"hash-{request_key}"}
+            before_write = lambda gs=groups, state=context_state: self.decision_context(gs, source_hash=state["source_hash"])
+            arguments = {"comparison_key": comparison["comparison"]["ComparisonKey"], "action": action,
+                "difference_keys": [difference["DifferenceKey"]], "actor": "engineering reviewer", "reason": f"Recover {action}",
+                "replacement_part_id": replacement_id, "baseline_requirement_key": requirement_key, "request_key": request_key,
+                "request_payload": request_payload, "before_write": before_write}
+            if first_arguments is None:
+                first_arguments = arguments
+            self.client.lose_after_create_table = "PartWorkbookDecision"
+            with self.assertRaises(TimeoutError):
+                self.service.decide(**arguments)
+            # A confirmed partial write retries its exact request even if the
+            # live workbook changes after the response is lost.
+            context_state["source_hash"] = f"changed-after-commit-{request_key}"
+            recovered = PartBaselineService(self.registry).decide(**arguments)
+            self.assertTrue(recovered["idempotent"], action)
+            self.assertEqual(sum(row["fields"].get("RequestKey") == request_key for row in self.client.tables["PartWorkbookDecision"]), 1, action)
+            replay = self.service.decide(**arguments)
+            self.assertTrue(replay["idempotent"], action)
+        self.assertEqual(sum(row["fields"].get("RequestKey") == "decision-retry-propose" for row in self.client.tables["PartChangeProposal"]), 1)
+        self.assertEqual(sum(row["fields"].get("ResolvedFromDifference") is not None
+            and row["fields"].get("RequestKey") == "decision-retry-match" for row in self.client.tables["PartRequirementDifference"]), 1)
+        with self.assertRaises(Exception) as conflict:
+            changed_payload = {**first_arguments["request_payload"], "path": "C:/different-workbook.ods"}
+            self.service.decide(**{**first_arguments, "request_payload": changed_payload})
+        self.assertEqual(conflict.exception.code, "PART_REQUEST_CONFLICT")
+        self.assertEqual(len([row for row in self.client.tables["PartWorkbookDecision"]
+            if row["fields"].get("RequestKey", "").startswith("decision-retry-")]), 4)
+
+    def test_every_decision_action_rejects_changed_workbook_association_or_mapping(self):
+        self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2"),
+            source_row(11, material="Copper", dimension="9 x 20", quantity="1")])
+        replacement = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
+            description="Stale Decision Part", variant="Standard", expected_name="S1K — Stale Decision Part — Standard",
+            actor="reviewer", reason="Isolated stale decision", request_key="create-stale-replacement", revision_assertion="A")["part"]
+        before_decisions = len(self.client.tables.get("PartWorkbookDecision", []))
+        before_proposals = len(self.client.tables.get("PartChangeProposal", []))
+        baseline_ref = self.registry.current_revision(self.part["id"])["fields"]["ManufacturingBaseline"]
+        from app.part_mapping import save_mapping
+
+        source_cases = {
+            "keep_existing_baseline": [source_row(10, material="MS Plate", dimension="3 x 25", quantity="3"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")],
+            "propose_part_change": [source_row(10, material="MS Plate", dimension="3 x 25", quantity="2")],
+            "match_correspondence": [source_row(10, material="Aluminum", dimension="3 x 25", quantity="2"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")],
+            "use_different_part": [source_row(10, material="MS Plate", dimension="3 x 25", quantity="4"), source_row(11, material="Copper", dimension="9 x 20", quantity="1")],
+        }
+        for label in ("hash", "association", "mapping"):
+            for index, (action, rows) in enumerate(source_cases.items()):
+                request_key = f"stale-{label}-{index}"
+                source_hash = f"hash-stale-{label}-{index}"
+                groups, mapped, comparison = self.compare_rows(rows, source_hash=source_hash, request_key=f"compare-{request_key}")
+                expected_type = "proposed_modification" if action in {"keep_existing_baseline", "use_different_part"} else "proposed_deletion" if action == "propose_part_change" else "ambiguous_correspondence"
+                if action == "match_correspondence":
+                    difference = next(row for row in comparison["differences"]
+                        if row["DifferenceType"] == expected_type and row.get("IncomingObservation"))
+                    baseline = next(row for row in comparison["differences"]
+                        if row["DifferenceType"] == expected_type and row.get("BaselineRevisionLine"))
+                    requirement_key = baseline["BaselineRequirementKey"]
+                else:
+                    difference = next(row for row in comparison["differences"] if row["DifferenceType"] == expected_type)
+                    requirement_key = ""
+                replacement_id = replacement["id"] if action == "use_different_part" else ""
+                if label == "mapping":
+                    save_mapping(self.mapping_store, file_id="pilot.ods", source_hash=source_hash, association=self.association,
+                        groups=groups, decisions={groups[0]["key"]: replacement["id"]}, group_reasons={groups[0]["key"]: "Stale evidence fixture"}, expected_hash=source_hash,
+                        expected_version=mapped["version"], expected_association=self.association.id,
+                        expected_association_version=self.association.version, actor="mapping reviewer", request_key=f"remap-{request_key}")
+                if label == "hash":
+                    context_factory = lambda gs=groups, sh=source_hash: self.decision_context(gs, source_hash=f"changed-{sh}")
+                elif label == "association":
+                    changed_association = SimpleNamespace(id=f"association:changed:{index}", version=2)
+                    context_factory = lambda gs=groups, sh=source_hash, assoc=changed_association: self.decision_context(gs, source_hash=sh, association=assoc)
+                else:
+                    context_factory = lambda gs=groups, sh=source_hash: self.decision_context(gs, source_hash=sh)
+                with self.subTest(stale=label, action=action):
+                    with self.assertRaises(Exception) as caught:
+                        self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action=action,
+                            difference_keys=[difference["DifferenceKey"]], actor="engineering reviewer", reason="Reject stale evidence",
+                            replacement_part_id=replacement_id, baseline_requirement_key=requirement_key, request_key=request_key,
+                            before_write=context_factory)
+                    self.assertEqual(caught.exception.code, "PART_COMPARISON_STALE")
+                    self.assertFalse(any(row["fields"].get("RequestKey") == request_key for row in self.client.tables["PartRegistryRequest"]))
+        self.assertEqual(len(self.client.tables.get("PartWorkbookDecision", [])), before_decisions)
+        self.assertEqual(len(self.client.tables.get("PartChangeProposal", [])), before_proposals)
+        self.assertEqual(self.registry.current_revision(self.part["id"])["fields"]["ManufacturingBaseline"], baseline_ref)
+
+    def test_baseline_only_deletion_requires_saved_complete_family_evidence(self):
+        self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2"),
+            source_row(11, material="Copper", dimension="9 x 20", quantity="1")])
+        groups, _mapped, comparison = self.compare_rows([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2")],
+            source_hash="hash-baseline-only-deletion", request_key="compare-baseline-only-deletion")
+        deletion = next(row for row in comparison["differences"] if row["DifferenceType"] == "proposed_deletion")
+        self.assertIsNone(deletion["IncomingObservation"])
+        family = next(row for row in self.client.tables["PartComparisonFamily"]
+            if row["fields"].get("WorkbookComparison") == comparison["comparison"]["id"]
+            and row["fields"].get("Family") == deletion["Family"])
+        family["fields"]["CompletenessConfirmed"] = False
+        before_decisions = len(self.client.tables.get("PartWorkbookDecision", []))
+        before_proposals = len(self.client.tables.get("PartChangeProposal", []))
+        with self.assertRaises(Exception) as caught:
+            self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action="keep_existing_baseline",
+                difference_keys=[deletion["DifferenceKey"]], actor="engineering reviewer", reason="Reject incomplete deletion evidence",
+                request_key="incomplete-baseline-only-deletion",
+                before_write=lambda: self.decision_context(groups, source_hash="hash-baseline-only-deletion"))
+        self.assertEqual(caught.exception.code, "PART_COMPARISON_STALE")
+        self.assertEqual(len(self.client.tables.get("PartWorkbookDecision", [])), before_decisions)
+        self.assertEqual(len(self.client.tables.get("PartChangeProposal", [])), before_proposals)
+        self.assertFalse(any(row["fields"].get("RequestKey") == "incomplete-baseline-only-deletion"
+            for row in self.client.tables["PartRegistryRequest"]))
 
 
 class PartRequirementComparisonPolicyTests(unittest.TestCase):

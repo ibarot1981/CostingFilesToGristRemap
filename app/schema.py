@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-08.v11"
+SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-09.v12"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -108,6 +108,13 @@ FOUNDATION_TABLES += (
     _table("PartRequirementDifference", {"DifferenceKey": "Text", "WorkbookComparison": "Ref:PartWorkbookComparison", "ProductPart": "Ref:ProductPart", "Family": "Text", "DifferenceType": "Text", "Status": "Text", "BaselineRevisionLine": "Ref:PartRevisionLine", "BaselineLineMaster": "Ref:LineMaster", "BaselineRequirementKey": "Text", "ResolvedFromDifference": "Ref:PartRequirementDifference", "IncomingObservation": "Ref:SourceLineObservation", "IncomingRequirementKey": "Text", "MappingGroupKey": "Text", "MappingEvidenceFingerprint": "Text", "SourceSheet": "Text", "SourceRow": "Numeric", "SourceCellEvidence": "Any", "BaselineValues": "Any", "IncomingValues": "Any", "FieldDifferences": "Any", "CandidateBaselineLines": "Any", "RequestKey": "Text", "RequestFingerprint": "Text"}),
     _table("PartWorkbookDecision", {"DecisionKey": "Text", "WorkbookComparison": "Ref:PartWorkbookComparison", "PartRequirementDifference": "Ref:PartRequirementDifference", "ProductPart": "Ref:ProductPart", "Action": "Text", "OldData": "Bool", "ReplacementPart": "Ref:ProductPart", "MatchedBaselineRevisionLine": "Ref:PartRevisionLine", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
     _table("PartChangeProposal", {"ProposalKey": "Text", "WorkbookComparison": "Ref:PartWorkbookComparison", "ProductPart": "Ref:ProductPart", "BaselineProcessing": "Ref:PartBaselineProcessing", "BaselineRevision": "Ref:PartRevision", "Status": "Text", "ProposedChangeCount": "Numeric", "CRRequired": "Bool", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# v12: freeze the saved mapping review version on each workbook comparison so
+# every later decision can reject stale source-to-Part assignments.
+FOUNDATION_TABLES += (
+    _table("PartWorkbookComparison", {"MappingVersion": "Numeric"}),
 )
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 

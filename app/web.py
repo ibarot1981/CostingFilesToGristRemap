@@ -438,7 +438,21 @@ def _legacy_part_payloads(repository: SafariRepository, rows: list[dict[str, Any
 
 def _part_http_error(exc) -> HTTPException:
     status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE", "PART_SCHEMA_UNAVAILABLE", "PART_BASELINE_SCHEMA_REQUIRED", "PART_COORDINATOR_UNBOUND", "PART_WRITE_UNCONFIRMED", "PART_COORDINATOR_UNCONFIRMED", "PART_GRIST_REQUIRED", "PART_CREATED_SHARING_PENDING"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED", "INACTIVE")) else 409
-    return _error(status, exc.code, str(exc))
+    refresh_codes = {
+        "PART_BASELINE_STALE", "PART_BASELINE_EXISTS", "PART_BASELINE_RECOVERY_BLOCKED", "PART_BASELINE_JOIN_CONFIRMATION_REQUIRED",
+        "PART_BASELINE_REQUIREMENTS_INCOMPLETE", "PART_BASELINE_NOT_ESTABLISHED",
+        "PART_COMPARISON_EVIDENCE_INVALID", "PART_COMPARISON_STALE", "PART_COMPARISON_NOT_FOUND",
+    }
+    safe_codes = {
+        "PART_BASELINE_INPUT_REQUIRED", "PART_REVISION_LOCKED", "PART_BASELINE_INCOMPLETE",
+        "PART_COMPARISON_INPUT_REQUIRED",
+        "PART_DECISION_INPUT_INVALID", "PART_DECISION_REASON_REQUIRED", "PART_DECISION_ALREADY_RESOLVED",
+        "PART_CHANGE_PROPOSAL_INCOMPLETE", "PART_REPLACEMENT_REQUIRED", "PART_SELECTION_INVALID",
+        "PART_REPLACEMENT_SOURCE_REQUIRED", "PART_MATCH_INPUT_INVALID", "PART_MATCH_CANDIDATE_INVALID",
+        "PART_MATCH_CANDIDATE_ALREADY_USED", "PART_MATCH_SOURCE_ALREADY_USED",
+    }
+    disposition = "refresh_required" if exc.code in refresh_codes else "safe_to_edit" if exc.code in safe_codes else "retry_same_request"
+    return _error(status, exc.code, str(exc), {"retryDisposition": disposition})
 
 
 @app.get("/api/parts")
@@ -781,27 +795,33 @@ def get_part_manufacturing_comparison(comparison_key: str):
 def decide_part_manufacturing_comparison(comparison_key: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     service = _part_baseline_service()
     replacement_id = str(payload.get("replacementPartId") or "")
-    if str(payload.get("action") or "") == "use_different_part":
-        path = str(payload.get("path") or "")
-        repository, file_id, association, source_hash, groups = _part_context(path)
-        comparison = service.get_comparison(comparison_key)["comparison"]
-        if (file_id != comparison.get("FileKey") or source_hash != comparison.get("SourceHash") or not association
-                or association.id != comparison.get("AssociationKey")
-                or association.version != comparison.get("AssociationVersion")):
-            raise _error(409, "PART_COMPARISON_STALE", "The incoming workbook changed. Recompare its current evidence before selecting a different Part.")
-        selected_keys = set(payload.get("differenceKeys") or [])
-        selected_differences = [row for row in service.get_comparison(comparison_key).get("differences", [])
-            if row.get("DifferenceKey") in selected_keys]
-        if len(selected_differences) != 1 or selected_differences[0].get("MappingGroupKey") != payload.get("groupKey"):
-            raise _error(422, "PART_REPLACEMENT_SOURCE_REQUIRED", "Choose one incoming difference with its current mapped source group.")
-        target = next((group for group in groups if group.get("key") == payload.get("groupKey")), None)
-        if not target or payload.get("evidenceFingerprint") != target.get("evidenceFingerprint") or selected_differences[0].get("MappingEvidenceFingerprint") != target.get("evidenceFingerprint"):
-            raise _error(409, "PART_COMPARISON_STALE", "The mapped source group changed after this difference was reviewed.")
+    comparison = service.get_comparison(comparison_key)["comparison"]
+    path = str(payload.get("path") or "")
+
+    def verify_current_decision_evidence():
+        from app.part_mapping import mapping_detail
+        stored_path = str(comparison.get("WorkbookPath") or "")
+        if (not path or not stored_path
+                or os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(stored_path))):
+            raise PartIdentityError("PART_COMPARISON_STALE", "This decision belongs to a different workbook path. Reopen the saved comparison and review current evidence.")
+        try:
+            repository, file_id, association, source_hash, groups = _part_context(path)
+            if not association:
+                raise PartIdentityError("PART_COMPARISON_STALE", "The workbook no longer has its saved Product Model association. Recompare after restoring the association.")
+            mapping = mapping_detail(_part_mapping_store(repository), file_id=file_id, source_hash=source_hash,
+                association=association, groups=groups, refresh_parts=True)
+            return {"fileId": file_id, "sourceHash": source_hash, "association": association, "mapping": mapping}
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict):
+                exc.detail.setdefault("retryDisposition", "refresh_required")
+            raise
+
     return service.decide(comparison_key=comparison_key, action=str(payload.get("action") or ""),
         difference_keys=payload.get("differenceKeys") if isinstance(payload.get("differenceKeys"), list) else [],
         actor=_request_actor(request), reason=str(payload.get("reason") or ""), old_data=bool(payload.get("oldData")),
         replacement_part_id=replacement_id, baseline_requirement_key=str(payload.get("baselineRequirementKey") or ""),
-        request_key=idempotency_key or "")
+        request_key=idempotency_key or "", request_payload=payload,
+        before_write=verify_current_decision_evidence)
 
 
 @app.get("/api/parts/{part_id}/composition")

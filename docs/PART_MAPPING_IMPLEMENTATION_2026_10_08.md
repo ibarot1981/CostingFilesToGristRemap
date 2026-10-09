@@ -101,9 +101,31 @@ An App-level integration test now exercises the owner’s four-choice navigation
 
 The baseline verification matrix was expanded in `tests/test_part_baseline.py`: isolated Grist-test-double cases cover Toolshop-only, CNC-only and combined-family publication; two concurrent writer registries cannot establish two initial baselines for one Part; complete comparisons distinguish reordered/duplicate matches from additions and deletions; rate/remark-only changes remain matches; keep-baseline records an explicit old-data decision without changing accepted Rev A requirements; and Use a different Part returns the exact workbook/group/row/hash provenance. This uncovered and fixed a guard-order issue where an already-established Part could produce an append-confirmation error before the existing-baseline rejection. These tests use `MemoryGrist`; they do not add a second production or disposable-Grist concurrency claim.
 
-### Remaining work before calling the full prompt complete
+## Part baseline/comparison defect follow-up — 9 October 2026
 
-- Execute any remaining cases from the full defect matrix not covered by the automated suite or disposable Grist readbacks; tests alone do not replace live Grist readback or visual verification.
+This follow-up resolves the five findings in `PART_BASELINE_IMPLEMENTATION_REVIEW_2026_10_09.md` while keeping prior Grist evidence and accepted Rev A unchanged.
+
+| Finding | Fix and regression coverage |
+| --- | --- |
+| Manual correspondence generated null or misleading field differences | Parse frozen `IncomingValues` JSON directly; validate the complete normalized physical object before writing; compare against the selected baseline line using normalized physical fields. Tests cover MS Plate → Aluminum with unchanged quantity, dimensions, units and weight, multi-field changes, malformed/missing evidence, no false proposal, proposal references and response-loss recovery. |
+| Failed comparison retry stayed disabled | Retain and retry only the same Part/compare operation with the exact request key and payload. UI tests cover a failed attempt, reload restoration, lockout of competing actions and exact request reuse. |
+| Invalid baseline confirmation locked the form | Validate family evidence, applicability, completeness and append confirmation in the client; the backend remains authoritative and returns structured retry dispositions. Definite pre-write rejection unlocks correction; uncertain/partial publication retains its exact attempt. UI tests cover validation explanation, correction and exact retry across reload. |
+| Decisions used stale workbook/mapping context | Revalidate path/file identity, hash, association/version, mapping version/policy, assigned group fingerprints, family completeness, active selected Part and accepted baseline before all four decision actions. Baseline-only deletions use current hash/mapping/family evidence. Backend matrix tests alter hash, association or mapping for every action and verify no new decision/proposal. |
+| Decision retries minted new request IDs | Persist exact comparison/action/differences/body/key across reload and lock competing edits. The Grist request fingerprint includes the complete request body as well as semantic decision fields. Response-loss tests cover keep, match, proposal and replacement, enforce one decision/proposal/matched row, and reject the same key with a changed body. |
+
+The application schema advances to `safari-part-baseline-reconciliation-grist-2026-10-09.v12`. Its additive change adds numeric `PartWorkbookComparison.MappingVersion`, captured by comparisons and checked before decisions. The last documented applied schema is v11; this follow-up did not apply v12 to production or claim a real-Grist write. Apply and read back the additive v12 field before deploying this code. See [API/schema contract](API_SCHEMA.md).
+
+Latest verification for this follow-up: full `.venv` Python suite 232 passed / 1 skipped; focused baseline suite 23 passed; retry-disposition web tests 3 passed; full Vitest suite 53 passed across 12 files; standalone mapped-files checks 2 passed; TypeScript validation, production Vite build and `git diff --check` passed. The backend write/retry tests use `MemoryGrist`; no disposable or production Grist records were written for these corrections.
+
+The recovery guard also distinguishes two pending-publication cases. A browser holding the original request key can retry that exact body; if the workbook, association, mapping or pre-write validation has changed, the server returns `PART_BASELINE_RECOVERY_REQUIRED` and preserves the retry identity. A different request is blocked with `PART_BASELINE_RECOVERY_BLOCKED`. If a browser opens a Part already marked recovery-required but has no stored original request, the UI disables a second publication and explains that the original request must be recovered from its originating browser.
+
+An isolated local-browser fixture with mocked API responses was prepared. The computer-use helper could not activate the available Chrome window on its first attempt or after refreshing the window list, so interactive browser verification was stopped. No user browser tab was navigated. Automated UI tests are the browser-verification boundary for this follow-up.
+
+For possible historical manual-match errors, query `PartWorkbookDecision` where `Action="match_correspondence"`, follow its linked difference and `ResolvedFromDifference`, then compare `IncomingValues.physical` with the matched difference's `FieldDifferences`. Flag unchanged normalized fields represented as null/different; preserve those rows and request identities. Any correction should be separately reviewed and appended from verified workbook/mapping evidence. No historical Grist evidence was rewritten or queried during this follow-up.
+
+### Remaining verification and project gates
+
+- The five code findings in this review are implemented and covered by automated regressions. An isolated interactive browser check and a disposable-Grist readback for these exact corrections remain outstanding; the computer-use helper could not activate Chrome, and no Grist writes were made for this follow-up. Tests against `MemoryGrist` are not evidence of live persistence.
 - The approved CR workflow, automatic Summary import/costing-authority integration, and reviewed legacy Part identity/revision classification remain unimplemented project gates. No Part may be advanced beyond Rev A until approved CR control exists.
 
-No pull request has been merged or deployed. Continue this checkpoint on `codex/part-identity-foundation` and update the existing PR only with the remaining limits stated explicitly.
+No pull request has been merged or deployed. Apply and verify additive schema v12 before deploying this branch.

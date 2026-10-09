@@ -248,6 +248,55 @@ def _validate_requirements(requirements: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def _incoming_physical_evidence(value: Any, family: str) -> dict[str, Any]:
+    """Read and validate the frozen normalized physical side of a difference."""
+    parsed = _unjson(value)
+    physical = parsed.get("physical") if isinstance(parsed, dict) else None
+    required = {
+        "family", "material", "quantity", "quantity_uom", "dimension", "dimension_uom",
+        "length", "width", "thickness", "length_uom", "width_uom", "thickness_uom",
+        "weight_kg", "weight_grams", "weight_uom", "item_code", "item_name", "plate_part",
+        "toolshop_detail", "item_group",
+    }
+    if not isinstance(physical, dict) or not required.issubset(physical):
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement is missing normalized physical fields. Refresh the comparison before resolving this row.")
+    physical = {key: physical[key] for key in required}
+    if physical.get("family") != family or physical.get("quantity_uom") != "nos":
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement has an invalid family or quantity unit. Refresh the comparison before resolving this row.")
+    if not isinstance(physical.get("quantity"), str):
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement has a non-normalized quantity. Refresh the comparison before resolving this row.")
+    quantity = _decimal(physical.get("quantity"))
+    if quantity is None or quantity <= 0:
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement has no valid positive quantity. Refresh the comparison before resolving this row.")
+    for key in ("length", "width", "thickness", "weight_kg", "weight_grams"):
+        if physical.get(key) is not None:
+            number = _decimal(physical.get(key)) if isinstance(physical.get(key), str) else None
+            if number is None:
+                raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+                    f"The saved incoming requirement has an invalid normalized {key} value. Refresh the comparison before resolving this row.")
+            physical[key] = _decimal_text(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                if key == "weight_kg" else number)
+    physical["quantity"] = _decimal_text(quantity)
+    for key in required - {"quantity", "length", "width", "thickness", "weight_kg", "weight_grams"}:
+        if physical.get(key) is not None and not isinstance(physical.get(key), str):
+            raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+                f"The saved incoming requirement has an invalid {key} value. Refresh the comparison before resolving this row.")
+    for key in ("material", "dimension", "item_code", "item_name", "plate_part", "toolshop_detail", "item_group"):
+        if physical.get(key) is not None:
+            physical[key] = _normal_text(physical[key])
+    if physical.get("dimension_uom") not in (None, "mm", "in") or physical.get("weight_uom") not in (None, "kg", "g"):
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement has an unsupported engineering unit. Refresh the comparison before resolving this row.")
+    if any(physical.get(key) not in (None, "mm") for key in ("length_uom", "width_uom", "thickness_uom")):
+        raise PartIdentityError("PART_COMPARISON_EVIDENCE_INVALID",
+            "The saved incoming requirement has an unsupported linear unit. Refresh the comparison before resolving this row.")
+    return physical
+
+
 def _candidate_similarity(left: dict[str, Any], right: dict[str, Any]) -> int:
     if left.get("family") != right.get("family"):
         return 0
@@ -279,7 +328,7 @@ class PartBaselineService:
         tables = {str(row.get("id")) for row in shim.list_tables()}
         missing = (BASELINE_TABLES | NORMALIZED_TABLES) - tables
         if missing:
-            raise PartIdentityError("PART_BASELINE_SCHEMA_REQUIRED", "Safari Grist needs additive Part baseline schema v11: " + ", ".join(sorted(missing)))
+            raise PartIdentityError("PART_BASELINE_SCHEMA_REQUIRED", "Safari Grist needs additive Part baseline schema v12: " + ", ".join(sorted(missing)))
         required_columns = {
             "PartRevision": {"ManufacturingBaselineStatus", "ManufacturingBaseline", "ManufacturingBaselineSourceHash"},
             "PartMappingReview": {"ActionType", "MappingPolicyVersion"},
@@ -287,12 +336,13 @@ class PartBaselineService:
             "PartRevisionLine": {"RequirementKey", "BaselineProcessing", "QuantityExact"},
             "PartRequirementDifference": {"BaselineRequirementKey", "ResolvedFromDifference"},
             "PartWorkbookDecision": {"MatchedBaselineRevisionLine"},
+            "PartWorkbookComparison": {"MappingVersion"},
         }
         for table, required in required_columns.items():
             columns = {str(row.get("id")) for row in shim.list_columns(table)}
             missing_columns = required - columns
             if missing_columns:
-                raise PartIdentityError("PART_BASELINE_SCHEMA_REQUIRED", f"Safari Grist {table} needs v11 columns: " + ", ".join(sorted(missing_columns)))
+                raise PartIdentityError("PART_BASELINE_SCHEMA_REQUIRED", f"Safari Grist {table} needs v12 columns: " + ", ".join(sorted(missing_columns)))
 
     def _upsert_many(self, table: str, records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if not records:
@@ -415,14 +465,25 @@ class PartBaselineService:
         self._verify_schema()
         if not request_key.strip() or not actor.strip():
             raise PartIdentityError("PART_BASELINE_INPUT_REQUIRED", "A request identity and attributable actor are required.")
-        if expected_hash != source_hash or not association or association.id != expected_association or association.version != expected_association_version:
-            raise PartIdentityError("PART_BASELINE_STALE", "The workbook or Product Model association changed; review current evidence before establishing this baseline.")
         part, revision = self._part_and_revision(part_id)
         revision_fields = _row_fields(revision)
         if str(revision_fields.get("BaselineStatus") or revision_fields.get("Status") or "draft").casefold() == "finalized":
             raise PartIdentityError("PART_REVISION_LOCKED", "The current Part revision is finalized; establish a baseline on a draft Rev A revision.")
+        pending = [row for row in self.registry._rows("PartBaselineProcessing")
+            if _ref_id(_row_fields(row).get("ProductPart")) == int(part["gristRecordId"])
+            and str(_row_fields(row).get("Status") or "").casefold() not in {"established", "abandoned"}]
+        same_pending = next((row for row in pending if _row_fields(row).get("RequestKey") == request_key), None)
+        other_pending = [row for row in pending if _row_fields(row).get("RequestKey") != request_key]
+        if other_pending:
+            raise PartIdentityError("PART_BASELINE_RECOVERY_BLOCKED", "Another initial baseline write is incomplete. Refresh the review and recover its original request before starting a different workbook operation.")
+        if expected_hash != source_hash or not association or association.id != expected_association or association.version != expected_association_version:
+            if same_pending:
+                raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "This request already has partial Grist records, but its original workbook or association evidence changed. Restore the original evidence and retry the saved request before starting another operation.")
+            raise PartIdentityError("PART_BASELINE_STALE", "The workbook or Product Model association changed; review current evidence before establishing this baseline.")
         mapping = mapping_detail(mapping_store, file_id=file_id, source_hash=source_hash, association=association, groups=groups, refresh_parts=True)
         if expected_mapping_version is not None and mapping.get("version") != expected_mapping_version:
+            if same_pending:
+                raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "This request already has partial Grist records, but its original saved mapping version changed. Restore the original mapping and retry the saved request before starting another operation.")
             raise PartIdentityError("PART_BASELINE_STALE", "Saved Part mappings changed after baseline review; reload the evidence before publishing.")
         families, family_errors = _family_confirmations(mapping, part_id, source_families)
         if family_errors:
@@ -431,15 +492,8 @@ class PartBaselineService:
         requirement_errors = _validate_requirements(requirements)
         if requirement_errors:
             raise PartIdentityError("PART_BASELINE_REQUIREMENTS_INCOMPLETE", "Cannot establish the Part baseline: " + " ".join(requirement_errors))
-        pending = [row for row in self.registry._rows("PartBaselineProcessing")
-            if _ref_id(_row_fields(row).get("ProductPart")) == int(part["gristRecordId"])
-            and str(_row_fields(row).get("Status") or "").casefold() not in {"established", "abandoned"}]
-        other_pending = [row for row in pending if _row_fields(row).get("RequestKey") != request_key]
-        if other_pending:
-            raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "Another initial baseline write is incomplete. Retry its original request so Grist can recover it before starting a different workbook operation.")
-
         request_fingerprint_value = _digest([part_id, file_id, workbook_name, workbook_path, source_hash,
-            association.id, association.version, mapping.get("mappingPolicyVersion"), source_families,
+            association.id, association.version, mapping.get("version"), mapping.get("mappingPolicyVersion"), source_families,
             append_existing, actor, reason.strip()])
         baseline_status = str(revision_fields.get("ManufacturingBaselineStatus") or "not_established").casefold()
         baseline_ref = _ref_id(revision_fields.get("ManufacturingBaseline"))
@@ -484,7 +538,12 @@ class PartBaselineService:
         if baseline_row and _row_fields(baseline_row).get("RequestFingerprint") != request_fingerprint_value:
             raise PartIdentityError("PART_REQUEST_CONFLICT", "The original baseline request key was retried with different workbook evidence or completeness selections.")
         if before_write:
-            before_write()
+            try:
+                before_write()
+            except Exception as exc:
+                if same_pending:
+                    raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "This request already has partial Grist records, but current source validation changed. Restore the original evidence and retry the saved request before starting another operation.") from exc
+                raise
         baseline_row = self._upsert_many("PartBaselineProcessing", [baseline_fields])[baseline_key]
         baseline_id = int(baseline_row["id"])
         family_records = []
@@ -714,7 +773,7 @@ class PartBaselineService:
             state["complete"] = state["sourceEvidenceStatus"] == "ok" and state["completenessConfirmed"] and state["applicabilityStatus"] in {"applicable", "not_applicable"}
         baseline_requirements = self._baseline_requirements(part, revision, baseline)
         comparison_fp = _digest([part_id, baseline_id, file_id, source_hash, association.id, association.version,
-            mapping.get("mappingPolicyVersion"), source_families, actor, reason.strip(), COMPARISON_POLICY])
+            mapping.get("version"), mapping.get("mappingPolicyVersion"), source_families, actor, reason.strip(), COMPARISON_POLICY])
         request = self.registry._begin_request(request_key, "compare_part_workbook", comparison_fp, part_id)
         comparison_key = f"part-comparison:{_digest([part_id, baseline_id, request_key])}"
         existing_comparison = self.registry._find(self.registry._rows("PartWorkbookComparison"), "ComparisonKey", comparison_key)
@@ -737,6 +796,7 @@ class PartBaselineService:
             "ProductPart": int(part["gristRecordId"]), "BaselineProcessing": baseline_id, "BaselineRevision": int(revision["id"]),
             "FileKey": file_id, "WorkbookName": workbook_name, "WorkbookPath": workbook_path,
             "SourceHash": source_hash, "AssociationKey": association.id, "AssociationVersion": association.version,
+            "MappingVersion": int(mapping.get("version") or 0),
             "BaselineSourceHash": _row_fields(baseline).get("SourceHash"),
             "MappingPolicyVersion": mapping.get("mappingPolicyVersion") or MAPPING_POLICY_VERSION,
             "Status": "evaluating", "DecisionStatus": "pending_review", "Actor": actor.strip(),
@@ -926,11 +986,87 @@ class PartBaselineService:
                     or not bool(row.get("CompletenessConfirmed"))
                     or str(row.get("ApplicabilityStatus") or "") not in {"applicable", "not_applicable"}]}
 
+    def _request_effects_exist(self, request_key: str) -> bool:
+        return any(str(_row_fields(row).get("RequestKey") or "") == request_key
+            for table in ("PartWorkbookDecision", "PartChangeProposal") for row in self.registry._rows(table)) or any(
+                str(_row_fields(row).get("RequestKey") or "") == request_key
+                and _ref_id(_row_fields(row).get("ResolvedFromDifference")) is not None
+                for row in self.registry._rows("PartRequirementDifference"))
+
+    def _validate_current_decision_evidence(self, *, comparison: dict[str, Any], comparison_id: int,
+                                            stable_part_id: str, all_differences: list[dict[str, Any]],
+                                            selected: list[dict[str, Any]], current_context: dict[str, Any]):
+        cf = _row_fields(comparison)
+        association = current_context.get("association")
+        mapping = current_context.get("mapping")
+        if (current_context.get("fileId") != cf.get("FileKey")
+                or current_context.get("sourceHash") != cf.get("SourceHash")
+                or not association
+                or association.id != cf.get("AssociationKey")
+                or association.version != cf.get("AssociationVersion")):
+            raise PartIdentityError("PART_COMPARISON_STALE", "The workbook identity, content or Product Model association changed after comparison. Recompare current evidence before resolving this difference.")
+        if not isinstance(mapping, dict) or mapping.get("mappingVersion", mapping.get("version")) != cf.get("MappingVersion"):
+            raise PartIdentityError("PART_COMPARISON_STALE", "Saved Part mappings changed after comparison. Recompare current workbook evidence before resolving this difference.")
+        if mapping.get("mappingPolicyVersion") != cf.get("MappingPolicyVersion"):
+            raise PartIdentityError("PART_COMPARISON_STALE", "The source grouping policy changed after comparison. Recompare current workbook evidence before resolving this difference.")
+
+        groups = mapping.get("groups") or []
+        current_groups = {}
+        assigned_context = set()
+        for group in groups:
+            family = FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))
+            if not family:
+                continue
+            if group.get("reviewed") and str((group.get("part") or {}).get("id") or "") == stable_part_id:
+                key = str(group.get("key") or "")
+                fingerprint = str(group.get("evidenceFingerprint") or "")
+                current_groups[key] = group
+                assigned_context.add((family, key, fingerprint))
+        recorded_context = set()
+        for row in all_differences:
+            fields = _row_fields(row)
+            if _ref_id(fields.get("IncomingObservation")) and fields.get("MappingGroupKey"):
+                recorded_context.add((str(fields.get("Family") or ""), str(fields.get("MappingGroupKey") or ""),
+                    str(fields.get("MappingEvidenceFingerprint") or "")))
+        if assigned_context != recorded_context:
+            raise PartIdentityError("PART_COMPARISON_STALE", "The set of source groups assigned to this Part changed after comparison. Recompare current workbook evidence before resolving this difference.")
+
+        family_rows = [row for row in self.registry._rows("PartComparisonFamily")
+            if _ref_id(_row_fields(row).get("WorkbookComparison")) == comparison_id]
+        family_by_key = {str(_row_fields(row).get("Family") or ""): _row_fields(row) for row in family_rows}
+        current_families = _family_review_rows(mapping, stable_part_id)
+        for family in FAMILY_ORDER:
+            saved = family_by_key.get(family)
+            current = current_families.get(family) or {}
+            if (not saved
+                    or saved.get("SourceEvidenceStatus") != current.get("sourceEvidenceStatus")
+                    or int(saved.get("MappedGroupCount") or 0) != int(current.get("mappedGroupCount") or 0)
+                    or int(saved.get("RequirementCount") or 0) != int(current.get("requirementCount") or 0)):
+                raise PartIdentityError("PART_COMPARISON_STALE", "Source-family completeness or mapping evidence changed after comparison. Recompare before resolving this difference.")
+        for row in selected:
+            fields = _row_fields(row)
+            if not _ref_id(fields.get("IncomingObservation")):
+                # A proposed deletion has no incoming row of its own. The exact
+                # workbook hash, mapping version and complete-family check above
+                # still prove the deletion came from current, complete evidence.
+                saved_family = family_by_key.get(str(fields.get("Family") or "")) or {}
+                if (saved_family.get("SourceEvidenceStatus") != "ok"
+                        or not bool(saved_family.get("CompletenessConfirmed"))
+                        or saved_family.get("ApplicabilityStatus") not in {"applicable", "not_applicable"}):
+                    raise PartIdentityError("PART_COMPARISON_STALE", "A baseline-only deletion can be resolved only from a complete, current incoming source family. Recompare after confirming complete evidence.")
+                continue
+            group_key = str(fields.get("MappingGroupKey") or "")
+            group = current_groups.get(group_key)
+            if (not group or str(group.get("evidenceFingerprint") or "") != str(fields.get("MappingEvidenceFingerprint") or "")
+                    or FAMILY_TO_SHEET.get(str(group.get("sheet") or "")) != str(fields.get("Family") or "")):
+                raise PartIdentityError("PART_COMPARISON_STALE", "The selected source group or its Part assignment changed after comparison. Recompare current evidence before resolving this difference.")
+
     @_serialized
     def decide(self, *, comparison_key: str, action: str, difference_keys: list[str],
                actor: str, reason: str, old_data: bool = False, replacement_part_id: str = "",
                baseline_requirement_key: str = "",
-               request_key: str) -> dict[str, Any]:
+               request_key: str, request_payload: dict[str, Any] | None = None,
+               before_write: Callable[[], dict[str, Any]] | None = None) -> dict[str, Any]:
         self.registry._verify_writer()
         self._verify_schema()
         allowed = {"keep_existing_baseline", "propose_part_change", "use_different_part", "match_correspondence"}
@@ -940,22 +1076,57 @@ class PartBaselineService:
         if not comparison:
             raise PartIdentityError("PART_COMPARISON_NOT_FOUND", "The saved workbook comparison was not found.")
         cf = _row_fields(comparison)
+        requested = [str(key) for key in (difference_keys or [])]
+        if not requested or len(requested) != len(set(requested)):
+            raise PartIdentityError("PART_DECISION_INPUT_INVALID", "Select each saved source difference once before resolving it.")
+        normalized_reason = reason.strip()
+        # The complete HTTP payload is part of request identity: a retry cannot
+        # change workbook path, matching choice or source evidence tokens.
+        fp = _digest([comparison_key, action, sorted(requested), actor.strip(), normalized_reason,
+            bool(old_data), replacement_part_id, baseline_requirement_key, request_payload or {}])
+        existing_request = self.registry._find(self.registry._rows("PartRegistryRequest"), "RequestKey", request_key)
+        if existing_request:
+            request_fields = _row_fields(existing_request)
+            if (request_fields.get("RequestFingerprint") != fp
+                    or request_fields.get("RequestType") != "resolve_part_comparison"):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This decision request key was already used with different comparison evidence or choices.")
+            if request_fields.get("Status") == "published":
+                saved_result = _unjson(request_fields.get("Result"))
+                if isinstance(saved_result, dict) and saved_result:
+                    saved_result["idempotent"] = True
+                    return saved_result
+                return {**self.get_comparison(comparison_key), "idempotent": True}
+        write_started = bool(existing_request and self._request_effects_exist(request_key))
         part_id = _ref_id(cf.get("ProductPart"))
         part = next((row for row in self.registry._rows("ProductPart") if int(row.get("id", -1)) == part_id), None)
         stable_part_id = str(_row_fields(part or {}).get("StablePartId") or "")
         current = self.registry.get_part(stable_part_id)
-        revision = self.registry.current_revision(stable_part_id)
-        if _ref_id(_row_fields(revision).get("ManufacturingBaseline")) != _ref_id(cf.get("BaselineProcessing")):
+        if (not current or current.get("id") != stable_part_id
+                or current.get("gristRecordId") != part_id
+                or current.get("legacy") or current.get("status") == "retired"
+                or current.get("publishStatus") != "published"):
+            raise PartIdentityError("PART_COMPARISON_STALE", "The canonical Part selected by this comparison is no longer an active published Part. Review the current Part before resolving differences.")
+        current_revision = self.registry.current_revision(stable_part_id)
+        revision = next((row for row in self.registry._rows("PartRevision")
+            if int(row.get("id", -1)) == _ref_id(cf.get("BaselineRevision"))), None)
+        baseline = next((row for row in self.registry._rows("PartBaselineProcessing")
+            if int(row.get("id", -1)) == _ref_id(cf.get("BaselineProcessing"))), None)
+        if not revision or not baseline:
+            raise PartIdentityError("PART_BASELINE_UNAVAILABLE", "The comparison's accepted baseline or revision evidence is unavailable.")
+        if (not write_started and (_ref_id(_row_fields(current_revision).get("ManufacturingBaseline")) != _ref_id(cf.get("BaselineProcessing"))
+                or int(current_revision.get("id", -1)) != int(revision.get("id", -2)))):
             raise PartIdentityError("PART_COMPARISON_STALE", "The accepted Part baseline changed after this comparison. Re-evaluate the workbook against the current baseline.")
         all_differences = [row for row in self.registry._rows("PartRequirementDifference") if _ref_id(_row_fields(row).get("WorkbookComparison")) == int(comparison["id"])]
-        requested_keys = set(difference_keys or [])
+        requested_keys = set(requested)
         selected = [row for row in all_differences if _row_fields(row).get("DifferenceKey") in requested_keys]
-        if not selected:
+        if len(selected) != len(requested_keys):
             raise PartIdentityError("PART_DECISION_INPUT_INVALID", "Select at least one saved source difference to resolve.")
         if any(str(_row_fields(row).get("DifferenceType") or "") in {"match", "incomplete_evidence"} for row in selected):
             raise PartIdentityError("PART_DECISION_INPUT_INVALID", "Resolve only conclusive non-match evidence; matching rows and incomplete families are not change decisions.")
-        if not reason.strip():
+        if not normalized_reason:
             raise PartIdentityError("PART_DECISION_REASON_REQUIRED", "Record why this workbook difference is being kept, proposed or assigned to a different Part.")
+        if not write_started and any(str(_row_fields(row).get("Status") or "") != "pending_review" for row in selected):
+            raise PartIdentityError("PART_DECISION_ALREADY_RESOLVED", "At least one selected difference already has a saved decision. Reload the comparison before continuing.")
         if action == "propose_part_change" and (cf.get("Status") != "complete" or any(_row_fields(row).get("DifferenceType") not in {"proposed_addition", "proposed_modification", "proposed_deletion"} for row in selected)):
             raise PartIdentityError("PART_CHANGE_PROPOSAL_INCOMPLETE", "Only complete, unambiguous additions, modifications and deletions can be collected into a pending Change Request proposal.")
         replacement = None
@@ -1008,8 +1179,7 @@ class PartBaselineService:
                 if item.get("key") == baseline_requirement_key), None)
             if not baseline_item:
                 raise PartIdentityError("PART_MATCH_CANDIDATE_INVALID", "The selected normalized baseline requirement could not be read.")
-            incoming_physical = _unjson(_row_fields(selected_fields.get("IncomingValues") or "{}")).get("physical")
-            incoming_physical = incoming_physical or {}
+            incoming_physical = _incoming_physical_evidence(selected_fields.get("IncomingValues"), str(selected_fields.get("Family") or ""))
             field_differences = [{"field": key, "baseline": (baseline_item.get("physical") or {}).get(key), "incoming": incoming_physical.get(key)}
                 for key in sorted(set(baseline_item.get("physical") or {}) | set(incoming_physical))
                 if (baseline_item.get("physical") or {}).get(key) != incoming_physical.get(key)]
@@ -1028,8 +1198,11 @@ class PartBaselineService:
                 "FieldDifferences": _json(field_differences), "CandidateBaselineLines": _json([]),
                 "RequestKey": request_key, "RequestFingerprint": ""}
 
-        fp = _digest([comparison_key, action, sorted(_row_fields(row).get("DifferenceKey") for row in selected),
-            actor, reason.strip(), bool(old_data), replacement_part_id, baseline_requirement_key])
+        if before_write and not write_started:
+            current_context = before_write()
+            self._validate_current_decision_evidence(comparison=comparison, comparison_id=int(comparison["id"]),
+                stable_part_id=stable_part_id, all_differences=all_differences, selected=selected,
+                current_context=current_context)
         req = self.registry._begin_request(request_key, "resolve_part_comparison", fp, comparison_key)
         if req.get("fields", {}).get("Status") == "published":
             saved_result = _unjson(req.get("fields", {}).get("Result"))
@@ -1047,7 +1220,7 @@ class PartBaselineService:
                 "Action": action, "OldData": bool(old_data),
                 "ReplacementPart": int(replacement["gristRecordId"]) if replacement and replacement.get("gristRecordId") else None,
                 "MatchedBaselineRevisionLine": int(matched_baseline["id"]) if matched_baseline and action == "match_correspondence" else None,
-                "Actor": actor.strip(), "Reason": reason.strip(), "OccurredAt": now, "RequestKey": request_key,
+            "Actor": actor.strip(), "Reason": reason.strip(), "OccurredAt": now, "RequestKey": request_key,
                 "RequestFingerprint": _digest([key, fp])})
         self._upsert_many("PartWorkbookDecision", decision_rows)
         if matched_modification:
@@ -1098,6 +1271,6 @@ class PartBaselineService:
                 "evidenceFingerprint": _row_fields(selected[0]).get("MappingEvidenceFingerprint") or "",
                 "sourceHash": cf.get("SourceHash"), "fileKey": cf.get("FileKey"),
                 "associationKey": cf.get("AssociationKey") or "", "associationVersion": cf.get("AssociationVersion") or 0} if replacement else None),
-            "idempotent": False}
+            "idempotent": bool(existing_request)}
         self.registry._complete_request(req, result)
         return result

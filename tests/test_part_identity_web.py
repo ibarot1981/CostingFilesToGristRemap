@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 from app import web
 from app.domain import Product, ProductModel, ProductModelCode
-from app.part_identity import PartIdentityStore
+from app.part_identity import PartIdentityError, PartIdentityStore
 from app.part_mapping import MemoryPartStore
 from app.repository import InMemorySafariRepository
 
@@ -40,6 +40,20 @@ class PartIdentityWebTests(unittest.TestCase):
     def set_shortcode(self, scope, target_id, code, key):
         return self.request(web.maintain_part_shortcode, self.request_context(), {"scope": scope, "targetId": target_id,
             "shortcode": code, "reason": "Reviewed master shortcode"}, key)
+
+    def test_part_baseline_retry_dispositions_separate_refresh_from_edit(self):
+        cases = {
+            "PART_BASELINE_INCOMPLETE": "safe_to_edit",
+            "PART_BASELINE_JOIN_CONFIRMATION_REQUIRED": "refresh_required",
+            "PART_BASELINE_RECOVERY_BLOCKED": "refresh_required",
+            "PART_COMPARISON_STALE": "refresh_required",
+            "PART_COMPARISON_EVIDENCE_INVALID": "refresh_required",
+            "PART_BASELINE_RECOVERY_REQUIRED": "retry_same_request",
+        }
+        for code, expected in cases.items():
+            with self.subTest(code=code):
+                response = web._part_http_error(PartIdentityError(code, "test retry policy"))
+                self.assertEqual(response.detail["retryDisposition"], expected)
 
     def test_scope_relationships_live_preview_create_detail_and_metadata_change(self):
         self.set_shortcode("product", "product-1", "S1K", "short-product")
