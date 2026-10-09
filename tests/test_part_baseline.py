@@ -4,11 +4,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from app.grist_parts import GristPartRegistry
 from app.part_baseline import PartBaselineService
 from app.part_baseline import _family_confirmations, _raw_requirement
-from app.part_mapping import MemoryPartStore, PartConflict, PartRegistryMappingStore, PartSourceGroups, save_mapping
+from app.part_mapping import MemoryPartStore, PartConflict, PartRegistryMappingStore, PartSourceGroups, mapping_detail, save_mapping
 from test_grist_parts_recovery import MemoryGrist
 
 
@@ -82,6 +84,53 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             "toolshop": {"status": "not_applicable", "confirmedComplete": True},
             "cnc": {"status": "not_applicable", "confirmedComplete": True}}
 
+    def family_group(self, family, row_number, *, description=None, **overrides):
+        sheet = {"mcl": MCL, "toolshop": TOOLSHOP, "cnc": CNC}[family]
+        row = source_row(row_number)
+        row["sheet"] = sheet
+        row["fields"].update(overrides)
+        label_field = "part_category" if family == "cnc" else "product_part_name"
+        label = description or (row["fields"].get(label_field) or f"{family} item")
+        row["fields"][label_field] = label
+        key = f"{family}:{row_number}:{label}"
+        return {"key": key, "mappingPolicyVersion": "part-source-labels-v2", "evidenceFingerprint": f"evidence:{key}",
+            "sheet": sheet, "labelField": label_field, "description": label, "blankDescription": False,
+            "rows": [row], "part": None, "reviewed": False, "version": 0}
+
+    def save_group_set(self, groups, source_hash, *, file_id="pilot.ods"):
+        groups = PartSourceGroups(groups, all_source_diagnostics())
+        detail = mapping_detail(self.mapping_store, file_id=file_id, source_hash=source_hash,
+            association=self.association, groups=groups)
+        return save_mapping(self.mapping_store, file_id=file_id, source_hash=source_hash, association=self.association,
+            groups=groups, decisions={group["key"]: self.part["id"] for group in groups}, expected_hash=source_hash,
+            expected_version=detail["version"], expected_association=self.association.id,
+            expected_association_version=self.association.version, actor="mapping reviewer", request_key=f"map:{source_hash}")
+
+    def family_choices_for(self, applicable):
+        return {family: {"status": "applicable" if family in applicable else "not_applicable", "confirmedComplete": True}
+            for family in ("mcl", "toolshop", "cnc")}
+
+    def establish_group_set(self, families, *, source_hash="family-baseline", file_id="pilot.ods"):
+        groups = []
+        applicable = set(families)
+        for index, family in enumerate(families, start=20):
+            if family == "mcl":
+                groups.extend([self.family_group(family, index, description=f"MCL item {index}"),
+                    self.family_group(family, index + 100, description=f"MCL item {index + 100}", quantity="1")])
+            elif family == "toolshop":
+                groups.append(self.family_group(family, index, description=f"Tool {index}", toolshop_part_name=f"Tool {index}", item_code=f"TS-{index:02}", item_name=f"Tool {index}"))
+            else:
+                groups.append(self.family_group(family, index, description=f"Frame {index}", part_category=f"Frame {index}", product_part_name="Plate 1", length="300", width="25", thickness="3"))
+        groups = PartSourceGroups(groups, all_source_diagnostics())
+        mapping_result = self.save_group_set(groups, source_hash, file_id=file_id)
+        result = self.service.establish(part_id=self.part["id"], file_id=file_id, workbook_name=f"{file_id}.ods",
+            workbook_path=f"C:/isolated/{file_id}.ods", source_hash=source_hash, association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=self.family_choices_for(applicable),
+            actor="baseline reviewer", reason="Verify family-specific baseline", request_key=f"baseline:{source_hash}",
+            expected_hash=source_hash, expected_association=self.association.id,
+            expected_association_version=self.association.version, expected_mapping_version=mapping_result["version"])
+        return result
+
     def establish(self, rows, *, source_hash="hash-v1", request_key="baseline-v1", append_existing=False):
         groups, mapping_result = self.save_rows(rows, source_hash, request_key=f"map:{source_hash}")
         return self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
@@ -109,6 +158,32 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual(detail["status"], "established")
         self.assertEqual(detail["baseline"]["WorkbookName"], "pilot.ods")
         self.assertEqual(len(detail["requirements"]), 2)
+
+    def test_toolshop_only_baseline_does_not_require_other_source_families(self):
+        result = self.establish_group_set(["toolshop"], source_hash="toolshop-only", file_id="toolshop-only")
+        self.assertEqual(result["baselineStatus"], "established")
+        detail = self.service.baseline_detail(self.part["id"])
+        self.assertEqual(len(detail["requirements"]), 1)
+        self.assertEqual(detail["requirements"][0]["physical"]["family"], "toolshop")
+        families = {row["fields"]["Family"]: row["fields"] for row in self.client.tables["PartBaselineFamily"]}
+        self.assertEqual(families["toolshop"]["ApplicabilityStatus"], "applicable")
+        self.assertEqual(families["mcl"]["ApplicabilityStatus"], "not_applicable")
+
+    def test_cnc_only_baseline_uses_part_category_and_preserves_plate_identity(self):
+        result = self.establish_group_set(["cnc"], source_hash="cnc-only", file_id="cnc-only")
+        self.assertEqual(result["baselineStatus"], "established")
+        requirement = self.service.baseline_detail(self.part["id"])["requirements"][0]
+        self.assertEqual(requirement["physical"]["family"], "cnc")
+        self.assertEqual(requirement["rawFields"]["part_category"], "Frame 20")
+        self.assertEqual(requirement["physical"]["plate_part"], "plate 1")
+
+    def test_combined_baseline_establishes_every_applicable_mapped_source_group(self):
+        result = self.establish_group_set(["mcl", "toolshop", "cnc"], source_hash="combined-families", file_id="combined-families")
+        self.assertEqual(result["requirementCount"], 4)
+        detail = self.service.baseline_detail(self.part["id"])
+        self.assertEqual({item["physical"]["family"] for item in detail["requirements"]}, {"mcl", "toolshop", "cnc"})
+        self.assertEqual(len(self.client.tables["PartRevisionLine"]), 4)
+        self.assertEqual(len(self.client.tables["SourceLineObservation"]), 4)
 
     def test_replacement_requires_a_reason_but_unchanged_context_reconfirmation_does_not(self):
         rows = [source_row(10)]
@@ -168,6 +243,36 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertTrue(recovered["idempotent"])
         self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)
         self.assertEqual(len(self.client.tables["SourceLineObservation"]), 1)
+
+    def test_concurrent_initial_baseline_requests_cannot_claim_one_part_twice(self):
+        rows = [source_row(10)]
+        groups, mapping_result = self.save_rows(rows, "hash-concurrent", request_key="map:concurrent")
+        second_registry = GristPartRegistry(self.client, self.registry.path)
+        second_registry._verify_writer = lambda: None
+        services = [self.service, PartBaselineService(second_registry)]
+        arguments = {"part_id": self.part["id"], "file_id": "pilot.ods", "workbook_name": "pilot.ods",
+            "workbook_path": "C:/isolated/pilot.ods", "source_hash": "hash-concurrent", "association": self.association,
+            "groups": groups, "mapping_store": self.mapping_store, "source_families": self.family_choices(),
+            "actor": "baseline reviewer", "reason": "Concurrent initial baseline", "expected_hash": "hash-concurrent",
+            "expected_association": self.association.id, "expected_association_version": self.association.version,
+            "expected_mapping_version": mapping_result["version"]}
+        barrier = Barrier(2)
+
+        def establish(service, request_key):
+            barrier.wait()
+            try:
+                return ("ok", service.establish(**arguments, request_key=request_key))
+            except Exception as error:
+                return ("error", getattr(error, "code", type(error).__name__))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda item: establish(*item), [(services[0], "baseline-concurrent-a"),
+                (services[1], "baseline-concurrent-b")]))
+        self.assertEqual([state for state, _ in outcomes].count("ok"), 1)
+        errors = [value for state, value in outcomes if state == "error"]
+        self.assertEqual(errors, ["PART_BASELINE_EXISTS"])
+        self.assertEqual(len(self.client.tables["PartBaselineProcessing"]), 1)
+        self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)
 
     def test_existing_purchase_and_component_content_requires_append_and_is_preserved(self):
         revision = self.registry.current_revision(self.part["id"])
@@ -234,6 +339,54 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertIn("incomplete_evidence", types)
         self.assertTrue(result["evidenceWarnings"])
 
+    def test_keep_baseline_records_old_data_and_preserves_accepted_requirement(self):
+        self.establish([source_row(10, quantity="2")])
+        groups, mapped = self.save_rows([source_row(10, quantity="3")], "hash-old-workbook", expected_version=1,
+            request_key="map:old-workbook")
+        comparison = self.service.compare(part_id=self.part["id"], file_id="pilot.ods", workbook_name="older-export.ods",
+            workbook_path="C:/isolated/older-export.ods", source_hash="hash-old-workbook", association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=self.family_choices(), actor="reviewer",
+            reason="Review older workbook export", request_key="compare-old-workbook", expected_hash="hash-old-workbook",
+            expected_association=self.association.id, expected_association_version=self.association.version,
+            expected_mapping_version=mapped["version"])
+        difference = next(item for item in comparison["differences"] if item["DifferenceType"] == "proposed_modification")
+        kept = self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action="keep_existing_baseline",
+            difference_keys=[difference["DifferenceKey"]], actor="engineering reviewer", reason="This export predates the accepted definition",
+            old_data=True, request_key="decision-old-workbook")
+        self.assertEqual(kept["comparison"]["DecisionStatus"], "kept_existing_baseline")
+        decision = kept["decisions"][0]
+        self.assertTrue(decision["OldData"])
+        self.assertEqual(decision["Action"], "keep_existing_baseline")
+        accepted = self.service.baseline_detail(self.part["id"])["requirements"]
+        self.assertEqual(accepted[0]["physical"]["quantity"], "2")
+        self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)
+        incoming = next(row for row in self.client.tables["SourceLineObservation"]
+            if row["fields"].get("Status") == "incoming_comparison")
+        self.assertEqual(incoming["fields"]["SourceHash"], "hash-old-workbook")
+
+    def test_different_part_decision_returns_exact_mapping_provenance(self):
+        self.establish([source_row(10, quantity="2")])
+        groups, mapped = self.save_rows([source_row(10, quantity="3")], "hash-distinct-design", expected_version=1,
+            request_key="map:distinct-design")
+        comparison = self.service.compare(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot-new-design.ods",
+            workbook_path="C:/isolated/pilot-new-design.ods", source_hash="hash-distinct-design", association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=self.family_choices(), actor="reviewer",
+            reason="Compare a distinct chassis", request_key="compare-distinct-design", expected_hash="hash-distinct-design",
+            expected_association=self.association.id, expected_association_version=self.association.version,
+            expected_mapping_version=mapped["version"])
+        difference = next(item for item in comparison["differences"] if item["DifferenceType"] == "proposed_modification")
+        replacement = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
+            description="Separate Frame", variant="Standard", expected_name="S1K — Separate Frame — Standard",
+            actor="reviewer", reason="Different physical design", request_key="create-separate-frame", revision_assertion="A")["part"]
+        result = self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action="use_different_part",
+            difference_keys=[difference["DifferenceKey"]], replacement_part_id=replacement["id"], actor="reviewer",
+            reason="The incoming design is a separate Part", request_key="decision-separate-frame")
+        self.assertEqual(result["replacementMapping"], {"partId": replacement["id"], "path": "C:/isolated/pilot-new-design.ods",
+            "sourceSheet": MCL, "sourceRow": 10, "groupKey": "mcl:chassis", "evidenceFingerprint": "evidence:10",
+            "sourceHash": "hash-distinct-design", "fileKey": "pilot.ods", "associationKey": "association:pilot", "associationVersion": 1})
+        self.assertEqual(self.registry.get_part(self.part["id"])["engineeringRevision"], "A")
+        self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)
+
     def test_material_substitution_can_be_matched_explicitly_then_proposed_as_a_cr_change(self):
         self.establish([source_row(10, material="MS Plate", dimension="3 x 25", quantity="2")])
         incoming_row = source_row(10, material="Aluminum", dimension="3 x 25", quantity="2")
@@ -281,6 +434,36 @@ class PartRequirementComparisonPolicyTests(unittest.TestCase):
         self.assertEqual(first["rawFields"]["rate"], "5")
         self.assertNotIn("rate", first["physical"])
         self.assertNotIn("remarks", first["physical"])
+        service = object.__new__(PartBaselineService)
+        classified = service._classify([first], [second], {"mcl": {"complete": True}, "toolshop": {"complete": True}, "cnc": {"complete": True}})
+        self.assertEqual([row["type"] for row in classified], ["match"])
+
+    def test_reordered_and_duplicate_looking_lines_match_one_to_one(self):
+        def line(key, material, dimension, quantity="1"):
+            return {"key": key, "family": "mcl", "physical": {"family": "mcl", "material": material,
+                "dimension": dimension, "quantity": quantity, "quantity_uom": "nos"}}
+
+        baseline = [line("steel-a", "steel", "3 x 25"), line("steel-b", "steel", "3 x 25"), line("al-a", "aluminum", "4 x 25")]
+        incoming = [line("al-new", "aluminum", "4 x 25"), line("steel-new-a", "steel", "3 x 25"), line("steel-new-b", "steel", "3 x 25")]
+        service = object.__new__(PartBaselineService)
+        classified = service._classify(baseline, incoming, {"mcl": {"complete": True}, "toolshop": {"complete": True}, "cnc": {"complete": True}})
+        self.assertEqual([row["type"] for row in classified].count("match"), 3)
+        self.assertFalse(any(row["type"] in {"proposed_addition", "proposed_deletion", "ambiguous_correspondence"} for row in classified))
+
+    def test_complete_evidence_identifies_additions_and_deletions_separately(self):
+        def line(key, material, dimension):
+            return {"key": key, "family": "mcl", "physical": {"family": "mcl", "material": material,
+                "dimension": dimension, "quantity": "1", "quantity_uom": "nos"}}
+
+        unchanged = line("unchanged", "steel", "3 x 25")
+        added = line("added", "aluminum", "1 x 10")
+        deleted = line("deleted", "copper", "2 x 20")
+        service = object.__new__(PartBaselineService)
+        complete = {"mcl": {"complete": True}, "toolshop": {"complete": True}, "cnc": {"complete": True}}
+        additions = service._classify([unchanged], [unchanged, added], complete)
+        deletions = service._classify([unchanged, deleted], [unchanged], complete)
+        self.assertEqual({row["type"] for row in additions}, {"match", "proposed_addition"})
+        self.assertEqual({row["type"] for row in deletions}, {"match", "proposed_deletion"})
 
     def test_material_substitution_with_only_one_identity_anchor_is_ambiguous(self):
         old = {"key": "old-line", "family": "mcl", "physical": {"family": "mcl", "material": "steel", "dimension": "3 x 25", "quantity": "2"}}

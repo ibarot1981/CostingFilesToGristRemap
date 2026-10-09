@@ -437,16 +437,6 @@ class PartBaselineService:
         other_pending = [row for row in pending if _row_fields(row).get("RequestKey") != request_key]
         if other_pending:
             raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "Another initial baseline write is incomplete. Retry its original request so Grist can recover it before starting a different workbook operation.")
-        # A response-lost retry may already have appended this operation's
-        # normalized PartRevisionLine rows. They are its own resumable payload,
-        # not manually existing content requiring a second append confirmation.
-        existing_lines = [row for row in self.registry._rows("PartRevisionLine")
-            if _ref_id(_row_fields(row).get("PartRevision")) == int(revision["id"])
-            and str(_row_fields(row).get("RequestKey") or "") != request_key]
-        existing_components = [row for row in self.registry._rows("PartComponentRevision") if _ref_id(_row_fields(row).get("ParentRevision")) == int(revision["id"])]
-        existing_specs = [row for row in self.registry._rows("PartPurchaseSpecification") if _ref_id(_row_fields(row).get("PartRevision")) == int(revision["id"])]
-        if (existing_lines or existing_components or existing_specs) and not append_existing:
-            raise PartIdentityError("PART_BASELINE_JOIN_CONFIRMATION_REQUIRED", "This Part already has requirements, subparts or purchase specifications. Review the existing content and confirm that mapped workbook requirements will be appended without replacing it.")
 
         request_fingerprint_value = _digest([part_id, file_id, workbook_name, workbook_path, source_hash,
             association.id, association.version, mapping.get("mappingPolicyVersion"), source_families,
@@ -464,6 +454,17 @@ class PartBaselineService:
                     self.registry._complete_request(request, result)
                 return result
             raise PartIdentityError("PART_BASELINE_EXISTS", "This Part already has an established manufacturing baseline. Use workbook comparison instead of replacing it.")
+
+        # A response-lost retry may already have appended this operation's
+        # normalized PartRevisionLine rows. They are its own resumable payload,
+        # not manually existing content requiring a second append confirmation.
+        existing_lines = [row for row in self.registry._rows("PartRevisionLine")
+            if _ref_id(_row_fields(row).get("PartRevision")) == int(revision["id"])
+            and str(_row_fields(row).get("RequestKey") or "") != request_key]
+        existing_components = [row for row in self.registry._rows("PartComponentRevision") if _ref_id(_row_fields(row).get("ParentRevision")) == int(revision["id"])]
+        existing_specs = [row for row in self.registry._rows("PartPurchaseSpecification") if _ref_id(_row_fields(row).get("PartRevision")) == int(revision["id"])]
+        if (existing_lines or existing_components or existing_specs) and not append_existing:
+            raise PartIdentityError("PART_BASELINE_JOIN_CONFIRMATION_REQUIRED", "This Part already has requirements, subparts or purchase specifications. Review the existing content and confirm that mapped workbook requirements will be appended without replacing it.")
         request = self.registry._begin_request(request_key, "establish_part_baseline", request_fingerprint_value, part_id)
         if request.get("fields", {}).get("Status") == "published":
             saved = next((row for row in self.registry._rows("PartBaselineProcessing") if _row_fields(row).get("RequestKey") == request_key), None)
