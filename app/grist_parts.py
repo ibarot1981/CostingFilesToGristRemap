@@ -1519,7 +1519,11 @@ class GristAdminClientShim:
         self.doc_id = client.doc_id
 
     def list_tables(self):
-        return self.admin.list_tables(self.doc_id)
+        # Writer guards need table identities here; fetching the columns of
+        # every table is unnecessary because _ensure_schema checks only the
+        # managed table set and fetches columns for the specific tables whose
+        # fields it validates.
+        return self.admin.list_tables(self.doc_id, include_columns=False)
 
     def list_columns(self, table: str):
         return self.admin.list_columns(self.doc_id, table)

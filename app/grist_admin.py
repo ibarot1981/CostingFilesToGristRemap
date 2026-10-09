@@ -139,9 +139,11 @@ class GristAdminClient:
             raise GristValidationError("Grist returned an invalid created-document payload.")
         return document
 
-    def list_tables(self, document_id: str) -> list[dict[str, Any]]:
+    def list_tables(self, document_id: str, *, include_columns: bool = True) -> list[dict[str, Any]]:
         payload = self._request("GET", f"/api/docs/{document_id}/tables")
         tables = [dict(item) for item in _items(payload, "tables")]
+        if not include_columns:
+            return tables
         enriched: list[dict[str, Any]] = []
         for table in tables:
             if not isinstance(table.get("columns"), list):

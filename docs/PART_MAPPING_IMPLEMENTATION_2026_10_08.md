@@ -61,9 +61,9 @@ A separate disposable Grist document verified a synthetic Part's baseline write 
 
 ### Verification and measured performance
 
-- Full Python suite: 217 tests, 216 passed and one platform-specific skip.
-- UI suite: 40 tests passed across 9 files. TypeScript check, Vite production build and `git diff --check` passed.
-- An isolated current-code browser session opened the HF workbook and rendered the mapping page with 25 groups/100 active rows. Groups were collapsed by default; the baseline Part selector stayed unavailable until a saved mapping existed. The page-level workbook preview indicator remained in `Reading workbook…` during this check even though the mapping endpoint parsed the workbook. This DOM check does **not** satisfy the prompt’s visual review at normal and narrow widths or the full Parts-detail visual review.
+- Full Python suite: 218 tests, 217 passed and one platform-specific skip.
+- UI suite: 41 Vitest tests passed across 9 files, plus the 2 standalone mapped-files view-model tests. TypeScript check, Vite production build and `git diff --check` passed.
+- An isolated current-code browser session opened the HF workbook and rendered 25 groups/100 active rows. Groups were collapsed by default; the baseline Part selector stayed unavailable until a saved mapping existed. Parts and Mapping were visually reviewed at 1366×900 and 823×900. The production Chassis detail and mapping page were read only. During one mapping view the adjacent workbook-preview indicator still showed `Reading workbook…` while the mapping endpoint had returned parsed rows; a prior browser check later showed the bounded preview loaded. The indicator’s timing remains an observed UI limitation, not a Grist persistence claim.
 - Production API observations below are single local-environment samples, not timing guarantees. “Prior loop” is a replay of the known pre-fix access pattern against the current document, not a recorded historical benchmark.
 
 | Operation | Observed result |
@@ -76,13 +76,30 @@ A separate disposable Grist document verified a synthetic Part's baseline write 
 | Part search, cold / warm | 69.9 ms and 2 reads / 0.2 ms and 0 reads; warm result uses a bounded five-second document-keyed cache |
 | Mapping load, extraction cache cold / warm | 7287.4 ms and 18 reads / 912.4 ms and 16 reads |
 
-The mapping UI keeps views mounted across navigation, consumes confirmed targeted mapping responses and refreshes Part creation in the background after displaying the confirmed record. These are implementation observations, not separate timing measurements. The prompt’s separate timings for Part creation plus intended-sharing publication, a single mapping save, Parts↔Mapping navigation and post-save refresh have not yet been captured. The combined cold/warm mapping sample also includes local ODS and repository refresh/cache work, so it is not a controlled isolated workbook-parser benchmark.
+The mapping UI keeps views mounted across navigation, consumes confirmed targeted mapping responses and refreshes Part creation in the background after displaying the confirmed record. These are implementation observations, not separate timing measurements. The combined cold/warm mapping sample also includes local ODS and repository refresh/cache work, so it is not a controlled isolated workbook-parser benchmark.
+
+#### Disposable-Grists writer request reduction
+
+The first timed operations exposed repeated schema-column discovery: each Parts write asked Grist to enumerate columns for every table, even though the writer only needed the table names before it knew which table schema to validate. The registry now requests the table list without eager columns, and fetches columns only for the specific table being validated. The schema/data behavior is unchanged. Measurements below compare one operation per run against disposable copies of the validated document; they are local samples and not a timing guarantee.
+
+| Operation | Before fast schema listing | After fast schema listing | Change |
+| --- | --- | --- | --- |
+| Part-name preview | 179.3 ms; 3 HTTP requests | 112.6 ms; 3 requests | One sample each; request count unchanged |
+| Part creation and Grist publication | 4,772.1 ms; 95 requests, including 66 table-column requests | 1,261.6 ms; 31 requests, including 2 table-list requests | 73.6% lower elapsed time; 67.4% fewer HTTP requests |
+| Intended-sharing publication | 4,648.6 ms; 98 requests, including 66 table-column requests | 1,324.2 ms; 34 requests, including 2 table-list requests | 71.5% lower elapsed time; 65.3% fewer HTTP requests |
+| One mapping save with Grist read-back | 4,104.4 ms; 77 requests, including 66 table-column requests | 1,406.4 ms; 13 requests, including 2 table-list requests | 65.7% lower elapsed time; 83.1% fewer HTTP requests |
+
+The Part Mapping page’s post-save endpoint projection was 100.3 ms and three HTTP reads after the optimized save. The current UI displays the confirmed targeted save response rather than reloading the entire mapping page after every save. Part creation similarly displays the confirmed created Part while its register refresh runs in the background. The sample above times Part creation/publication and intended-sharing publication as separate operations; it does not imply a rate guarantee.
+
+#### Navigation and rendered-UI checks
+
+In one isolated-browser pass against the current production-backed read-only API, switching from Mapping to the already-loaded Parts detail took 608 ms to the next accessibility snapshot and issued two GETs (scope targets and the Parts register). Returning to Part Mapping took 543 ms to the next snapshot and issued one GET for mapping evidence. The app immediately reused the existing 25-group/100-row view and showed a revalidation indicator while that request completed; it did not blank the page or discard the current review. These are one-pass interaction samples and include browser accessibility-tree collection, not repeatable UI timing guarantees.
+
+The current Part detail uses native `<details>/<summary>` disclosures. Overview opens first; baseline, sharing, process lines, components, purchase details, drawings, actual-configuration use and history start collapsed. Keyboard-operable summaries expand individual sections, and the section shortcuts open the matching section before scrolling. Parts and Mapping were inspected in the isolated browser at 1366×900 and 823×900. The production Chassis detail and HF workbook mapping review were read only: no baseline, Part Mapping row, Part, or intended-sharing record was written.
 
 ### Remaining work before calling the full prompt complete
 
-- Capture the four missing per-operation performance measurements above in a disposable document and isolate workbook-extraction timing from unrelated refresh work.
-- Inspect the rendered mapping and Part-detail UI at a normal desktop size and a narrower width on the current code, including the collapsible baseline/comparison sections.
-- Execute the full defect matrix against current code where it is not already covered by automated tests; tests alone do not replace live Grist readback or visual verification.
+- Execute any remaining cases from the full defect matrix not covered by the automated suite or disposable Grist readbacks; tests alone do not replace live Grist readback or visual verification.
 - The approved CR workflow, automatic Summary import/costing-authority integration, and reviewed legacy Part identity/revision classification remain unimplemented project gates. No Part may be advanced beyond Rev A until approved CR control exists.
 
 No pull request has been merged or deployed. Continue this checkpoint on `codex/part-identity-foundation` and update the existing PR only with the remaining limits stated explicitly.

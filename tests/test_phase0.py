@@ -383,6 +383,14 @@ class _SchemaClient:
 
 
 class GristAdminTests(unittest.TestCase):
+    def test_list_tables_can_skip_column_enrichment_for_existence_checks(self) -> None:
+        session = _Session([_Response({"tables": [{"id": "Product"}, {"id": "ProductPart"}]})])
+        tables = GristAdminClient("secret", "https://grist.test", session=session).list_tables("safari-doc", include_columns=False)
+
+        self.assertEqual(tables, [{"id": "Product"}, {"id": "ProductPart"}])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][1], "https://grist.test/api/docs/safari-doc/tables")
+
     def test_workspace_discovery_and_exact_name_duplicate_refusal(self) -> None:
         session = _Session([
             _Response({"orgs": [{"id": "org1", "name": "Safari"}]}),

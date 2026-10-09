@@ -51,8 +51,10 @@ it("collapses and expands scope targets, then opens the selected Part details", 
   fireEvent.click(partRow);
   await screen.findByRole("heading", {name:"S1K — Chassis — Standard"});
   fireEvent.click(screen.getByRole("button", {name:/Open full Part details/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Purchase details"}));
   await screen.findByRole("heading", {name:/Purchased Part details/});
   expect(screen.getByText("No eligible actual purchase exists.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Used in configurations"}));
   expect(screen.getByRole("heading", {name:/Used in configurations/})).toBeTruthy();
   expect(screen.getByText("Configured directly; no intended-sharing link is recorded.")).toBeTruthy();
   expect(mocks.partDetails).toHaveBeenCalledWith("part-uuid");
@@ -132,6 +134,7 @@ it("saves audited intended-sharing changes without changing actual configuration
   fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
   fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
   fireEvent.click(await screen.findByRole("button", {name:/Open full Part details/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Intended sharing"}));
   await screen.findByRole("heading", {name:/Intended sharing/});
   fireEvent.click(screen.getByRole("button", {name:/Remove S1KHFSTD/}));
   fireEvent.change(screen.getByLabelText("Why is intended sharing changing?"), {target:{value:"This code no longer shares the housing"}});
@@ -151,9 +154,35 @@ it("shows component navigation and actual purchase capture affordances", async (
   fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
   fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
   fireEvent.click(await screen.findByRole("button", {name:/Open full Part details/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Purchase details"}));
   await screen.findByRole("heading", {name:/Purchased Part details/});
   expect(screen.getByText(/2 each · Rev A/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", {name:/Record actual purchase/}));
   expect(screen.getByLabelText("Transaction reference")).toBeTruthy();
   expect(screen.getByText(/MaterialRateLog and Default Material rates are not used/)).toBeTruthy();
+});
+
+it("keeps Part detail sections collapsed until opened, and section shortcuts reopen them", async () => {
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Open full Part details/}));
+
+  const overview = document.getElementById("overview") as HTMLDetailsElement;
+  const baseline = document.getElementById("manufacturing-baseline") as HTMLDetailsElement;
+  const sharing = document.getElementById("intended-sharing") as HTMLDetailsElement;
+  expect(overview.open).toBe(true);
+  expect(baseline.open).toBe(false);
+  expect(sharing.open).toBe(false);
+
+  fireEvent.click(screen.getByText("Overview", {selector:"summary h3"}));
+  expect(overview.open).toBe(false);
+  fireEvent.click(screen.getByRole("button", {name:"Manufacturing baseline"}));
+  expect(baseline.open).toBe(true);
+  fireEvent.click(screen.getByRole("button", {name:"Intended sharing"}));
+  expect(sharing.open).toBe(true);
+  expect(screen.getByText(/Advisory links only/)).toBeTruthy();
 });
