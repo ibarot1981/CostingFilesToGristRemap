@@ -322,6 +322,29 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
+    def test_schema_plan_accepts_grist_text_inference_for_legacy_engineering_attributes(self) -> None:
+        client = _SchemaClient()
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": (
+                    "Text" if table["id"] == "LineDetail" and column["id"] == "EngineeringAttributes"
+                    else "Bool" if table["id"] == "PartWorkbookComparison" and column["id"] == "Status"
+                    else column["type"]
+                )}}
+                for column in table["columns"]
+            ]}
+            for table in FOUNDATION_TABLES
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual(plan.create_tables, ())
+        self.assertEqual(plan.add_columns, ())
+        self.assertEqual(plan.update_columns, ({"tableId": "PartWorkbookComparison", "columns": [
+            {"id": "Status", "type": "Text"},
+        ]},))
+        self.assertEqual(client.writes, [])
+
     def test_schema_apply_revalidates_remote_identity_before_writes(self) -> None:
         client = _SchemaClient()
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")

@@ -174,6 +174,16 @@ def _validate_remote_target(client: GristAdminClient, document_id: str, workspac
     validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id)
 
 
+def _is_compatible_grist_type(table_id: str, column_id: str, current_type: Any, expected_type: Any) -> bool:
+    # The legacy LineDetail column is an empty Any formula placeholder in the
+    # deployed document. Grist converts it to a non-formula Text column when
+    # the first serialized baseline attributes are written. The application
+    # reads both representations, so trying to restore Any would make the
+    # next schema plan report a change that Grist will immediately undo.
+    return (table_id == "LineDetail" and column_id == "EngineeringAttributes"
+            and current_type == "Text" and expected_type == "Any")
+
+
 def plan_schema(client: GristAdminClient, document_id: str, *, workspace_id: str, document_name: str = SAFARI_DOCUMENT_NAME, legacy_doc_id: str | None = None) -> SchemaPlan:
     _validate_remote_target(client, document_id, workspace_id, document_name=document_name, legacy_doc_id=legacy_doc_id)
     current = {str(item.get("id")): item for item in client.list_tables(document_id)}
@@ -194,7 +204,8 @@ def plan_schema(client: GristAdminClient, document_id: str, *, workspace_id: str
             current_column = existing_columns.get(str(column["id"]))
             current_fields = current_column.get("fields", {}) if isinstance(current_column, dict) else {}
             current_type = current_fields.get("type") or (current_column.get("type") if isinstance(current_column, dict) else None)
-            if current_column is not None and current_type != column.get("type"):
+            if (current_column is not None and current_type != column.get("type")
+                    and not _is_compatible_grist_type(str(table["id"]), str(column["id"]), current_type, column.get("type"))):
                 changed.append(column)
         if changed:
             update.append({"tableId": table["id"], "columns": changed})

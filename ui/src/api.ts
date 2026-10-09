@@ -7,12 +7,28 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   return payload;
 }
 
-async function send<T>(path: string, body: unknown, headers: Record<string, string> = {}, method = "POST"): Promise<T> {
-  const response = await fetch(path, { method, headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
-  const payload = await response.json();
-  if (!response.ok) throw apiError(payload, response.status);
-  return payload;
+async function send<T>(path: string, body: unknown, headers: Record<string, string> = {}, method = "POST", timeoutMs?: number): Promise<T> {
+  const controller = timeoutMs ? new AbortController() : null;
+  let timedOut = false;
+  const timer = timeoutMs ? setTimeout(() => {
+    timedOut = true;
+    controller?.abort();
+  }, timeoutMs) : null;
+  try {
+    const response = await fetch(path, { method, headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), ...(controller ? { signal: controller.signal } : {}) });
+    const payload = await response.json();
+    if (!response.ok) throw apiError(payload, response.status);
+    return payload;
+  } catch (cause) {
+    if (timedOut) throw new Error(`Request timed out after ${Math.round((timeoutMs || 0) / 1000)} seconds; the outcome may be uncertain. Retry the saved request.`);
+    if (timeoutMs && cause instanceof SyntaxError) throw new Error("The server response was incomplete; the outcome may be uncertain. Retry the saved request.");
+    throw cause;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
+
+const PART_BASELINE_WRITE_TIMEOUT_MS = 30_000;
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code = "", readonly retryDisposition = "retry_same_request", readonly detail: unknown = null) {
@@ -68,10 +84,10 @@ export const api = {
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
   partBaselineReview: (id: string, path: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/review?path=${encodeURIComponent(path)}`),
-  establishPartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/establish`, payload, {"Idempotency-Key": key}),
-  comparePartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/compare`, payload, {"Idempotency-Key": key}),
+  establishPartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/establish`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
+  comparePartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/compare`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   partManufacturingComparison: (key: string) => get<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}`),
-  decidePartManufacturingComparison: (key: string, payload: unknown, requestKey: string) => send<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}/decisions`, payload, {"Idempotency-Key": requestKey}),
+  decidePartManufacturingComparison: (key: string, payload: unknown, requestKey: string) => send<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}/decisions`, payload, {"Idempotency-Key": requestKey}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   processingState: (path: string) => get<any>(`/api/processing/state?path=${encodeURIComponent(path)}`),
   changeProcessingState: (payload: unknown, key: string) => send<any>("/api/processing/state", payload, {"Idempotency-Key":key}),
   fileAssociation: (path: string) => get<import("./types").SavedAssociation>(`/api/explorer/association?path=${encodeURIComponent(path)}`),
