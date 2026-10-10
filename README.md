@@ -4,6 +4,17 @@ Windows-friendly Python CLI for processing LibreOffice Calc `.ods` product costi
 
 > **Safari Manufacturing work:** the CLI remains supported while the manufacturing ERP frontend is developed. Start with the [requirements baseline](docs/MANUFACTURING_ERP_REQUIREMENTS.md), [interactive data model](docs/data-model.html), [implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md), [numbering audit](docs/MILESTONE_NUMBERING_AUDIT.md), [decision log](docs/DECISION_LOG.md), and [requirements status register](docs/requirements-status.html). Milestone 2 is synced as `476ad3a`; [Delivery Milestone 3](docs/MILESTONE_3_IMPLEMENTATION_PROMPT.md) implements Phase 1 work package 1.1. Its [pilot evidence](docs/MILESTONE_3_PILOT_RECONCILIATION.md) distinguishes local projection from live Safari normalization.
 
+**Parts implementation update — 7 October 2026:** PR #3 adds the Grist-canonical
+Part register, permanent number allocation, generated-name/metadata history,
+Rev A, mapping references, mixed manufacturing/component composition and
+vendor/purchase history. Safari schema v8 was applied additively after a
+verified native backup. Production legacy Part/revision/line rows remain
+unchanged and no synthetic managed Part was added. An isolated real-Grist
+document verified persistence and recovery. Full per-Code configuration,
+Summary costing integration, CR approvals and legacy identity migration remain
+open; see [Parts API/schema](docs/API_SCHEMA.md) and the
+[Parts entity model](docs/PARTS_ENTITY_DIAGRAM.md).
+
 To inspect the selected S1KHF workbook without writing any ODS or Grist data:
 
 ```powershell
@@ -431,6 +442,38 @@ The screens include guidance text so the utility explains what table is being fi
 - The app uses `pyexcel-ods3` for ODS read/write. It preserves sheet data, unknown columns, reordered columns, and extra columns, but it is not intended as a high-fidelity formatting engine.
 - `pandas` is included for future reporting/data analysis convenience, but the workbook workflows do not depend on dataframe-shaped data.
 - Keep a backup workflow for production costing files until your exact sheet headers and Grist fields are validated.
+
+### Managed Parts register
+
+The Parts tab stores managed Part identity, permanent number, generated name,
+metadata/alias history, revision baseline, source mappings, composition and
+purchase evidence in Safari Manufacturing Grist. Local SQLite is only a
+single-host coordinator, number reservation and retry/recovery journal. All
+app processes on the bound writer host must share `SAFARI_PART_DATABASE_PATH`
+on local disk; independent host databases and network-share allocators are not
+supported. The default `state/safari_parts.sqlite3` and its backup directory
+are ignored by Git. Back up the allocator journal with:
+
+```powershell
+.venv\Scripts\python.exe scripts\backup_part_registry.py
+```
+
+Keep allocator backups outside the checkout. Before any Safari Parts schema or
+bulk-data change, download a native `.grist` backup and verify its hash and
+SQLite integrity; the guarded schema-apply command performs this check. For a
+writer-host restore/replacement, stop Part writes, preserve the current local
+journal and Grist backup for diagnosis, and reconcile reserved numbers and
+`PartRegistryCoordinator`/`PartRegistryRequest` against Grist before writes
+resume. Never bind a fresh allocator or manually create a replacement Part
+after a timeout. The Grist coordinator rejects automatic host takeover.
+
+Schema `safari-parts-grist-2026-10-07.v8` was applied additively. Production's
+legacy ProductPart, numeric PartRevision and line ownership remain unchanged;
+no synthetic managed Part or purchase record was added. Legacy numeric
+revisions remain unclassified pending a separately reviewed compatibility
+plan. A temporary isolated Grist document was used for persistence/recovery
+verification and moved to Grist Trash afterward. See the [Parts API and schema
+contract](docs/API_SCHEMA.md) and [entity model](docs/PARTS_ENTITY_DIAGRAM.md).
 
 ### Ongoing processing workflow
 

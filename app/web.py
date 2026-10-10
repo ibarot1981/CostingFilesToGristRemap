@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import csv
+import hashlib
 import io
 from datetime import datetime
+from functools import lru_cache, wraps
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -15,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.catalog import scan_costing_file
 from app.catalog_import import import_catalog
@@ -26,6 +28,7 @@ from app.repository import AssociationConflict, AssociationProposal, GovernanceC
 from app.workbook import OdsWorkbook
 from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
 from app.libreoffice_refresh import LibreOfficeRefreshError, linked_ods_sources, refreshed_ods_copy
+from app.part_identity import PartIdentityError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +39,13 @@ DEFAULT_CATALOG_NAME = "Product-ProductModelNo-ModelCode.ods"
 app = FastAPI(title="Safari Manufacturing ERP", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4320", "http://localhost:4320"], allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
 _repository: SafariRepository | None = None
+_part_identity_registry = None
+
+
+@app.exception_handler(PartIdentityError)
+async def _part_identity_error_handler(request: Request, exc: PartIdentityError):
+    error = _part_http_error(exc)
+    return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
 
 @app.get("/api/health")
@@ -211,11 +221,12 @@ def _processing_context(path: str):
 
 
 def _part_context(path: str):
-    from app.part_mapping import PartConflict, source_groups
-    from app.milestone2 import _configured_process_lines
+    from app.part_mapping import PartConflict, MAPPING_POLICY_VERSION
     repository, file_id, association, source_hash = _processing_context(path)
     try:
-        groups = source_groups(_configured_process_lines(read_ods(_resolve_preview_workbook(path))))
+        before_hits = _cached_part_groups.cache_info().hits
+        groups = _cached_part_groups(str(_resolve_preview_workbook(path)), source_hash, MAPPING_POLICY_VERSION)
+        groups.source_cache_hit = _cached_part_groups.cache_info().hits > before_hits
     except (OSError, KeyError, ValueError, BadZipFile, ET.ParseError) as exc:
         raise _error(422, "PART_SOURCE_UNAVAILABLE", str(exc))
     if sha256_file(_resolve_preview_workbook(path)) != source_hash:
@@ -223,24 +234,796 @@ def _part_context(path: str):
     return repository, file_id, association, source_hash, groups
 
 
-@app.post("/api/parts")
-def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
-    from app.part_mapping import PartConflict, create_part
+@lru_cache(maxsize=16)
+def _cached_part_groups(workbook_path: str, source_hash: str, mapping_policy_version: str):
+    """Cache pure source extraction by exact file content and mapping policy.
+
+    The caller computes a fresh hash and association before lookup, so this
+    cache never validates a stale mapping save or substitutes cached context.
+    """
+    from app.part_mapping import source_groups, MAPPING_POLICY_VERSION
+    from app.milestone2 import _configured_process_lines, part_mapping_source_diagnostics
+    document = read_ods(Path(workbook_path))
+    groups = source_groups(_configured_process_lines(document), sheet_diagnostics=part_mapping_source_diagnostics(document))
+    groups.mapping_policy_version = mapping_policy_version
+    return groups
+
+
+def _part_registry():
+    global _part_identity_registry
+    if _part_identity_registry is None:
+        try:
+            repository = _get_repository()
+            if repository.adapter_name != "grist-safari":
+                raise _error(503, "PART_GRIST_REQUIRED", "Canonical Part writes require the configured Safari Manufacturing Grist adapter; local SQLite is not used as a business-data fallback.")
+            from app.grist_parts import GristPartRegistry
+            _part_identity_registry = GristPartRegistry(repository.client)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _error(503, "PART_DATABASE_UNAVAILABLE", "The durable Part registry could not be opened.") from exc
+    return _part_identity_registry
+
+
+def _part_registry_read_scope(endpoint):
+    """Reuse Grist table reads made by one Part read endpoint."""
+    @wraps(endpoint)
+    def wrapped(*args, **kwargs):
+        registry = _part_registry()
+        scope_factory = getattr(registry, "read_scope", None)
+        if scope_factory is None:
+            return endpoint(*args, **kwargs)
+        with scope_factory():
+            return endpoint(*args, **kwargs)
+    return wrapped
+
+
+def _part_features():
+    from app.grist_parts import GristPartFeatures, GristPartRegistry
+    registry = _part_registry()
+    if not isinstance(registry, GristPartRegistry):
+        raise _error(503, "PART_GRIST_REQUIRED", "Composition and purchased-Part records require the configured Safari Manufacturing Grist adapter.")
+    return GristPartFeatures(registry)
+
+
+def _part_baseline_service():
+    from app.part_baseline import PartBaselineService
+    return PartBaselineService(_part_registry())
+
+
+def _live_cost_service():
+    from app.live_cost import GristLiveCostService
+    return GristLiveCostService(_part_registry())
+
+
+def _legacy_part_rows(repository: SafariRepository) -> list[dict[str, Any]]:
+    if repository.adapter_name != "grist-safari":
+        return []
     try:
-        return create_part(_get_repository().part_store, name=str(payload.get("name") or ""),
-            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+        rows = repository.part_store.legacy_part_records() if hasattr(repository.part_store, "legacy_part_records") else repository.part_store.records("ProductPart")
+        rows = [row for row in rows if not row.get("fields", {}).get("StablePartId")]
+    except Exception as exc:
+        from app.part_identity import PartIdentityError
+        raise PartIdentityError("PART_LEGACY_UNAVAILABLE", "Existing Safari Parts could not be read; creation is paused to protect name uniqueness.") from exc
+    if not getattr(repository.part_store, "legacy_parts_available", getattr(repository.part_store, "available", True)):
+        from app.part_identity import PartIdentityError
+        raise PartIdentityError("PART_LEGACY_UNAVAILABLE", "The Safari ProductPart table is unavailable; creation is paused to protect name uniqueness.")
+    return rows
+
+
+def _part_registry_product_rows(registry, repository: SafariRepository):
+    """Read ProductPart once when the Grist registry and legacy view share a document."""
+    if registry.__class__.__name__ == "GristPartRegistry":
+        rows = registry._rows("ProductPart")
+        return rows, [row for row in rows if not row.get("fields", {}).get("StablePartId")]
+    return None, _legacy_part_rows(repository)
+
+
+def _part_mapping_store(repository: SafariRepository):
+    if hasattr(repository.part_store, "identity_store"):
+        return repository.part_store
+    from app.part_mapping import PartRegistryMappingStore
+    repository.part_store = PartRegistryMappingStore(repository.part_store, _part_registry())
+    return repository.part_store
+
+
+def _part_scope_warnings(repository: SafariRepository, association, part: dict[str, Any]) -> list[dict[str, str]]:
+    if not association or part.get("legacy") or not part.get("scope"):
+        return []
+    if part.get("scope") == "global":
+        return []
+    model = repository.models.get(getattr(association, "model_id", None))
+    if not model:
+        return []
+    code_ids = [item.code_id for item in repository.code_associations.values()
+                if item.active and item.association_id == association.id and item.code_id in repository.codes]
+    out_of_scope = []
+    if part["scope"] == "product":
+        product_id = model.product_id
+        if product_id != part.get("scopeTargetId"):
+            out_of_scope = code_ids
+    elif part["scope"] == "product_model":
+        if model.id != part.get("scopeTargetId"):
+            out_of_scope = code_ids
+    elif part["scope"] == "model_code":
+        out_of_scope = [code_id for code_id in code_ids if code_id != part.get("scopeTargetId")]
+    return [{"id": code_id, "code": repository.codes[code_id].code} for code_id in out_of_scope]
+
+
+def _scope_target(repository: SafariRepository, scope: str, target_id: str) -> dict[str, str]:
+    if scope not in {"global", "product", "product_model", "model_code"}:
+        raise _error(422, "PART_SCOPE_INVALID", "Choose Global, Product, Product Model or Model Code sharing scope.", {"retryDisposition": "safe_to_edit"})
+    if scope == "global":
+        if target_id != "global":
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Global scope must use its maintained global target.", {"retryDisposition": "safe_to_edit"})
+        return {"id": "global", "label": "Safari Manufacturing"}
+    if scope == "product":
+        item = repository.products.get(str(target_id))
+        if not item or not item.active:
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product from Safari Manufacturing.", {"retryDisposition": "safe_to_edit"})
+        return {"id": item.id, "label": item.name}
+    if scope == "product_model":
+        item = repository.models.get(str(target_id))
+        product = repository.products.get(item.product_id) if item else None
+        if not item or not item.active or not product or not product.active:
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product Model and its active Product.", {"retryDisposition": "safe_to_edit"})
+        return {"id": item.id, "label": " ".join(value for value in [item.model_number, item.name] if value).strip()}
+    item = repository.codes.get(str(target_id))
+    model = repository.models.get(item.model_id) if item else None
+    product = repository.products.get(model.product_id) if model else None
+    if not item or not item.active or item.legacy_spares_only or not model or not model.active or not product or not product.active:
+        raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Model Code under an active Product Model and Product.", {"retryDisposition": "safe_to_edit"})
+    return {"id": item.id, "label": item.code}
+
+
+def _part_scope_targets() -> dict[str, Any]:
+    repository = _get_repository()
+    registry = _part_registry()
+    stored = {(item["scope_type"], item["target_id"]): item["shortcode"] for item in registry.shortcodes()}
+    products = [{"id": item.id, "label": item.name, "shortcode": stored.get(("product", item.id)), "active": item.active}
+                for item in repository.products.values() if item.active]
+    models = [{"id": item.id, "parentId": item.product_id,
+               "label": " ".join(value for value in [item.model_number, item.name] if value).strip(),
+               "shortcode": stored.get(("product_model", item.id)), "active": item.active}
+              for item in repository.models.values() if item.active and item.product_id in repository.products and repository.products[item.product_id].active]
+    codes = [{"id": item.id, "parentId": item.model_id, "label": item.code,
+              "shortcode": stored.get(("model_code", item.id)), "active": item.active}
+             for item in repository.codes.values() if item.active and not item.legacy_spares_only and item.model_id in repository.models
+             and repository.models[item.model_id].active and repository.models[item.model_id].product_id in repository.products
+             and repository.products[repository.models[item.model_id].product_id].active]
+    return {"scopes": [
+        {"id": "global", "label": "Global", "target": {"id": "global", "label": "Safari Manufacturing", "shortcode": stored.get(("global", "global"))}},
+        {"id": "product", "label": "Product", "targets": products},
+        {"id": "product_model", "label": "Product Model", "targets": models},
+        {"id": "model_code", "label": "Model Code", "targets": codes},
+    ]}
+
+
+def _legacy_part_payloads(repository: SafariRepository, rows: list[dict[str, Any]], query: str = "", *, revision_rows=None) -> list[dict[str, Any]]:
+    from app.part_identity import normalized_name
+    revisions: dict[str, set[str]] = {}
+    if repository.adapter_name == "grist-safari":
+        try:
+            for revision in (revision_rows if revision_rows is not None else repository.client.fetch_table_records_with_ids("PartRevision")):
+                fields = revision.get("fields", {})
+                reference = fields.get("ProductPart")
+                if isinstance(reference, list) and len(reference) > 2 and reference[0] == "R":
+                    part_id = str(reference[2])
+                elif isinstance(reference, int):
+                    part_id = str(reference)
+                else:
+                    continue
+                value = fields.get("Revision")
+                revisions.setdefault(part_id, set()).add(str(value))
+        except Exception:
+            revisions = {}
+    search_key = normalized_name(query)
+    result = []
+    for row in rows:
+        fields = row.get("fields", {})
+        name = str(fields.get("DisplayName") or "")
+        name_key = normalized_name(name)
+        search_text = normalized_name(str(name) + " " + str(row.get("id")) + " " + str(fields.get("PartKey") or ""))
+        if search_key and search_key not in search_text:
+            continue
+        result.append({"id": f"legacy:{row.get('id')}", "legacyRecordId": str(row.get("id")),
+            "partNumber": None, "name": name, "description": name, "variant": "", "scope": "legacy",
+            "scopeTargetId": None, "scopeTarget": "Legacy record", "engineeringRevision": None,
+            "legacyRevisionValues": sorted(revisions.get(str(row.get("id")), set())),
+            "status": str(fields.get("Status") or "legacy"), "metadataVersion": None,
+            "aliases": [], "partKey": fields.get("PartKey"), "legacy": True,
+            "ambiguousName": sum(1 for other in rows if normalized_name(str(other.get("fields", {}).get("DisplayName") or "")) == name_key) > 1})
+    return result
+
+
+def _part_http_error(exc) -> HTTPException:
+    status = 404 if exc.code == "PART_NOT_FOUND" else 503 if exc.code in {"PART_DATABASE_UNAVAILABLE", "PART_DATABASE_UNSUPPORTED", "PART_LEGACY_UNAVAILABLE", "PART_SCHEMA_UNAVAILABLE", "PART_BASELINE_SCHEMA_REQUIRED", "PART_COORDINATOR_UNBOUND", "PART_WRITE_UNCONFIRMED", "PART_COORDINATOR_UNCONFIRMED", "PART_GRIST_REQUIRED", "PART_CREATED_SHARING_PENDING"} else 422 if exc.code.endswith(("INVALID", "REQUIRED", "LOCKED", "INACTIVE")) else 409
+    refresh_codes = {
+        "PART_BASELINE_STALE", "PART_BASELINE_EXISTS", "PART_BASELINE_RECOVERY_BLOCKED", "PART_BASELINE_JOIN_CONFIRMATION_REQUIRED",
+        "PART_BASELINE_REQUIREMENTS_INCOMPLETE", "PART_BASELINE_NOT_ESTABLISHED",
+        "PART_COMPARISON_EVIDENCE_INVALID", "PART_COMPARISON_STALE", "PART_COMPARISON_NOT_FOUND",
+    }
+    safe_codes = {
+        "PART_BASELINE_INPUT_REQUIRED", "PART_REVISION_LOCKED", "PART_BASELINE_INCOMPLETE",
+        "PART_COMPARISON_INPUT_REQUIRED",
+        "PART_DECISION_INPUT_INVALID", "PART_DECISION_REASON_REQUIRED", "PART_DECISION_ALREADY_RESOLVED",
+        "PART_CHANGE_PROPOSAL_INCOMPLETE", "PART_REPLACEMENT_REQUIRED", "PART_SELECTION_INVALID",
+        "PART_REPLACEMENT_SOURCE_REQUIRED", "PART_MATCH_INPUT_INVALID", "PART_MATCH_CANDIDATE_INVALID",
+        "PART_MATCH_CANDIDATE_ALREADY_USED", "PART_MATCH_SOURCE_ALREADY_USED",
+        # These are emitted by Part creation/name/intended-code validation before
+        # the Grist reservation or canonical Part publication begins. Unknown
+        # errors and failures after reservation stay retry_same_request.
+        "PART_SCOPE_TARGET_INVALID", "PART_INPUT_INVALID", "PART_INPUT_REQUIRED", "PART_SHORTCODE_REQUIRED",
+        "PART_SHORTCODE_INVALID", "PART_SHORTCODE_CONFLICT", "PART_NAME_PREVIEW_STALE", "PART_NAME_EXISTS", "PART_REVISION_LOCKED",
+        "PART_INTENDED_CODES_INVALID", "PART_INTENDED_CONTEXT_INVALID", "PART_INTENDED_CODE_INACTIVE",
+        "PART_INTENDED_SHARING_REQUIRES_GRIST",
+    }
+    disposition = "refresh_required" if exc.code in refresh_codes else "safe_to_edit" if exc.code in safe_codes else "retry_same_request"
+    return _error(status, exc.code, str(exc), {"retryDisposition": disposition})
+
+
+@app.get("/api/parts")
+@_part_registry_read_scope
+def parts_register(search: str = "", scope: str = "", target_id: str = "", include_retired: bool = True) -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    repository = _get_repository()
+    registry = _part_registry()
+    try:
+        product_rows, legacy = _part_registry_product_rows(registry, repository)
+        if product_rows is not None:
+            # list_parts and the legacy display can share the full identity read.
+            revision_rows = registry._rows("PartRevision")
+        else:
+            revision_rows = None
+        registry.sync_legacy_names(legacy)
+        list_arguments = {"search": search, "scope_type": scope, "target_id": target_id, "include_retired": include_retired}
+        if registry.__class__.__name__ == "GristPartRegistry":
+            list_arguments["source_rows"] = product_rows
+        return {"items": registry.list_parts(**list_arguments),
+                "legacyItems": _legacy_part_payloads(repository, legacy, search, revision_rows=revision_rows),
+                "storage": "Grist Safari Manufacturing" if repository.adapter_name == "grist-safari" else "in-memory local preview",
+                "schemaAvailable": True}
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.get("/api/parts/scope-targets")
+@_part_registry_read_scope
+def part_scope_targets() -> dict[str, Any]:
+    return _part_scope_targets()
+
+
+@app.get("/api/parts/preview")
+@_part_registry_read_scope
+def part_name_preview(scope: str, target_id: str, description: str, variant: str = "", exclude_id: str = "") -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    repository = _get_repository()
+    target = _scope_target(repository, scope, target_id)
+    registry = _part_registry()
+    _, legacy = _part_registry_product_rows(registry, repository)
+    registry.sync_legacy_names(legacy)
+    try:
+        result = registry.preview(scope_type=scope, target_id=target_id, description=description, variant=variant, exclude_part_id=exclude_id)
+        result["targetLabel"] = target["label"]
+        return result
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.get("/api/parts/search")
+@_part_registry_read_scope
+def part_search(query: str = "", offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100), path: str = "") -> dict[str, Any]:
+    """Bounded canonical Part lookup for Part Mapping and other pickers."""
+    from app.part_mapping import PartConflict, search_parts
+    repository = _get_repository()
+    try:
+        store = _part_mapping_store(repository)
+        page = search_parts(store, query=query, offset=offset, limit=limit)
+        if path:
+            try:
+                association = repository.current_association(f"file:{path.casefold()}")
+            except Exception:
+                association = None
+            for part in page["items"]:
+                part["outOfScopeCodes"] = _part_scope_warnings(repository, association, part)
+        return page
     except PartConflict as exc:
         raise _error(409, exc.code, str(exc))
+    except GristError as exc:
+        raise _error(503, "PART_DATABASE_UNAVAILABLE", "Canonical Part search could not read Safari Manufacturing Grist.") from exc
+
+
+@app.post("/api/parts/shortcodes")
+def maintain_part_shortcode(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    scope = str(payload.get("scope") or "")
+    target_id = str(payload.get("targetId") or "")
+    target = _scope_target(_get_repository(), scope, target_id)
+    try:
+        return _part_registry().set_shortcode(scope_type=scope, target_id=target_id, target_label=target["label"],
+            shortcode=str(payload.get("shortcode") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+            request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.post("/api/parts")
+def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.part_identity import PartIdentityError
+    repository = _get_repository()
+    scope = str(payload.get("scope") or "")
+    target_id = str(payload.get("targetId") or "")
+    try:
+        registry = _part_registry()
+        recovery = registry.prepare_create_recovery(idempotency_key or "", payload) if hasattr(registry, "prepare_create_recovery") else None
+        if recovery:
+            # Resolve an already reserved request from its immutable Grist/SQLite
+            # evidence before consulting mutable Products, Models or Model Codes.
+            # This keeps stale current validation from releasing a prior write.
+            scope = str(recovery.get("scopeType") or scope)
+            target_id = str(recovery.get("targetId") or target_id)
+            target = {"id": target_id, "label": str(recovery.get("targetLabel") or "")}
+        else:
+            target = _scope_target(repository, scope, target_id)
+            legacy = _legacy_part_rows(repository)
+            registry.sync_legacy_names(legacy)
+        actor = _request_actor(request)
+        reason = str(payload.get("reason") or "")
+        code_ids = payload.get("intendedModelCodeIds", [])
+        product_id = payload.get("selectedProductId")
+        model_id = payload.get("selectedProductModelId")
+        if not isinstance(code_ids, list):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Codes must be submitted as a list.")
+        if not recovery and hasattr(registry, "validate_intended_model_codes"):
+            registry.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
+        elif not recovery and code_ids:
+            raise PartIdentityError("PART_INTENDED_SHARING_REQUIRES_GRIST", "Intended sharing can be saved only when Safari Manufacturing Grist is the active Part store.")
+        create_arguments = dict(scope_type=scope, target_id=target_id, target_label=target["label"],
+            description=str(payload.get("description") or ""), variant=str(payload.get("variant") or ""),
+            expected_name=str(payload.get("expectedName") or ""), actor=actor,
+            reason=reason, request_key=idempotency_key or "",
+            revision_assertion=payload.get("engineeringRevision", payload.get("revision")))
+        if hasattr(registry, "prepare_create_recovery"):
+            create_arguments["request_payload"] = payload
+        result = registry.create_part(**create_arguments)
+        if code_ids:
+            sharing_key = "part-create-intended:" + hashlib.sha256(str(idempotency_key or "").encode()).hexdigest()
+            try:
+                result["intendedSharing"] = registry.save_intended_sharing(part_id=result["part"]["id"], code_ids=code_ids,
+                    expected_version=0, actor=actor, reason=reason, request_key=sharing_key,
+                    product_id=product_id, model_id=model_id)
+            except PartIdentityError as exc:
+                if exc.code == "PART_REQUEST_CONFLICT":
+                    raise
+                raise PartIdentityError("PART_CREATED_SHARING_PENDING",
+                    f"Part {result['part']['partNumber']} ({result['part']['id']}) is saved. Intended sharing is still pending; retry this same Save so it can resume without creating another Part.") from exc
+            except Exception as exc:
+                raise PartIdentityError("PART_CREATED_SHARING_PENDING",
+                    f"Part {result['part']['partNumber']} ({result['part']['id']}) is saved. Intended sharing is still pending; retry this same Save so it can resume without creating another Part.") from exc
+        return result
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.post("/api/parts/{part_id}/metadata")
+def update_part_metadata(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    scope = str(payload.get("scope") or "")
+    target_id = str(payload.get("targetId") or "")
+    target = _scope_target(_get_repository(), scope, target_id)
+    expected_version = payload.get("expectedVersion")
+    if type(expected_version) is not int:
+        raise _error(422, "PART_METADATA_VERSION_REQUIRED", "Reload the Part and include its current metadata version.")
+    try:
+        return _part_registry().update_metadata(part_id=part_id, scope_type=scope, target_id=target_id,
+            target_label=target["label"], description=str(payload.get("description") or ""), variant=str(payload.get("variant") or ""),
+            expected_version=expected_version, expected_name=str(payload.get("expectedName") or ""), actor=_request_actor(request),
+            expected_usage_fingerprint=str(payload.get("expectedUsageFingerprint") or ""),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.get("/api/parts/{part_id}/metadata-preview")
+@_part_registry_read_scope
+def part_metadata_preview(part_id: str, scope: str, target_id: str, description: str, variant: str = "") -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    repository = _get_repository()
+    target = _scope_target(repository, scope, target_id)
+    registry = _part_registry()
+    _, legacy = _part_registry_product_rows(registry, repository)
+    registry.sync_legacy_names(legacy)
+    part = registry.get_part(part_id)
+    if not part:
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    try:
+        name = registry.preview(scope_type=scope, target_id=target_id, description=description, variant=variant, exclude_part_id=part_id)
+        usage = registry.usage_evidence(part_id)
+        return {"before": {"scope": part["scope"], "targetId": part["scopeTargetId"], "target": part["scopeTarget"], "name": part["name"]},
+                "after": {"scope": scope, "targetId": target_id, "target": target["label"], "name": name["name"]},
+                "available": name["available"], "collision": name["collision"],
+                "affectedSourceAssignments": usage["items"], "usageFingerprint": usage["fingerprint"],
+                "partNumber": part["partNumber"], "engineeringRevision": "A"}
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.post("/api/parts/{part_id}/retire")
+def retire_part(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    from app.part_identity import PartIdentityError
+    expected_version = payload.get("expectedVersion")
+    if type(expected_version) is not int:
+        raise _error(422, "PART_METADATA_VERSION_REQUIRED", "Reload the Part and include its current metadata version.")
+    try:
+        return _part_registry().retire_part(part_id=part_id, expected_version=expected_version, actor=_request_actor(request),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
 
 
 @app.get("/api/parts/mappings")
+@_part_registry_read_scope
 def part_mappings(path: str):
     from app.part_mapping import PartConflict, mapping_detail
     try:
         repository, file_id, association, source_hash, groups = _part_context(path)
-        return mapping_detail(repository.part_store, file_id=file_id, source_hash=source_hash, association=association, groups=groups)
+        detail = mapping_detail(_part_mapping_store(repository), file_id=file_id, source_hash=source_hash, association=association, groups=groups)
+        warnings = {part["id"]: _part_scope_warnings(repository, association, part) for part in detail["parts"]}
+        for part in detail["parts"]:
+            part["outOfScopeCodes"] = warnings[part["id"]]
+        for group in detail["groups"]:
+            if group["part"]:
+                group["part"]["outOfScopeCodes"] = warnings.get(group["part"]["id"], [])
+        detail["scopeAdvisoryOnly"] = True
+        detail["sourceEvidenceCacheHit"] = bool(getattr(groups, "source_cache_hit", False))
+        return detail
     except PartConflict as exc:
         raise _error(409, exc.code, str(exc))
+
+
+@app.get("/api/parts/{part_id}")
+@_part_registry_read_scope
+def part_details(part_id: str) -> dict[str, Any]:
+    repository = _get_repository()
+    part = _part_registry().get_part(part_id)
+    if part:
+        registry = _part_registry()
+        if hasattr(registry, "history"):
+            history = registry.history(part_id)
+            part["metadataHistory"] = [{"part_id": part_id, "version": item.get("Version"), "display_name": item.get("DisplayName"),
+                "scope_type": item.get("ScopeType"), "target_label": item.get("ScopeTargetLabel"), "shortcode": item.get("Shortcode"),
+                "occurred_at": item.get("OccurredAt"), "description": item.get("Description"), "variant": item.get("DesignVariant"),
+                "actor": item.get("Actor"), "reason": item.get("Reason")} for item in history["metadata"]]
+            part["aliasHistory"] = history["aliases"]
+            part["revisionHistory"] = history["revisions"]
+            part["lifecycleHistory"] = [{"event_id": item.get("RequestKey"), "event_type": item.get("EventType"), "status": "recorded",
+                "occurred_at": item.get("OccurredAt"), "actor": item.get("Actor"), "reason": item.get("Reason")} for item in history["lifecycle"]]
+            part["mappingHistory"] = history["mappings"]
+        else:
+            history = {}
+        part.setdefault("mappingHistory", [])
+        mapped_sources = [{"name": f"{item['SheetName']} · row {item['SourceRow']}", "sheet": item["SheetName"],
+            "row": item["SourceRow"], "description": item["SourceDescription"], "sourceHash": item["SourceHash"],
+            "associationVersion": item["AssociationVersion"], "mappingVersion": item["Version"],
+            "actor": item.get("Actor"), "reason": item.get("Reason"), "occurredAt": item.get("OccurredAt")} for item in part["mappingHistory"]]
+        if registry.__class__.__name__ == "GristPartRegistry":
+            features = _part_features()
+            process_lines = features.process_lines(part_id)
+            components = features.components(part_id)
+            drawings = features.drawings(part_id)
+            purchases = features.purchase_detail(part_id)
+            intended_sharing = registry.intended_sharing(part_id)
+            used_in = _live_cost_service().part_usage(part_id)
+            part["compositionStatus"] = part.get("revisionStatus") or "draft"
+            try:
+                manufacturing_baseline = _part_baseline_service().baseline_detail(part_id)
+            except PartIdentityError as exc:
+                if exc.code != "PART_BASELINE_SCHEMA_REQUIRED":
+                    raise
+                manufacturing_baseline = {"status": "schema_required", "message": str(exc), "baseline": None, "families": [], "requirements": []}
+        else:
+            process_lines = {"status": "partial" if mapped_sources else "unavailable", "items": mapped_sources,
+                "message": "Process line requirements are not pinned to stable Parts in this local preview."}
+            components, drawings, purchases = [], [], {"specifications": [], "purchaseHistoryAvailable": False, "message": "Purchase capture requires Safari Grist."}
+            intended_sharing = {"status": "unavailable", "version": 0, "items": [], "history": []}
+            used_in = {"status": "unavailable", "coverage": "none", "items": [], "message": "Current configuration usage requires Safari Grist."}
+        return {"part": part, "mappingHistory": part["mappingHistory"],
+                "manufacturingBaseline": manufacturing_baseline if registry.__class__.__name__ == "GristPartRegistry" else {"status": "unavailable", "baseline": None, "families": [], "requirements": []},
+                "processLines": process_lines,
+                "components": {"status": "available", "items": components, "message": "No component Parts are linked." if not components else None},
+                "purchases": purchases,
+                "intendedSharing": intended_sharing,
+                "drawings": {"status": "available" if drawings else "empty", "items": drawings, "message": "No drawings are linked to this revision." if not drawings else None},
+                "usedIn": used_in}
+    if part_id.startswith("legacy:") and repository.adapter_name == "grist-safari":
+        record_id = part_id.split(":", 1)[1]
+        rows = _legacy_part_rows(repository)
+        row = next((item for item in rows if str(item.get("id")) == record_id), None)
+        if row:
+            legacy = _legacy_part_payloads(repository, [row])
+        return {"part": legacy[0], "processLines": {"status": "unavailable", "items": [], "message": "Legacy line references are retained in Grist and have not been migrated."},
+                    "drawings": {"status": "unavailable", "items": [], "message": "Legacy drawing references have not been reconciled."},
+                    "usedIn": {"status": "unavailable", "items": [], "message": "Legacy configurations have not been reconciled."}}
+    raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+
+
+@app.get("/api/parts/{part_id}/manufacturing-baseline/review")
+@_part_registry_read_scope
+def review_part_manufacturing_baseline(part_id: str, path: str):
+    repository, file_id, association, source_hash, groups = _part_context(path)
+    if not association:
+        raise _error(409, "PART_BASELINE_ASSOCIATION_REQUIRED", "Save a Product Model association before reviewing this workbook for a Part baseline.")
+    try:
+        result = _part_baseline_service().review(part_id=part_id, file_id=file_id, workbook_path=path,
+            source_hash=source_hash, association=association, groups=groups, mapping_store=_part_mapping_store(repository))
+        result["source"]["sourceEvidenceCacheHit"] = bool(getattr(groups, "source_cache_hit", False))
+        return result
+    except PartIdentityError:
+        raise
+
+
+def _baseline_write_context(part_id: str, request: Request, payload: dict[str, Any], operation: str, idempotency_key: str | None):
+    from app.processing import processing_detail
+    path = str(payload.get("path") or "")
+    repository, file_id, association, source_hash, groups = _part_context(path)
+    if not association:
+        raise _error(409, "PART_BASELINE_ASSOCIATION_REQUIRED", "Save a Product Model association before processing Part manufacturing requirements.")
+    source = {"sourceHash": source_hash, "associationKey": association.id, "associationVersion": association.version}
+    def verify_current():
+        fresh_repo, fresh_id, fresh_association, fresh_hash = _processing_context(path)
+        if (fresh_id != file_id or fresh_hash != source_hash or not fresh_association
+                or (fresh_association.id, fresh_association.version) != (association.id, association.version)):
+            raise PartIdentityError("PART_BASELINE_STALE", "The workbook or Product Model association changed while Part requirements were being processed.")
+        state = processing_detail(fresh_repo.processing_store, file_id, fresh_association, fresh_hash)
+        if state.get("state") == "stale":
+            raise PartIdentityError("PART_BASELINE_STALE", "Workbook processing evidence is stale; reload and review the current source before continuing.")
+    arguments = {"part_id": part_id, "file_id": file_id, "workbook_name": Path(_resolve_preview_workbook(path)).name,
+        "workbook_path": path, "source_hash": source_hash, "association": association, "groups": groups,
+        "mapping_store": _part_mapping_store(repository), "source_families": payload.get("sourceFamilies"),
+        "actor": _request_actor(request), "reason": str(payload.get("reason") or ""),
+        "request_key": idempotency_key or "", "expected_hash": str(payload.get("expectedHash") or ""),
+        "expected_association": str(payload.get("expectedAssociationKey") or ""),
+        "expected_association_version": payload.get("expectedAssociationVersion"),
+        "expected_mapping_version": payload.get("expectedMappingVersion"), "before_write": verify_current}
+    if type(arguments["expected_association_version"]) is not int or type(arguments["expected_mapping_version"]) is not int:
+        raise _error(422, "PART_BASELINE_INPUT_REQUIRED", "Reload the source-family review and include its current association and mapping versions.")
+    service = _part_baseline_service()
+    if operation == "establish":
+        arguments["append_existing"] = bool(payload.get("appendExisting", False))
+        return service.establish(**arguments)
+    return service.compare(**arguments)
+
+
+@app.post("/api/parts/{part_id}/manufacturing-baseline/establish")
+def establish_part_manufacturing_baseline(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _baseline_write_context(part_id, request, payload, "establish", idempotency_key)
+
+
+@app.post("/api/parts/{part_id}/manufacturing-baseline/compare")
+def compare_part_manufacturing_baseline(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _baseline_write_context(part_id, request, payload, "compare", idempotency_key)
+
+
+@app.get("/api/parts/manufacturing-comparisons/{comparison_key}")
+@_part_registry_read_scope
+def get_part_manufacturing_comparison(comparison_key: str):
+    return _part_baseline_service().get_comparison(comparison_key)
+
+
+@app.post("/api/parts/manufacturing-comparisons/{comparison_key}/decisions")
+def decide_part_manufacturing_comparison(comparison_key: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    service = _part_baseline_service()
+    replacement_id = str(payload.get("replacementPartId") or "")
+    comparison = service.get_comparison(comparison_key)["comparison"]
+    path = str(payload.get("path") or "")
+
+    def verify_current_decision_evidence():
+        from app.part_mapping import mapping_detail
+        stored_path = str(comparison.get("WorkbookPath") or "")
+        if (not path or not stored_path
+                or os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(stored_path))):
+            raise PartIdentityError("PART_COMPARISON_STALE", "This decision belongs to a different workbook path. Reopen the saved comparison and review current evidence.")
+        try:
+            repository, file_id, association, source_hash, groups = _part_context(path)
+            if not association:
+                raise PartIdentityError("PART_COMPARISON_STALE", "The workbook no longer has its saved Product Model association. Recompare after restoring the association.")
+            mapping = mapping_detail(_part_mapping_store(repository), file_id=file_id, source_hash=source_hash,
+                association=association, groups=groups, refresh_parts=True)
+            return {"fileId": file_id, "sourceHash": source_hash, "association": association, "mapping": mapping}
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict):
+                exc.detail.setdefault("retryDisposition", "refresh_required")
+            raise
+
+    return service.decide(comparison_key=comparison_key, action=str(payload.get("action") or ""),
+        difference_keys=payload.get("differenceKeys") if isinstance(payload.get("differenceKeys"), list) else [],
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), old_data=bool(payload.get("oldData")),
+        replacement_part_id=replacement_id, baseline_requirement_key=str(payload.get("baselineRequirementKey") or ""),
+        request_key=idempotency_key or "", request_payload=payload,
+        before_write=verify_current_decision_evidence)
+
+
+@app.get("/api/parts/{part_id}/composition")
+def part_composition(part_id: str):
+    return {"items": _part_features().components(part_id)}
+
+
+@app.put("/api/parts/{part_id}/intended-sharing")
+def save_part_intended_sharing(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.part_identity import PartIdentityError
+    registry = _part_registry()
+    if not hasattr(registry, "save_intended_sharing"):
+        raise _error(503, "PART_INTENDED_SHARING_REQUIRES_GRIST", "Intended sharing can be saved only when Safari Manufacturing Grist is the active Part store.")
+    try:
+        return registry.save_intended_sharing(part_id=part_id, code_ids=payload.get("intendedModelCodeIds", []),
+            expected_version=payload.get("expectedVersion"), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+            request_key=idempotency_key or "", product_id=payload.get("selectedProductId"), model_id=payload.get("selectedProductModelId"))
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
+@app.post("/api/parts/{part_id}/components")
+def add_part_component(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_component(parent_part_id=part_id, child_part_id=str(payload.get("childPartId") or ""),
+        quantity=payload.get("quantity"), uom=str(payload.get("uom") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+        request_key=idempotency_key or "", sourcing_route=str(payload.get("sourcingRoute") or "auto"))
+
+
+@app.post("/api/parts/{part_id}/finalize-revision")
+def finalize_part_revision(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().finalize_revision(part_id=part_id, actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/process-lines")
+def link_part_process_line(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().link_process_line(part_id=part_id, line_master_id=int(payload.get("lineMasterId") or 0),
+        line_revision_id=int(payload.get("lineRevisionId") or 0), quantity=payload.get("quantity", 1), uom=str(payload.get("uom") or "each"),
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+        reassign_owner=bool(payload.get("reassignOwner")), expected_owner_id=payload.get("expectedOwnerId"))
+
+
+@app.get("/api/part-line-candidates")
+def part_line_candidates(search: str = ""):
+    return {"items": _part_features().line_candidates(search)}
+
+
+@app.post("/api/parts/{part_id}/drawings")
+def add_part_drawing(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_drawing(part_id=part_id, identity=str(payload.get("identity") or ""), link_type=str(payload.get("linkType") or ""),
+        file_path=str(payload.get("filePath") or ""), external_url=str(payload.get("externalUrl") or ""), file_version=str(payload.get("fileVersion") or ""),
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.get("/api/parts/drawings/{drawing_key}/open")
+def open_part_drawing(drawing_key: str):
+    features = _part_features()
+    rows = features.registry._rows("PartDrawing")
+    row = next((item for item in rows if str(item.get("fields", {}).get("DrawingKey") or "") == drawing_key), None)
+    if not row or row.get("fields", {}).get("LinkType") != "local_file":
+        raise _error(404, "PART_DRAWING_NOT_FOUND", "The local drawing link was not found.")
+    root_value = os.getenv("SAFARI_DRAWINGS_ROOT", "").strip()
+    if not root_value:
+        raise _error(503, "PART_DRAWINGS_ROOT_UNCONFIGURED", "Local drawing preview is unavailable because the approved drawings root is not configured.")
+    try:
+        root = Path(root_value).resolve(strict=True)
+        raw_path = Path(str(row.get("fields", {}).get("FilePath") or ""))
+        resolved = (root / raw_path).resolve(strict=True) if not raw_path.is_absolute() else raw_path.resolve(strict=True)
+        resolved.relative_to(root)
+        if not resolved.is_file() or resolved.suffix.casefold() not in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+            raise ValueError("Unsupported preview file")
+    except (OSError, ValueError):
+        raise _error(404, "PART_DRAWING_NOT_FOUND", "The drawing file is missing or outside the configured drawings root.")
+    return FileResponse(resolved, filename=resolved.name, content_disposition_type="inline")
+
+
+@app.post("/api/parts/{part_id}/vendors")
+def create_part_vendor(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    if not _part_registry().get_part(part_id):
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    return _part_features().create_vendor(name=str(payload.get("name") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications")
+def create_purchase_specification(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().create_purchase_specification(part_id=part_id, code=str(payload.get("code") or ""), manufacturer=str(payload.get("manufacturer") or ""),
+        manufacturer_part_number=str(payload.get("manufacturerPartNumber") or ""), description=str(payload.get("description") or ""),
+        costing_uom=str(payload.get("costingUOM") or ""), currency=str(payload.get("currency") or ""),
+        purchase_item_id=int(payload["purchaseItemId"]) if payload.get("purchaseItemId") not in (None, "") else None,
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/vendor-mappings")
+def create_vendor_part_mapping(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    if not _part_registry().get_part(part_id):
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    return _part_features().create_vendor_mapping(specification_id=int(payload.get("specificationId") or 0), vendor_id=int(payload.get("vendorId") or 0),
+        sku=str(payload.get("sku") or ""), description=str(payload.get("description") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchases")
+def record_part_purchase(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().capture_purchase(part_id=part_id, specification_id=int(payload.get("specificationId") or 0), mapping_id=int(payload.get("vendorMappingId") or 0),
+        transaction_key=str(payload.get("transactionKey") or ""), transaction_line_key=str(payload.get("transactionLineKey") or ""),
+        record_type=str(payload.get("recordType") or "actual_purchase"), status=str(payload.get("status") or "posted"),
+        transaction_at=str(payload.get("transactionAt") or ""), document_reference=str(payload.get("documentReference") or ""),
+        quantity=payload.get("quantity"), quantity_uom=str(payload.get("quantityUOM") or ""), currency=str(payload.get("currency") or ""),
+        extended_amount=payload.get("extendedAmount"), discount_amount=payload.get("discountAmount", 0), tax_amount=payload.get("taxAmount", 0),
+        freight_amount=payload.get("freightAmount", 0), other_charges=payload.get("otherCharges", 0), actor=_request_actor(request), reason=str(payload.get("reason") or ""),
+        request_key=idempotency_key or "", reverses_record_id=int(payload["reversesRecordId"]) if payload.get("reversesRecordId") else None,
+        supersedes_record_key=str(payload.get("supersedesRecordKey") or ""))
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications/{specification_id}/unit-conversions")
+def add_purchase_unit_conversion(part_id: str, specification_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_unit_conversion(specification_id=specification_id, from_uom=str(payload.get("fromUOM") or ""), to_uom=str(payload.get("toUOM") or ""),
+        factor=payload.get("factor"), evidence=str(payload.get("evidence") or ""), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/purchase-specifications/{specification_id}/currency-conversions")
+def add_purchase_currency_conversion(part_id: str, specification_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_features().add_currency_conversion(specification_id=specification_id, from_currency=str(payload.get("fromCurrency") or ""), to_currency=str(payload.get("toCurrency") or ""),
+        rate=payload.get("rate"), rate_date=str(payload.get("rateDate") or ""), evidence=str(payload.get("evidence") or ""), actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.get("/api/parts/{part_id}/purchase-rate")
+def part_purchase_rate(part_id: str, as_of: str = ""):
+    return _part_features().purchase_detail(part_id, as_of=as_of or None)
+
+
+@app.get("/api/model-codes/{code_id}/costing-configuration")
+def model_code_costing_configuration(code_id: str):
+    return _live_cost_service().get_configuration(code_id)
+
+
+@app.put("/api/model-codes/{code_id}/costing-configuration")
+def save_model_code_costing_configuration(code_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().save_configuration(code_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.get("/api/model-codes/{code_id}/live-cost")
+def model_code_live_cost(code_id: str):
+    return _live_cost_service().live_cost(code_id)
+
+
+@app.get("/api/model-codes/{code_id}/cost-snapshots")
+def model_code_cost_snapshots(code_id: str, offset: int = 0, limit: int = 25):
+    return _live_cost_service().snapshot_history(code_id, offset=offset, limit=limit)
+
+
+@app.post("/api/model-codes/{code_id}/cost-snapshots")
+def save_model_code_cost_snapshot(code_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().save_snapshot(code_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.post("/api/model-codes/{code_id}/cost-comparisons")
+def compare_model_code_cost(code_id: str, payload: dict[str, Any] = Body(...)):
+    return _live_cost_service().compare(code_id, payload)
+
+
+@app.get("/api/model-codes/{code_id}/cost-policy")
+def model_code_cost_policy(code_id: str):
+    return _live_cost_service().policy_state(code_id)
+
+
+@app.put("/api/cost-snapshot-policies/{scope_type}")
+def save_cost_snapshot_policy(scope_type: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().set_policy(scope_type, payload.get("scopeId"), payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.post("/api/line-masters/{line_master_id}/process-rates")
+def record_process_rate(line_master_id: int, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _live_cost_service().record_process_rate(line_master_id, payload, actor=_request_actor(request), request_key=idempotency_key or "")
+
+
+@app.get("/api/cost-snapshots/{snapshot_key}")
+def get_cost_snapshot(snapshot_key: str, offset: int = 0, limit: int = 100):
+    return _live_cost_service().get_snapshot(snapshot_key, offset=offset, limit=limit)
+
+
+@app.post("/api/parts/{part_id}/purchase-rate-evidence")
+def save_part_purchase_rate_evidence(part_id: str, payload: dict[str, Any] = Body(...)):
+    raise _error(410, "SNAPSHOT_REQUIRED", "Purchase rate evidence is no longer written from a cost-run selection. Resolve the rate through the read-only purchase-rate endpoint, then use Save Cost Snapshot to persist frozen evidence.")
 
 
 @app.post("/api/parts/mappings")
@@ -250,8 +1033,11 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
     version = payload.get("expectedVersion")
     association_version = payload.get("expectedAssociationVersion")
     decisions = payload.get("decisions")
+    group_reasons = payload.get("reasons", {})
     if (type(version) is not int or type(association_version) is not int or not isinstance(decisions, dict)
-            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in decisions.items())):
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in decisions.items())
+            or not isinstance(group_reasons, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in group_reasons.items())):
         raise _error(422, "PART_REVIEW_INPUT_INVALID", "Mapping versions and selected Parts are required")
     path = str(payload.get("path") or "")
     try:
@@ -264,11 +1050,13 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
             state = processing_detail(fresh_repo.processing_store, file_id, fresh_association, fresh_hash)
             if state["state"] == "processed":
                 raise PartConflict("PART_REOPEN_REQUIRED", "Record Changes Pending before revising Parts for a processed file")
-        return save_mapping(repository.part_store, file_id=file_id, source_hash=source_hash, association=association,
+        store = _part_mapping_store(repository) if repository.adapter_name == "grist-safari" or any(not value.isdigit() for value in decisions.values()) else repository.part_store
+        return save_mapping(store, file_id=file_id, source_hash=source_hash, association=association,
             groups=groups, decisions=decisions, expected_hash=str(payload.get("expectedHash") or ""),
             expected_version=version, expected_association=str(payload.get("expectedAssociationKey") or ""),
             expected_association_version=association_version, actor=_request_actor(request),
-            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "", before_write=verify_current)
+            reason=str(payload.get("reason") or ""), group_reasons=group_reasons,
+            request_key=idempotency_key or "", before_write=verify_current)
     except PartConflict as exc:
         raise _error(409, exc.code, str(exc))
 
@@ -1121,7 +1909,7 @@ def costing_review(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                                            "readOnly": True, "processingBlocker": False}
             if file_id and review.get("processing_evidence"):
                 from app.part_mapping import source_groups, mapping_detail, attach_mapping_evidence
-                detail = mapping_detail(repository.part_store, file_id=file_id,
+                detail = mapping_detail(_part_mapping_store(repository), file_id=file_id,
                     source_hash=evidence.original_sha256, association=repository.current_association(file_id),
                     groups=source_groups(review["semantic_snapshot"]["content"]["process_lists"]))
                 attach_mapping_evidence(review["processing_evidence"], detail)

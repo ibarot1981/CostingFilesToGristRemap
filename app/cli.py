@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import logging
 import os
+import sqlite3
+import tempfile
 import webbrowser
 
 import typer
@@ -166,7 +170,26 @@ def safari_setup_command(
         console.print(f"Validated document: {result.document.name} ({result.document.id})")
         schema_plan = plan_schema(client, result.document.id, workspace_id=result.workspace.id, document_name=result.document.name, legacy_doc_id=legacy_doc_id)
         console.print(f"Schema plan {schema_plan.schema_version}: {len(schema_plan.create_tables)} tables to create, {len(schema_plan.add_columns)} tables to extend, {len(schema_plan.update_columns)} tables to update.")
+        console.print_json(json.dumps(schema_plan.to_dict(), ensure_ascii=False, default=str))
         if schema_apply:
+            live_client = GristClient.from_safari_environment()
+            if live_client.doc_id != result.document.id or live_client.safari_workspace_id != result.workspace.id:
+                raise GristValidationError("Safari backup target does not match the exact document and workspace in the schema plan.")
+            live_client.validate_safari_write_target()
+            backup_data = live_client.download_document_backup()
+            backup_dir = Path(tempfile.gettempdir()) / "CostingFilesToGristRemap" / "safari-grist-backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"safari-manufacturing-{result.document.id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.grist"
+            backup_path.write_bytes(backup_data)
+            digest = sha256(backup_data).hexdigest()
+            with sqlite3.connect(f"file:{backup_path.as_posix()}?mode=ro", uri=True) as backup_db:
+                integrity = backup_db.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok" or sha256(backup_path.read_bytes()).hexdigest() != digest:
+                raise GristValidationError("Safari backup failed integrity or hash verification; schema was not changed.")
+            refreshed_plan = plan_schema(client, result.document.id, workspace_id=result.workspace.id, document_name=result.document.name, legacy_doc_id=legacy_doc_id)
+            if refreshed_plan.to_dict() != schema_plan.to_dict():
+                raise GristValidationError("Safari schema changed after the reviewed plan; refresh and review it before applying.")
+            console.print(f"Verified pre-change Grist backup: {backup_path} · SHA-256 {digest} · integrity {integrity}")
             apply_schema(client, schema_plan, legacy_doc_id=legacy_doc_id)
             console.print("Schema applied to the independently revalidated Safari Manufacturing document.")
         else:
@@ -184,6 +207,25 @@ def safari_setup_command(
         raise typer.Exit(code=2) from exc
     except CostingAppError as exc:
         logger.exception("Safari Manufacturing setup failed")
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("safari-parts-bind-writer")
+def safari_parts_bind_writer_command(
+    actor: str = typer.Option(..., "--actor", help="Named operator approving the first single-writer binding."),
+    reason: str = typer.Option(..., "--reason", help="Why this host and shared local allocator are the sole supported writer."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the explicit Grist coordinator binding."),
+) -> None:
+    """Bind the configured Safari deployment to one shared local allocator."""
+    if not yes and not Confirm.ask("Bind this host and local allocator as the sole Safari Parts writer?", default=False):
+        console.print("Cancelled; no Grist mutation was attempted.")
+        return
+    try:
+        from app.grist_parts import GristPartRegistry
+        registry = GristPartRegistry(GristClient.from_safari_environment())
+        console.print_json(json.dumps(registry.bind_coordinator(actor=actor, reason=reason), ensure_ascii=False))
+    except CostingAppError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
