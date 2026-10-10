@@ -1,4 +1,4 @@
-import {cleanup, fireEvent, render, screen, waitFor} from "@testing-library/react";
+import {cleanup, fireEvent, render, screen, waitFor, within} from "@testing-library/react";
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
 import {PartsView} from "../src/PartsView";
 
@@ -65,8 +65,12 @@ it("collapses and expands scope targets, then opens the selected Part details", 
 it("filters one Model's code list and keeps intended codes separate from its naming anchor", async () => {
   render(<PartsView/>);
   fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
-  fireEvent.change(await screen.findByLabelText("Intended sharing Product filter"), {target:{value:"product-1"}});
-  fireEvent.change(screen.getByLabelText("Intended sharing Product Model filter"), {target:{value:"model-1"}});
+  const productFilter = await screen.findByLabelText("Intended sharing Product filter") as HTMLSelectElement;
+  await waitFor(() => expect(productFilter.disabled).toBe(false));
+  fireEvent.change(productFilter, {target:{value:"product-1"}});
+  const modelFilter = screen.getByLabelText(/Intended sharing Product Model filter/) as HTMLSelectElement;
+  await waitFor(() => expect(modelFilter.disabled).toBe(false));
+  fireEvent.change(modelFilter, {target:{value:"model-1"}});
   expect(screen.getByRole("checkbox", {name:/S1KHFELP/})).toBeTruthy();
   expect(screen.getByRole("checkbox", {name:/S1KHFSTD/})).toBeTruthy();
   expect(screen.queryByRole("checkbox", {name:/S1KHDSTD/})).toBeNull();
@@ -89,9 +93,11 @@ it("allows Product-level descendant codes without a Model selection and keeps Gl
   fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
   fireEvent.change(await screen.findByLabelText("Name derives from"), {target:{value:"product"}});
   fireEvent.change(screen.getByLabelText("Name derives from"), {target:{value:"global"}});
-  fireEvent.change(screen.getByLabelText("Intended sharing Product filter"), {target:{value:"product-1"}});
+  const productFilter = screen.getByLabelText("Intended sharing Product filter") as HTMLSelectElement;
+  await waitFor(() => expect(productFilter.disabled).toBe(false));
+  fireEvent.change(productFilter, {target:{value:"product-1"}});
   expect((screen.getByLabelText("Name derives from") as HTMLSelectElement).value).toBe("global");
-  expect((screen.getByLabelText("Intended sharing Product Model filter") as HTMLSelectElement).value).toBe("");
+  expect((screen.getByLabelText(/Intended sharing Product Model filter/) as HTMLSelectElement).value).toBe("");
   expect(screen.getByRole("checkbox", {name:/S1KHDSTD/})).toBeTruthy();
   fireEvent.click(screen.getByRole("checkbox", {name:/S1KHDSTD/}));
   expect(screen.getByText("1 intended Model Code")).toBeTruthy();
@@ -103,8 +109,12 @@ it("restores a failed initial Part save from the same browser session request", 
     .mockResolvedValueOnce({part:{...part,id:"resumed-part",partNumber:"SM-P-000002",name:"S1KHF — Chassis — Standard"}});
   const saveForm = async () => {
     fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
-    fireEvent.change(await screen.findByLabelText("Intended sharing Product filter"), {target:{value:"product-1"}});
-    fireEvent.change(screen.getByLabelText("Intended sharing Product Model filter"), {target:{value:"model-1"}});
+    const productFilter = await screen.findByLabelText("Intended sharing Product filter") as HTMLSelectElement;
+    await waitFor(() => expect(productFilter.disabled).toBe(false));
+    fireEvent.change(productFilter, {target:{value:"product-1"}});
+    const modelFilter = screen.getByLabelText(/Intended sharing Product Model filter/) as HTMLSelectElement;
+    await waitFor(() => expect(modelFilter.disabled).toBe(false));
+    fireEvent.change(modelFilter, {target:{value:"model-1"}});
     fireEvent.click(screen.getByRole("checkbox", {name:/S1KHFELP/}));
     fireEvent.change(screen.getByLabelText("What is the Part called?"), {target:{value:"Chassis"}});
     fireEvent.change(screen.getByLabelText("What distinguishes this design?"), {target:{value:"Standard"}});
@@ -120,7 +130,7 @@ it("restores a failed initial Part save from the same browser session request", 
   cleanup();
   render(<PartsView/>);
   await screen.findByDisplayValue("Chassis");
-  fireEvent.click(await screen.findByRole("button", {name:"Retry same request"}));
+  fireEvent.click(await screen.findByRole("button", {name:/Retry same creation request/}));
   await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(2));
   expect(mocks.createManagedPart.mock.calls[1][1]).toBe(firstCall[1]);
   expect(mocks.createManagedPart.mock.calls[1][0]).toEqual(firstCall[0]);
@@ -160,6 +170,27 @@ it("shows component navigation and actual purchase capture affordances", async (
   fireEvent.click(screen.getByRole("button", {name:/Record actual purchase/}));
   expect(screen.getByLabelText("Transaction reference")).toBeTruthy();
   expect(screen.getByText(/MaterialRateLog and Default Material rates are not used/)).toBeTruthy();
+});
+
+it("uses stable app-specific names and autofill hints in the standalone shared creation form", async () => {
+  render(<PartsView/>);
+  const search = screen.getByLabelText("Search Parts by number, name or alias") as HTMLInputElement;
+  expect(search.name).toBe("parts-register-search");
+  expect(search.autocomplete).toBe("off");
+  expect(search.getAttribute("spellcheck")).toBe("false");
+  expect(search.getAttribute("autocapitalize")).toBe("none");
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  const form = await screen.findByRole("region", {name:"Create a canonical Part"});
+  await waitFor(() => expect((within(form).getByLabelText("What is the Part called?") as HTMLInputElement).disabled).toBe(false));
+  const editable = Array.from(form.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input:not([type=checkbox]),select,textarea"));
+  expect(editable.length).toBeGreaterThan(5);
+  for (const control of editable) {
+    expect(control.name).not.toBe("");
+    expect(control.getAttribute("autocomplete")).toBe("off");
+    expect(control.name).not.toMatch(/address|card|payment|password|email|phone/i);
+  }
+  expect((within(form).getByLabelText("Search intended Model Codes") as HTMLInputElement).getAttribute("autocapitalize")).toBe("none");
+  expect((within(form).getByLabelText("Search intended Model Codes") as HTMLInputElement).getAttribute("spellcheck")).toBe("false");
 });
 
 it("keeps Part detail sections collapsed until opened, and section shortcuts reopen them", async () => {

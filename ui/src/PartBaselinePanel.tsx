@@ -229,7 +229,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
       {open ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}<span><strong>Manufacturing baseline &amp; workbook comparison</strong><small>Explicitly establish Rev A requirements or compare another mapped workbook.</small></span>
     </button>
     {open && <div className="part-baseline-content">
-      <div className="part-baseline-toolbar"><label>Canonical Part<select value={partId} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !choices.length} onChange={event => { setPartId(event.target.value); setReview(null); setComparison(null); }}><option value="">Choose a saved mapping</option>{choices.map(part => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label>
+      <div className="part-baseline-toolbar"><label>Canonical Part<select name="part-baseline-canonical-part" autoComplete="off" value={partId} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !choices.length} onChange={event => { setPartId(event.target.value); setReview(null); setComparison(null); }}><option value="">Choose a saved mapping</option>{choices.map(part => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label>
         <button className="button" disabled={!partId || busy || Boolean(attempt) || Boolean(decisionAttempt)} onClick={() => void loadReview()}>{busy ? <LoaderCircle size={13}/> : <Search size={13}/>} Review this workbook</button></div>
       {!choices.length && <p className="part-baseline-muted">Save at least one source-group mapping to a canonical Part before baseline processing.</p>}
       {error && <div className="part-baseline-error" role="alert"><AlertTriangle size={14}/><span>{error}</span></div>}
@@ -244,14 +244,14 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
           const family = review.families[key]; const choice = families[key] || { status: "", confirmedComplete: false };
           const readable = family?.sourceEvidenceStatus === "ok";
           return <article className="part-baseline-family" key={key}><div><strong>{family?.sheet || familyNames[key]}</strong><span>{readable ? `${family.mappedGroupCount} mapped groups · ${family.requirementCount} mapped requirement rows` : `Evidence ${family?.sourceEvidenceStatus?.replaceAll("_", " ") || "missing"}`}</span></div>
-            <label>Applicability<select value={choice.status} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, status: event.target.value, confirmedComplete: false } }))}>
+            <label>Applicability<select name={`part-baseline-applicability-${key}`} autoComplete="off" value={choice.status} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, status: event.target.value, confirmedComplete: false } }))}>
               <option value="">Choose…</option><option value="applicable">Applicable</option><option value="not_applicable" disabled={(family?.mappedGroupCount || 0) > 0}>Confirmed not applicable</option></select></label>
             {choice.status === "applicable" && <label className="part-baseline-confirm"><input type="checkbox" checked={choice.confirmedComplete} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable || !family?.mappedGroupCount} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, confirmedComplete: event.target.checked } }))}/>All applicable rows for this Part are mapped and complete</label>}
             {choice.status === "not_applicable" && <label className="part-baseline-confirm"><input type="checkbox" checked={choice.confirmedComplete} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, confirmedComplete: event.target.checked } }))}/>I confirm this source family does not apply</label>}
             {readable && choice.status === "applicable" && !family?.mappedGroupCount && <small className="part-baseline-warning-text">Applicable but incomplete: map this Part’s rows before establishing the baseline.</small>}
           </article>;
         })}</div>
-        <label className="part-baseline-reason">Processing reason<input value={reason} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setReason(event.target.value)} placeholder="Optional audit context"/></label>
+        <label className="part-baseline-reason">Processing reason<input name="part-baseline-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setReason(event.target.value)} placeholder="Optional audit context"/></label>
         <div className="part-baseline-actions">{attempt?.operation === "establish" || review.baselineStatus !== "established"
           ? <button className="button primary" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "establish") || (!attempt && (establishmentIssues.length > 0 || review.baselineStatus === "recovery_required"))} onClick={() => void runWrite("establish")}>{attempt?.operation === "establish" ? "Retry baseline publication" : "Establish Part baseline"}</button>
           : <button className="button primary" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "compare")} onClick={() => void runWrite("compare")}>{attempt?.operation === "compare" ? "Retry comparison" : "Compare incoming workbook"}</button>}
@@ -289,7 +289,7 @@ function ComparisonReview({ comparison, path, groups, onDecision, onRetryDecisio
         onDecision={onDecision} reason={reason} oldData={oldData} busy={busy || Boolean(decisionAttempt)} complete={summary.Status === "complete"}/>;
     })}
     {comparison.differences.every(item => item.DifferenceType === "match") && <p>No manufacturing requirement differences were found. The comparison was saved as source evidence.</p>}
-    {!!comparison.differences.some(item => item.DifferenceType !== "match" && item.DifferenceType !== "incomplete_evidence") && <div className="part-comparison-decision-tools"><label>Decision reason<input value={reason} onChange={event => setReason(event.target.value)} disabled={busy || Boolean(decisionAttempt)} placeholder="Required for every decision"/></label><label><input type="checkbox" checked={oldData} onChange={event => setOldData(event.target.checked)} disabled={busy || Boolean(decisionAttempt)}/>Classify this incoming workbook as old data</label></div>}
+    {!!comparison.differences.some(item => item.DifferenceType !== "match" && item.DifferenceType !== "incomplete_evidence") && <div className="part-comparison-decision-tools"><label>Decision reason<input name="part-comparison-decision-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} onChange={event => setReason(event.target.value)} disabled={busy || Boolean(decisionAttempt)} placeholder="Required for every decision"/></label><label><input type="checkbox" checked={oldData} onChange={event => setOldData(event.target.checked)} disabled={busy || Boolean(decisionAttempt)}/>Classify this incoming workbook as old data</label></div>}
   </section>;
 }
 
@@ -305,7 +305,7 @@ function DifferenceCard({ difference, path, groups, baselineCandidates, selected
     {difference.Status !== "pending_review" && <p className="part-baseline-notice">Decision saved · {String(difference.Status).replaceAll("_", " ")}</p>}
     {difference.DifferenceType === "incomplete_evidence" && <p className="part-baseline-warning">The source family is incomplete. No addition or deletion is inferred until its evidence is complete.</p>}
     {difference.Status === "pending_review" && difference.DifferenceType === "ambiguous_correspondence" && hasIncoming && complete && baselineCandidates.length > 0 && <div className="part-ambiguous-match">
-      <label>Match this incoming row to a baseline requirement<select value={matchedBaselineKey} onChange={event => setMatchedBaselineKey(event.target.value)} disabled={busy}>
+      <label>Match this incoming row to a baseline requirement<select name="part-baseline-match-requirement" autoComplete="off" value={matchedBaselineKey} onChange={event => setMatchedBaselineKey(event.target.value)} disabled={busy}>
         <option value="">Choose a possible baseline line…</option>{baselineCandidates.map(candidate => <option key={candidate.key} value={candidate.key}>{candidate.label}</option>)}
       </select></label><button className="button" disabled={busy || !reason.trim() || !matchedBaselineKey}
         onClick={() => void onDecision(difference, "match_correspondence", undefined, matchedBaselineKey)}>Match to baseline requirement</button>
@@ -332,7 +332,7 @@ function PartReplacementLookup({ path, disabled, onSelect }: { path: string; dis
     }).catch(() => { if (!controller.signal.aborted) { setResults([]); setResultsFor(search); } }).finally(() => { if (!controller.signal.aborted) setLoading(false); }), 180);
     return () => { controller.abort(); window.clearTimeout(timer); };
   }, [query, path]);
-  return <div className="part-replacement-lookup"><label>Replacement canonical Part<input value={query} disabled={disabled} onChange={event => setQuery(event.target.value)} placeholder="Search Part number, name or alias"/></label>
+  return <div className="part-replacement-lookup"><label>Replacement canonical Part<input name="part-replacement-search" autoComplete="off" spellCheck={false} autoCapitalize="none" value={query} disabled={disabled} onChange={event => setQuery(event.target.value)} placeholder="Search Part number, name or alias"/></label>
     {loading && <small role="status">Searching…</small>}{!loading && resultsFor === query.trim() && results.length === 0 && <small>No selectable Parts found.</small>}
     {resultsFor === query.trim() && results.length > 0 && <ul role="listbox">{results.filter(item => item.selectable && !item.duplicateName).map(part => <li key={part.id}><button type="button" role="option" disabled={disabled} onClick={() => { onSelect(part); setQuery(`${part.partNumber} · ${part.name}`); setResults([]); setResultsFor(""); }}>{part.partNumber} · {part.name}</button></li>)}</ul>}
   </div>;

@@ -100,22 +100,20 @@ beforeEach(() => {
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
 
 async function expandGroup(index: number) {
-  const toggle = screen.getByRole("button", {name: new RegExp(`Item ${index} Source Part`)});
+  const toggle = screen.getByRole("button", {name: new RegExp(`source evidence · Item ${index}`, "i")});
   if (toggle.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
   return toggle;
 }
 
 async function chooseExistingPart(groupIndex: number, partIndex: number) {
-  await expandGroup(groupIndex);
   const combo = screen.getByRole("combobox", {name: `Part assignment for Item ${groupIndex}`});
   fireEvent.focus(combo);
   fireEvent.click(await screen.findByRole("option", {name: new RegExp(existingParts[partIndex].partNumber!)}));
 }
 
 function expectPendingChanges(count: number) {
-  const summary = screen.getByRole("region", {name: "Mapping summary"});
-  const pendingLabel = within(summary).getByText("unsaved changes");
-  expect(pendingLabel.parentElement?.querySelector("strong")?.textContent).toBe(String(count));
+  const summary = screen.getByRole("region", {name: "Save Part mapping drafts"});
+  expect(within(summary).getByText(`${count} unsaved group${count === 1 ? "" : "s"}`)).toBeTruthy();
 }
 
 it("keeps four App-level mapping choices through Part creation and navigation, then saves one and the remaining three", async () => {
@@ -131,23 +129,25 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   await chooseExistingPart(3, 2);
   expectPendingChanges(3);
 
-  const fourthToggle = await expandGroup(4);
-  fireEvent.click(within(fourthToggle.closest(".part-source-group")!).getByRole("button", {name: "Browse / create Part", exact: true}));
-  fireEvent.click((await screen.findAllByRole("button", {name: "New Part"}))[0]);
-  fireEvent.change(screen.getByLabelText("What is the Part called?"), {target: {value: "Mapping Return"}});
-  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target: {value: "Integrated mapping navigation test"}});
+  const fourth = screen.getByRole("combobox", {name: "Part assignment for Item 4"}).closest(".part-source-group")!;
+  expect(fourth.classList.contains("is-collapsed")).toBe(true);
+  fireEvent.click(within(fourth).getByRole("button", {name: "Create Part"}));
+  const createDialog = await screen.findByRole("dialog", {name: "Create and assign a Part"});
+  fireEvent.change(within(createDialog).getByLabelText("Name derives from"), {target: {value: "global"}});
+  fireEvent.change(within(createDialog).getByLabelText("What is the Part called?"), {target: {value: "Mapping Return"}});
+  fireEvent.change(within(createDialog).getByLabelText("Why is this Part needed?"), {target: {value: "Integrated mapping navigation test"}});
   await screen.findByText("Generated name · server validated");
-  fireEvent.click(screen.getByRole("button", {name: "Save Part"}));
-  await screen.findByText(/Created SM-P-000004/);
-  fireEvent.click(await screen.findByRole("button", {name: "Use this Part in mapping"}));
-  expect(await screen.findByText(/SM-P-000004 added to the draft for Item 4/)).toBeTruthy();
+  fireEvent.click(within(createDialog).getByRole("button", {name: "Create and assign"}));
+  await waitFor(() => expect(screen.queryByRole("dialog", {name: "Create and assign a Part"})).toBeNull());
+  expect(fourth.classList.contains("is-collapsed")).toBe(true);
+  expect(within(fourth).getByRole("combobox", {name: "Part assignment for Item 4"})).toHaveProperty("value", expect.stringContaining("SM-P-000004"));
   expectPendingChanges(4);
   expect(apiMocks.createManagedPart).toHaveBeenCalledOnce();
   expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
 
   const firstToggle = await expandGroup(1);
-  fireEvent.click(within(firstToggle.closest(".part-source-group")!).getByRole("button", {name: "Save this mapping"}));
-  await screen.findByText(/Grist confirmed 1 source-row assignment/);
+  fireEvent.click(within(firstToggle.closest(".part-source-group")!).getByRole("button", {name: "Save", exact: true}));
+  await waitFor(() => expect(within(firstToggle.closest(".part-source-group")!).getByText("Saved")).toBeTruthy());
   expect(apiMocks.savePartMappings).toHaveBeenCalledTimes(1);
   expect(apiMocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mapping-1": "part-1"});
   expectPendingChanges(3);
@@ -155,7 +155,7 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   fireEvent.click(screen.getByRole("button", {name: "Collapse all displayed"}));
   await waitFor(() => expect(firstToggle.getAttribute("aria-expanded")).toBe("false"));
   for (const index of [2, 3, 4]) {
-    expect(screen.getByRole("button", {name: new RegExp(`Item ${index} Source Part`)}).getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByRole("button", {name: new RegExp(`source evidence · Item ${index}`, "i")}).getAttribute("aria-expanded")).toBe("false");
   }
 
   fireEvent.click(screen.getByRole("button", {name: "Parts", exact: true}));
@@ -166,12 +166,13 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   await waitFor(() => expectPendingChanges(3));
   expect(apiMocks.savePartMappings).toHaveBeenCalledTimes(1);
   for (const index of [2, 3, 4]) {
-    const toggle = screen.getByRole("button", {name: new RegExp(`Item ${index} Source Part`)});
+    const toggle = screen.getByRole("button", {name: new RegExp(`source evidence · Item ${index}`, "i")});
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
   }
   for (const [index, partNumber] of [[2, "SM-P-000002"], [3, "SM-P-000003"], [4, "SM-P-000004"]] as const) {
-    const toggle = screen.getByRole("button", {name: new RegExp(`Item ${index} Source Part`)});
-    expect(toggle.closest(".part-source-group")?.textContent).toContain(partNumber);
+    const toggle = screen.getByRole("button", {name: new RegExp(`source evidence · Item ${index}`, "i")});
+    const assignment = toggle.closest(".part-source-group")?.querySelector<HTMLInputElement>("input[role=combobox]");
+    expect(assignment?.value).toContain(partNumber);
   }
 
   fireEvent.click(screen.getByRole("button", {name: "Save pending mappings"}));

@@ -2,7 +2,7 @@ import {act, cleanup, fireEvent, render, screen, waitFor, within} from "@testing
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
 import {PartMappingView} from "../src/PartMappingView";
 
-const mocks = vi.hoisted(() => ({partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(),
+const mocks = vi.hoisted(() => ({partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(), partScopeTargets: vi.fn(), fileAssociation: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), parts: vi.fn(),
   partBaselineReview: vi.fn(), establishPartBaseline: vi.fn(), comparePartBaseline: vi.fn(), decidePartManufacturingComparison: vi.fn()}));
 vi.mock("../src/api", () => ({api: mocks}));
 
@@ -26,6 +26,7 @@ beforeEach(() => {
   Object.values(mocks).forEach(mock => mock.mockReset());
   vi.stubGlobal("crypto", {randomUUID: () => "request-key"});
   sessionStorage.clear();
+  localStorage.removeItem("part-mapping:context-open");
   mocks.partMappings.mockResolvedValue(detail());
   mocks.searchParts.mockResolvedValue({items:[chassis,bracket],total:2,offset:0,limit:30,hasMore:false});
   mocks.savePartMappings.mockImplementation(async (payload:any) => ({savedRows:Object.keys(payload.decisions).length,
@@ -39,16 +40,24 @@ beforeEach(() => {
   mocks.establishPartBaseline.mockResolvedValue({baselineStatus:"established"});
   mocks.comparePartBaseline.mockResolvedValue({});
   mocks.decidePartManufacturingComparison.mockResolvedValue({});
+  mocks.partScopeTargets.mockResolvedValue({scopes:[
+    {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
+    {id:"product",label:"Product",targets:[{id:"product-1",label:"Safari 1000",shortcode:"S1K"}]},
+    {id:"product_model",label:"Product Model",targets:[{id:"model-1",parentId:"product-1",label:"Safari 1000 HF",shortcode:"S1KHF"}]},
+    {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"}]},
+  ]});
+  mocks.fileAssociation.mockResolvedValue({current:{product_id:"product-1",model_id:"model-1"},product:{id:"product-1"},model:{id:"model-1"},codes:[{id:"code-1"}]});
+  mocks.partNamePreview.mockImplementation(async (_scope:string, _target:string, description:string, variant:string) => ({name:`S1KHF — ${description}${variant ? ` — ${variant}` : ""}`,available:true,collision:[]}));
+  mocks.createManagedPart.mockResolvedValue({part:{...chassis,id:"created-part",partNumber:"SM-P-000003",name:"S1KHF — Shaft"}});
+  mocks.parts.mockResolvedValue({items:[chassis],legacyItems:[]});
 });
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
 
 async function expandGroup(label = "Shaft") {
-  const toggles = await screen.findAllByRole("button", {name:/Source Part/});
-  const toggle = toggles.find(button => button.textContent?.includes(label));
+  const toggle = await screen.findByRole("button", {name:new RegExp(`source evidence · ${label}`, "i")});
   if (toggle?.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
 }
 async function choosePart(label = "Shaft", index = 0) {
-  await expandGroup(label);
   const combo = await screen.findByRole("combobox", {name:`Part assignment for ${label}`});
   fireEvent.focus(combo);
   const partOption = await screen.findByRole("option", {name:new RegExp(index === 0 ? "SM-P-000001" : "SM-P-000002")});
@@ -61,7 +70,7 @@ it("uses a sheet-specific label and shows bounded source values with workbook pr
   expect(await screen.findByText("Frame")).toBeTruthy();
   expect(screen.getByText(/Part Category from Part Category at C8/)).toBeTruthy();
   expect(screen.queryByRole("columnheader", {name:"Material to Cut"})).toBeNull();
-  const groupToggle = screen.getByRole("button", {name:/CNC Cut List Frame Source Part/});
+  const groupToggle = screen.getByRole("button", {name:/Expand source evidence · Frame/});
   expect(groupToggle.getAttribute("aria-expanded")).toBe("false");
   fireEvent.click(groupToggle);
   fireEvent.click(screen.getByRole("button", {name:"Expand source details"}));
@@ -76,10 +85,11 @@ it("saves only one group, retries the identical request, and reloads saved state
   mocks.savePartMappings.mockRejectedValueOnce(new Error("response lost"));
   render(<PartMappingView path="pilot.ods"/>);
   await choosePart();
-  fireEvent.click(screen.getByRole("button", {name:"Save this mapping"}));
+  expect(screen.queryByRole("textbox", {name:/Reason for mapping change/})).toBeNull();
+  fireEvent.click(screen.getByRole("button", {name:"Save"}));
   await screen.findByRole("alert");
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).disabled).toBe(true);
-  fireEvent.click(screen.getByRole("button", {name:"Retry saving this mapping"}));
+  fireEvent.click(screen.getByRole("button", {name:"Retry save"}));
   expect(await screen.findByText("Saved")).toBeTruthy();
   expect(mocks.savePartMappings.mock.calls[1]).toEqual(mocks.savePartMappings.mock.calls[0]);
   expect(mocks.savePartMappings.mock.calls[0][0]).toMatchObject({path:"pilot.ods",expectedHash:"hash1",expectedVersion:0,
@@ -103,22 +113,127 @@ it("keeps hidden drafts and names every pending group in batch confirmation", as
   expect(mocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mcl-shaft":"part-1","tool-bracket":"part-2"});
 });
 
-it("persists temporary drafts and exact source context when browsing Parts, then restores the chosen Part", async () => {
-  const onOpenParts = vi.fn();
-  const view = render(<PartMappingView path="pilot.ods" onOpenParts={onOpenParts}/>);
+it("opens contextual creation without leaving Mapping and assigns the created Part as an unsaved draft", async () => {
+  mocks.partMappings.mockResolvedValue(detail([group(),group("tool-bracket","Tool Shop Items","Bracket",18)]));
+  const view = render(<PartMappingView path="pilot.ods"/>);
   await choosePart();
+  await choosePart("Bracket",1);
   fireEvent.change(screen.getByLabelText("Search descriptions or source fields"), {target:{value:"MS Plate"}});
   fireEvent.change(screen.getByLabelText("Source sheet"), {target:{value:"mcl"}});
-  fireEvent.change(screen.getByLabelText("Search descriptions or source fields"), {target:{value:"MS Plate"}});
-  const shaftCard = screen.getByText("Shaft").closest(".part-source-group")!;
-  fireEvent.click(within(shaftCard).getByRole("button", {name:"Browse / create Part", exact:true}));
-  expect(onOpenParts).toHaveBeenCalledWith("mcl-shaft","part-1","select",expect.objectContaining({sourceHash:"hash1",evidenceFingerprint:"evidence-mcl-shaft"}));
-  expect(JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).toMatchObject({decisions:{"mcl-shaft":"part-1"},query:"MS Plate",sheetFilter:"mcl"});
+  const table = document.querySelector<HTMLElement>(".part-source-table")!;
+  table.scrollTop = 37;
+  fireEvent.scroll(table);
+  fireEvent.click(document.querySelector<HTMLButtonElement>(".part-context-desktop-toggle")!);
+  expect(document.querySelector(".part-context-panel")?.classList.contains("closed")).toBe(true);
+  const reloadCount = mocks.partMappings.mock.calls.length;
+  fireEvent.click(screen.getByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  expect(within(dialog).getByText("Workbook · pilot.ods")).toBeTruthy();
+  expect(within(dialog).getByText("Sheet · 5. Material Cut List Price")).toBeTruthy();
+  expect((within(dialog).getByLabelText("What is the Part called?") as HTMLInputElement).value).toBe("Shaft");
+  expect((within(dialog).getByLabelText("Scope target") as HTMLSelectElement).value).toBe("model-1");
+  expect(within(dialog).queryByLabelText(/Select workbook/i)).toBeNull();
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Canonical Part for mapping review"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toContain("SM-P-000003"));
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
+  expect(mocks.partMappings).toHaveBeenCalledTimes(reloadCount);
+  expect(screen.getByText("Unsaved")).toBeTruthy();
+  expect(screen.getByText(/created in Grist and added as an unsaved mapping selection/)).toBeTruthy();
+  expect(JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).toMatchObject({decisions:{"mcl-shaft":"created-part","tool-bracket":"part-2"},query:"MS Plate",sheetFilter:"mcl",scrollTop:37});
+  expect(table.scrollTop).toBe(37);
+  expect(document.querySelector(".part-context-panel")?.classList.contains("closed")).toBe(true);
+  expect(screen.queryByRole("combobox", {name:"Part assignment for Bracket"})).toBeNull();
   view.unmount();
-  render(<PartMappingView path="pilot.ods" returnSelection={{path:"pilot.ods",groupKey:"mcl-shaft",partId:"part-2",mode:"select",sourceHash:"hash1",associationKey:"assoc1",associationVersion:2,evidenceFingerprint:"evidence-mcl-shaft"}} onReturnSelectionConsumed={vi.fn()}/>);
-  await waitFor(() => expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toContain("SM-P-000002"));
-  expect(screen.getByLabelText("Search descriptions or source fields")).toHaveProperty("value","MS Plate");
+});
+
+it("restores an uncertain contextual creation with the exact Grist request and group context", async () => {
+  mocks.createManagedPart.mockReset()
+    .mockRejectedValueOnce(new Error("response lost after submit"))
+    .mockResolvedValueOnce({part:{...chassis,id:"restored-created",partNumber:"SM-P-000004",name:"S1KHF — Shaft"}});
+  const view = render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  let dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Recover the uncertain creation"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await within(dialog).findByRole("alert");
+  const original = mocks.createManagedPart.mock.calls[0];
+  const savedAttempt = JSON.parse(sessionStorage.getItem("part-mapping:create-attempt") || "{}");
+  expect(savedAttempt).toMatchObject({key:original[1],payload:original[0],origin:{workbookPath:"pilot.ods",groupKey:"mcl-shaft",sourceHash:"hash1",evidenceFingerprint:"evidence-mcl-shaft"}});
+  expect(within(dialog).getByRole("button", {name:"Close Part creation dialog"})).toHaveProperty("disabled", true);
+  fireEvent.keyDown(document, {key:"Escape"});
+  expect(screen.getByRole("dialog", {name:"Create and assign a Part"})).toBeTruthy();
+  view.unmount();
+
+  const restored = render(<PartMappingView path="pilot.ods"/>);
+  dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.click(await within(dialog).findByRole("button", {name:"Retry same creation request"}));
+  await waitFor(() => expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toContain("SM-P-000004"));
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(2);
+  expect(mocks.createManagedPart.mock.calls[1]).toEqual(original);
+  expect(mocks.partMappings).toHaveBeenCalledTimes(2);
+  expect(JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).toMatchObject({decisions:{"mcl-shaft":"restored-created"}});
+  restored.unmount();
+});
+
+it("refuses to apply the created Part when the originating workbook changes", async () => {
+  const view = render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  view.rerender(<PartMappingView path="different.ods"/>);
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Keep the created identity"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(screen.getByText(/originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+});
+
+it("offers a selectable colliding Part as an unsaved assignment", async () => {
+  mocks.partNamePreview.mockResolvedValue({name:"S1KHF — Shaft",available:false,collision:[{source:"canonical",id:"part-1",number:"SM-P-000001",status:"active"}]});
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:/Use existing Part/}));
+  await waitFor(() => expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toContain("SM-P-000001"));
+  expect(mocks.createManagedPart).not.toHaveBeenCalled();
+  expect(screen.getByText("Unsaved")).toBeTruthy();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
+});
+
+it("traps dialog focus and returns focus to the initiating group on safe cancellation", async () => {
+  render(<PartMappingView path="pilot.ods"/>);
+  const opener = await screen.findByRole("button", {name:"Create Part"});
+  fireEvent.click(opener);
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+  const focusable = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled])"));
+  expect(focusable.length).toBeGreaterThan(1);
+  focusable[0].focus();
+  fireEvent.keyDown(document, {key:"Tab",shiftKey:true});
+  expect(document.activeElement).toBe(focusable[focusable.length - 1]);
+  fireEvent.keyDown(document, {key:"Escape"});
+  await waitFor(() => expect(screen.queryByRole("dialog", {name:"Create and assign a Part"})).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(opener));
+  expect(mocks.createManagedPart).not.toHaveBeenCalled();
+});
+
+it("keeps assignment and Save actionable while source evidence stays collapsed", async () => {
+  render(<PartMappingView path="pilot.ods"/>);
+  await choosePart();
+  const card = screen.getByRole("combobox", {name:"Part assignment for Shaft"}).closest(".part-source-group")!;
+  expect(card.classList.contains("is-collapsed")).toBe(true);
+  fireEvent.click(within(card).getByRole("button", {name:"Create Part"}));
+  fireEvent.click(await screen.findByRole("button", {name:"Cancel before creation"}));
+  expect(card.classList.contains("is-collapsed")).toBe(true);
+  fireEvent.click(within(card).getByRole("button", {name:"Save"}));
+  await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
+  expect(card.classList.contains("is-collapsed")).toBe(true);
+  expect(within(card).getByRole("button", {name:/Expand source evidence/}).getAttribute("aria-expanded")).toBe("false");
+  expect((card.querySelector(".part-source-details-heading button") as HTMLButtonElement).textContent).toBe("Expand source details");
 });
 
 it("rejects a Part returned from Parts when that source group changed", async () => {
@@ -134,7 +249,7 @@ it("holds stale selections until the refreshed source is explicitly reviewed", a
   mocks.savePartMappings.mockRejectedValueOnce(new Error("PART_REVIEW_STALE: The workbook changed; reload the review"));
   render(<PartMappingView path="pilot.ods"/>);
   await choosePart();
-  fireEvent.click(screen.getByRole("button", {name:"Save this mapping"}));
+  fireEvent.click(screen.getByRole("button", {name:"Save"}));
   await screen.findByRole("alert");
   fireEvent.click(screen.getByRole("button", {name:"Review current source"}));
   expect(await screen.findByRole("region", {name:"Drafts held for source review"})).toBeTruthy();
@@ -163,9 +278,39 @@ it("supports keyboard navigation in the searchable Part combobox", async () => {
   const combo = await screen.findByRole("combobox", {name:"Part assignment for Shaft"});
   fireEvent.focus(combo);
   await screen.findByRole("option", {name:/SM-P-000002/});
+  const popover = screen.getByRole("listbox", {name:"Matching canonical Parts"});
+  expect(popover.closest(".part-source-table")).toBeNull();
+  expect(getComputedStyle(popover).position).toBe("fixed");
   fireEvent.keyDown(combo, {key:"ArrowDown"});
   fireEvent.keyDown(combo, {key:"Enter"});
   await waitFor(() => expect((combo as HTMLInputElement).value).toContain("SM-P-000002"));
+});
+
+it("uses a focus-managed overlay context drawer at narrow widths", async () => {
+  const originalWidth = window.innerWidth;
+  const originalPreference = localStorage.getItem("part-mapping:context-open");
+  localStorage.removeItem("part-mapping:context-open");
+  Object.defineProperty(window, "innerWidth", {configurable:true,value:390});
+  try {
+    render(<PartMappingView path="pilot.ods"/>);
+    await waitFor(() => expect(document.querySelector(".part-mapping-shell")?.classList.contains("narrow")).toBe(true));
+    const show = await waitFor(() => {
+      const toggle = document.querySelector<HTMLButtonElement>(".part-context-mobile-toggle");
+      expect(toggle?.textContent).toBe("Show supporting information");
+      return toggle!;
+    });
+    fireEvent.click(show);
+    const panel = document.querySelector(".part-context-panel")!;
+    await waitFor(() => expect(panel.classList.contains("open")).toBe(true));
+    expect(screen.getByRole("button", {name:"Close Mapping context panel"})).toBeTruthy();
+    fireEvent.keyDown(document, {key:"Escape"});
+    await waitFor(() => expect(panel.classList.contains("closed")).toBe(true));
+    await waitFor(() => expect(document.activeElement).toBe(show));
+  } finally {
+    Object.defineProperty(window, "innerWidth", {configurable:true,value:originalWidth});
+    if (originalPreference === null) localStorage.removeItem("part-mapping:context-open");
+    else localStorage.setItem("part-mapping:context-open", originalPreference);
+  }
 });
 
 it("keeps collapsed-group and source-detail expansion per workbook across reloads", async () => {
@@ -176,7 +321,7 @@ it("keeps collapsed-group and source-detail expansion per workbook across reload
     expandedGroups:{"mcl-shaft":true},expandedSourceDetails:{"mcl-shaft":true}}));
   first.unmount();
   render(<PartMappingView path="pilot.ods"/>);
-  const groupToggle = await screen.findByRole("button", {name:/5\. Material Cut List Price Shaft/});
+  const groupToggle = await screen.findByRole("button", {name:/source evidence · Shaft/});
   await waitFor(() => expect(groupToggle.getAttribute("aria-expanded")).toBe("true"));
   expect(screen.getByRole("button", {name:"Show key fields"})).toBeTruthy();
 });
@@ -224,7 +369,7 @@ it("establishes Rev A requirements only after explicit source-family confirmatio
   render(<PartMappingView path="pilot.ods"/>);
   fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline & workbook comparison/}));
   fireEvent.click(await screen.findByRole("button", {name:"Review this workbook"}));
-  await screen.findByText("5. Material Cut List Price");
+  await waitFor(() => expect(document.querySelectorAll(".part-baseline-family")).toHaveLength(3));
   const familyCards = document.querySelectorAll(".part-baseline-family");
   fireEvent.change(within(familyCards[0]).getByLabelText("Applicability"), {target:{value:"applicable"}});
   fireEvent.click(within(familyCards[0]).getByLabelText("All applicable rows for this Part are mapped and complete"));
@@ -260,7 +405,7 @@ it("requires an explicit baseline-line choice before resolving an ambiguous mate
   render(<PartMappingView path="pilot.ods"/>);
   fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline & workbook comparison/}));
   fireEvent.click(await screen.findByRole("button", {name:"Review this workbook"}));
-  await screen.findByText("5. Material Cut List Price");
+  await waitFor(() => expect(document.querySelectorAll(".part-baseline-family")).toHaveLength(3));
   const familyCards = document.querySelectorAll(".part-baseline-family");
   fireEvent.change(within(familyCards[0]).getByLabelText("Applicability"), {target:{value:"applicable"}});
   fireEvent.click(within(familyCards[0]).getByLabelText("All applicable rows for this Part are mapped and complete"));
@@ -289,7 +434,61 @@ it("keeps saved assignments distinct from an explicit audited clear", async () =
   expect(screen.getByText("Unsaved")).toBeTruthy();
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toBe("No Part selected");
   fireEvent.change(screen.getByLabelText("Reason for mapping change · Shaft"), {target:{value:"Assignment was made in error"}});
-  fireEvent.click(screen.getByRole("button", {name:"Save this mapping"}));
+  fireEvent.click(screen.getByRole("button", {name:"Save"}));
   await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
   expect(mocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mcl-shaft":""});
+});
+
+it("shows a compact reason only when replacing an existing mapping", async () => {
+  const saved = group("mcl-shaft","5. Material Cut List Price","Shaft",10,{part:chassis,reviewed:true,version:1});
+  mocks.partMappings.mockResolvedValue(detail([saved],{version:1,unresolvedGroups:0}));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Saved");
+  expect(screen.queryByRole("textbox", {name:/Reason for mapping change/})).toBeNull();
+  await choosePart("Shaft",1);
+  expect(screen.getByLabelText("Reason for mapping change · Shaft")).toBeTruthy();
+  expect((screen.getByRole("button", {name:"Save"}) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("retracts the context panel without unmounting an unresolved baseline publication", async () => {
+  const saved = group("mcl-shaft","5. Material Cut List Price","Shaft",10,{part:chassis,reviewed:true,version:1});
+  mocks.partMappings.mockResolvedValue(detail([saved],{version:1,unresolvedGroups:0}));
+  mocks.partBaselineReview.mockResolvedValue({baselineStatus:"not_established",source:{fileId:"pilot.ods",workbookPath:"pilot.ods",sourceHash:"hash1",associationKey:"assoc1",associationVersion:2,mappingVersion:1,mappingPolicyVersion:"part-source-labels-v2"},
+    families:{mcl:{sheet:"5. Material Cut List Price",sourceEvidenceStatus:"ok",mappedGroupCount:1,requirementCount:1,applicabilityStatus:"unconfirmed"},
+      toolshop:{sheet:"Tool Shop Items",sourceEvidenceStatus:"ok",mappedGroupCount:0,requirementCount:0,applicabilityStatus:"unconfirmed"},
+      cnc:{sheet:"CNC Cut List",sourceEvidenceStatus:"ok",mappedGroupCount:0,requirementCount:0,applicabilityStatus:"unconfirmed"}},
+    existingContent:{processRequirements:0,components:0,purchaseSpecifications:0,requiresAppendConfirmation:false}});
+  mocks.establishPartBaseline.mockRejectedValueOnce(new Error("response lost"));
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline & workbook comparison/}));
+  const reviewButton = screen.getByRole("button", {name:"Review this workbook"});
+  await waitFor(() => expect(reviewButton).toHaveProperty("disabled", false));
+  fireEvent.click(reviewButton);
+  await waitFor(() => expect(document.querySelectorAll(".part-baseline-family")).toHaveLength(3));
+  const families = document.querySelectorAll(".part-baseline-family");
+  fireEvent.change(within(families[0]).getByLabelText("Applicability"), {target:{value:"applicable"}});
+  fireEvent.click(within(families[0]).getByLabelText("All applicable rows for this Part are mapped and complete"));
+  for (const index of [1,2]) {
+    fireEvent.change(within(families[index]).getByLabelText("Applicability"), {target:{value:"not_applicable"}});
+    fireEvent.click(within(families[index]).getByLabelText("I confirm this source family does not apply"));
+  }
+  fireEvent.click(screen.getByRole("button", {name:"Establish Part baseline"}));
+  await screen.findByRole("alert");
+  const attemptKey = "part-baseline-attempt:pilot.ods:part-1";
+  const attemptBefore = localStorage.getItem(attemptKey);
+  expect(JSON.parse(attemptBefore || "{}")).toMatchObject({operation:"establish",partId:"part-1",key:"request-key"});
+  const panel = document.querySelector(".part-context-panel")!;
+  const baselineComponent = panel.querySelector(".part-baseline-panel");
+  const desktopToggle = document.querySelector<HTMLButtonElement>(".part-context-desktop-toggle")!;
+  fireEvent.click(desktopToggle);
+  expect(panel.classList.contains("closed")).toBe(true);
+  expect(panel.getAttribute("aria-hidden")).toBe("true");
+  expect(panel.querySelector(".part-baseline-panel")).toBe(baselineComponent);
+  expect(localStorage.getItem(attemptKey)).toBe(attemptBefore);
+  fireEvent.click(desktopToggle);
+  expect(panel.classList.contains("open")).toBe(true);
+  expect(panel.querySelector(".part-baseline-panel")).toBe(baselineComponent);
+  expect(screen.getByRole("button", {name:"Retry baseline publication"})).toBeTruthy();
+  expect(mocks.partBaselineReview).toHaveBeenCalledTimes(1);
+  expect(mocks.establishPartBaseline).toHaveBeenCalledTimes(1);
 });
