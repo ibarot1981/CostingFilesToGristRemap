@@ -17,6 +17,8 @@ From Mapping, **Create Part** opens a labelled modal with read-only workbook, so
 
 Creation request key, payload and source-group identity survive an uncertain outcome in `sessionStorage`. The dialog cannot be dismissed while recovery is required; Retry uses the original key and body. Reload restores the attempt with its original source context. The originating path, saved association/version, source hash, group key and evidence fingerprint are checked again before assignment. If they changed, the Part is preserved but not attached to a different group. A same-name selectable canonical Part can be used through the same context guard.
 
+A creation-specific regression now refreshes the same workbook while the dialog is open, changes the originating group's evidence fingerprint, and confirms that the returned Part remains published without becoming a mapping draft.
+
 ## Persistence and business boundaries
 
 Canonical Part creation and mapping review remain separate Grist publications. The mapping draft is never represented as saved until Grist confirms the explicit individual or batch save. Initial assignments remain reason-free; replacements and clears require a reason. The refactor does not change the schema or business semantics, baseline/configuration state, accepted requirements, or immutable snapshots.
@@ -24,7 +26,7 @@ Canonical Part creation and mapping review remain separate Grist publications. T
 ## Verification
 
 - Python `unittest` discovery: 233 tests run; 232 passed and one was skipped.
-- UI checks with the bundled Node 24 runtime: 64 Vitest tests passed across 13 files; the standalone mapped-files checks passed (2); TypeScript validation and the production Vite build passed (1,597 modules).
+- UI checks with the bundled Node 24 runtime: 65 Vitest tests passed across 13 files; the standalone mapped-files checks passed (2); TypeScript validation and the production Vite build passed (1,597 modules).
 - An isolated browser used a disposable Grist-backed local app. At 1366×900, the collapsed group header, individual Save placement, contextual dialog and searchable selector results were inspected. At 823×900, the overlay context drawer, background scrim, wrapped Mapping controls and Escape dismissal/focus return were inspected. The browser viewport override was reset after the checks.
 - Real Grist writes were made only in a disposable full-data copy in workspace 3. A synthetic Part (`SM-P-000004`) was created with metadata/name/revision history and eight normalized intended Model Code links. The original group remained a draft until its individual Save. Fresh Grist reads confirmed the Part and intended-sharing rows first, then three mapping-review rows for the saved source rows and the incremented review version. The test copy used an isolated temporary coordinator journal. No production Part or mapping was created and no production schema was changed.
 - Browser hints were inspected in the rendered controls and tests; they cannot prevent password managers or browser extensions from overriding them.

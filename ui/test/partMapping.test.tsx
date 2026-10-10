@@ -191,6 +191,24 @@ it("refuses to apply the created Part when the originating workbook changes", as
   expect(screen.getByText("0 unsaved groups")).toBeTruthy();
 });
 
+it("preserves a published Part without assigning it when the originating group evidence changes", async () => {
+  mocks.partMappings.mockReset()
+    .mockResolvedValueOnce(detail())
+    .mockResolvedValueOnce(detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{evidenceFingerprint:"changed-evidence"})]));
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.click(screen.getByRole("button", {name:"Reload review"}));
+  await waitFor(() => expect(mocks.partMappings).toHaveBeenCalledTimes(2));
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Preserve identity after source evidence changes"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(screen.getByText(/exists in Grist\. The originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+});
+
 it("offers a selectable colliding Part as an unsaved assignment", async () => {
   mocks.partNamePreview.mockResolvedValue({name:"S1KHF — Shaft",available:false,collision:[{source:"canonical",id:"part-1",number:"SM-P-000001",status:"active"}]});
   render(<PartMappingView path="pilot.ods"/>);
