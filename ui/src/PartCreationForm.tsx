@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 
 export type PartScope = "global" | "product" | "product_model" | "model_code";
 export type PartTarget = { id: string; label: string; parentId?: string; shortcode?: string | null };
@@ -15,12 +15,15 @@ export type PartCreationOrigin = {
   evidenceFingerprint: string;
 };
 type NamePreview = { name: string; available: boolean; collision: { source: string; id: string; number: string | null; status: string }[] };
-export type PartCreateAttempt = { key: string; payload: Record<string, unknown>; origin?: PartCreationOrigin | null };
+export type PartCreateAttempt = { key: string; payload: Record<string, unknown>; origin?: PartCreationOrigin | null;
+  formState?: { description?: string; variant?: string; reason?: string; productId?: string; modelId?: string; intendedIds?: string[] } };
 export type ExistingPart = { id: string; name: string; partNumber?: string | null; selectable?: boolean; duplicateName?: boolean; legacy?: boolean; [key: string]: unknown };
 
 const scopeLabels: Record<PartScope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 export const MAPPING_PART_CREATE_ATTEMPT_KEY = "part-mapping:create-attempt";
 const STANDALONE_PART_CREATE_ATTEMPT_KEY = "parts:create-attempt";
+const STANDALONE_SHORTCODE_ATTEMPT_STORAGE_KEY = "part-shortcode:attempt";
+const MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY = "part-mapping:shortcode-attempt";
 
 function readAttempt(key: string): PartCreateAttempt | null {
   try {
@@ -29,8 +32,19 @@ function readAttempt(key: string): PartCreateAttempt | null {
   } catch { return null; }
 }
 
+function updateScopeShortcode(scopes: PartScopeOption[], scope: PartScope, targetId: string, shortcode: string): PartScopeOption[] {
+  return scopes.map(option => {
+    if (option.id !== scope) return option;
+    if (scope === "global") return option.target?.id === targetId ? { ...option, target: { ...option.target, shortcode } } : option;
+    return { ...option, targets: (option.targets || []).map(target => target.id === targetId ? { ...target, shortcode } : target) };
+  });
+}
+
 export function restoredMappingPartCreateAttempt(): PartCreateAttempt | null {
-  return readAttempt(MAPPING_PART_CREATE_ATTEMPT_KEY);
+  const createAttempt = readAttempt(MAPPING_PART_CREATE_ATTEMPT_KEY);
+  if (createAttempt) return createAttempt;
+  const shortcodeAttempt = readAttempt(MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY);
+  return shortcodeAttempt?.origin ? shortcodeAttempt : null;
 }
 
 export function CascadeCodePicker({ scopes, productId, modelId, selectedIds, onProductChange, onModelChange, onSelectedChange, disabled = false, restrictSelectionToContext = false }:
@@ -86,42 +100,48 @@ export function CascadeCodePicker({ scopes, productId, modelId, selectedIds, onP
 export function PartCreationForm({ origin = null, originContextCurrent = true, onCreated, onUseExisting, onCancel, onAttemptStateChange, cancelLabel = "Cancel" }:
   { origin?: PartCreationOrigin | null; originContextCurrent?: boolean; onCreated: (part: ExistingPart, attempt: PartCreateAttempt) => void; onUseExisting: (part: ExistingPart) => void; onCancel: () => void; onAttemptStateChange?: (pending: boolean) => void; cancelLabel?: string }) {
   const storageKey = origin ? MAPPING_PART_CREATE_ATTEMPT_KEY : STANDALONE_PART_CREATE_ATTEMPT_KEY;
+  const shortcodeStorageKey = origin ? MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY : STANDALONE_SHORTCODE_ATTEMPT_STORAGE_KEY;
   const initialAttempt = useMemo(() => readAttempt(storageKey), [storageKey]);
+  const initialShortcodeAttempt = useMemo(() => readAttempt(shortcodeStorageKey), [shortcodeStorageKey]);
+  const restoredForm = initialShortcodeAttempt?.formState;
   const [scopes, setScopes] = useState<PartScopeOption[]>([]);
-  const [scope, setScope] = useState<PartScope>((initialAttempt?.payload.scope as PartScope) || (origin ? "product_model" : "global"));
-  const [targetId, setTargetId] = useState(String(initialAttempt?.payload.targetId || (origin ? "" : "global")));
-  const [description, setDescription] = useState(String(initialAttempt?.payload.description || origin?.sourceDescription || ""));
-  const [variant, setVariant] = useState(String(initialAttempt?.payload.variant || ""));
-  const [reason, setReason] = useState(String(initialAttempt?.payload.reason || ""));
-  const [productId, setProductId] = useState(String(initialAttempt?.payload.selectedProductId || ""));
-  const [modelId, setModelId] = useState(String(initialAttempt?.payload.selectedProductModelId || ""));
-  const [intendedIds, setIntendedIds] = useState<string[]>(Array.isArray(initialAttempt?.payload.intendedModelCodeIds) ? (initialAttempt.payload.intendedModelCodeIds as unknown[]).map(String) : []);
+  const [scope, setScope] = useState<PartScope>((initialAttempt?.payload.scope as PartScope) || (initialShortcodeAttempt?.payload.scope as PartScope) || (origin ? "product_model" : "global"));
+  const [targetId, setTargetId] = useState(String(initialAttempt?.payload.targetId || initialShortcodeAttempt?.payload.targetId || (origin ? "" : "global")));
+  const [description, setDescription] = useState(String(initialAttempt?.payload.description || restoredForm?.description || origin?.sourceDescription || ""));
+  const [variant, setVariant] = useState(String(initialAttempt?.payload.variant || restoredForm?.variant || ""));
+  const [reason, setReason] = useState(String(initialAttempt?.payload.reason || restoredForm?.reason || ""));
+  const [productId, setProductId] = useState(String(initialAttempt?.payload.selectedProductId || restoredForm?.productId || ""));
+  const [modelId, setModelId] = useState(String(initialAttempt?.payload.selectedProductModelId || restoredForm?.modelId || ""));
+  const [intendedIds, setIntendedIds] = useState<string[]>(Array.isArray(initialAttempt?.payload.intendedModelCodeIds)
+    ? (initialAttempt.payload.intendedModelCodeIds as unknown[]).map(String) : restoredForm?.intendedIds || []);
   const [attempt, setAttempt] = useState<PartCreateAttempt | null>(initialAttempt);
   const [preview, setPreview] = useState<NamePreview | null>(null);
   const [loading, setLoading] = useState(true);
   const [associationMessage, setAssociationMessage] = useState("");
   const [associationLoaded, setAssociationLoaded] = useState(!origin);
   const [error, setError] = useState("");
-  const [shortcode, setShortcode] = useState("");
-  const [shortcodeReason, setShortcodeReason] = useState("");
-  const [shortcodeAttempt, setShortcodeAttempt] = useState<PartCreateAttempt | null>(null);
+  const [shortcode, setShortcode] = useState(String(initialShortcodeAttempt?.payload.shortcode || ""));
+  const [shortcodeReason, setShortcodeReason] = useState(String(initialShortcodeAttempt?.payload.reason || ""));
+  const [shortcodeAttempt, setShortcodeAttempt] = useState<PartCreateAttempt | null>(initialShortcodeAttempt);
   const [editingShortcode, setEditingShortcode] = useState(false);
   const [busy, setBusy] = useState(false);
   const [previewVersion, setPreviewVersion] = useState(0);
   const generation = useRef(0);
-  const userEdited = useRef(false);
+  const userEdited = useRef(Boolean(initialAttempt || initialShortcodeAttempt));
   const attemptRef = useRef<PartCreateAttempt | null>(initialAttempt);
   const scopeOption = scopes.find(item => item.id === scope);
   const targets = scope === "global" ? (scopeOption?.target ? [scopeOption.target] : []) : (scopeOption?.targets || []);
   const target = targets.find(item => item.id === targetId);
   const shortcodeMissing = Boolean(scopeOption && target && !target.shortcode);
-  const locked = busy || Boolean(attempt) || loading || !associationLoaded;
+  const locked = busy || Boolean(attempt) || Boolean(shortcodeAttempt) || loading || !associationLoaded;
 
   useEffect(() => {
-    onAttemptStateChange?.(Boolean(attempt));
+    onAttemptStateChange?.(Boolean(attempt || shortcodeAttempt));
     if (attempt) sessionStorage.setItem(storageKey, JSON.stringify(attempt));
     else sessionStorage.removeItem(storageKey);
-  }, [attempt, onAttemptStateChange, storageKey]);
+    if (shortcodeAttempt) sessionStorage.setItem(shortcodeStorageKey, JSON.stringify(shortcodeAttempt));
+    else sessionStorage.removeItem(shortcodeStorageKey);
+  }, [attempt, shortcodeAttempt, onAttemptStateChange, storageKey, shortcodeStorageKey]);
 
   useEffect(() => {
     let active = true;
@@ -166,8 +186,8 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
   }, [scope, scopes]);
 
   useEffect(() => {
-    if (!targetId || !description.trim() || !target?.shortcode) { setPreview(null); return; }
     const request = ++generation.current;
+    if (!targetId || !description.trim() || !target?.shortcode) { setPreview(null); return; }
     const timer = window.setTimeout(async () => {
       try {
         const result = await api.partNamePreview(scope, targetId, description, variant);
@@ -190,7 +210,7 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
     }
   }
 
-  const nameAnchorTouched = useRef(Boolean(initialAttempt));
+  const nameAnchorTouched = useRef(Boolean(initialAttempt || initialShortcodeAttempt));
   function changeModel(value: string) {
     userEdited.current = true;
     setModelId(value);
@@ -207,7 +227,7 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
   }
 
   async function submit() {
-    if (loading || busy || (!attempt && (!preview?.available || !reason.trim()))) return;
+    if (loading || busy || shortcodeAttempt || (!attempt && (!preview?.available || !reason.trim()))) return;
     const next: PartCreateAttempt = attempt || { key: crypto.randomUUID(), payload: { scope, targetId, description, variant, expectedName: preview?.name || "", reason,
       selectedProductId: productId || null, selectedProductModelId: modelId || null, intendedModelCodeIds: [...intendedIds] }, origin };
     attemptRef.current = next;
@@ -221,8 +241,13 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
       onCreated(part as ExistingPart, next);
     } catch (cause) {
       setError(String(cause));
-      // Keep the exact request key, payload and captured source group for recovery after reload.
-      setAttempt(next);
+      if (cause instanceof ApiError && cause.retryDisposition === "safe_to_edit") {
+        // The backend explicitly confirms validation failed before publication began.
+        sessionStorage.removeItem(storageKey); attemptRef.current = null; setAttempt(null);
+      } else {
+        // Keep the exact request key, payload and captured source group for recovery after reload.
+        setAttempt(next);
+      }
     } finally { setBusy(false); }
   }
 
@@ -245,10 +270,44 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
   }
 
   async function saveShortcode() {
-    const next = shortcodeAttempt || { key: crypto.randomUUID(), payload: { scope, targetId, shortcode, reason: shortcodeReason } };
+    const next = shortcodeAttempt || { key: crypto.randomUUID(), payload: { scope, targetId, shortcode, reason: shortcodeReason }, origin,
+      formState: { description, variant, reason, productId, modelId, intendedIds: [...intendedIds] } };
+    sessionStorage.setItem(shortcodeStorageKey, JSON.stringify(next));
     setShortcodeAttempt(next); setBusy(true); setError("");
-    try { await api.maintainPartShortcode(next.payload, next.key); setShortcodeAttempt(null); setShortcodeReason(""); setEditingShortcode(false); setPreviewVersion(value => value + 1); }
-    catch (cause) { setError(String(cause)); }
+    try {
+      const result = await api.maintainPartShortcode(next.payload, next.key);
+      const confirmedShortcode = typeof result?.shortcode === "string" ? result.shortcode : "";
+      const requestedShortcode = String(next.payload.shortcode || "").trim().toUpperCase();
+      if (!confirmedShortcode || confirmedShortcode !== requestedShortcode) {
+        throw new Error("The shortcode response did not confirm the requested value. The outcome may be uncertain; retry the saved request.");
+      }
+      const savedScope = next.payload.scope as PartScope;
+      const savedTargetId = String(next.payload.targetId || "");
+      generation.current += 1;
+      setPreview(null);
+      setScopes(current => updateScopeShortcode(current, savedScope, savedTargetId, confirmedShortcode));
+      try {
+        const refreshed = await api.partScopeTargets();
+        const refreshedScopes = (refreshed.scopes || []) as PartScopeOption[];
+        const refreshedTarget = savedScope === "global"
+          ? refreshedScopes.find(item => item.id === savedScope)?.target
+          : refreshedScopes.find(item => item.id === savedScope)?.targets?.find(item => item.id === savedTargetId);
+        setScopes(refreshedTarget?.shortcode === confirmedShortcode
+          ? refreshedScopes
+          : updateScopeShortcode(refreshedScopes, savedScope, savedTargetId, confirmedShortcode));
+      } catch {
+        // The write response confirms the value; retain the local target update if the follow-up read is unavailable.
+      }
+      sessionStorage.removeItem(shortcodeStorageKey);
+      setShortcodeAttempt(null); setShortcode(confirmedShortcode); setShortcodeReason(""); setEditingShortcode(false); setPreviewVersion(value => value + 1);
+    }
+    catch (cause) {
+      setError(String(cause));
+      if (cause instanceof ApiError && cause.retryDisposition === "safe_to_edit") {
+        sessionStorage.removeItem(shortcodeStorageKey);
+        setShortcodeAttempt(null);
+      }
+    }
     finally { setBusy(false); }
   }
 
@@ -262,7 +321,7 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
     {scope !== "global" && <label>Scope target<select name="part-name-target" autoComplete="off" disabled={locked} value={targetId} onChange={event => { userEdited.current = true; nameAnchorTouched.current = true; setTargetId(event.target.value); }}><option value="">Choose {scopeLabels[scope]}</option>{targets.map(item => <option key={item.id} value={item.id}>{item.label}{item.shortcode ? ` · ${item.shortcode}` : " · shortcode needed"}</option>)}</select></label>}
     {scope === "global" && <p className="parts-target-line">Safari Manufacturing · Global scope</p>}
     {target && <div className="parts-shortcode-box"><div><strong>Maintained shortcode</strong><span>{target.shortcode || "Not set for this target"}</span></div>
-      {(!target.shortcode || editingShortcode) && <div className="parts-shortcode-edit"><label>Shortcode<input name="part-shortcode" autoComplete="off" spellCheck={false} autoCapitalize="characters" value={shortcode} maxLength={20} onChange={event => setShortcode(event.target.value.toUpperCase())} placeholder="Letters and digits" disabled={locked}/></label><label>Why is this shortcode being set?<input name="part-shortcode-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={shortcodeReason} onChange={event => setShortcodeReason(event.target.value)} disabled={locked}/></label><button type="button" className="button" disabled={locked || !shortcode.trim() || !shortcodeReason.trim()} onClick={() => void saveShortcode()}>{shortcodeAttempt ? "Retry shortcode save" : "Save shortcode"}</button></div>}
+      {(!target.shortcode || editingShortcode || Boolean(shortcodeAttempt)) && <div className="parts-shortcode-edit"><label>Shortcode<input name="part-shortcode" autoComplete="off" spellCheck={false} autoCapitalize="characters" value={shortcode} maxLength={20} onChange={event => setShortcode(event.target.value.toUpperCase())} placeholder="Letters and digits" disabled={locked}/></label><label>Why is this shortcode being set?<input name="part-shortcode-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={shortcodeReason} onChange={event => setShortcodeReason(event.target.value)} disabled={locked}/></label><button type="button" className="button" disabled={busy || Boolean(attempt) || loading || !associationLoaded || (!shortcodeAttempt && (!shortcode.trim() || !shortcodeReason.trim()))} onClick={() => void saveShortcode()}>{shortcodeAttempt ? "Retry shortcode save" : "Save shortcode"}</button></div>}
       {target.shortcode && !editingShortcode && <button type="button" className="button ghost" disabled={locked} onClick={() => { setShortcode(target.shortcode || ""); setEditingShortcode(true); }}>Review shortcode</button>}
     </div>}
     {shortcodeMissing && <p className="parts-validation warning">Resolve the missing shortcode before generating a Part name. The app will not guess it.</p>}
@@ -272,7 +331,7 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
     <div className="parts-readonly-facts"><span>Part number <strong>Allocated on Save</strong></span><span>Engineering revision <strong>Rev A</strong></span></div>
     <label>Why is this Part needed?<textarea name="part-creation-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} onChange={event => { userEdited.current = true; setReason(event.target.value); }} rows={3} maxLength={2000} disabled={locked}/></label>
     {error && <div className="parts-error" role="alert">{error}{attempt && <small>The canonical Part may already exist. Retry uses the original request key and payload; do not start another creation.</small>}</div>}
-    <div className="parts-form-actions"><button type="button" className="button" disabled={busy || Boolean(attempt)} onClick={onCancel}>{attempt ? "Creation recovery is required" : cancelLabel}</button><button type="button" className="button primary" disabled={busy || loading || !associationLoaded || (!attempt && (!preview?.available || !reason.trim()))} onClick={() => void submit()}>{busy ? "Creating Part in Grist…" : attempt ? "Retry same creation request" : origin ? "Create and assign" : "Save Part"}</button></div>
+    <div className="parts-form-actions"><button type="button" className="button" disabled={busy || Boolean(attempt) || Boolean(shortcodeAttempt)} onClick={onCancel}>{attempt || shortcodeAttempt ? "Recovery is required" : cancelLabel}</button><button type="button" className="button primary" disabled={busy || loading || !associationLoaded || Boolean(shortcodeAttempt) || (!attempt && (!preview?.available || !reason.trim()))} onClick={() => void submit()}>{busy ? "Creating Part in Grist…" : attempt ? "Retry same creation request" : origin ? "Create and assign" : "Save Part"}</button></div>
   </section>;
 
   return form;

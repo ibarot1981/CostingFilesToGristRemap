@@ -55,6 +55,82 @@ class PartIdentityWebTests(unittest.TestCase):
                 response = web._part_http_error(PartIdentityError(code, "test retry policy"))
                 self.assertEqual(response.detail["retryDisposition"], expected)
 
+    def test_part_creation_prewrite_rejections_are_editable_but_partial_publication_is_not(self):
+        safe_codes = {
+            "PART_SCOPE_TARGET_INVALID", "PART_INPUT_INVALID", "PART_INPUT_REQUIRED", "PART_SHORTCODE_REQUIRED",
+            "PART_SHORTCODE_INVALID", "PART_SHORTCODE_CONFLICT", "PART_NAME_PREVIEW_STALE", "PART_NAME_EXISTS",
+            "PART_REVISION_LOCKED", "PART_INTENDED_CODES_INVALID", "PART_INTENDED_CONTEXT_INVALID",
+            "PART_INTENDED_CODE_INACTIVE", "PART_INTENDED_SHARING_REQUIRES_GRIST",
+        }
+        for code in safe_codes:
+            with self.subTest(code=code):
+                response = web._part_http_error(PartIdentityError(code, "known pre-write validation"))
+                self.assertEqual(response.detail["retryDisposition"], "safe_to_edit")
+        for code in ("PART_CREATED_SHARING_PENDING", "PART_WRITE_UNCONFIRMED", "PART_REQUEST_CONFLICT", "UNCLASSIFIED_422"):
+            with self.subTest(code=code):
+                response = web._part_http_error(PartIdentityError(code, "publication may have started"))
+                self.assertEqual(response.detail["retryDisposition"], "retry_same_request")
+
+        self.set_shortcode("product_model", "model-1", "S1KHF", "creation-prefix")
+        rejected = self.request(web.create_canonical_part, self.request_context(), {
+            "scope": "product_model", "targetId": "model-1", "description": "Shaft", "variant": "Standard",
+            "expectedName": "old preview", "reason": "Exercise explicit stale-preview rejection",
+        }, "stale-create")
+        self.assertIsInstance(rejected, HTTPException)
+        self.assertEqual(rejected.detail["retryDisposition"], "safe_to_edit")
+        self.assertEqual(self.store.list_parts(), [])
+        preview = self.request(web.part_name_preview, "product_model", "model-1", "Shaft corrected", "Standard")
+        corrected = self.request(web.create_canonical_part, self.request_context(), {
+            "scope": "product_model", "targetId": "model-1", "description": "Shaft corrected", "variant": "Standard",
+            "expectedName": preview["name"], "reason": "Retry corrected fields",
+        }, "corrected-create")
+        self.assertEqual(corrected["part"]["name"], preview["name"])
+        self.assertEqual(len(self.store.list_parts()), 1)
+
+    def test_partial_intended_sharing_response_keeps_same_request_recovery_disposition(self):
+        class PartialRegistry:
+            def __init__(self):
+                self.parts = {}
+                self.share_calls = 0
+
+            def sync_legacy_names(self, _rows):
+                return None
+
+            def validate_intended_model_codes(self, code_ids, **_context):
+                return code_ids
+
+            def create_part(self, *, request_key, **_fields):
+                idempotent = request_key in self.parts
+                if not idempotent:
+                    self.parts[request_key] = {"id": "stable-part", "partNumber": "SM-P-000001", "name": "S1K — Shaft",
+                        "engineeringRevision": "A", "publishStatus": "published"}
+                return {"part": self.parts[request_key], "idempotent": idempotent}
+
+            def save_intended_sharing(self, **_fields):
+                self.share_calls += 1
+                if self.share_calls == 1:
+                    raise TimeoutError("sharing publication response was lost")
+                return {"version": 1, "activeCodeIds": [7]}
+
+        registry = PartialRegistry()
+        payload = {"scope": "product", "targetId": "product-1", "description": "Shaft", "expectedName": "S1K — Shaft",
+            "reason": "Recover partial intended sharing", "selectedProductId": "1", "selectedProductModelId": "2",
+            "intendedModelCodeIds": [7]}
+        with mock.patch.object(web, "_repository", self.repository), mock.patch.object(web, "_part_identity_registry", registry), \
+             mock.patch.object(web, "_legacy_part_rows", return_value=[]):
+            try:
+                first = web.create_canonical_part(self.request_context(), payload, "recover-part-and-sharing")
+            except HTTPException as exc:
+                first = exc
+            self.assertIsInstance(first, HTTPException)
+            self.assertEqual(first.detail["code"], "PART_CREATED_SHARING_PENDING")
+            self.assertEqual(first.detail["retryDisposition"], "retry_same_request")
+            recovered = web.create_canonical_part(self.request_context(), payload, "recover-part-and-sharing")
+        self.assertEqual(recovered["part"]["id"], "stable-part")
+        self.assertEqual(recovered["intendedSharing"]["activeCodeIds"], [7])
+        self.assertEqual(len(registry.parts), 1)
+        self.assertEqual(registry.share_calls, 2)
+
     def test_scope_relationships_live_preview_create_detail_and_metadata_change(self):
         self.set_shortcode("product", "product-1", "S1K", "short-product")
         self.set_shortcode("product_model", "model-1", "S1KHF", "short-model")

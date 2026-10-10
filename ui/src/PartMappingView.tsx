@@ -85,6 +85,8 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   const restoredCreateAttempt = restoredMappingPartCreateAttempt();
   const [createOrigin, setCreateOrigin] = useState<PartCreationOrigin | null>(() => restoredCreateAttempt?.origin || null);
   const [createAttemptPending, setCreateAttemptPending] = useState(Boolean(restoredCreateAttempt));
+  const acceptedMappingRef = useRef({ path, detail, loading, createOrigin });
+  acceptedMappingRef.current = { path, detail, loading, createOrigin };
   const generation = useRef(0);
   const inFlight = useRef(false);
   const tableScroll = useRef<HTMLDivElement>(null);
@@ -255,9 +257,11 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }
 
   function currentOriginMatches(origin: PartCreationOrigin | null | undefined) {
-    if (!origin || !detail || origin.workbookPath !== path || origin.sourceHash !== detail.sourceHash
-      || origin.associationKey !== detail.associationKey || origin.associationVersion !== detail.associationVersion) return false;
-    const group = detail.groups.find(item => item.key === origin.groupKey);
+    const current = acceptedMappingRef.current;
+    const currentDetail = current.detail;
+    if (!origin || !currentDetail || current.loading || origin.workbookPath !== current.path || origin.sourceHash !== currentDetail.sourceHash
+      || origin.associationKey !== currentDetail.associationKey || origin.associationVersion !== currentDetail.associationVersion) return false;
+    const group = currentDetail.groups.find(item => item.key === origin.groupKey);
     return Boolean(group && group.evidenceFingerprint === origin.evidenceFingerprint
       && group.sheet === origin.sheet && groupTitle(group) === origin.sourceDescription);
   }
@@ -279,8 +283,9 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
 
   function finishContextualCreation(part: ExistingPart, attempt?: PartCreateAttempt) {
     const origin = attempt?.origin || createOrigin;
+    const current = acceptedMappingRef.current;
     if (origin && currentOriginMatches(origin)) {
-      const group = detail?.groups.find(item => item.key === origin.groupKey);
+      const group = current.detail?.groups.find(item => item.key === origin.groupKey);
       if (group) {
         const selectablePart = { ...part, selectable: true, duplicateName: false, legacy: false } as Part;
         selectPart(group, selectablePart);
@@ -294,11 +299,11 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }
 
   function useExistingInContext(part: ExistingPart) {
-    const origin = createOrigin;
+    const origin = acceptedMappingRef.current.createOrigin;
     if (!origin || !currentOriginMatches(origin)) {
       setNotice(`${part.partNumber || part.name} is selectable, but the originating source context changed. Review the current group before assigning it.`);
     } else {
-      const group = detail?.groups.find(item => item.key === origin.groupKey);
+      const group = acceptedMappingRef.current.detail?.groups.find(item => item.key === origin.groupKey);
       if (group) {
         selectPart(group, { ...part, selectable: true, duplicateName: false, legacy: false } as Part);
         setNotice(`${part.partNumber || part.name} was added as an unsaved mapping selection. Save this group or the pending mappings to persist the assignment.`);

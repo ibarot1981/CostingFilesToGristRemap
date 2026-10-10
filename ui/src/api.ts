@@ -31,18 +31,21 @@ async function send<T>(path: string, body: unknown, headers: Record<string, stri
 const PART_BASELINE_WRITE_TIMEOUT_MS = 30_000;
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code = "", readonly retryDisposition = "retry_same_request", readonly detail: unknown = null) {
+  constructor(message: string, readonly status: number, readonly code = "", readonly retryDisposition: RetryDisposition = "retry_same_request", readonly detail: unknown = null) {
     super(message);
     this.name = "ApiError";
   }
 }
 
+export type RetryDisposition = "safe_to_edit" | "refresh_required" | "retry_same_request";
+const RETRY_DISPOSITIONS: RetryDisposition[] = ["safe_to_edit", "refresh_required", "retry_same_request"];
+
 function apiError(payload: any, status: number): ApiError {
   const detail = payload?.detail;
   const code = typeof detail?.code === "string" ? `${detail.code}: ` : "";
   const message = typeof detail?.message === "string" ? detail.message : typeof detail === "string" ? detail : `Request failed (${status})`;
-  return new ApiError(`${code}${message}`, status, typeof detail?.code === "string" ? detail.code : "",
-    typeof detail?.retryDisposition === "string" ? detail.retryDisposition : "retry_same_request", detail);
+  const disposition = RETRY_DISPOSITIONS.includes(detail?.retryDisposition) ? detail.retryDisposition : "retry_same_request";
+  return new ApiError(`${code}${message}`, status, typeof detail?.code === "string" ? detail.code : "", disposition, detail);
 }
 
 export const api = {

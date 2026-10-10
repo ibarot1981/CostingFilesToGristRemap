@@ -1,13 +1,14 @@
 import {cleanup, fireEvent, render, screen, waitFor, within} from "@testing-library/react";
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
+import {ApiError} from "../src/api";
 import {PartsView} from "../src/PartsView";
 
 const mocks = vi.hoisted(() => ({
   parts: vi.fn(), partScopeTargets: vi.fn(), partDetails: vi.fn(),
-  partNamePreview: vi.fn(), createManagedPart: vi.fn(), savePartIntendedSharing: vi.fn(),
+  partNamePreview: vi.fn(), createManagedPart: vi.fn(), maintainPartShortcode: vi.fn(), savePartIntendedSharing: vi.fn(),
   addPartComponent: vi.fn(), recordPartPurchase: vi.fn(),
 }));
-vi.mock("../src/api", () => ({api: mocks}));
+vi.mock("../src/api", async () => ({...(await vi.importActual<typeof import("../src/api")>("../src/api")), api: mocks}));
 
 const part = {id:"part-uuid", partNumber:"SM-P-000001", name:"S1K — Chassis — Standard", description:"Chassis", variant:"Standard",
   scope:"product_model", scopeTargetId:"model-1", scopeTarget:"Safari 1000 HF", shortcode:"S1K", engineeringRevision:"A",
@@ -18,6 +19,12 @@ const details = {part:{...part, compositionStatus:"draft", metadataHistory:[], l
   usedIn:{status:"available",coverage:"direct_selections_only",items:[{modelCodeId:"code-1",modelCode:"S1KHFELP",model:"Safari 1000 HF",configurationId:8,configurationVersion:2,configurationRevisionId:9,selectionIdentity:"front-actuator",occurrenceLabel:"Front actuator",quantity:2,uom:"each",sourcingRoute:"make",direct:true}],message:"Direct Parts selected in current published configurations. Component/indirect usage is not included."},
   purchases:{specifications:[{specification:{id:41,SpecificationCode:"MOTOR-1",Manufacturer:"Maker",ManufacturerPartNumber:"M-1",CostingUOM:"each",CostingCurrency:"INR"},
     rate:{status:"unavailable",rate:null,reason:"No eligible actual purchase exists.",ratePolicy:"net merchandise per costing UOM"},vendors:[],purchases:[],unitConversions:[],currencyConversions:[]}],vendorCatalog:[]}};
+const scopeTargets = (modelShortcode: string | null) => ({scopes:[
+  {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
+  {id:"product",label:"Product",targets:[{id:"product-1",label:"Safari 1000",shortcode:"S1K"}]},
+  {id:"product_model",label:"Product Model",targets:[{id:"model-1",parentId:"product-1",label:"Safari 1000 HF",shortcode:modelShortcode}]},
+  {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD"}]},
+]});
 
 beforeEach(() => {
   sessionStorage.clear(); window.history.replaceState(null,"", "#parts");
@@ -31,6 +38,7 @@ beforeEach(() => {
   ]});
   mocks.partNamePreview.mockImplementation(async (scope, targetId, description, variant) => ({name:`${targetId === "model-1" ? "S1KHF" : "S1K"} — ${description}${variant ? ` — ${variant}` : ""}`,available:true,collision:[]}));
   mocks.createManagedPart.mockResolvedValue({part:{...part,id:"new-part",partNumber:"SM-P-000002",name:"S1KHF — Chassis — Standard"}});
+  mocks.maintainPartShortcode.mockResolvedValue({shortcode:"S1KHF",version:1});
   mocks.savePartIntendedSharing.mockResolvedValue({partId:part.id,version:1,activeCodeIds:["code-2"]});
   mocks.parts.mockResolvedValue({items:[part],legacyItems:[],storage:"Grist Safari Manufacturing"});
   mocks.partDetails.mockResolvedValue(details);
@@ -134,6 +142,119 @@ it("restores a failed initial Part save from the same browser session request", 
   await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(2));
   expect(mocks.createManagedPart.mock.calls[1][1]).toBe(firstCall[1]);
   expect(mocks.createManagedPart.mock.calls[1][0]).toEqual(firstCall[0]);
+});
+
+it("unlocks a standalone creation after a structured pre-write rejection so it can be corrected", async () => {
+  vi.stubGlobal("crypto", {randomUUID: vi.fn().mockReturnValueOnce("rejected-request").mockReturnValueOnce("corrected-request")});
+  mocks.createManagedPart.mockReset()
+    .mockRejectedValueOnce(new ApiError("PART_NAME_PREVIEW_STALE: refresh the name", 409, "PART_NAME_PREVIEW_STALE", "safe_to_edit"))
+    .mockResolvedValueOnce({part:{...part,id:"corrected-standalone",partNumber:"SM-P-000003",name:"S1K — Chassis corrected"}});
+  render(<PartsView/>);
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  const description = await screen.findByLabelText("What is the Part called?") as HTMLInputElement;
+  await waitFor(() => expect(description.disabled).toBe(false));
+  fireEvent.change(description, {target:{value:"Chassis"}});
+  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target:{value:"Correct a rejected Part request"}});
+  await waitFor(() => expect(screen.getByText("S1K — Chassis")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", {name:"Save Part"}));
+  await screen.findByRole("alert");
+  expect(description.disabled).toBe(false);
+  expect(screen.getByRole("button", {name:"Back to Parts"})).toHaveProperty("disabled", false);
+  const firstCall = mocks.createManagedPart.mock.calls[0];
+  fireEvent.change(description, {target:{value:"Chassis corrected"}});
+  await waitFor(() => expect(screen.getByText("S1K — Chassis corrected")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", {name:"Save Part"}));
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(2));
+  expect(mocks.createManagedPart.mock.calls[1][0]).toMatchObject({...firstCall[0],description:"Chassis corrected",expectedName:"S1K — Chassis corrected"});
+  expect(mocks.createManagedPart.mock.calls[1][1]).not.toBe(firstCall[1]);
+});
+
+it("allows standalone creation to be cancelled after a structured pre-write rejection", async () => {
+  mocks.createManagedPart.mockRejectedValueOnce(new ApiError("Correct the Part fields", 422, "PART_INPUT_INVALID", "safe_to_edit"));
+  render(<PartsView/>);
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  const description = await screen.findByLabelText("What is the Part called?") as HTMLInputElement;
+  await waitFor(() => expect(description.disabled).toBe(false));
+  fireEvent.change(description, {target:{value:"Chassis"}});
+  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target:{value:"Cancel after a rejected request"}});
+  await waitFor(() => expect(screen.getByText("S1K — Chassis")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", {name:"Save Part"}));
+  await screen.findByRole("alert");
+  fireEvent.click(screen.getByRole("button", {name:"Back to Parts"}));
+  expect(screen.queryByLabelText("What is the Part called?")).toBeNull();
+  expect(sessionStorage.getItem("parts:create-attempt")).toBeNull();
+});
+
+it("refreshes the mounted name preview after a shortcode change and ignores an older preview response", async () => {
+  const obsoletePreview = new Promise<{name:string;available:boolean;collision:never[]}>(resolve => { (window as any).__resolveObsoletePartPreview = resolve; });
+  mocks.partScopeTargets.mockReset()
+    .mockResolvedValueOnce(scopeTargets("S1KHF"))
+    .mockResolvedValueOnce(scopeTargets("S1KHF"))
+    .mockResolvedValueOnce(scopeTargets("S1000HF"));
+  mocks.partNamePreview.mockReset()
+    .mockReturnValueOnce(obsoletePreview)
+    .mockResolvedValueOnce({name:"S1000HF — Chassis — Reinforced",available:true,collision:[]});
+  mocks.maintainPartShortcode.mockReset().mockResolvedValue({shortcode:"S1000HF",version:2});
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  const nameScope = await screen.findByLabelText("Name derives from") as HTMLSelectElement;
+  await waitFor(() => expect(nameScope.disabled).toBe(false));
+  fireEvent.change(nameScope, {target:{value:"product_model"}});
+  const nameTarget = await screen.findByLabelText("Scope target") as HTMLSelectElement;
+  await waitFor(() => expect(nameTarget.disabled).toBe(false));
+  fireEvent.change(nameTarget, {target:{value:"model-1"}});
+  fireEvent.change(screen.getByLabelText("What is the Part called?"), {target:{value:"Chassis"}});
+  fireEvent.change(screen.getByLabelText("What distinguishes this design?"), {target:{value:"Reinforced"}});
+  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target:{value:"Use the current reviewed prefix"}});
+  await waitFor(() => expect(mocks.partNamePreview).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", {name:"Review shortcode"}));
+  fireEvent.change(screen.getByLabelText("Shortcode"), {target:{value:"S1000HF"}});
+  fireEvent.change(screen.getByLabelText("Why is this shortcode being set?"), {target:{value:"Prefix changed in the master"}});
+  fireEvent.click(screen.getByRole("button", {name:"Save shortcode"}));
+  await waitFor(() => expect(mocks.partNamePreview).toHaveBeenCalledTimes(2));
+  await screen.findByText("S1000HF — Chassis — Reinforced");
+  (window as any).__resolveObsoletePartPreview({name:"S1KHF — Chassis — Reinforced",available:true,collision:[]});
+  await waitFor(() => expect(screen.getByText("S1000HF — Chassis — Reinforced")).toBeTruthy());
+  expect(screen.queryByText("S1KHF — Chassis — Reinforced")).toBeNull();
+  expect((screen.getByLabelText("What is the Part called?") as HTMLInputElement).value).toBe("Chassis");
+  expect((screen.getByLabelText("What distinguishes this design?") as HTMLInputElement).value).toBe("Reinforced");
+  delete (window as any).__resolveObsoletePartPreview;
+});
+
+it("recovers an uncertain shortcode save with the exact request after remount", async () => {
+  mocks.partScopeTargets.mockReset().mockResolvedValue(scopeTargets(null));
+  mocks.partNamePreview.mockResolvedValue({name:"S1KHF — Chassis",available:true,collision:[]});
+  mocks.maintainPartShortcode.mockReset()
+    .mockRejectedValueOnce(new Error("response lost after the shortcode write"))
+    .mockResolvedValueOnce({shortcode:"S1KHF",version:1});
+  render(<PartsView/>);
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  const nameScope = await screen.findByLabelText("Name derives from") as HTMLSelectElement;
+  await waitFor(() => expect(nameScope.disabled).toBe(false));
+  fireEvent.change(nameScope, {target:{value:"product_model"}});
+  const nameTarget = await screen.findByLabelText("Scope target") as HTMLSelectElement;
+  await waitFor(() => expect(nameTarget.disabled).toBe(false));
+  fireEvent.change(nameTarget, {target:{value:"model-1"}});
+  fireEvent.change(screen.getByLabelText("What is the Part called?"), {target:{value:"Chassis"}});
+  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target:{value:"Create after recovering the prefix"}});
+  fireEvent.change(await screen.findByLabelText("Shortcode"), {target:{value:"S1KHF"}});
+  fireEvent.change(screen.getByLabelText("Why is this shortcode being set?"), {target:{value:"Recover a lost confirmation"}});
+  fireEvent.click(screen.getByRole("button", {name:"Save shortcode"}));
+  await screen.findByRole("alert");
+  const original = mocks.maintainPartShortcode.mock.calls[0];
+  expect(JSON.parse(sessionStorage.getItem("part-shortcode:attempt") || "{}")).toMatchObject({key:original[1],payload:original[0]});
+  expect(screen.getByLabelText("Shortcode")).toHaveProperty("disabled", true);
+  cleanup();
+  render(<PartsView/>);
+  fireEvent.click(await screen.findAllByRole("button", {name:/New Part/}).then(buttons => buttons[0]));
+  const retryShortcode = await screen.findByRole("button", {name:"Retry shortcode save"}) as HTMLButtonElement;
+  await waitFor(() => expect(retryShortcode.disabled).toBe(false));
+  fireEvent.click(retryShortcode);
+  await waitFor(() => expect(mocks.maintainPartShortcode).toHaveBeenCalledTimes(2));
+  expect(mocks.maintainPartShortcode.mock.calls[1]).toEqual(original);
+  await waitFor(() => expect(screen.getByText("S1KHF — Chassis")).toBeTruthy());
+  expect(screen.queryByText(/Resolve the missing shortcode/)).toBeNull();
 });
 
 it("saves audited intended-sharing changes without changing actual configuration usage", async () => {

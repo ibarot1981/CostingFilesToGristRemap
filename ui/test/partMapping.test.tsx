@@ -1,10 +1,11 @@
 import {act, cleanup, fireEvent, render, screen, waitFor, within} from "@testing-library/react";
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
+import {ApiError} from "../src/api";
 import {PartMappingView} from "../src/PartMappingView";
 
-const mocks = vi.hoisted(() => ({partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(), partScopeTargets: vi.fn(), fileAssociation: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), parts: vi.fn(),
+const mocks = vi.hoisted(() => ({partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(), partScopeTargets: vi.fn(), fileAssociation: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), maintainPartShortcode: vi.fn(), parts: vi.fn(),
   partBaselineReview: vi.fn(), establishPartBaseline: vi.fn(), comparePartBaseline: vi.fn(), decidePartManufacturingComparison: vi.fn()}));
-vi.mock("../src/api", () => ({api: mocks}));
+vi.mock("../src/api", async () => ({...(await vi.importActual<typeof import("../src/api")>("../src/api")), api: mocks}));
 
 const chassis = {id:"part-1", partNumber:"SM-P-000001", name:"S1KHF — Chassis", description:"Chassis", variant:"Standard", engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
 const bracket = {id:"part-2", partNumber:"SM-P-000002", name:"S1KHF — Bracket", description:"Bracket", variant:"Folded", engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
@@ -22,6 +23,17 @@ const detail = (groups = [group()], overrides = {}) => ({sourceHash:"hash1", ass
   sourceSheets:{"5. Material Cut List Price":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A8",ambiguousLabelHeaders:[],headerRow:8},
     "CNC Cut List":{present:true,status:"ok",labelField:"part_category",labelHeader:"Part Category",labelHeaderCell:"C8",ambiguousLabelHeaders:[],headerRow:8}},
   parts:[], groups, unresolvedGroups:groups.filter(item => !item.reviewed).length, history:[], ...overrides});
+const partScopeTargets = (modelShortcode: string | null) => ({scopes:[
+  {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
+  {id:"product",label:"Product",targets:[{id:"product-1",label:"Safari 1000",shortcode:"S1K"}]},
+  {id:"product_model",label:"Product Model",targets:[{id:"model-1",parentId:"product-1",label:"Safari 1000 HF",shortcode:modelShortcode}]},
+  {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"}]},
+]});
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return {promise, resolve};
+}
 beforeEach(() => {
   Object.values(mocks).forEach(mock => mock.mockReset());
   vi.stubGlobal("crypto", {randomUUID: () => "request-key"});
@@ -49,6 +61,7 @@ beforeEach(() => {
   mocks.fileAssociation.mockResolvedValue({current:{product_id:"product-1",model_id:"model-1"},product:{id:"product-1"},model:{id:"model-1"},codes:[{id:"code-1"}]});
   mocks.partNamePreview.mockImplementation(async (_scope:string, _target:string, description:string, variant:string) => ({name:`S1KHF — ${description}${variant ? ` — ${variant}` : ""}`,available:true,collision:[]}));
   mocks.createManagedPart.mockResolvedValue({part:{...chassis,id:"created-part",partNumber:"SM-P-000003",name:"S1KHF — Shaft"}});
+  mocks.maintainPartShortcode.mockResolvedValue({shortcode:"S1KHF",version:1});
   mocks.parts.mockResolvedValue({items:[chassis],legacyItems:[]});
 });
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
@@ -207,6 +220,175 @@ it("preserves a published Part without assigning it when the originating group e
   expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
   expect(screen.getByText("0 unsaved groups")).toBeTruthy();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["workbook path", "different.ods", detail()],
+  ["source hash", "pilot.ods", detail([group()], {sourceHash:"hash2"})],
+  ["association identity", "pilot.ods", detail([group()], {associationKey:"assoc2"})],
+  ["association version", "pilot.ods", detail([group()], {associationVersion:3})],
+  ["source group identity", "pilot.ods", detail([group("replacement-group")])],
+  ["source evidence fingerprint", "pilot.ods", detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{evidenceFingerprint:"changed-evidence"})])],
+])("withholds assignment when %s changes while canonical creation is pending", async (_change, refreshedPath, refreshedDetail) => {
+  const pending = deferred<{part: typeof chassis}>();
+  mocks.partMappings.mockReset().mockResolvedValueOnce(detail()).mockResolvedValueOnce(refreshedDetail);
+  mocks.createManagedPart.mockReturnValue(pending.promise);
+  const view = render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Preserve identity while source evidence refreshes"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  if (refreshedPath !== "pilot.ods") view.rerender(<PartMappingView path={refreshedPath}/>);
+  else fireEvent.click(screen.getByRole("button", {name:"Reload review"}));
+  await waitFor(() => expect(mocks.partMappings).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(screen.queryByText(/Refreshing workbook and saved mapping evidence/)).toBeNull());
+  await act(async () => { pending.resolve({part:{...chassis,id:"created-after-refresh",partNumber:"SM-P-000010",name:"S1KHF — Shaft"}}); await pending.promise; });
+  await waitFor(() => expect(screen.getByText(/exists in Grist\. The originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
+  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+  expect(sessionStorage.getItem("part-mapping:create-attempt")).toBeNull();
+});
+
+it("withholds a colliding Part when its lookup resolves after group evidence changed", async () => {
+  const pending = deferred<{items: Array<typeof chassis>}>();
+  mocks.partNamePreview.mockResolvedValue({name:"S1KHF — Shaft",available:false,collision:[{source:"canonical",id:"part-1",number:"SM-P-000001",status:"active"}]});
+  mocks.partMappings.mockReset()
+    .mockResolvedValueOnce(detail())
+    .mockResolvedValueOnce(detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{evidenceFingerprint:"changed-evidence"})]));
+  mocks.searchParts.mockReturnValue(pending.promise);
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:/Use existing Part/}));
+  await waitFor(() => expect(mocks.searchParts).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", {name:"Reload review"}));
+  await waitFor(() => expect(mocks.partMappings).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(screen.queryByText(/Refreshing workbook and saved mapping evidence/)).toBeNull());
+  await act(async () => { pending.resolve({items:[chassis]}); await pending.promise; });
+  await waitFor(() => expect(screen.getByText(/is selectable, but the originating source context changed/)).toBeTruthy());
+  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+});
+
+it("allows a contextual creation to be corrected after a structured pre-write rejection", async () => {
+  vi.stubGlobal("crypto", {randomUUID: vi.fn().mockReturnValueOnce("rejected-request").mockReturnValueOnce("corrected-request")});
+  mocks.createManagedPart.mockReset()
+    .mockRejectedValueOnce(new ApiError("PART_NAME_PREVIEW_STALE: refresh the name", 409, "PART_NAME_PREVIEW_STALE", "safe_to_edit"))
+    .mockResolvedValueOnce({part:{...chassis,id:"corrected-part",partNumber:"SM-P-000011",name:"S1KHF — Shaft corrected"}});
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  const description = within(dialog).getByLabelText("What is the Part called?") as HTMLInputElement;
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Correct a rejected request"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await within(dialog).findByRole("alert");
+  expect(description.disabled).toBe(false);
+  expect(within(dialog).getByRole("button", {name:"Cancel before creation"})).toHaveProperty("disabled", false);
+  const firstCall = mocks.createManagedPart.mock.calls[0];
+  fireEvent.change(description, {target:{value:"Shaft corrected"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft corrected")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(screen.getByText("Unsaved")).toBeTruthy());
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(2);
+  expect(mocks.createManagedPart.mock.calls[1][0]).toMatchObject({...firstCall[0],description:"Shaft corrected",expectedName:"S1KHF — Shaft corrected"});
+  expect(mocks.createManagedPart.mock.calls[1][1]).not.toBe(firstCall[1]);
+});
+
+it("allows contextual creation to be cancelled after a structured pre-write rejection", async () => {
+  mocks.createManagedPart.mockRejectedValueOnce(new ApiError("Correct the Part fields", 422, "PART_INPUT_INVALID", "safe_to_edit"));
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Cancel after rejection"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await within(dialog).findByRole("alert");
+  fireEvent.click(within(dialog).getByRole("button", {name:"Cancel before creation"}));
+  expect(screen.queryByRole("dialog", {name:"Create and assign a Part"})).toBeNull();
+  expect(sessionStorage.getItem("part-mapping:create-attempt")).toBeNull();
+});
+
+it("refreshes a missing shortcode in the mounted contextual form and preserves origin and intended sharing", async () => {
+  mocks.partScopeTargets.mockReset().mockResolvedValueOnce(partScopeTargets(null)).mockResolvedValueOnce(partScopeTargets("HFNEW"));
+  mocks.maintainPartShortcode.mockReset().mockResolvedValue({shortcode:"HFNEW",version:1});
+  mocks.partNamePreview.mockReset().mockResolvedValue({name:"HFNEW — Shaft updated — Forged",available:true,collision:[]});
+  const pendingCreate = deferred<{part: typeof chassis}>();
+  mocks.createManagedPart.mockReturnValue(pendingCreate.promise);
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  const description = within(dialog).getByLabelText("What is the Part called?") as HTMLInputElement;
+  await waitFor(() => expect(description.disabled).toBe(false));
+  await waitFor(() => expect((within(dialog).getByLabelText("Scope target") as HTMLSelectElement).value).toBe("model-1"));
+  expect(within(dialog).getByText("Workbook · pilot.ods")).toBeTruthy();
+  expect(within(dialog).getByText("Sheet · 5. Material Cut List Price")).toBeTruthy();
+  const intendedCode = within(dialog).getByRole("checkbox", {name:/S1KHFELP/}) as HTMLInputElement;
+  await waitFor(() => expect(intendedCode.checked).toBe(true));
+  fireEvent.change(description, {target:{value:"Shaft updated"}});
+  fireEvent.change(within(dialog).getByLabelText("What distinguishes this design?"), {target:{value:"Forged"}});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Preserve workbook context after prefix maintenance"}});
+  fireEvent.change(await within(dialog).findByLabelText("Shortcode"), {target:{value:"HFNEW"}});
+  fireEvent.change(within(dialog).getByLabelText("Why is this shortcode being set?"), {target:{value:"Maintain the missing model prefix"}});
+  fireEvent.click(within(dialog).getByRole("button", {name:"Save shortcode"}));
+  await waitFor(() => expect(mocks.maintainPartShortcode).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(within(dialog).queryByText(/Resolve the missing shortcode/)).toBeNull());
+  await within(dialog).findByText("HFNEW — Shaft updated — Forged");
+  expect((within(dialog).getByLabelText("What is the Part called?") as HTMLInputElement).value).toBe("Shaft updated");
+  expect((within(dialog).getByLabelText("What distinguishes this design?") as HTMLInputElement).value).toBe("Forged");
+  expect((within(dialog).getByRole("checkbox", {name:/S1KHFELP/}) as HTMLInputElement).checked).toBe(true);
+  expect(within(dialog).getByText("Workbook · pilot.ods")).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  const retainedAttempt = JSON.parse(sessionStorage.getItem("part-mapping:create-attempt") || "{}");
+  expect(retainedAttempt).toMatchObject({key:"request-key",origin:{workbookPath:"pilot.ods",groupKey:"mcl-shaft",sourceHash:"hash1",associationKey:"assoc1",associationVersion:2,evidenceFingerprint:"evidence-mcl-shaft"}});
+  expect(mocks.createManagedPart.mock.calls[0][0]).toMatchObject({scope:"product_model",targetId:"model-1",description:"Shaft updated",variant:"Forged",expectedName:"HFNEW — Shaft updated — Forged",intendedModelCodeIds:["code-1"]});
+  await act(async () => { pendingCreate.resolve({part:{...chassis,id:"shortcode-created",partNumber:"SM-P-000012",name:"HFNEW — Shaft updated — Forged"}}); await pendingCreate.promise; });
+  await waitFor(() => expect(screen.getByText("Unsaved")).toBeTruthy());
+  expect(screen.getByText(/created in Grist and added as an unsaved mapping selection/)).toBeTruthy();
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+});
+
+it("recovers contextual shortcode maintenance after remount with its exact request and workbook origin", async () => {
+  mocks.partScopeTargets.mockReset().mockResolvedValueOnce(partScopeTargets(null)).mockResolvedValueOnce(partScopeTargets("HFNEW"));
+  mocks.maintainPartShortcode.mockReset()
+    .mockRejectedValueOnce(new Error("shortcode response was lost after the write"))
+    .mockResolvedValueOnce({shortcode:"HFNEW",version:1});
+  mocks.partNamePreview.mockResolvedValue({name:"HFNEW — Shaft restored — Forged",available:true,collision:[]});
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Create Part"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  const description = within(dialog).getByLabelText("What is the Part called?") as HTMLInputElement;
+  await waitFor(() => expect(description.disabled).toBe(false));
+  await waitFor(() => expect((within(dialog).getByLabelText("Scope target") as HTMLSelectElement).value).toBe("model-1"));
+  fireEvent.change(description, {target:{value:"Shaft restored"}});
+  fireEvent.change(within(dialog).getByLabelText("What distinguishes this design?"), {target:{value:"Forged"}});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Restore the same contextual capture"}});
+  fireEvent.change(await within(dialog).findByLabelText("Shortcode"), {target:{value:"HFNEW"}});
+  fireEvent.change(within(dialog).getByLabelText("Why is this shortcode being set?"), {target:{value:"Recover maintained model prefix"}});
+  fireEvent.click(within(dialog).getByRole("button", {name:"Save shortcode"}));
+  await within(dialog).findByRole("alert");
+  const original = mocks.maintainPartShortcode.mock.calls[0];
+  const saved = JSON.parse(sessionStorage.getItem("part-mapping:shortcode-attempt") || "{}");
+  expect(saved).toMatchObject({key:original[1],payload:original[0],origin:{workbookPath:"pilot.ods",groupKey:"mcl-shaft",sourceHash:"hash1",associationKey:"assoc1",associationVersion:2,evidenceFingerprint:"evidence-mcl-shaft"},
+    formState:{description:"Shaft restored",variant:"Forged",reason:"Restore the same contextual capture"}});
+  cleanup();
+
+  render(<PartMappingView path="pilot.ods"/>);
+  const restoredDialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  await waitFor(() => expect((within(restoredDialog).getByLabelText("What is the Part called?") as HTMLInputElement).value).toBe("Shaft restored"));
+  expect(within(restoredDialog).getByText("Workbook · pilot.ods")).toBeTruthy();
+  expect((within(restoredDialog).getByLabelText("What distinguishes this design?") as HTMLInputElement).value).toBe("Forged");
+  const retry = within(restoredDialog).getByRole("button", {name:"Retry shortcode save"});
+  await waitFor(() => expect(retry).toHaveProperty("disabled", false));
+  fireEvent.click(retry);
+  await waitFor(() => expect(mocks.maintainPartShortcode).toHaveBeenCalledTimes(2));
+  expect(mocks.maintainPartShortcode.mock.calls[1]).toEqual(original);
+  await within(restoredDialog).findByText("HFNEW — Shaft restored — Forged");
+  expect(sessionStorage.getItem("part-mapping:shortcode-attempt")).toBeNull();
 });
 
 it("offers a selectable colliding Part as an unsaved assignment", async () => {

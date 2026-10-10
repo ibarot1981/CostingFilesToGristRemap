@@ -352,27 +352,27 @@ def _part_scope_warnings(repository: SafariRepository, association, part: dict[s
 
 def _scope_target(repository: SafariRepository, scope: str, target_id: str) -> dict[str, str]:
     if scope not in {"global", "product", "product_model", "model_code"}:
-        raise _error(422, "PART_SCOPE_INVALID", "Choose Global, Product, Product Model or Model Code sharing scope.")
+        raise _error(422, "PART_SCOPE_INVALID", "Choose Global, Product, Product Model or Model Code sharing scope.", {"retryDisposition": "safe_to_edit"})
     if scope == "global":
         if target_id != "global":
-            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Global scope must use its maintained global target.")
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Global scope must use its maintained global target.", {"retryDisposition": "safe_to_edit"})
         return {"id": "global", "label": "Safari Manufacturing"}
     if scope == "product":
         item = repository.products.get(str(target_id))
         if not item or not item.active:
-            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product from Safari Manufacturing.")
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product from Safari Manufacturing.", {"retryDisposition": "safe_to_edit"})
         return {"id": item.id, "label": item.name}
     if scope == "product_model":
         item = repository.models.get(str(target_id))
         product = repository.products.get(item.product_id) if item else None
         if not item or not item.active or not product or not product.active:
-            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product Model and its active Product.")
+            raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Product Model and its active Product.", {"retryDisposition": "safe_to_edit"})
         return {"id": item.id, "label": " ".join(value for value in [item.model_number, item.name] if value).strip()}
     item = repository.codes.get(str(target_id))
     model = repository.models.get(item.model_id) if item else None
     product = repository.products.get(model.product_id) if model else None
     if not item or not item.active or item.legacy_spares_only or not model or not model.active or not product or not product.active:
-        raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Model Code under an active Product Model and Product.")
+        raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Model Code under an active Product Model and Product.", {"retryDisposition": "safe_to_edit"})
     return {"id": item.id, "label": item.code}
 
 
@@ -450,6 +450,13 @@ def _part_http_error(exc) -> HTTPException:
         "PART_CHANGE_PROPOSAL_INCOMPLETE", "PART_REPLACEMENT_REQUIRED", "PART_SELECTION_INVALID",
         "PART_REPLACEMENT_SOURCE_REQUIRED", "PART_MATCH_INPUT_INVALID", "PART_MATCH_CANDIDATE_INVALID",
         "PART_MATCH_CANDIDATE_ALREADY_USED", "PART_MATCH_SOURCE_ALREADY_USED",
+        # These are emitted by Part creation/name/intended-code validation before
+        # the Grist reservation or canonical Part publication begins. Unknown
+        # errors and failures after reservation stay retry_same_request.
+        "PART_SCOPE_TARGET_INVALID", "PART_INPUT_INVALID", "PART_INPUT_REQUIRED", "PART_SHORTCODE_REQUIRED",
+        "PART_SHORTCODE_INVALID", "PART_SHORTCODE_CONFLICT", "PART_NAME_PREVIEW_STALE", "PART_NAME_EXISTS", "PART_REVISION_LOCKED",
+        "PART_INTENDED_CODES_INVALID", "PART_INTENDED_CONTEXT_INVALID", "PART_INTENDED_CODE_INACTIVE",
+        "PART_INTENDED_SHARING_REQUIRES_GRIST",
     }
     disposition = "refresh_required" if exc.code in refresh_codes else "safe_to_edit" if exc.code in safe_codes else "retry_same_request"
     return _error(status, exc.code, str(exc), {"retryDisposition": disposition})
