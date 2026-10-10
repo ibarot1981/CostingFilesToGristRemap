@@ -355,12 +355,194 @@ class GristPartRegistry:
         self._complete_request(request, result)
         return {**result, "idempotent": False}
 
+    @staticmethod
+    def _json_fingerprint_payload(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def _local_create_reservation(self, request_key: str) -> dict[str, Any] | None:
+        with self._database() as db:
+            row = db.execute("SELECT * FROM part_registry_reservations WHERE request_key=?", (request_key,)).fetchone()
+        return dict(row) if row else None
+
+    def _reservation_create_payload(self, reservation: dict[str, Any]) -> dict[str, Any]:
+        try:
+            payload = json.loads(reservation.get("payload_json") or "{}")
+        except (TypeError, ValueError):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The saved Part reservation has no readable recovery payload.")
+        if not isinstance(payload, dict):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The saved Part reservation has no readable recovery payload.")
+        return payload
+
+    @staticmethod
+    def _create_client_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        value = payload.get("_clientPayload")
+        return value if isinstance(value, dict) else None
+
+    def _legacy_create_payload_matches(self, saved: dict[str, Any], incoming: dict[str, Any]) -> bool:
+        """Conservatively recognize retries from before the request body was journaled."""
+        if incoming.get("scope") != saved.get("scopeType") or str(incoming.get("targetId") or "") != str(saved.get("targetId") or ""):
+            return False
+        if " ".join(str(incoming.get("description") or "").split()) != saved.get("description", ""):
+            return False
+        if " ".join(str(incoming.get("variant") or "").split()) != saved.get("variant", ""):
+            return False
+        if incoming.get("expectedName") != saved.get("expectedName", "") or incoming.get("reason") != saved.get("reason", ""):
+            return False
+        expected = {"scope", "targetId", "description", "variant", "expectedName", "reason"}
+        allowed = expected | {"selectedProductId", "selectedProductModelId", "intendedModelCodeIds", "engineeringRevision", "revision"}
+        if set(incoming) - allowed:
+            return False
+        if incoming.get("selectedProductId") not in (None, "") or incoming.get("selectedProductModelId") not in (None, ""):
+            return False
+        if incoming.get("intendedModelCodeIds", []) not in ([], None):
+            return False
+        if incoming.get("engineeringRevision", incoming.get("revision", "A")) not in (None, "", "A", "a"):
+            return False
+        return True
+
+    def _restore_local_create_reservation(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild the allocator journal from the Grist request written before ProductPart."""
+        fields = request.get("fields", {})
+        try:
+            envelope = json.loads(fields.get("Payload") or "{}")
+        except (TypeError, ValueError):
+            envelope = {}
+        saved = envelope.get("createPayload") if isinstance(envelope, dict) else None
+        if not isinstance(saved, dict):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist has a pending Part request but no complete saved recovery payload.")
+        request_key = str(fields.get("RequestKey") or "")
+        try:
+            fingerprint = request_fingerprint([saved["scopeType"], str(saved["targetId"]), saved["targetLabel"],
+                saved["description"], saved["variant"], saved["expectedName"], saved["actor"], saved["reason"]])
+        except (KeyError, TypeError):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request has incomplete recovery data.")
+        if fingerprint != fields.get("RequestFingerprint"):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request does not match its saved recovery data.")
+        stable_id = str(fields.get("EntityUUID") or "")
+        number = str(fields.get("ReservedPartNumber") or "")
+        name_key = str(fields.get("ReservedNameKey") or "")
+        if not request_key or not stable_id or not number or not name_key:
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request is missing its reserved identity.")
+        if (not number.startswith("SM-P-") or not number[5:].isdigit() or int(number[5:]) < 1
+                or name_key != normalized_name(str(saved.get("expectedName") or ""))):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request has an invalid reserved number or name key.")
+        if self._create_client_payload(saved) is None:
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request is missing its original client payload.")
+        client_payload = self._create_client_payload(saved) or {}
+        if (client_payload.get("scope") != saved.get("scopeType")
+                or str(client_payload.get("targetId") or "") != str(saved.get("targetId") or "")
+                or " ".join(str(client_payload.get("description") or "").split()) != saved.get("description")
+                or " ".join(str(client_payload.get("variant") or "").split()) != saved.get("variant")
+                or client_payload.get("expectedName") != saved.get("expectedName")
+                or client_payload.get("reason") != saved.get("reason")):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's pending Part request body does not match its saved creation data.")
+        status = "published" if fields.get("Status") == "published" else "reserved"
+        result_json = fields.get("Result") if status == "published" else None
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT * FROM part_registry_reservations WHERE request_key=?", (request_key,)).fetchone()
+            if not existing:
+                try:
+                    db.execute("INSERT INTO part_registry_reservations(request_key,request_type,request_fingerprint,stable_part_id,part_number,name_key,payload_json,status,result_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (request_key, "create", fingerprint, stable_id, number, name_key, json.dumps(saved, sort_keys=True), status, result_json, utc_now()))
+                except sqlite3.IntegrityError as exc:
+                    db.rollback()
+                    raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "Grist's reserved Part number or name conflicts with this local recovery journal.") from exc
+                try:
+                    next_number = int(number.removeprefix("SM-P-")) + 1
+                except ValueError:
+                    next_number = 1
+                db.execute("UPDATE part_registry_settings SET next_part_number=max(next_part_number,?) WHERE singleton=1", (next_number,))
+            else:
+                existing_payload = json.loads(existing["payload_json"] or "{}")
+                if existing["request_fingerprint"] != fingerprint or existing_payload.get("_clientPayload") != saved.get("_clientPayload"):
+                    db.rollback()
+                    raise PartIdentityError("PART_REQUEST_CONFLICT", "Grist and the local journal contain different payloads for this Part request.")
+            db.commit()
+        reservation = self._local_create_reservation(request_key)
+        if not reservation:
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The Grist Part request could not be restored to the local allocator journal.")
+        return reservation
+
+    def prepare_create_recovery(self, request_key: str, request_payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Return immutable saved creation data before current target/code validation runs."""
+        if not request_key or not request_key.strip():
+            return None
+        reservation = self._local_create_reservation(request_key)
+        request = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
+        if request and request.get("fields", {}).get("RequestType") not in (None, "create_part"):
+            raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key belongs to a different operation.")
+        if reservation is None and request:
+            reservation = self._restore_local_create_reservation(request)
+        if reservation is None:
+            return None
+        if reservation.get("request_type") != "create":
+            raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key belongs to a different operation.")
+        saved = self._reservation_create_payload(reservation)
+        core = {key: saved.get(key) for key in ("scopeType", "targetId", "targetLabel", "description", "variant", "expectedName", "actor", "reason", "shortcode")}
+        fingerprint = request_fingerprint([core["scopeType"], str(core["targetId"]), core["targetLabel"], core["description"],
+            core["variant"], core["expectedName"], str(core["actor"] or "").strip(), str(core["reason"] or "").strip()])
+        if fingerprint != reservation.get("request_fingerprint"):
+            raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The saved Part request data does not match its reserved identity.")
+        original_client = self._create_client_payload(saved)
+        request_fields = request.get("fields", {}) if request else {}
+        if request and (request_fields.get("RequestFingerprint") != reservation.get("request_fingerprint")
+                or request_fields.get("EntityUUID") != reservation.get("stable_part_id")
+                or request_fields.get("ReservedPartNumber") != reservation.get("part_number")
+                or request_fields.get("ReservedNameKey") != reservation.get("name_key")):
+            raise PartIdentityError("PART_REQUEST_CONFLICT", "Grist and the local journal reserve different Part identities for this request key.")
+        remote_envelope = {}
+        try:
+            remote_envelope = json.loads(request_fields.get("Payload") or "{}")
+        except (TypeError, ValueError):
+            pass
+        remote_client = remote_envelope.get("clientPayload") if isinstance(remote_envelope, dict) else None
+        if original_client is not None:
+            if self._json_fingerprint_payload(original_client) != self._json_fingerprint_payload(request_payload):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with a different original Part payload.")
+            if isinstance(remote_client, dict) and self._json_fingerprint_payload(remote_client) != self._json_fingerprint_payload(original_client):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "Grist and the local journal contain different original Part payloads.")
+        else:
+            if not self._legacy_create_payload_matches(saved, request_payload):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "The original Part payload cannot be proven from this older request; keep and retry the original request without editing it.")
+            if isinstance(remote_client, dict) and self._json_fingerprint_payload(remote_client) != self._json_fingerprint_payload(request_payload):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with a different original Part payload.")
+            saved["_clientPayload"] = request_payload
+            with self._database() as db:
+                db.execute("UPDATE part_registry_reservations SET payload_json=?,updated_at=? WHERE request_key=?",
+                    (json.dumps(saved, sort_keys=True), utc_now(), request_key))
+            reservation["payload_json"] = json.dumps(saved, sort_keys=True)
+            original_client = request_payload
+        if not saved.get("shortcode"):
+            metadata = self._find(self._rows("PartMetadataVersion"), "RequestKey", request_key)
+            if metadata:
+                saved["shortcode"] = metadata.get("fields", {}).get("Shortcode")
+            else:
+                suffix = f" — {saved.get('description', '')}" + (f" — {saved.get('variant')}" if saved.get("variant") else "")
+                expected_name = str(saved.get("expectedName") or "")
+                if not suffix.strip() or not expected_name.endswith(suffix) or len(expected_name) <= len(suffix):
+                    raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The original Part shortcode cannot be recovered from the saved reservation.")
+                saved["shortcode"] = expected_name[:-len(suffix)]
+            if not saved["shortcode"]:
+                raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The original Part shortcode cannot be recovered from Grist or the saved reservation.")
+            with self._database() as db:
+                db.execute("UPDATE part_registry_reservations SET payload_json=?,updated_at=? WHERE request_key=?",
+                    (json.dumps(saved, sort_keys=True), utc_now(), request_key))
+        if request and not isinstance(remote_client, dict):
+            envelope = {"createPayload": saved, "clientPayload": original_client}
+            self.client.update_table_records(REQUEST_TABLE, [{"id": int(request["id"]), "fields": {
+                "Payload": json.dumps(envelope, sort_keys=True), "UpdatedAt": grist_datetime(utc_now())}}])
+        return saved
+
     def _reserve_create(self, *, scope_type: str, target_id: str, target_label: str, description: str, variant: str,
-                        expected_name: str, actor: str, reason: str, request_key: str) -> dict[str, Any]:
+                        expected_name: str, actor: str, reason: str, request_key: str, shortcode: str,
+                        request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
         now = utc_now()
         fingerprint = request_fingerprint([scope_type, target_id, target_label, description, variant, expected_name, actor.strip(), reason.strip()])
         payload = {"scopeType": scope_type, "targetId": target_id, "targetLabel": target_label, "description": description,
-                   "variant": variant, "expectedName": expected_name, "actor": actor.strip(), "reason": reason.strip()}
+                   "variant": variant, "expectedName": expected_name, "actor": actor.strip(), "reason": reason.strip(), "shortcode": shortcode}
+        if request_payload is not None:
+            payload["_clientPayload"] = request_payload
         with self._database() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM part_registry_reservations WHERE request_key=?", (request_key,)).fetchone()
@@ -368,6 +550,11 @@ class GristPartRegistry:
                 if existing["request_fingerprint"] != fingerprint:
                     db.rollback()
                     raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different Part data.")
+                existing_payload = json.loads(existing["payload_json"] or "{}")
+                saved_client = self._create_client_payload(existing_payload)
+                if saved_client is not None and request_payload is not None and self._json_fingerprint_payload(saved_client) != self._json_fingerprint_payload(request_payload):
+                    db.rollback()
+                    raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with a different original Part payload.")
                 db.commit()
                 return dict(existing)
             collisions = self._check_name_available(normalized_name(expected_name))
@@ -396,8 +583,31 @@ class GristPartRegistry:
                 "payload_json": json.dumps(payload, sort_keys=True), "status": "reserved", "result_json": None}
 
     def create_part(self, *, scope_type: str, target_id: str, target_label: str, description: str, variant: str = "",
-                    expected_name: str, actor: str, reason: str, request_key: str, revision_assertion: Any = None) -> dict[str, Any]:
+                    expected_name: str, actor: str, reason: str, request_key: str, revision_assertion: Any = None,
+                    request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
         self._verify_writer()
+        existing_reservation = self._local_create_reservation(request_key) if request_key else None
+        saved_payload = self._reservation_create_payload(existing_reservation) if existing_reservation else None
+        if saved_payload:
+            saved_target_label = str(saved_payload.get("targetLabel") or "")
+            if request_fingerprint([scope_type, str(target_id), saved_target_label, " ".join(description.split()), " ".join(variant.split()),
+                    expected_name, actor.strip(), reason.strip()]) != existing_reservation.get("request_fingerprint"):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different Part data.")
+            target_label = saved_target_label
+            saved_shortcode = str(saved_payload.get("shortcode") or "")
+            if not saved_shortcode:
+                suffix = f" — {saved_payload.get('description', '')}" + (f" — {saved_payload.get('variant')}" if saved_payload.get("variant") else "")
+                if not suffix.strip() or not str(saved_payload.get("expectedName") or "").endswith(suffix):
+                    raise PartIdentityError("PART_REQUEST_RECOVERY_REQUIRED", "The original Part shortcode cannot be recovered from its saved reservation.")
+                saved_shortcode = str(saved_payload["expectedName"])[:-len(suffix)]
+            shortcode = {"Shortcode": saved_shortcode}
+            if request_payload is not None:
+                saved_client = self._create_client_payload(saved_payload)
+                if saved_client is not None and self._json_fingerprint_payload(saved_client) != self._json_fingerprint_payload(request_payload):
+                    raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with a different original Part payload.")
+                request_payload = saved_client if saved_client is not None else request_payload
+        else:
+            shortcode = None
         if revision_assertion is not None and str(revision_assertion).casefold() != "a":
             raise PartIdentityError("PART_REVISION_LOCKED", "New Parts remain Rev A until approved CR control is available.")
         description = " ".join(description.split())
@@ -406,12 +616,14 @@ class GristPartRegistry:
             raise PartIdentityError("PART_SCOPE_TARGET_INVALID", "Choose a valid scope and target.")
         if not description or len(description) > 120 or len(variant) > 120 or not reason.strip() or not actor.strip() or not request_key.strip():
             raise PartIdentityError("PART_INPUT_REQUIRED", "Description, actor, reason and idempotency key are required.")
-        shortcode = self._shortcode(scope_type, target_id)
-        actual_name = generated_name(str(shortcode["Shortcode"]), description, variant)
-        if actual_name != expected_name:
-            raise PartIdentityError("PART_NAME_PREVIEW_STALE", "The generated name changed after preview. Review it before saving.")
+        if shortcode is None:
+            shortcode = self._shortcode(scope_type, target_id)
+            actual_name = generated_name(str(shortcode["Shortcode"]), description, variant)
+            if actual_name != expected_name:
+                raise PartIdentityError("PART_NAME_PREVIEW_STALE", "The generated name changed after preview. Review it before saving.")
         reservation = self._reserve_create(scope_type=scope_type, target_id=target_id, target_label=target_label,
-            description=description, variant=variant, expected_name=expected_name, actor=actor, reason=reason, request_key=request_key)
+            description=description, variant=variant, expected_name=expected_name, actor=actor, reason=reason, request_key=request_key,
+            shortcode=str(shortcode["Shortcode"]), request_payload=request_payload)
         if reservation.get("status") == "published" and reservation.get("result_json"):
             return {"part": json.loads(reservation["result_json"]), "idempotent": True}
         payload = json.loads(reservation["payload_json"])
@@ -419,6 +631,7 @@ class GristPartRegistry:
         metadata_key, revision_key = f"{stable_id}:metadata:1", f"{stable_id}:revision:A"
         fingerprint = reservation["request_fingerprint"]
         now = grist_datetime(utc_now())
+        shortcode_value = str(payload.get("shortcode") or shortcode["Shortcode"])
         name_key = normalized_name(expected_name)
         target_field = {"product": "ScopeProduct", "product_model": "ScopeProductModel", "model_code": "ScopeModelCode"}.get(payload["scopeType"])
         typed_target = {"ScopeProduct": None, "ScopeProductModel": None, "ScopeModelCode": None}
@@ -429,8 +642,12 @@ class GristPartRegistry:
             if grist_request.get("fields", {}).get("RequestFingerprint") != fingerprint:
                 raise PartIdentityError("PART_REQUEST_CONFLICT", "Grist already contains this request key with different Part data.")
         else:
+            request_envelope = {"createPayload": payload}
+            if isinstance(payload.get("_clientPayload"), dict):
+                request_envelope["clientPayload"] = payload["_clientPayload"]
             self.client.create_table_records(REQUEST_TABLE, [{"fields": {"RequestKey": request_key, "RequestType": "create_part", "RequestFingerprint": fingerprint,
                 "EntityUUID": stable_id, "ReservedPartNumber": number, "ReservedNameKey": name_key, "Status": "publishing",
+                "Payload": json.dumps(request_envelope, sort_keys=True),
                 "StartedAt": now, "UpdatedAt": now, "WriterHostId": self.host_id, "CoordinatorId": self.coordinator_id}}])
         part = self._find(self._rows("ProductPart"), "StablePartId", stable_id)
         if not part:
@@ -449,7 +666,7 @@ class GristPartRegistry:
         if target_field:
             scope_fields[target_field] = int(payload["targetId"])
         metadata_fields = {"MetadataKey": metadata_key, "ProductPart": part_id, "Version": 1, **scope_fields,
-            "Shortcode": shortcode["Shortcode"], "Description": payload["description"], "DesignVariant": payload["variant"],
+            "Shortcode": shortcode_value, "Description": payload["description"], "DesignVariant": payload["variant"],
             "DisplayName": expected_name, "NameKey": name_key, "Actor": payload["actor"], "Reason": payload["reason"],
             "OccurredAt": now, "RequestKey": request_key, "RequestFingerprint": fingerprint}
         metadata = self._ensure_keyed("PartMetadataVersion", "MetadataKey", metadata_key, metadata_fields)
@@ -660,12 +877,24 @@ class GristPartRegistry:
             raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
         if type(expected_version) is not int or expected_version < 0 or not actor.strip() or not reason.strip() or not request_key.strip():
             raise PartIdentityError("PART_INTENDED_SHARING_INPUT_INVALID", "A valid expected version, actor, reason and idempotency key are required.")
-        desired = self.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
+        if not isinstance(code_ids, list):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Codes must be submitted as a list.")
+        try:
+            requested_ids = [int(value) for value in code_ids]
+        except (TypeError, ValueError):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Every intended Model Code must be a Grist record ID.")
+        if any(value <= 0 for value in requested_ids) or len(set(requested_ids)) != len(requested_ids):
+            raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Code IDs must be positive and unique.")
+        desired = sorted(requested_ids)
+        request = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
+        if not request:
+            # New requests must still prove that all codes and context are current
+            # before writing the immutable request journal.
+            desired = self.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
         fingerprint = request_fingerprint([part_id, desired, expected_version, actor.strip(), reason.strip()])
         state_row = self._sharing_state(part)
         state = state_row.get("fields", {}) if state_row else {"Version": 0, "Fingerprint": request_fingerprint([])}
         current_version = int(state.get("Version") or 0)
-        request = self._find(self._rows(REQUEST_TABLE), "RequestKey", request_key)
         if request:
             fields = request.get("fields", {})
             if fields.get("RequestType") != "save_intended_sharing" or fields.get("RequestFingerprint") != fingerprint:

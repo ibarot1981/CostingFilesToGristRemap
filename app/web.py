@@ -553,11 +553,20 @@ def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...),
     repository = _get_repository()
     scope = str(payload.get("scope") or "")
     target_id = str(payload.get("targetId") or "")
-    target = _scope_target(repository, scope, target_id)
     try:
-        legacy = _legacy_part_rows(repository)
         registry = _part_registry()
-        registry.sync_legacy_names(legacy)
+        recovery = registry.prepare_create_recovery(idempotency_key or "", payload) if hasattr(registry, "prepare_create_recovery") else None
+        if recovery:
+            # Resolve an already reserved request from its immutable Grist/SQLite
+            # evidence before consulting mutable Products, Models or Model Codes.
+            # This keeps stale current validation from releasing a prior write.
+            scope = str(recovery.get("scopeType") or scope)
+            target_id = str(recovery.get("targetId") or target_id)
+            target = {"id": target_id, "label": str(recovery.get("targetLabel") or "")}
+        else:
+            target = _scope_target(repository, scope, target_id)
+            legacy = _legacy_part_rows(repository)
+            registry.sync_legacy_names(legacy)
         actor = _request_actor(request)
         reason = str(payload.get("reason") or "")
         code_ids = payload.get("intendedModelCodeIds", [])
@@ -565,15 +574,18 @@ def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...),
         model_id = payload.get("selectedProductModelId")
         if not isinstance(code_ids, list):
             raise PartIdentityError("PART_INTENDED_CODES_INVALID", "Intended Model Codes must be submitted as a list.")
-        if hasattr(registry, "validate_intended_model_codes"):
+        if not recovery and hasattr(registry, "validate_intended_model_codes"):
             registry.validate_intended_model_codes(code_ids, product_id=product_id, model_id=model_id)
-        elif code_ids:
+        elif not recovery and code_ids:
             raise PartIdentityError("PART_INTENDED_SHARING_REQUIRES_GRIST", "Intended sharing can be saved only when Safari Manufacturing Grist is the active Part store.")
-        result = registry.create_part(scope_type=scope, target_id=target_id, target_label=target["label"],
+        create_arguments = dict(scope_type=scope, target_id=target_id, target_label=target["label"],
             description=str(payload.get("description") or ""), variant=str(payload.get("variant") or ""),
             expected_name=str(payload.get("expectedName") or ""), actor=actor,
             reason=reason, request_key=idempotency_key or "",
             revision_assertion=payload.get("engineeringRevision", payload.get("revision")))
+        if hasattr(registry, "prepare_create_recovery"):
+            create_arguments["request_payload"] = payload
+        result = registry.create_part(**create_arguments)
         if code_ids:
             sharing_key = "part-create-intended:" + hashlib.sha256(str(idempotency_key or "").encode()).hexdigest()
             try:

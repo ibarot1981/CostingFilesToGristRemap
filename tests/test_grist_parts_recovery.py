@@ -10,6 +10,12 @@ import unittest
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
 from app.part_identity import PartIdentityError, request_fingerprint
+from app.domain import Product, ProductModel, ProductModelCode
+from app.repository import InMemorySafariRepository
+from app import web
+from fastapi import HTTPException
+from starlette.requests import Request
+from unittest import mock
 
 
 class MemoryGrist:
@@ -193,6 +199,8 @@ class GristPartRecoveryTests(unittest.TestCase):
             client.lose_after_update_table = "PartIntendedSharingState"
             with self.assertRaises(TimeoutError):
                 self.share(registry, part, codes=[301, 302], version=0, key="recover-state")
+            # The durable request/event set must survive a later code deactivation.
+            client.tables["ProductModelCode"][0]["fields"]["Active"] = False
 
             restarted = self.make_registry(client, path)
             recovered = self.share(restarted, part, codes=[302, 301], version=0, key="recover-state")
@@ -281,6 +289,94 @@ class GristPartRecoveryTests(unittest.TestCase):
                              ("SM-P-000001", "S1K — Chassis — Standard", "A"))
             self.assertEqual(self.create(after_restart)["part"]["id"], part["id"])
             self.assertEqual(len(client.tables["ProductPart"]), 1)
+
+    def test_partial_create_recovers_same_part_after_shortcode_and_target_change_from_grist_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "parts-journal.sqlite3"
+            client = MemoryGrist()
+            client.lose_after_create_table = "ProductPart"
+            registry = self.make_registry(client, path)
+            repository = InMemorySafariRepository()
+            repository.add_product(Product(id="17", name="Safari 1000"))
+            payload = {"scope": "product", "targetId": "17", "description": "Chassis", "variant": "Standard",
+                "expectedName": "S1K — Chassis — Standard", "reason": "Recover the original published identity",
+                "selectedProductId": None, "selectedProductModelId": None, "intendedModelCodeIds": []}
+            request = Request({"type": "http", "headers": [(b"x-authentik-uid", b"recovery-operator")]})
+
+            with mock.patch.object(web, "_repository", repository), mock.patch.object(web, "_part_identity_registry", registry), \
+                 mock.patch.object(web, "_legacy_part_rows", return_value=[]):
+                with self.assertRaises(TimeoutError):
+                    web.create_canonical_part(request, payload, "lost-part-response")
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
+                request_row = client.tables["PartRegistryRequest"][0]
+                envelope = json.loads(request_row["fields"]["Payload"])
+                self.assertEqual(envelope["clientPayload"], payload)
+                self.assertEqual(envelope["createPayload"]["shortcode"], "S1K")
+
+                # Model loss of the local allocator journal: recovery must be
+                # reconstructable from the request already persisted in Grist.
+                with registry._database() as db:
+                    db.execute("DELETE FROM part_registry_reservations WHERE request_key=?", ("lost-part-response",))
+                registry.set_shortcode(scope_type="product", target_id="17", target_label="Safari 1000", shortcode="SNEW",
+                    actor="master-data operator", reason="Product shortcode maintenance", request_key="change-product-code")
+                repository.products["17"] = Product(id="17", name="Safari 1000", active=False)
+                restarted = self.make_registry(client, path)
+                web._part_identity_registry = restarted
+
+                recovered = web.create_canonical_part(request, payload, "lost-part-response")
+                self.assertEqual(recovered["part"]["partNumber"], "SM-P-000001")
+                self.assertEqual(recovered["part"]["name"], "S1K — Chassis — Standard")
+                self.assertEqual(recovered["part"]["shortcode"], "S1K")
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
+                self.assertEqual(client.tables["PartRegistryRequest"][0]["fields"]["Status"], "published")
+
+                changed = {**payload, "expectedName": "SNEW — Chassis — Standard"}
+                with self.assertRaises(HTTPException) as conflict:
+                    web.create_canonical_part(request, changed, "lost-part-response")
+                self.assertEqual(conflict.exception.detail["code"], "PART_REQUEST_CONFLICT")
+                self.assertEqual(conflict.exception.detail["retryDisposition"], "retry_same_request")
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
+
+    def test_partial_create_with_intended_code_change_keeps_exact_attempt_until_sharing_recovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            self.seed_model_codes(client)
+            client.lose_after_create_table = "ProductPart"
+            registry = self.make_registry(client, Path(temp) / "parts-journal.sqlite3")
+            repository = InMemorySafariRepository()
+            repository.add_product(Product(id="17", name="Safari 1000"))
+            repository.add_model(ProductModel(id="201", product_id="17", model_number="S1KHF", name="Safari 1000 HF"))
+            repository.add_code(ProductModelCode(id="301", model_id="201", code="HF-ELP"))
+            payload = {"scope": "product", "targetId": "17", "description": "Chassis", "variant": "",
+                "expectedName": "S1K — Chassis", "reason": "Recover saved intended sharing",
+                "selectedProductId": "17", "selectedProductModelId": "201", "intendedModelCodeIds": [301]}
+            request = Request({"type": "http", "headers": [(b"x-authentik-uid", b"sharing-recovery-operator")]})
+
+            with mock.patch.object(web, "_repository", repository), mock.patch.object(web, "_part_identity_registry", registry), \
+                 mock.patch.object(web, "_legacy_part_rows", return_value=[]):
+                with self.assertRaises(TimeoutError):
+                    web.create_canonical_part(request, payload, "lost-part-before-sharing")
+                client.tables["ProductModelCode"][0]["fields"]["Active"] = False
+                with self.assertRaises(HTTPException) as pending:
+                    web.create_canonical_part(request, payload, "lost-part-before-sharing")
+                self.assertEqual(pending.exception.detail["code"], "PART_CREATED_SHARING_PENDING")
+                self.assertEqual(pending.exception.detail["retryDisposition"], "retry_same_request")
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
+                self.assertEqual(len(client.tables.get("PartIntendedModelCode", [])), 0)
+
+                client.tables["ProductModelCode"][0]["fields"]["Active"] = True
+                recovered = web.create_canonical_part(request, payload, "lost-part-before-sharing")
+                self.assertEqual(recovered["part"]["partNumber"], "SM-P-000001")
+                self.assertEqual(recovered["intendedSharing"]["activeCodeIds"], [301])
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
+                self.assertEqual(len(client.tables["PartIntendedModelCode"]), 1)
+
+                changed_context = {**payload, "selectedProductModelId": "999"}
+                with self.assertRaises(HTTPException) as conflict:
+                    web.create_canonical_part(request, changed_context, "lost-part-before-sharing")
+                self.assertEqual(conflict.exception.detail["code"], "PART_REQUEST_CONFLICT")
+                self.assertEqual(conflict.exception.detail["retryDisposition"], "retry_same_request")
+                self.assertEqual(len(client.tables["ProductPart"]), 1)
 
     def test_reused_request_key_with_changed_payload_conflicts(self):
         with tempfile.TemporaryDirectory() as temp:

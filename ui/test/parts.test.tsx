@@ -144,6 +144,60 @@ it("restores a failed initial Part save from the same browser session request", 
   expect(mocks.createManagedPart.mock.calls[1][0]).toEqual(firstCall[0]);
 });
 
+it("keeps a partially published create locked and retries its original name after shortcode maintenance", async () => {
+  let currentShortcode = "S1K";
+  const serverParts = new Map<string, {part: typeof part}>();
+  mocks.partScopeTargets.mockImplementation(async () => {
+    const current:any = scopeTargets(currentShortcode);
+    current.scopes.find((item:any) => item.id === "product").targets[0].shortcode = currentShortcode;
+    return current;
+  });
+  mocks.partNamePreview.mockImplementation(async (scope, targetId, description, variant) => ({
+    name:`${scope === "product" && currentShortcode === "SNEW" ? "SNEW" : targetId === "model-1" ? "S1KHF" : "S1K"} — ${description}${variant ? ` — ${variant}` : ""}`,
+    available:true,collision:[],
+  }));
+  mocks.createManagedPart.mockReset()
+    .mockImplementationOnce((payload: any, key: string) => {
+      serverParts.set(key, {part:{...part,id:"server-part-1",partNumber:"SM-P-000001",name:payload.expectedName}});
+      return Promise.reject(new ApiError("PART_NAME_PREVIEW_STALE after the Part row committed", 409,
+        "PART_NAME_PREVIEW_STALE", "retry_same_request"));
+    })
+    .mockImplementation((payload: any, key: string) => Promise.resolve(serverParts.get(key)));
+
+  const firstView = render(<PartsView/>);
+  fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
+  fireEvent.change(await screen.findByLabelText("Name derives from"), {target:{value:"product"}});
+  const target = await screen.findByLabelText("Scope target") as HTMLSelectElement;
+  await waitFor(() => expect(target.disabled).toBe(false));
+  fireEvent.change(target, {target:{value:"product-1"}});
+  const description = screen.getByLabelText("What is the Part called?") as HTMLInputElement;
+  fireEvent.change(description, {target:{value:"Chassis"}});
+  fireEvent.change(screen.getByLabelText("Why is this Part needed?"), {target:{value:"Recover after partial Grist publication"}});
+  await waitFor(() => expect(screen.getByText("S1K — Chassis")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", {name:"Save Part"}));
+  await screen.findByRole("alert");
+  const original = mocks.createManagedPart.mock.calls[0];
+  expect(screen.getByRole("button", {name:"Retry same creation request"})).toHaveProperty("disabled", false);
+  expect(description.disabled).toBe(true);
+  expect(screen.getByRole("button", {name:"Recovery is required"})).toHaveProperty("disabled", true);
+  expect(serverParts.size).toBe(1);
+
+  currentShortcode = "SNEW";
+  firstView.unmount();
+  render(<PartsView/>);
+  expect(await screen.findByRole("option", {name:"Safari 1000 · SNEW"})).toBeTruthy();
+  const restoredDescription = await screen.findByDisplayValue("Chassis") as HTMLInputElement;
+  expect(restoredDescription.disabled).toBe(true);
+  expect(screen.getByRole("button", {name:"Retry same creation request"})).toBeTruthy();
+  expect(screen.queryByRole("button", {name:"Save Part"})).toBeNull();
+  fireEvent.click(screen.getByRole("button", {name:"Retry same creation request"}));
+  await waitFor(() => expect(screen.queryByLabelText("What is the Part called?")).toBeNull());
+  expect(mocks.createManagedPart).toHaveBeenCalledTimes(2);
+  expect(mocks.createManagedPart.mock.calls[1]).toEqual(original);
+  expect(serverParts.size).toBe(1);
+  expect([...serverParts.values()][0].part).toMatchObject({partNumber:"SM-P-000001",name:"S1K — Chassis"});
+});
+
 it("unlocks a standalone creation after a structured pre-write rejection so it can be corrected", async () => {
   vi.stubGlobal("crypto", {randomUUID: vi.fn().mockReturnValueOnce("rejected-request").mockReturnValueOnce("corrected-request")});
   mocks.createManagedPart.mockReset()
