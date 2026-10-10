@@ -1,0 +1,9 @@
+{
+  "task_id":"example-001", "round":1,
+  "pr_url":"https://github.com/owner/repo/pull/3", "pr_number":3,
+  "branch":"codex/example", "worktree_path":"D:/path/to/checkout",
+  "commit_sha":"REPLACE_WITH_EXACT_40_CHARACTER_SHA",
+  "implemented_requirements":["c1"],
+  "validation_results":[{"name":"workflow-tests","status":"pass","verified":true,"evidence":"Replace with actual command, observed output and evidence location."}],
+  "unverified_checks":[], "blockers":[]
+}

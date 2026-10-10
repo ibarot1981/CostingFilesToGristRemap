@@ -12,3 +12,8 @@ state/
 
 .env
 config/safari_manufacturing.local.json
+
+# Local agent handoffs and coordination metadata (instructions remain tracked).
+.agent-workflow/tasks/
+.agent-workflow/.transition.lock/
+.agent-workflow/*.tmp
