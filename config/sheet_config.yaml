@@ -196,6 +196,8 @@ supported_sheets:
         - Remarks
         - ToolShop Part Name
         - Tool Shop Part Name
+      toolshop_remarks:
+        - Remarks
       job_remarks:
         - Remarks on Job for this part
         - Job Remarks

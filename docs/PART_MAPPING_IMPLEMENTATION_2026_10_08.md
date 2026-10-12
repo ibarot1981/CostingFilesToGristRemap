@@ -130,6 +130,32 @@ For possible historical manual-match errors, query `PartWorkbookDecision` where 
 
 No pull request has been merged or deployed. Apply and verify additive schema v12 before deploying this branch.
 
+## Source-line field and navigation follow-up (12 October 2026)
+
+This PR follow-up makes two source-owned descriptions independently available from mapping through the Part baseline and normalized line APIs. Tool Shop Items `Remarks` is extracted as `toolshop_remarks`; `Job Remarks` remains `job_remarks`, and the legacy `toolshop_part_name` alias is retained for old consumers. CNC `Plate Part to Cut` remains `product_part_name` in source evidence and `LineDetail.PlatePart` in normalized detail. CNC mapping identity continues to use `Part Category`; plate text is never used as the canonical Part assignment.
+
+| Record | Grist table and columns | Relationship / provenance |
+| --- | --- | --- |
+| Typed line detail | `LineDetail.LineRevision` (`Ref:LineRevision`), `LineDetail.ToolShopRemarks` (`Text`, new in schema v13), `LineDetail.PlatePart` (`Text`, existing) | One deterministic detail key per normalized line revision; the baseline writer stores the exact source text without trimming. A blank available Remarks column is stored as an empty string; an absent column is stored as null. |
+| Source observation | `SourceLineObservation.ObservedFields` and `SourceLineObservation.Cells` (JSON Text) | Includes exact parsed `toolshop_remarks`, `job_remarks`, and `product_part_name` values; source headers, header-cell coordinates, data-cell coordinates and header row remain in `Cells`. The mapping GET returns these as `fields`, `sourceHeaders`, `sourceHeaderCells`, `sourceCells` and `availableFields`. |
+| Source-to-line mapping | `SourceLineMapping.Observation` (`Ref:SourceLineObservation`), `SourceLineMapping.LineMaster` (`Ref:LineMaster`) | Connects the immutable workbook/sheet/row observation to the normalized line identity. |
+| Part baseline occurrence | `PartRevisionLine.PartRevision`, `BaselineProcessing`, `LineMaster`, `LineRevision`, `SourceLineObservation` | Pins each exact source row and typed detail to the accepted Part revision; repeated baseline requests upsert deterministic keys and do not duplicate line records. |
+
+The schema code advances to `safari-part-baseline-reconciliation-grist-2026-10-12.v13`. Its only new column is `LineDetail.ToolShopRemarks` as `Text`; v13 is prepared by the normal additive plan and was not written to production Grist. Existing `PlatePart` is reused. Source descriptions do not join the physical engineering signature, change Rev A or introduce a new revision policy. Normalized reads prefer each selected snapshot's own observation text when a physical revision is reused, so descriptive updates do not mutate historical snapshots.
+
+Part Mapping shows Tool Shop Remarks in compact and expanded source detail, preserves Job Remarks as a separate column, and retains blank/missing status plus header and cell coordinates. CNC Plate Part to Cut appears in both detail sizes beside unchanged category-based grouping. MS List, Tool Shop Items and CNC Cut List keep their complete source names and use stable peach, blue and green pastel labels. Parts and Part Mapping remain cached as separate pages; hidden cached wrappers now override flex display, receive `aria-hidden` and `inert`, and source-search portals/focus traps are inactive off-page. View Part remains view-only; returning preserves the workbook-specific draft, query, sheet filter and collapse state without saving assignments.
+
+### Verification (12 October 2026)
+
+- `\.venv\Scripts\python.exe -m unittest discover -s tests -v` — 259 tests passed; one platform-specific test was skipped. This includes ODS extraction through the mapping API, isolated Grist-compatible baseline/detail writes and rereads, blank/missing header distinctions, exact retries, source observation provenance, unchanged CNC category grouping, snapshot-specific descriptions, and additive v13 schema planning without writes.
+- Bundled Node 24 `node_modules/vitest/vitest.mjs run --config vitest.config.ts --maxWorkers=1` — 13 test files and 87 tests passed, including App-level view navigation, draft/context retention and previous Part creation recovery cases.
+- Bundled Node 24 `test/mappedFilesViewModel.test.mjs` — 2 tests passed.
+- Bundled Node 24 `node_modules/typescript/bin/tsc --noEmit` — passed.
+- Bundled Node 24 `node_modules/vite/bin/vite.js build` — passed.
+- A task-created browser tab against the local Safari UI used the cited HF workbook in read-only preview. Parts and Part Mapping were switched repeatedly; browser `getComputedStyle`, bounding boxes and focusable-control counts confirmed the inactive cached view has `display:none`, zero geometry and zero focusable controls, with `hidden`, `aria-hidden` and `inert` set. A Tool Shop assignment draft, family/search filters and collapse state survived navigation; the draft was reverted without saving. Tool Shop Remarks and Job Remarks appeared separately with row/cell provenance; CNC Plate Part to Cut remained separate from Part Category. The contextual create dialog and standalone New Part form opened and were exited without creating a record. MS List, Tool Shop Items and CNC Cut List labels rendered with distinct peach, blue and green treatments. Browser interactions did not save any Part or mapping.
+
+The persistence tests use isolated Grist-compatible fixtures. This follow-up did not write production Grist data or apply schema v13. The deployment target still needs the documented additive `LineDetail.ToolShopRemarks` Text column before the new field can persist in a live document; existing `LineDetail.PlatePart` is reused.
+
 ## Integration verification and v12 rollout preparation — 9 October 2026
 
 This section supersedes the earlier statement that the five corrections lacked disposable-Grist and interactive-browser verification. The production document was only read. The explicit configured target (`bAPdkEDn7brbqTrfVsRmXZ`, workspace `3`, exact name `Safari Manufacturing`) still plans exactly one additive change: numeric `PartWorkbookComparison.MappingVersion`. No table creation or column type change is pending. `MappingVersion` freezes the saved mapping review version associated with each comparison, so later decisions can reject changed assignments rather than infer their historical context.

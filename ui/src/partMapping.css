@@ -53,6 +53,10 @@
 .part-state.state-failed { color: #9e3d23; background: #fff0e9; }
 .part-group-content { padding-top: 8px; }
 .part-sheet-chip { display: inline-flex; padding: 3px 7px; border-radius: 10px; color: #76522d; background: #f6ece2; font-size: 9px; font-weight: 700; }
+.part-sheet-family-mcl { color: #75482e; background: #f8e9dd; }
+.part-sheet-family-toolshop { color: #355571; background: #e5eef7; }
+.part-sheet-family-cnc { color: #365b3d; background: #e6f0e6; }
+.part-sheet-label { display: inline-block; padding: 2px 5px; border-radius: 4px; font-weight: 650; }
 .part-state { flex: none; display: inline-flex; padding: 4px 8px; border-radius: 11px; font-size: 9px; font-weight: 700; }
 .part-state.saved { color: #39745d; background: #e3ede8; }
 .part-state.pending { color: #875522; background: #fff1d7; }
@@ -66,6 +70,7 @@
 .part-source-details table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .part-source-details th { position: sticky; top: 0; z-index: 1; padding: 5px 7px; color: #677387; background: #f0f2f4; border-bottom: 1px solid #dfe2e6; font-size: 9px; text-align: left; }
 .part-source-details td { min-width: 75px; padding: 5px 7px; color: #48566b; border-bottom: 1px solid #eceef1; font-size: 10px; overflow-wrap: anywhere; vertical-align: top; }
+.part-source-details td.part-source-value { white-space: pre-wrap; overflow-wrap: anywhere; }
 .part-source-details td:last-child,.part-source-details th:last-child { width: 140px; }
 .part-source-details tbody tr:last-child td { border-bottom: 0; }
 .part-source-details td small,.part-cell-ref { display: block; margin-top: 2px; color: #8a94a2; font-size: 8px; }
@@ -158,6 +163,7 @@
 
 /* Mapping workbench: flexible viewport layout, persistent context drawer and contextual creation. */
 .app-cached-view { flex: 1 1 auto; min-height: 0; display: flex; }
+.app-cached-view[hidden] { display: none !important; }
 .part-mapping-shell { position: relative; display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: #f7f6f3; }
 .part-context-panel { position: relative; z-index: 5; display: flex; flex: 0 0 310px; flex-direction: column; min-width: 0; width: 310px; background: #fbfaf8; border-right: 1px solid #dfe2e6; transition: flex-basis .2s ease,width .2s ease; }
 .part-context-panel.closed { flex-basis: 38px; width: 38px; }

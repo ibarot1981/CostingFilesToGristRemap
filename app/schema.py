@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-09.v12"
+SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-12.v13"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -141,6 +141,13 @@ FOUNDATION_TABLES += (
     _table("PartRevision", {"RevisionLabel": "Text", "BaselineStatus": "Text", "DefinitionHash": "Text", "FinalizedAt": "DateTime", "FinalizedBy": "Text", "FinalizationReason": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
     _table("PartMappingReview", {"StablePartId": "Text", "PartRevision": "Ref:PartRevision", "PartMetadataVersion": "Ref:PartMetadataVersion", "PartNumberUsed": "Text", "NameUsed": "Text"}),
     _table("PartComponentRevision", {"QuantityUOM": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text", "ComponentStatus": "Text", "SourcingRoute": "Text"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# v13 stores Tool Shop Items Remarks as typed line detail while retaining its
+# original source cell and header in SourceLineObservation.
+FOUNDATION_TABLES += (
+    _table("LineDetail", {"ToolShopRemarks": "Text"}),
 )
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 

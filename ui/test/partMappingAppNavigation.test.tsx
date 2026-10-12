@@ -13,7 +13,7 @@ vi.mock("../src/api", () => ({api: apiMocks}));
 const existingParts = [1, 2, 3].map(number => ({
   id: `part-${number}`, partNumber: `SM-P-${String(number).padStart(6, "0")}`,
   name: `Safari Manufacturing — Existing ${number}`, description: `Existing ${number}`, variant: "Standard",
-  engineeringRevision: "A", selectable: true, duplicateName: false, outOfScopeCodes: [],
+  engineeringRevision: "A", selectable: true, duplicateName: false, outOfScopeCodes: [], aliases: [],
 }));
 const newPart = {
   id: "part-created", partNumber: "SM-P-000004", name: "Safari Manufacturing — Mapping Return",
@@ -185,4 +185,68 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   expect(apiMocks.savePartMappings.mock.calls[1][0].decisions).toEqual({"mapping-2": "part-2", "mapping-3": "part-3", "mapping-4": "part-created"});
   expect(apiMocks.savePartMappings.mock.calls[1][0].expectedVersion).toBe(1);
   await waitFor(() => expectPendingChanges(0));
+}, 20000);
+
+it("keeps cached Parts and Mapping separate and preserves a view-only Part return without saving drafts", async () => {
+  persistedDetail = makeDetail([makeGroup(1), makeGroup(2, {sheet:"Tool Shop Items", labelField:"product_part_name"})]);
+  apiMocks.parts.mockResolvedValue({items:existingParts, legacyItems:[]});
+  render(<App/>);
+  fireEvent.click(await screen.findByRole("button", {name:/pilot\.ods/}));
+  await screen.findByText("No saved association");
+  fireEvent.click(screen.getByRole("button", {name:"Part Mapping"}));
+  await screen.findByText("Showing 2 of 2 source groups");
+
+  const search = screen.getByLabelText("Search descriptions or source fields");
+  fireEvent.change(search, {target:{value:"Item 1"}});
+  fireEvent.change(screen.getByLabelText("Source sheet"), {target:{value:"mcl"}});
+  const toggle = screen.getByRole("button", {name:/source evidence · Item 1/i});
+  fireEvent.click(toggle);
+  await chooseExistingPart(1, 0);
+  expectPendingChanges(1);
+  expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
+
+  const mappingWrapper = Array.from(document.querySelectorAll<HTMLElement>(".app-cached-view"))
+    .find(node => Boolean(node.querySelector(".part-mapping-shell")))!;
+  const partsBeforeVisit = document.querySelector<HTMLElement>(".app-cached-view .parts-page");
+  expect(mappingWrapper.hidden).toBe(false);
+  expect(mappingWrapper.hasAttribute("inert")).toBe(false);
+  expect(partsBeforeVisit).toBeNull();
+
+  const group = toggle.closest(".part-source-group")!;
+  fireEvent.click(within(group).getByRole("button", {name:"View Part"}));
+  await screen.findByText("Part number");
+  const partsWrapper = Array.from(document.querySelectorAll<HTMLElement>(".app-cached-view"))
+    .find(node => Boolean(node.querySelector(".parts-page")))!;
+  expect(partsWrapper.hidden).toBe(false);
+  expect(mappingWrapper.hidden).toBe(true);
+  expect(mappingWrapper.getAttribute("aria-hidden")).toBe("true");
+  expect(mappingWrapper.hasAttribute("inert")).toBe(true);
+  expect(getComputedStyle(mappingWrapper).display).toBe("none");
+  expect(mappingWrapper.querySelector("input[role=combobox]")?.tabIndex).toBe(0);
+
+  fireEvent.click(screen.getByRole("button", {name:"Return to Part Mapping"}));
+  await screen.findByText("Showing 1 of 2 source groups");
+  await waitFor(() => expectPendingChanges(1));
+  expect((screen.getByLabelText("Search descriptions or source fields") as HTMLInputElement).value).toBe("Item 1");
+  expect((screen.getByLabelText("Source sheet") as HTMLSelectElement).value).toBe("mcl");
+  expect(screen.getByRole("button", {name:/source evidence · Item 1/i}).getAttribute("aria-expanded")).toBe("true");
+  expect((screen.getByRole("combobox", {name:"Part assignment for Item 1"}) as HTMLInputElement).value).toContain("SM-P-000001");
+  expect(partsWrapper.hidden).toBe(true);
+  expect(partsWrapper.getAttribute("aria-hidden")).toBe("true");
+  expect(partsWrapper.hasAttribute("inert")).toBe(true);
+  expect(getComputedStyle(partsWrapper).display).toBe("none");
+  expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
+
+  for (let index = 0; index < 3; index += 1) {
+    fireEvent.click(screen.getByRole("button", {name:"Parts", exact:true}));
+    await screen.findByRole("heading", {name:"Parts"});
+    expect(partsWrapper.hidden).toBe(false);
+    expect(mappingWrapper.hidden).toBe(true);
+    fireEvent.click(screen.getByRole("button", {name:"Part Mapping"}));
+    await screen.findByText("Showing 1 of 2 source groups");
+    expect(mappingWrapper.hidden).toBe(false);
+    expect(partsWrapper.hidden).toBe(true);
+  }
+  expectPendingChanges(1);
+  expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
 }, 20000);

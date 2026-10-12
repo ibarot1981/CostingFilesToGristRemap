@@ -94,6 +94,54 @@ it("uses a sheet-specific label and shows bounded source values with workbook pr
   expect(screen.getByText("row 42 · headers row 8")).toBeTruthy();
 });
 
+it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-family treatments", async () => {
+  const toolGroup = group("toolshop-jig", "Tool Shop Items", "Inspection jig", 18, {rows:[
+    {sheet:"Tool Shop Items",row:18,fields:{item_name:"Jig",material_to_cut:"Steel",dimension_to_cut_mm:"80",qty:"1",toolshop_remarks:"Deburr\ninside",job_remarks:"Job only"},
+      sourceHeaders:{toolshop_remarks:"Remarks",job_remarks:"Job Remarks"},sourceHeaderCells:{toolshop_remarks:"G9",job_remarks:"H9"},
+      sourceCells:{toolshop_remarks:{cell:"G18"},job_remarks:{cell:"H18"}},headerRow:9,availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","toolshop_remarks","job_remarks"]},
+    {sheet:"Tool Shop Items",row:19,fields:{item_name:"Second jig",material_to_cut:"Steel",dimension_to_cut_mm:"80",qty:"1",toolshop_remarks:""},
+      sourceHeaders:{toolshop_remarks:"Remarks"},sourceHeaderCells:{toolshop_remarks:"G9"},sourceCells:{toolshop_remarks:{cell:"G19"}},headerRow:9,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","toolshop_remarks"]},
+    {sheet:"Tool Shop Items",row:20,fields:{item_name:"Legacy jig",material_to_cut:"Steel",dimension_to_cut_mm:"80",qty:"1"},
+      sourceHeaders:{},sourceHeaderCells:{},sourceCells:{},headerRow:9,availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty"]},
+  ]});
+  const cncGroup = group("cnc-frame", "CNC Cut List", "Frame", 42, {rows:[
+    {sheet:"CNC Cut List",row:42,fields:{product_part_name:"Plate flange source",part_category:"Frame",material_to_cut:"MS Plate",length:"120",width:"60",thickness:"3",qty:"2"},
+      sourceHeaders:{product_part_name:"Plate Part to Cut",part_category:"Part Category"},sourceHeaderCells:{product_part_name:"A8",part_category:"B8"},
+      sourceCells:{product_part_name:{cell:"A42"},part_category:{cell:"B42"}},headerRow:8,availableFields:["product_part_name","part_category","material_to_cut","length","width","thickness","qty"]},
+  ]});
+  const mclGroup = group("mcl-frame", "5. Material Cut List Price", "MS frame", 11);
+  mocks.partMappings.mockResolvedValue(detail([mclGroup,toolGroup,cncGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 3 of 3 source groups");
+
+  const familyClasses = ["part-sheet-family-mcl", "part-sheet-family-toolshop", "part-sheet-family-cnc"];
+  for (const [label, className] of [["5. Material Cut List Price", familyClasses[0]], ["Tool Shop Items", familyClasses[1]], ["CNC Cut List", familyClasses[2]]] as const) {
+    const chip = screen.getByText(label, {selector:".part-sheet-chip"});
+    expect(chip.classList.contains(className)).toBe(true);
+  }
+  for (const label of ["MS frame", "Inspection jig", "Frame"]) await expandGroup(label);
+  for (const className of familyClasses) {
+    expect(document.querySelector(`.part-sheet-label.${className}`)).toBeTruthy();
+  }
+
+  const toolToggle = screen.getByRole("button", {name:/source evidence · Inspection jig/i});
+  fireEvent.click(within(toolToggle.closest(".part-source-group")!).getByRole("button", {name:"Expand source details"}));
+  expect(screen.getByRole("columnheader", {name:"Remarks"})).toBeTruthy();
+  expect(document.querySelector('td[title="Source cell G18 · Remarks"]')?.textContent).toContain("Deburr\ninside");
+  expect(document.querySelector('td[title="Source cell H18 · Job Remarks"]')?.textContent).toContain("Job only");
+  expect(screen.getByText("— blank in source")).toBeTruthy();
+  const missingRemarkRow = Array.from(document.querySelectorAll(".part-source-details[aria-label='Tool Shop Items source details'] tbody tr"))
+    .find(row => row.textContent?.includes("row 20"));
+  expect(missingRemarkRow?.querySelector(".part-source-missing")?.textContent).toBe("Not in sheet");
+  expect(screen.getByTitle("Source cell G18 · Remarks")).toBeTruthy();
+
+  const cncToggle = screen.getByRole("button", {name:/source evidence · Frame/i});
+  fireEvent.click(within(cncToggle.closest(".part-source-group")!).getByRole("button", {name:"Expand source details"}));
+  expect(screen.getByRole("columnheader", {name:"Plate Part to Cut"})).toBeTruthy();
+  expect(screen.getByText("Plate flange source")).toBeTruthy();
+});
+
 it("saves only one group, retries the identical request, and reloads saved state", async () => {
   mocks.savePartMappings.mockRejectedValueOnce(new Error("response lost"));
   render(<PartMappingView path="pilot.ods"/>);

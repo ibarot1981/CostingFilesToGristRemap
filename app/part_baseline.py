@@ -98,6 +98,11 @@ def _normal_text(value: Any) -> str | None:
     return text or None
 
 
+def _source_text(value: Any) -> str:
+    """Convert source descriptions to text without trimming or normalizing."""
+    return "" if value is None else str(value)
+
+
 def _ref_id(value: Any) -> int | None:
     return _ref(value)
 
@@ -192,6 +197,7 @@ def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) ->
     item_code = fields.get("item_code")
     plate_part = fields.get("product_part_name") if family == "cnc" else None
     toolshop_detail = fields.get("toolshop_part_name") if family == "toolshop" else None
+    toolshop_remarks = fields.get("toolshop_remarks") if family == "toolshop" else None
     group_value = fields.get("optional_item_group_1")
     # This list contains only engineering requirements. CR Log, remarks, rates,
     # calculated cost and the source Part label remain observation evidence.
@@ -220,7 +226,8 @@ def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) ->
         "dimension": str(dimension) if dimension not in (None, "") else None,
         "dimensionMM": _decimal(dimension) if physical["dimension_uom"] == "mm" else None,
         "itemName": str(item_name or ""), "itemCode": str(item_code or ""),
-        "material": str(material or ""), "platePart": str(plate_part or ""),
+        "material": str(material or ""), "platePart": _source_text(plate_part),
+        "toolshopRemarks": _source_text(toolshop_remarks),
         "partCategory": str(fields.get("part_category") or ""),
         "length": length, "width": width, "thickness": thickness,
         "physical": physical,
@@ -637,6 +644,7 @@ class PartBaselineService:
                 "PartWeightKg": _number(fields.get("part_weight_kg")), "Length": _number(item["length"]),
                 "Width": _number(item["width"]), "Thickness": _number(item["thickness"]),
                 "ItemName": item["itemName"], "ItemCode": item["itemCode"], "PlatePart": item["platePart"],
+                "ToolShopRemarks": item["toolshopRemarks"] if "toolshop_remarks" in fields else None,
                 "PartCategory": item["partCategory"], "MaterialDisplayName": item["material"],
                 "ExactQuantityText": _decimal_text(item["quantity"]), "ExactWeightKgText": _decimal_text(item["weightKg"]),
                 "WeightUOM": "kg" if item["weightKg"] is not None else "g" if item["weightGrams"] is not None else "",
@@ -729,9 +737,28 @@ class PartBaselineService:
             observation = observations.get(observation_id or -1)
             observed = _unjson(_row_fields(observation or {}).get("ObservedFields"))
             cells = _unjson(_row_fields(observation or {}).get("Cells"))
+            observed = observed if isinstance(observed, dict) else {}
+            cell_evidence = cells if isinstance(cells, dict) else {}
+            source_headers = cell_evidence.get("sourceHeaders") if isinstance(cell_evidence.get("sourceHeaders"), dict) else {}
+            remarks_present = "toolshop_remarks" in observed or (
+                "toolshop_part_name" in observed and bool(source_headers.get("toolshop_part_name"))
+            )
+            plate_part_present = "product_part_name" in observed
+            remarks_value = detail.get("ToolShopRemarks")
+            if remarks_value is None and remarks_present:
+                remarks_value = observed.get("toolshop_remarks", observed.get("toolshop_part_name"))
+            plate_part_value = detail.get("PlatePart")
+            if plate_part_value is None and plate_part_present:
+                plate_part_value = observed.get("product_part_name")
             result.append({"id": int(link_row["id"]), "key": link.get("RequirementKey"),
                 "family": physical.get("family") or FAMILY_TO_SHEET.get(str(_row_fields(observation or {}).get("SheetName") or "")),
-                "physical": physical, "rawFields": observed, "cellEvidence": cells,
+                "physical": physical, "rawFields": observed, "cellEvidence": cell_evidence,
+                "lineDetail": {
+                    "toolShopItemsRemarks": {"value": _source_text(remarks_value) if remarks_value is not None else None,
+                        "sourceStatus": "missing" if not remarks_present else "blank" if not _source_text(remarks_value).strip() else "present"},
+                    "platePartToCut": {"value": _source_text(plate_part_value) if plate_part_value is not None else None,
+                        "sourceStatus": "missing" if not plate_part_present else "blank" if not _source_text(plate_part_value).strip() else "present"},
+                },
                 "sheet": _row_fields(observation or {}).get("SheetName"), "row": _row_fields(observation or {}).get("SourceRow"),
                 "lineMasterId": master_id, "lineRevisionId": line_revision_id, "requirementLineId": int(link_row["id"]),
                 "lineKey": _row_fields(masters.get(master_id or -1, {})).get("LineKey"),

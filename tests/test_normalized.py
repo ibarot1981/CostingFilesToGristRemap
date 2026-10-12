@@ -85,6 +85,91 @@ class NormalizedTests(unittest.TestCase):
         self.assertEqual(observed["source_hash"], "h")
         self.assertEqual(result["reconciliation"]["differences"], [])
 
+    def test_toolshop_remarks_and_cnc_plate_text_serialize_to_grist_detail_and_reread(self):
+        tool = line(21)
+        tool.update({"identity_values": {"product_part_name": "Tool fixture", "item_name": "Jig", "material_to_cut": "Steel",
+            "dimension_to_cut_mm": "80", "qty": "1", "optional_item_group_1": ""},
+            "fields": {"product_part_name": "Tool fixture", "item_name": "Jig", "material_to_cut": "Steel",
+                "dimension_to_cut_mm": "80", "qty": "1", "toolshop_remarks": "  keep\nexact text  ", "job_remarks": "separate note", "amount": "100"},
+            "source_cells": {"toolshop_remarks": {"cell": "G21"}, "job_remarks": {"cell": "H21"}}})
+        cnc = line(31)
+        cnc.update({"identity_values": {"product_part_name": "Plate source label", "material_to_cut": "MS Plate", "length": "120",
+            "width": "60", "thickness": "3", "qty": "2", "optional_item_group_1": ""},
+            "fields": {"product_part_name": "Plate source label", "part_category": "Bracket", "material_to_cut": "MS Plate",
+                "length": "120", "width": "60", "thickness": "3", "qty": "2", "amount": "200"},
+            "source_cells": {"product_part_name": {"cell": "A31"}, "part_category": {"cell": "B31"}}})
+        semantic = {"process_lists": {"Tool Shop Items": [tool], "CNC Cut List": [cnc]},
+            "material_master_state": {"Steel": {}, "MS Plate": {}}}
+        projection = project_snapshot(semantic, snapshot_key="fields-snapshot", source_hash="fields-hash")
+        detail_by_type = {row["process_type"]: row for row in projection["line_details"]}
+        self.assertEqual(detail_by_type["tool_shop"]["toolshop_remarks"], "  keep\nexact text  ")
+        self.assertEqual(detail_by_type["cnc"]["plate_part"], "Plate source label")
+        observed_tool = next(row for row in projection["source_observations"] if row["sheet"] == "Tool Shop Items")
+        observed_cnc = next(row for row in projection["source_observations"] if row["sheet"] == "CNC Cut List")
+        self.assertEqual(observed_tool["observed_fields"]["job_remarks"], "separate note")
+        self.assertEqual(observed_cnc["observed_fields"]["part_category"], "Bracket")
+        self.assertEqual(observed_cnc["observed_fields"]["product_part_name"], "Plate source label")
+
+        class Client:
+            def __init__(self):
+                self.allowed = True
+                self.tables = {table: [] for _, table, _, _ in TABLES}
+                self.tables["CostingSnapshot"] = [{"id": 1, "fields": {"SnapshotKey": "fields-snapshot", "Status": "accepted",
+                    "SourceHashes": {"selected_workbook_saved": "fields-hash"}}}]
+                self.next_id = 2
+
+            def validate_safari_write_target(self):
+                if not self.allowed:
+                    raise ValueError("wrong document")
+
+            def fetch_table_records_with_ids(self, table):
+                return self.tables[table]
+
+            def create_table_records(self, table, records):
+                saved = []
+                for record in records:
+                    item = {"id": self.next_id, "fields": record["fields"]}
+                    self.next_id += 1
+                    self.tables[table].append(item)
+                    saved.append(item)
+                return saved
+
+        client = Client()
+        grist = GristNormalizedStore(client)
+        plan = grist.plan(projection, snapshot_key="fields-snapshot", source_hash="fields-hash")
+        grist.apply(projection, plan)
+        detail_rows = client.tables["LineDetail"]
+        by_fields = {row["fields"]["ProcessType"]: row["fields"] for row in detail_rows}
+        self.assertEqual(by_fields["tool_shop"]["ToolShopRemarks"], "  keep\nexact text  ")
+        self.assertEqual(by_fields["cnc"]["PlatePart"], "Plate source label")
+        readback = grist.query(snapshot_key="fields-snapshot", filters={}, offset=0, limit=10)
+        reread_tool = next(row for row in readback["items"] if row["observation"]["sheet"] == "Tool Shop Items")
+        reread_cnc = next(row for row in readback["items"] if row["observation"]["sheet"] == "CNC Cut List")
+        self.assertEqual(reread_tool["detail"]["toolshop_remarks"], "  keep\nexact text  ")
+        self.assertEqual(reread_tool["observation"]["observed_fields"]["job_remarks"], "separate note")
+        self.assertEqual(reread_cnc["detail"]["plate_part"], "Plate source label")
+        self.assertEqual(reread_cnc["observation"]["observed_fields"]["part_category"], "Bracket")
+
+        updated_tool = copy.deepcopy(tool)
+        updated_tool["fields"]["toolshop_remarks"] = "Changed source note"
+        updated_tool["source_cells"]["toolshop_remarks"] = {"cell": "G21", "value": "Changed source note"}
+        next_semantic = {"process_lists": {"Tool Shop Items": [updated_tool], "CNC Cut List": [copy.deepcopy(cnc)]},
+            "material_master_state": {"Steel": {}, "MS Plate": {}}}
+        next_projection = project_snapshot(next_semantic, snapshot_key="fields-snapshot-2", source_hash="fields-hash-2", previous=projection)
+        self.assertEqual(next_projection["line_revisions"], [])
+        self.assertEqual(next_projection["line_details"], [])
+        client.tables["CostingSnapshot"].append({"id": 90, "fields": {"SnapshotKey": "fields-snapshot-2", "Status": "accepted",
+            "PreviousSnapshotKey": "fields-snapshot", "SourceHashes": {"selected_workbook_saved": "fields-hash-2"}}})
+        next_plan = grist.plan(next_projection, snapshot_key="fields-snapshot-2", source_hash="fields-hash-2")
+        grist.apply(next_projection, next_plan)
+        latest = grist.query(snapshot_key="fields-snapshot-2", filters={}, offset=0, limit=10)
+        latest_tool = next(row for row in latest["items"] if row["observation"]["sheet"] == "Tool Shop Items")
+        self.assertEqual(latest_tool["detail"]["toolshop_remarks"], "Changed source note")
+        self.assertEqual(latest_tool["revision"]["key"], reread_tool["revision"]["key"])
+        historical = grist.query(snapshot_key="fields-snapshot", filters={}, offset=0, limit=10)
+        historical_tool = next(row for row in historical["items"] if row["observation"]["sheet"] == "Tool Shop Items")
+        self.assertEqual(historical_tool["detail"]["toolshop_remarks"], "  keep\nexact text  ")
+
     def test_cost_drift_reconciles_workbook_total_without_replacing_physical_baseline(self):
         old = line()
         old["cost_value"] = "100"

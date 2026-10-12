@@ -210,6 +210,125 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.client.tables["PartRevisionLine"]), 4)
         self.assertEqual(len(self.client.tables["SourceLineObservation"]), 4)
 
+    def test_toolshop_remarks_and_cnc_plate_text_round_trip_per_line_through_grist_and_retry(self):
+        groups = []
+
+        def add_header_evidence(group, field, value, header, column):
+            row = group["rows"][0]
+            row["fields"][field] = value
+            row["sourceHeaders"][field] = header
+            row["sourceHeaderCells"][field] = f"{column}8"
+            row["sourceCells"][field] = {"cell": f"{column}{row['row']}", "value": value}
+            if field not in row["availableFields"]:
+                row["availableFields"].append(field)
+
+        remarks_cases = [
+            (201, "present", "  Deburr\ninside; keep burr allowance  ", "Remarks"),
+            (202, "blank", "", "Remarks"),
+            (203, "missing", None, None),
+        ]
+        for row_number, state, value, header in remarks_cases:
+            group = self.family_group("toolshop", row_number, description=f"Tool {row_number}",
+                item_name=f"Fixture {row_number}", item_code=f"TS-{row_number}",
+                toolshop_part_name=f"Fixture {row_number}")
+            source = group["rows"][0]
+            source["fields"].pop("remarks", None)
+            source["sourceHeaders"].pop("remarks", None)
+            source["sourceCells"].pop("remarks", None)
+            source["availableFields"] = [field for field in source["availableFields"] if field != "remarks"]
+            add_header_evidence(group, "job_remarks", f"Job only {row_number}", "Job Remarks", "H")
+            if header:
+                add_header_evidence(group, "toolshop_remarks", value, header, "G")
+                add_header_evidence(group, "toolshop_part_name", value, header, "G")
+            else:
+                for field in ("toolshop_remarks", "toolshop_part_name"):
+                    source["fields"].pop(field, None)
+                    source["availableFields"] = [name for name in source["availableFields"] if name != field]
+                    source["sourceHeaders"].pop(field, None)
+                    source["sourceHeaderCells"].pop(field, None)
+                    source["sourceCells"].pop(field, None)
+            group["remarksState"] = state
+            groups.append(group)
+
+        for row_number, plate, category in ((301, "Plate A raw text", "Bracket"), (302, "Plate B raw text", "Bracket")):
+            group = self.family_group("cnc", row_number, description=category, part_category=category,
+                product_part_name=plate, length="120", width="60", thickness="3")
+            add_header_evidence(group, "product_part_name", plate, "Plate Part to Cut", "A")
+            add_header_evidence(group, "part_category", category, "Part Category", "B")
+            groups.append(group)
+
+        source_hash = "source-line-fields-round-trip"
+        groups = PartSourceGroups(groups, all_source_diagnostics())
+        mapped = self.save_group_set(groups, source_hash)
+        kwargs = {"part_id": self.part["id"], "file_id": "pilot.ods", "workbook_name": "source-fields.ods",
+            "workbook_path": "C:/isolated/source-fields.ods", "source_hash": source_hash, "association": self.association,
+            "groups": groups, "mapping_store": self.mapping_store, "source_families": self.family_choices_for({"toolshop", "cnc"}),
+            "actor": "baseline reviewer", "reason": "Verify exact source-line field persistence", "request_key": "baseline-source-line-fields",
+            "expected_hash": source_hash, "expected_association": self.association.id,
+            "expected_association_version": self.association.version, "expected_mapping_version": mapped["version"]}
+        first = self.service.establish(**kwargs)
+        self.assertEqual(first["requirementCount"], 5)
+
+        details = self.client.tables["LineDetail"]
+        tool_details = [row["fields"] for row in details if row["fields"].get("ToolShopRemarks") is not None]
+        self.assertEqual(sorted(value["ToolShopRemarks"] for value in tool_details), ["", "  Deburr\ninside; keep burr allowance  "])
+        self.assertEqual(len(details), 5)
+
+        observations = self.client.tables["SourceLineObservation"]
+        observations_by_source = {(row["fields"]["SheetName"], row["fields"]["SourceRow"]): row for row in observations}
+        links = self.client.tables["PartRevisionLine"]
+        source_mappings = self.client.tables["SourceLineMapping"]
+        for row_number, state, expected, header in remarks_cases:
+            observation = observations_by_source[(TOOLSHOP, row_number)]
+            observation_fields = observation["fields"]
+            observed = json.loads(observation_fields["ObservedFields"])
+            cells = json.loads(observation_fields["Cells"])
+            link = next(row["fields"] for row in links if row["fields"].get("SourceLineObservation") == observation["id"])
+            line_detail = next(row["fields"] for row in details if row["fields"].get("LineRevision") == link["LineRevision"])
+            if state == "missing":
+                self.assertNotIn("toolshop_remarks", observed)
+                self.assertNotIn("toolshop_part_name", observed)
+                self.assertNotIn("toolshop_remarks", cells["sourceHeaders"])
+                self.assertIsNone(line_detail["ToolShopRemarks"])
+            else:
+                self.assertEqual(observed["toolshop_remarks"], expected)
+                self.assertEqual(cells["sourceHeaders"]["toolshop_remarks"], header)
+                self.assertEqual(cells["sourceHeaderCells"]["toolshop_remarks"], "G8")
+                self.assertEqual(cells["sourceCells"]["toolshop_remarks"]["cell"], f"G{row_number}")
+                self.assertEqual(line_detail["ToolShopRemarks"], expected)
+            self.assertEqual(observed["job_remarks"], f"Job only {row_number}")
+            self.assertTrue(any(row["fields"].get("Observation") == observation["id"] for row in source_mappings))
+
+        for row_number, expected in ((301, "Plate A raw text"), (302, "Plate B raw text")):
+            observation = observations_by_source[(CNC, row_number)]
+            fields = observation["fields"]
+            observed = json.loads(fields["ObservedFields"])
+            cells = json.loads(fields["Cells"])
+            self.assertEqual(observed["part_category"], "Bracket")
+            self.assertEqual(observed["product_part_name"], expected)
+            self.assertEqual(cells["sourceHeaders"]["product_part_name"], "Plate Part to Cut")
+            self.assertEqual(cells["sourceHeaderCells"]["product_part_name"], "A8")
+            self.assertEqual(cells["sourceCells"]["product_part_name"]["cell"], f"A{row_number}")
+            link = next(row["fields"] for row in links if row["fields"].get("SourceLineObservation") == observation["id"])
+            line_detail = next(row["fields"] for row in details if row["fields"].get("LineRevision") == link["LineRevision"])
+            self.assertEqual(line_detail["PlatePart"], expected)
+            self.assertEqual(line_detail["PartCategory"], "Bracket")
+
+        reread = self.service.baseline_detail(self.part["id"])
+        self.assertEqual(len(reread["requirements"]), 5)
+        reread_remarks = {item["row"]: item["lineDetail"]["toolShopItemsRemarks"] for item in reread["requirements"] if item["family"] == "toolshop"}
+        self.assertEqual(reread_remarks[201], {"value": "  Deburr\ninside; keep burr allowance  ", "sourceStatus": "present"})
+        self.assertEqual(reread_remarks[202], {"value": "", "sourceStatus": "blank"})
+        self.assertEqual(reread_remarks[203], {"value": None, "sourceStatus": "missing"})
+        reread_plates = {item["row"]: item["lineDetail"]["platePartToCut"] for item in reread["requirements"] if item["family"] == "cnc"}
+        self.assertEqual(reread_plates[301], {"value": "Plate A raw text", "sourceStatus": "present"})
+        self.assertEqual(reread_plates[302], {"value": "Plate B raw text", "sourceStatus": "present"})
+
+        counts_before_retry = {name: len(self.client.tables[name]) for name in ("LineDetail", "SourceLineObservation", "SourceLineMapping", "PartRevisionLine")}
+        retry = self.service.establish(**kwargs)
+        self.assertTrue(retry["idempotent"])
+        self.assertEqual({name: len(self.client.tables[name]) for name in counts_before_retry}, counts_before_retry)
+
     def test_replacement_requires_a_reason_but_unchanged_context_reconfirmation_does_not(self):
         rows = [source_row(10)]
         self.save_rows(rows, "hash-first", request_key="map:first")

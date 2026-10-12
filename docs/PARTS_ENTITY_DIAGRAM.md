@@ -6,6 +6,8 @@ Updated costing direction (D070): canonical Parts and rates feed disposable Live
 
 **Cascade update, 8 October 2026:** schema `safari-part-intended-sharing-grist-2026-10-08.v10` is also applied. It adds three normalized intended-sharing tables and `PartRegistryRequest.Payload`; intended sharing and actual configuration usage remain separate. See [implementation and verification record](PART_INTENDED_SHARING_IMPLEMENTATION.md).
 
+**Source-line fields follow-up, 12 October 2026:** PR #3 adds Tool Shop Items Remarks to the existing normalized `LineDetail` row as `ToolShopRemarks` (`Text`), while retaining exact source headers, cells and raw values in `SourceLineObservation.Cells` and `ObservedFields`. CNC Plate Part to Cut continues using the existing `LineDetail.PlatePart` (`Text`) column. The code's additive schema target is v13; this column has not been applied to a live Grist document by this follow-up. See the [source-line implementation record](PART_MAPPING_IMPLEMENTATION_2026_10_08.md#source-line-field-and-navigation-follow-up-12-october-2026).
+
 ## Deployed relationship model
 
 ```mermaid
@@ -37,8 +39,12 @@ erDiagram
     PartMetadataVersion ||--o{ PartMappingReview : pins_name_metadata
     ProductPart ||--o{ LineMaster : stable_line_owner
     LineMaster ||--o{ LineRevision : versions
+    LineRevision ||--o| LineDetail : normalized_line_fields
+    SourceLineObservation ||--o| SourceLineMapping : maps_source_to_line
+    LineMaster ||--o{ SourceLineMapping : mapped_line_identity
     PartRevision ||--o{ PartRevisionLine : exact_process_requirements
     LineRevision ||--o{ PartRevisionLine : pinned_line_revision
+    SourceLineObservation ||--o{ PartRevisionLine : exact_baseline_source_row
     PartRevision ||--o{ PartComponentRevision : parent_definition
     PartRevision ||--o{ PartComponentRevision : child_definition
     PartRevision ||--o{ PartDrawing : optional_revision_drawing
@@ -84,6 +90,8 @@ erDiagram
 | `PartChangeProposal` | Pending proposal with comparison, accepted baseline and Rev A references, actor/reason and CR-required status. It does not alter requirements or increment revision. |
 | `PartComponentRevision` | Parent and child `PartRevision`, positive quantity and UOM, lifecycle/audit and idempotency fields. Cycles are rejected. |
 | `PartRevisionLine` | Exact Part baseline to `LineMaster`/`LineRevision`/source observation, process type, quantity per Part and unit. MCL, Toolshop and CNC are optional and mixable. |
+| `LineDetail` | One typed normalized detail per accepted `LineRevision`; CNC source Plate Part to Cut is `PlatePart` (Text), Tool Shop Items Remarks is `ToolShopRemarks` (Text, added by the pending v13 plan). These descriptive values do not change engineering revision signatures. |
+| `SourceLineObservation`, `SourceLineMapping` | Immutable source-row evidence retains parsed fields, exact cell/header coordinates, workbook/sheet/row and links to the normalized line. `PartRevisionLine` pins the selected observation to a Part revision for Rev A. |
 | `PartDrawing` | Optional revision-specific file path or external URL, drawing identity, file version/hash and audit. |
 | `Vendor`, `PartPurchaseSpecification`, `VendorPartMapping` | Canonical supplier, purchased Part/revision specification, optional `PurchaseItem`, and reviewed SKU equivalence. Multiple vendors can supply the same Part. |
 | `PartPurchaseRecord` | Immutable actual transaction evidence: vendor, transaction/date/line, quantity/UOM, currency, extended merchandise amount, discount/charges, status, actor/reason, idempotency, reversal/supersession. |

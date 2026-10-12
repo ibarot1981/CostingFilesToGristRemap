@@ -27,7 +27,8 @@ const sourceFields: Record<string, { key: string; label: string }[]> = {
     { key: "item_name", label: "Item Name / Material" }, { key: "material_to_cut", label: "Material Used" },
     { key: "dimension_to_cut_mm", label: "Dimension (mm)" }, { key: "qty", label: "Quantity" },
     { key: "optional_item_group_1", label: "Item Group 1" }, { key: "in_use", label: "In Use" },
-    { key: "toolshop_part_name", label: "Tool Shop Part Name / Remarks" }, { key: "job_remarks", label: "Job Remarks" }, { key: "cr_log", label: "CR Log" },
+    { key: "toolshop_remarks", label: "Tool Shop Items Remarks" }, { key: "toolshop_part_name", label: "Legacy Tool Shop Part Name" },
+    { key: "job_remarks", label: "Job Remarks" }, { key: "cr_log", label: "CR Log" },
   ],
   "CNC Cut List": [
     { key: "product_part_name", label: "Plate Part to Cut" }, { key: "material_to_cut", label: "Material Used" },
@@ -52,6 +53,11 @@ function familyFor(sheet: string): SheetFilter {
 }
 function familyLabel(filter: SheetFilter) {
   return filter === "mcl" ? "MS List" : filter === "toolshop" ? "Toolshop" : filter === "cnc" ? "CNC" : "All sheets";
+}
+function sheetFamilyClass(sheet: string) {
+  return sheet === "5. Material Cut List Price" ? "part-sheet-family-mcl"
+    : sheet === "Tool Shop Items" ? "part-sheet-family-toolshop"
+      : sheet === "CNC Cut List" ? "part-sheet-family-cnc" : "";
 }
 function groupTitle(group: Group) {
   return group.blankDescription ? "Blank Part label · individual source row" : group.description;
@@ -109,14 +115,14 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }, []);
 
   useEffect(() => {
-    if (contextOpen && narrowViewport) {
+    if (active && contextOpen && narrowViewport) {
       const first = contextPanel.current?.querySelector<HTMLElement>("button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])");
       window.requestAnimationFrame(() => (first || contextPanel.current)?.focus());
     }
-  }, [contextOpen, narrowViewport]);
+  }, [active, contextOpen, narrowViewport]);
 
   useEffect(() => {
-    if (!contextOpen || !narrowViewport || createOrigin) return;
+    if (!active || !contextOpen || !narrowViewport || createOrigin) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); setContextOpen(false); window.requestAnimationFrame(() => contextToggle.current?.focus()); return; }
       if (event.key !== "Tab" || !contextPanel.current) return;
@@ -128,10 +134,10 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [contextOpen, narrowViewport, createOrigin]);
+  }, [active, contextOpen, narrowViewport, createOrigin]);
 
   useEffect(() => {
-    if (!createOrigin) return;
+    if (!active || !createOrigin) return;
     const focusInitial = () => createDialog.current?.querySelector<HTMLElement>("input:not([disabled]),select:not([disabled]),textarea:not([disabled]),button:not([disabled])")?.focus();
     window.requestAnimationFrame(focusInitial);
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -149,7 +155,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     };
     document.addEventListener("keydown", onKeyDown, true);
     return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [createOrigin, createAttemptPending]);
+  }, [active, createOrigin, createAttemptPending]);
 
   async function load(revision: number, restore = true) {
     setLoading(true); setError("");
@@ -269,7 +275,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   function closeCreateDialog() {
     if (createAttemptPending) return;
     setCreateOrigin(null); setCreateAttemptPending(false);
-    window.requestAnimationFrame(() => (createOpener.current || contextToggle.current)?.focus());
+    if (active) window.requestAnimationFrame(() => (createOpener.current || contextToggle.current)?.focus());
   }
 
   function openCreateDialog(group: Group, button: HTMLButtonElement) {
@@ -295,7 +301,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
       setNotice(`${part.partNumber || part.name} exists in Grist. The originating workbook or source group changed, so it was not assigned. Review current evidence before selecting it.`);
     }
     setCreateAttemptPending(false); setCreateOrigin(null);
-    window.requestAnimationFrame(() => (createOpener.current || contextToggle.current)?.focus());
+    if (active) window.requestAnimationFrame(() => (createOpener.current || contextToggle.current)?.focus());
   }
 
   function useExistingInContext(part: ExistingPart) {
@@ -474,6 +480,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }
 
   const [activePicker, setActivePicker] = useState<string | null>(null);
+  useEffect(() => { if (!active) setActivePicker(null); }, [active]);
   if (!path) return <main className="part-mapping"><h1>Part Mapping</h1><p>Select a costing workbook in Files to review its Parts.</p></main>;
 
   const allGroups = detail?.groups || [];
@@ -566,11 +573,11 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
               {group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" && <div className="part-compatibility-note" role="alert">Part label source is {group.sourceDiagnostic.status.replaceAll("_", " ")}. Resolve the source header before saving a Part assignment.</div>}
               <header className="part-group-heading">
                 <button type="button" className="part-group-toggle" aria-label={`${groupIsExpanded ? "Collapse" : "Expand"} source evidence · ${groupTitle(group)}`} aria-expanded={groupIsExpanded} aria-controls={`part-group-content-${group.key}`} onClick={() => setExpandedGroups(old => ({ ...old, [group.key]: !Boolean(old[group.key]) }))}>
-                  {groupIsExpanded ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}<span className="part-group-heading-copy"><span className="part-sheet-chip">{group.sheet}</span><strong>{groupTitle(group)}</strong><small>{group.rows.length} source row{group.rows.length === 1 ? "" : "s"} · {group.labelField === "part_category" ? "Part Category" : "Machine Piece Description"}</small></span>
+                  {groupIsExpanded ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}<span className="part-group-heading-copy"><span className={`part-sheet-chip ${sheetFamilyClass(group.sheet)}`}>{group.sheet}</span><strong>{groupTitle(group)}</strong><small>{group.rows.length} source row{group.rows.length === 1 ? "" : "s"} · {group.labelField === "part_category" ? "Part Category" : "Machine Piece Description"}</small></span>
                 </button>
                 <div className="part-group-header-controls">
                   <PartSearchCombobox group={group} selected={selectedPart} disabled={locked || !detail.schemaAvailable || Boolean(group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok")}
-                    path={path} open={activePicker === group.key} onOpen={() => setActivePicker(group.key)} onClose={() => setActivePicker(null)} onSelect={part => selectPart(group, part)}/>
+                    path={path} open={active && activePicker === group.key} onOpen={() => setActivePicker(group.key)} onClose={() => setActivePicker(null)} onSelect={part => selectPart(group, part)}/>
                   <div className="part-group-actions">
                     <button type="button" className="button" disabled={locked || !detail.schemaAvailable} onClick={event => openCreateDialog(group, event.currentTarget)}>Create Part</button>
                     <button type="button" className="button" disabled={locked || !onOpenParts || !selectedPart} onClick={() => openParts(group, selectedPart?.id || null, "view")}>View Part</button>
@@ -691,7 +698,14 @@ function PartSearchCombobox({ group, selected, disabled, path, open, onOpen, onC
 
 function SourceDetails({ group, expanded, onToggle }: { group: Group; expanded: boolean; onToggle: () => void }) {
   const columns = sourceFields[group.sheet] || [];
-  const visibleColumns = expanded ? columns : columns.slice(0, 5);
+  const compactKeys: Record<string, string[]> = {
+    "5. Material Cut List Price": columns.slice(0, 5).map(column => column.key),
+    "Tool Shop Items": ["item_name", "material_to_cut", "dimension_to_cut_mm", "qty", "toolshop_remarks"],
+    "CNC Cut List": columns.slice(0, 5).map(column => column.key),
+  };
+  const withoutLegacyRemarksDuplicate = columns.filter(column => !(group.sheet === "Tool Shop Items" && column.key === "toolshop_part_name"
+    && group.rows.some(row => row.sourceHeaders?.toolshop_part_name === "Remarks")));
+  const visibleColumns = (expanded ? withoutLegacyRemarksDuplicate : withoutLegacyRemarksDuplicate.filter(column => (compactKeys[group.sheet] || []).includes(column.key)));
   return <section className={`part-source-details ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
     <div className="part-source-details-heading"><strong>Source evidence</strong><button type="button" className="button quiet" aria-expanded={expanded} onClick={onToggle}>{expanded ? "Show key fields" : "Expand source details"}</button></div>
     {!columns.length ? <p>Source-specific fields are not configured for this sheet.</p> : <div className="part-detail-scroll"><table><thead><tr>{visibleColumns.map(column => {
@@ -702,10 +716,10 @@ function SourceDetails({ group, expanded, onToggle }: { group: Group; expanded: 
       const value = row.fields?.[column.key];
       const cell = row.sourceCells?.[column.key]?.cell;
       const available = row.availableFields?.includes(column.key);
-      return <td key={column.key} title={cell ? `Source cell ${cell}${row.sourceHeaders?.[column.key] ? ` · ${row.sourceHeaders[column.key]}` : ""}` : undefined}>
+      return <td className="part-source-value" key={column.key} title={cell ? `Source cell ${cell}${row.sourceHeaders?.[column.key] ? ` · ${row.sourceHeaders[column.key]}` : ""}` : undefined}>
         {value === null || value === undefined || String(value).trim() === "" ? <span className={available ? "part-source-blank" : "part-source-missing"}>{available ? "— blank in source" : "Not in sheet"}</span> : <>{String(value)}{cell && <small className="part-cell-ref">{cell}</small>}</>}
       </td>;
-    })}<td><strong>{row.sheet}</strong><small>row {row.row}{row.headerRow ? ` · headers row ${row.headerRow}` : ""}</small></td></tr>)}</tbody></table></div>}
+    })}<td><strong className={`part-sheet-label ${sheetFamilyClass(row.sheet)}`}>{row.sheet}</strong><small>row {row.row}{row.headerRow ? ` · headers row ${row.headerRow}` : ""}</small></td></tr>)}</tbody></table></div>}
     {expanded && <p className="part-source-note">Values and units are copied from the saved workbook. Blank or unavailable values remain blank; source text is displayed as text. CR Log is source evidence only.</p>}
   </section>;
 }

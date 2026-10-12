@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Calculator, Check, ChevronDown, ChevronRight, Database, ExternalLink, FileSpreadsheet, Folder, FolderOpen, FolderTree, LoaderCircle, Map as MapIcon, Maximize2, Minimize2, PackageOpen, RefreshCw, Search, ShieldCheck, Tags, X } from "lucide-react";
 import { api } from "./api";
 import { deriveMappedFileGroups, mappedFileIssueLabels } from "./mappedFilesViewModel";
@@ -49,6 +49,8 @@ export function App() {
   const validationRevision = useRef(0);
   const selectionRevision = useRef(0);
   const previewRevision = useRef(0);
+  const partsViewWrapper = useRef<HTMLDivElement>(null);
+  const mappingViewWrapper = useRef<HTMLDivElement>(null);
   const [savedAssociation, setSavedAssociation] = useState<SavedAssociation | null>(null);
   const [associationLoading, setAssociationLoading] = useState(false);
   const [filter, setFilter] = useState("");
@@ -61,6 +63,11 @@ export function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [adapter, setAdapter] = useState("in-memory");
+
+  useLayoutEffect(() => {
+    partsViewWrapper.current?.toggleAttribute("inert", view !== "parts");
+    mappingViewWrapper.current?.toggleAttribute("inert", view !== "mapping");
+  }, [view, partsVisited, mappingVisited]);
 
   const invalidateAssociation = () => {
     validationRevision.current += 1;
@@ -236,8 +243,8 @@ export function App() {
     : view === "costing" ? <CostingReviewView selectedPath={selectedFile?.relative_path || ""} selectedName={selectedFile?.name || ""}/>
     : view === "reconciliation" ? <ReconciliationView products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
     : <main className="workspace"><Explorer tree={explorerTree} expanded={explorerExpanded} visibleRoot={visibleRoot} filter={filter} setFilter={setFilter} statusFilter={statusFilter} setStatusFilter={setStatusFilter} typeFilter={typeFilter} setTypeFilter={setTypeFilter} classificationFilter={classificationFilter} setClassificationFilter={setClassificationFilter} matchesExplorer={visibleExplorerItem} toggleFolder={(path) => void toggleFolder(path)} chooseFile={(item) => void chooseFile(item)} selectedPath={selectedPath} summary={summary} searchPending={searchPending} searchTotal={searchResults?.total ?? null} searchItemCount={searchResults?.itemCount ?? 0} searchSource={searchResults?.source}/><AssociationPanel selectedFile={selectedFile} savedAssociation={savedAssociation} associationLoading={associationLoading} previewing={previewing || associationLoading || !savedAssociation} products={products} models={models} codes={codes} productId={productId} modelId={modelId} selectedCodes={selectedCodes} reason={reason} supersede={supersede} validation={validation} requestKeyReady={Boolean(requestKey)} busy={busy} setReason={(value) => { invalidateAssociation(); setReason(value); }} setSupersede={(value) => { invalidateAssociation(); setSupersede(value); }} loadModels={(id) => void loadModels(id)} loadCodes={(id) => void loadCodes(id)} toggleCode={(id) => { invalidateAssociation(); setSelectedCodes((old) => old.includes(id) ? old.filter((item) => item !== id) : [...old, id]); }} validate={() => void validate()} save={() => void save()}/><PreviewPanel selectedFile={selectedFile} preview={preview} previewing={previewing} refreshing={refreshingPreview} refreshExternalLinks={() => void refreshExternalLinks()} chooseSheet={(sheet) => void chooseSheet(sheet)} summary={summary}/></main>}
-    {partsVisited && <div className="app-cached-view" hidden={view !== "parts"}><PartsView active={view === "parts"} mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setMappingVisited(true); setView("mapping"); }}/></div>}
-    {mappingVisited && <div className="app-cached-view" hidden={view !== "mapping"}><PartMappingView active={view === "mapping"} path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId, mode = "select", context = {}) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId, mode, ...context }); setPartsVisited(true); setView("parts"); }}/></div>}
+    {partsVisited && <div ref={partsViewWrapper} className="app-cached-view" hidden={view !== "parts"} aria-hidden={view !== "parts"}><PartsView active={view === "parts"} mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setMappingVisited(true); setView("mapping"); }}/></div>}
+    {mappingVisited && <div ref={mappingViewWrapper} className="app-cached-view" hidden={view !== "mapping"} aria-hidden={view !== "mapping"}><PartMappingView active={view === "mapping"} path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId, mode = "select", context = {}) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId, mode, ...context }); setPartsVisited(true); setView("parts"); }}/></div>}
   </div>;
 }
 

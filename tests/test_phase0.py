@@ -17,7 +17,7 @@ from app.grist_admin import GristAdminClient, GristConnectivityError, GristDocum
 from app.grist_admin import GristWorkspace
 from app.grist import GristClient
 from app.repository import AssociationConflict, AssociationProposal, InMemorySafariRepository
-from app.schema import FOUNDATION_TABLES, apply_schema, plan_schema, validate_schema_target
+from app.schema import FOUNDATION_TABLES, SCHEMA_VERSION, apply_schema, plan_schema, validate_schema_target
 
 
 class Phase0Tests(unittest.TestCase):
@@ -321,6 +321,25 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(plan.to_dict()["workspaceId"], "ws1")
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
+
+    def test_schema_v13_plans_only_additive_toolshop_remarks_column(self) -> None:
+        client = _SchemaClient()
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": column["type"]}}
+                for column in table["columns"]
+                if not (table["id"] == "LineDetail" and column["id"] == "ToolShopRemarks")
+            ]}
+            for table in FOUNDATION_TABLES
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual(SCHEMA_VERSION, "safari-part-baseline-reconciliation-grist-2026-10-12.v13")
+        self.assertEqual(plan.create_tables, ())
+        self.assertEqual(plan.update_columns, ())
+        self.assertEqual(plan.add_columns, ({"tableId": "LineDetail", "columns": [{"id": "ToolShopRemarks", "type": "Text"}]},))
+        self.assertEqual(client.writes, [])
 
     def test_schema_plan_accepts_grist_text_inference_for_legacy_engineering_attributes(self) -> None:
         client = _SchemaClient()
