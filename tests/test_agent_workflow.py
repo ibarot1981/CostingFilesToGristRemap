@@ -61,6 +61,44 @@ class WorkflowTests(unittest.TestCase):
         self.publish(self.claim())
         return self.claim('review')
 
+    def test_owned_checkpoint_replay_and_duplicate_claim(self):
+        token = self.claim()
+        args = dict(token=token, goal_objective='Finish task-1 round 1', stage='tests', next_action='Run fixture check')
+        result = self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'progress-1', **args)
+        self.assertEqual(result['state'], 'implementing')
+        self.assertTrue(self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'progress-1', **args)['idempotent'])
+        self.assertEqual(len(list((self.flow.path('task-1') / 'checkpoints').glob('*.json'))), 1)
+        self.assertFalse(self.flow.status('task-1')['progress_overdue'])
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('claim-implementation', 'task-1', 1, 'implementing', 'duplicate', owner='other')
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('checkpoint', 'task-1', 2, 'implementing', 'wrong-round', **args)
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'wrong-token', **{**args, 'token':'wrong'})
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'progress-1', **{**args, 'stage':'different'})
+
+    def test_checkpoint_state_validation_and_interrupted_publication(self):
+        args = dict(goal_objective='Finish task-1', stage='tests', next_action='Run tests')
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('checkpoint', 'task-1', 1, 'awaiting_implementation', 'unclaimed', **args)
+        args['token'] = self.claim()
+        with patch.object(self.flow, 'commit', side_effect=OSError('interrupted before state publication')):
+            with self.assertRaises(OSError):
+                self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'interrupted', **args)
+        self.assertNotIn('progress', self.flow.status('task-1'))
+        # A timestamped orphan is not actionable; exact retry preserves its original timestamp.
+        self.assertTrue((self.flow.path('task-1') / 'checkpoints/001.json').exists())
+        orphan = json.loads((self.flow.path('task-1') / 'checkpoints/001.json').read_text())
+        self.flow.apply('checkpoint', 'task-1', 1, 'implementing', 'interrupted', **args)
+        self.assertEqual(self.flow.status('task-1')['progress']['at'], orphan['at'])
+        self.assertEqual(self.flow.status('task-1')['progress']['stage'], 'tests')
+        self.publish(args['token'])
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('checkpoint', 'task-1', 1, 'awaiting_review', 'submitted', **args)
+        review_token = self.claim('review')
+        self.flow.apply('checkpoint', 'task-1', 1, 'reviewing', 'review-progress', **{**args, 'token':review_token})
+
     def test_complete_and_repeated_commands(self):
         token=self.claim()
         self.assertEqual(token,self.claim())

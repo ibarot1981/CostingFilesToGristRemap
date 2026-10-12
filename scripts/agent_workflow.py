@@ -131,8 +131,12 @@ class Workflow:
             state = self.load(task_id)
             claim = state.get('claim')
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(claim['claimed_at'])).total_seconds() if claim else None
+            progress = state.get('progress')
+            last_activity = progress['at'] if claim and progress and progress.get('claim_token') == claim['token'] else claim['claimed_at'] if claim else None
+            idle_age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_activity)).total_seconds() if last_activity else None
             return {**state, 'claim_age_seconds': age, 'stale_claim': age is not None and age >= stale_seconds,
-                    'stale_policy': 'Never reclaim automatically; require owner intervention.'}
+                    'progress_age_seconds': idle_age, 'progress_overdue': idle_age is not None and idle_age >= stale_seconds,
+                    'stale_policy': 'Age never transfers ownership. Proven same-chat owner may continue its existing token; foreign recovery requires owner intervention.'}
         result = []
         for path in sorted(self.tasks.glob('*')):
             if path.is_dir():
@@ -189,7 +193,7 @@ class Workflow:
             else:
                 if not state or state['round'] != round_no or state['state'] != expected_state:
                     raise WorkflowError('Task ID, round or expected current state does not match.')
-                self.transition(state, action, payload)
+                self.transition(state, action, {**payload, '_request_id': request_id} if action == 'checkpoint' else payload)
             state['updated_at'] = utc()
             result = {'task_id': task_id, 'round': state['round'], 'state': state['state']}
             if state.get('claim'):
@@ -238,6 +242,24 @@ class Workflow:
                 self.exact_commit(state, self.submitted(state))
             state['claim'] = {'role': role, 'token': uuid.uuid4().hex, 'claimed_at': utc(), 'owner': p['owner']}
             state['state'] = 'implementing' if role == 'implementer' else 'reviewing'
+        elif action == 'checkpoint':
+            if current not in ('implementing', 'reviewing'):
+                raise WorkflowError('Checkpoint requires an existing active claim.')
+            self.owner(state, p, 'implementer' if current == 'implementing' else 'reviewer')
+            if any(not isinstance(p.get(key), str) or not p[key].strip() for key in ('goal_objective', 'stage', 'next_action')):
+                raise WorkflowError('Checkpoint requires goal objective, stage and next action.')
+            progress = {key: p[key].strip() for key in ('goal_objective', 'stage', 'next_action')}
+            progress.update(at=utc(), task_id=state['task_id'], round=number, claim_token=state['claim']['token'], request_id=p['_request_id'])
+            index = 1 + len([name for name in state['artifacts'] if name.startswith('checkpoints/')])
+            name = f'checkpoints/{index:03}.json'
+            orphan_path = self.path(state['task_id']) / name
+            if orphan_path.exists():
+                orphan = read_json(orphan_path)
+                if {k:v for k,v in orphan.items() if k != 'at'} != {k:v for k,v in progress.items() if k != 'at'}:
+                    raise WorkflowError('Conflicting orphan checkpoint; owner intervention required.')
+                progress = orphan
+            self.artifact(state, name, encoded(progress))
+            state['progress'] = progress
         elif action == 'publish-implementation':
             if current != 'implementing':
                 raise WorkflowError('Implementation publication requires implementing state.')
@@ -340,7 +362,7 @@ def main():
     status = commands.add_parser('status')
     status.add_argument('--task-id')
     status.add_argument('--stale-seconds', type=int, default=3600)
-    for action in ('create', 'claim-implementation', 'claim-review', 'publish-implementation', 'request-round', 'accept', 'block', 'resume'):
+    for action in ('create', 'claim-implementation', 'claim-review', 'checkpoint', 'publish-implementation', 'request-round', 'accept', 'block', 'resume'):
         p = commands.add_parser(action)
         p.add_argument('--task-id', required=True)
         p.add_argument('--round', type=int, required=True)
@@ -358,6 +380,10 @@ def main():
             p.add_argument('--owner', required=True)
         else:
             p.add_argument('--token', default='')
+            if action == 'checkpoint':
+                p.add_argument('--goal-objective', required=True)
+                p.add_argument('--stage', required=True)
+                p.add_argument('--next-action', required=True)
             if action in ('accept', 'request-round', 'publish-implementation'):
                 p.add_argument('--report', type=Path, required=True)
             if action == 'request-round':
