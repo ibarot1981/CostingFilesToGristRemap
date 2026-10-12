@@ -17,6 +17,7 @@ from app.grist_parts import GristAdminClientShim, GristPartRegistry, _ref, _seri
 from app.grist_types import grist_datetime
 from app.part_identity import PartIdentityError, request_fingerprint
 from app.part_mapping import MAPPING_POLICY_VERSION, mapping_detail
+from app.utils import normalize_header
 
 
 FAMILIES = {
@@ -740,13 +741,16 @@ class PartBaselineService:
             observed = observed if isinstance(observed, dict) else {}
             cell_evidence = cells if isinstance(cells, dict) else {}
             source_headers = cell_evidence.get("sourceHeaders") if isinstance(cell_evidence.get("sourceHeaders"), dict) else {}
-            remarks_present = "toolshop_remarks" in observed or (
-                "toolshop_part_name" in observed and bool(source_headers.get("toolshop_part_name"))
-            )
+            legacy_remarks_present = "toolshop_part_name" in observed and (
+                normalize_header(source_headers.get("toolshop_part_name")) == "remarks")
+            remarks_present = "toolshop_remarks" in observed or legacy_remarks_present
             plate_part_present = "product_part_name" in observed
             remarks_value = detail.get("ToolShopRemarks")
             if remarks_value is None and remarks_present:
-                remarks_value = observed.get("toolshop_remarks", observed.get("toolshop_part_name"))
+                if "toolshop_remarks" in observed:
+                    remarks_value = observed.get("toolshop_remarks")
+                elif legacy_remarks_present:
+                    remarks_value = observed.get("toolshop_part_name")
             plate_part_value = detail.get("PlatePart")
             if plate_part_value is None and plate_part_present:
                 plate_part_value = observed.get("product_part_name")

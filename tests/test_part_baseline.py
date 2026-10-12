@@ -329,6 +329,84 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertTrue(retry["idempotent"])
         self.assertEqual({name: len(self.client.tables[name]) for name in counts_before_retry}, counts_before_retry)
 
+    def test_toolshop_remarks_legacy_fallback_requires_proven_remarks_header(self):
+        cases = [
+            (401, "name-only", "Fixture TS-17", "Tool Shop Part Name", None, None,
+                {"value": None, "sourceStatus": "missing"}),
+            (402, "legacy-remarks", "Legacy remarks text", "  rEmArKs  ", None, None,
+                {"value": "Legacy remarks text", "sourceStatus": "present"}),
+            (403, "both-columns", "Fixture TS-19", "Tool Shop Part Name", "Dedicated remarks", "Remarks",
+                {"value": "Dedicated remarks", "sourceStatus": "present"}),
+            (404, "legacy-blank", "", "Remarks", None, None,
+                {"value": "", "sourceStatus": "blank"}),
+        ]
+        groups = []
+
+        def add_source_field(row, field, value, header, column):
+            row["fields"][field] = value
+            row["sourceHeaders"][field] = header
+            row["sourceHeaderCells"][field] = f"{column}8"
+            row["sourceCells"][field] = {"cell": f"{column}{row['row']}", "value": value}
+            if field not in row["availableFields"]:
+                row["availableFields"].append(field)
+
+        for row_number, key, legacy_value, legacy_header, explicit_value, explicit_header, _ in cases:
+            group = self.family_group("toolshop", row_number, description=f"Tool {key}",
+                item_name=f"Tool item {row_number}", item_code=f"TS-{row_number}",
+                toolshop_part_name=legacy_value)
+            row = group["rows"][0]
+            for field in ("remarks", "toolshop_remarks"):
+                row["fields"].pop(field, None)
+                row["sourceHeaders"].pop(field, None)
+                row["sourceHeaderCells"].pop(field, None)
+                row["sourceCells"].pop(field, None)
+                row["availableFields"] = [value for value in row["availableFields"] if value != field]
+            add_source_field(row, "job_remarks", f"Job note {row_number}", "Job Remarks", "H")
+            add_source_field(row, "toolshop_part_name", legacy_value, legacy_header, "G")
+            if explicit_header is not None:
+                add_source_field(row, "toolshop_remarks", explicit_value, explicit_header, "I")
+            groups.append(group)
+
+        source_hash = "toolshop-legacy-remarks-provenance"
+        mapped = self.save_group_set(groups, source_hash)
+        source_groups = PartSourceGroups(groups, all_source_diagnostics())
+        kwargs = {"part_id": self.part["id"], "file_id": "pilot.ods", "workbook_name": "legacy-remarks.ods",
+            "workbook_path": "C:/isolated/legacy-remarks.ods", "source_hash": source_hash,
+            "association": self.association, "groups": source_groups, "mapping_store": self.mapping_store,
+            "source_families": self.family_choices_for({"toolshop"}), "actor": "baseline reviewer",
+            "reason": "Verify legacy Remarks header provenance", "request_key": "baseline-legacy-remarks-provenance",
+            "expected_hash": source_hash, "expected_association": self.association.id,
+            "expected_association_version": self.association.version, "expected_mapping_version": mapped["version"]}
+        self.service.establish(**kwargs)
+
+        detail = self.service.baseline_detail(self.part["id"])
+        by_row = {item["row"]: item for item in detail["requirements"]}
+        for row_number, _, legacy_value, legacy_header, explicit_value, explicit_header, expected in cases:
+            requirement = by_row[row_number]
+            self.assertEqual(requirement["lineDetail"]["toolShopItemsRemarks"], expected)
+            self.assertEqual(requirement["rawFields"]["toolshop_part_name"], legacy_value)
+            self.assertEqual(requirement["rawFields"]["job_remarks"], f"Job note {row_number}")
+            self.assertEqual(requirement["cellEvidence"]["sourceHeaders"]["toolshop_part_name"], legacy_header)
+            if explicit_header is not None:
+                self.assertEqual(requirement["rawFields"]["toolshop_remarks"], explicit_value)
+                self.assertEqual(requirement["cellEvidence"]["sourceHeaders"]["toolshop_remarks"], explicit_header)
+            else:
+                self.assertNotIn("toolshop_remarks", requirement["rawFields"])
+
+        observations = {row["fields"]["SourceRow"]: row for row in self.client.tables["SourceLineObservation"]}
+        line_details = {row["fields"]["LineRevision"]: row["fields"] for row in self.client.tables["LineDetail"]}
+        links = {row["fields"]["SourceLineObservation"]: row["fields"] for row in self.client.tables["PartRevisionLine"]}
+        self.assertIsNone(line_details[links[observations[401]["id"]]["LineRevision"]]["ToolShopRemarks"])
+        self.assertIsNone(line_details[links[observations[402]["id"]]["LineRevision"]]["ToolShopRemarks"])
+        self.assertEqual(line_details[links[observations[403]["id"]]["LineRevision"]]["ToolShopRemarks"], "Dedicated remarks")
+        self.assertIsNone(line_details[links[observations[404]["id"]]["LineRevision"]]["ToolShopRemarks"])
+
+        counts_before_retry = {name: len(self.client.tables[name]) for name in
+            ("LineDetail", "SourceLineObservation", "SourceLineMapping", "PartRevisionLine")}
+        retry = self.service.establish(**kwargs)
+        self.assertTrue(retry["idempotent"])
+        self.assertEqual({name: len(self.client.tables[name]) for name in counts_before_retry}, counts_before_retry)
+
     def test_replacement_requires_a_reason_but_unchanged_context_reconfirmation_does_not(self):
         rows = [source_row(10)]
         self.save_rows(rows, "hash-first", request_key="map:first")
