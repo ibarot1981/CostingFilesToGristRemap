@@ -48,7 +48,7 @@
 .part-group-heading-copy .part-canonical-summary { color: #4c5d73; font-weight: 700; overflow-wrap: anywhere; }
 .part-state.state-saved { color: #39745d; background: #e3ede8; }
 .part-state.state-unsaved { color: #875522; background: #fff1d7; }
-.part-state.state-needs-review { color: #596679; background: #e9edf3; }
+.part-state.state-needs-review, .part-state.review { color: #8a4315; background: #fff0df; }
 .part-state.state-saving { color: #275d90; background: #e4f0fc; }
 .part-state.state-failed { color: #9e3d23; background: #fff0e9; }
 .part-group-content { padding-top: 8px; }
@@ -60,7 +60,6 @@
 .part-state { flex: none; display: inline-flex; padding: 4px 8px; border-radius: 11px; font-size: 9px; font-weight: 700; }
 .part-state.saved { color: #39745d; background: #e3ede8; }
 .part-state.pending { color: #875522; background: #fff1d7; }
-.part-state.review { color: #596679; background: #e9edf3; }
 .part-compatibility-note { margin: 8px 0; padding: 7px 9px; color: #785329; background: #fff8e8; border-left: 3px solid #d49361; font-size: 10px; line-height: 1.45; }
 .part-source-details { margin: 8px 0 9px; padding: 7px 9px; background: #faf9f7; border: 1px solid #ece9e3; border-radius: 7px; }
 .part-source-details-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; color: #647188; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
