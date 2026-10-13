@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 from app.domain import utc_now
 from app.exceptions import GristError, GristValidationError
 from app.grist import GristClient
-from app.grist_types import grist_datetime
+from app.grist_types import canonical_grist_json_cell, decode_grist_any_object, grist_datetime
 from app.part_identity import PartIdentityError, generated_name, normalized_name, normalized_shortcode, request_fingerprint
 
 
@@ -1145,24 +1145,50 @@ class GristPartRegistry:
         existing = self._rows("PartMappingReview")
         by_key = {str(row.get("fields", {}).get("ReviewKey") or ""): row for row in existing}
         missing = []
+        expected_by_key: dict[str, dict[str, Any]] = {}
         for item in fields:
             key = str(item.get("ReviewKey") or "")
             if not key:
                 raise PartIdentityError("PART_REVIEW_KEY_REQUIRED", "Every Grist mapping row requires a stable review key.")
+            expected = dict(item)
+            evidence = decode_grist_any_object(expected.get("SemanticEvidence"))
+            if evidence is None:
+                raise PartIdentityError("PART_SEMANTIC_EVIDENCE_INVALID", "A mapping review row requires valid object semantic evidence.")
+            try:
+                expected["SemanticEvidence"] = canonical_grist_json_cell(evidence)
+            except (TypeError, ValueError) as exc:
+                raise PartIdentityError("PART_SEMANTIC_EVIDENCE_INVALID", "Mapping semantic evidence cannot be encoded as canonical JSON.") from exc
+            expected_by_key[key] = expected
             row = by_key.get(key)
             if row:
-                if row.get("fields", {}) != item:
+                stored = dict(row.get("fields", {}))
+                stored_evidence = decode_grist_any_object(stored.get("SemanticEvidence"))
+                if stored_evidence is None:
+                    raise PartIdentityError("PART_SEMANTIC_EVIDENCE_INVALID", "Existing mapping evidence is corrupt and cannot be confirmed safely.")
+                try:
+                    stored["SemanticEvidence"] = canonical_grist_json_cell(stored_evidence)
+                except (TypeError, ValueError) as exc:
+                    raise PartIdentityError("PART_SEMANTIC_EVIDENCE_INVALID", "Existing mapping evidence cannot be normalized safely.") from exc
+                if stored != expected:
                     raise PartIdentityError("PART_REQUEST_CONFLICT", "A mapping review key already exists with different evidence.")
             else:
-                missing.append({"fields": item})
+                missing.append({"fields": expected})
         if missing:
             self.client.create_table_records("PartMappingReview", missing)
         confirmed = self._rows("PartMappingReview")
         by_key = {str(row.get("fields", {}).get("ReviewKey") or ""): row for row in confirmed}
         result = []
         for item in fields:
-            row = by_key.get(str(item["ReviewKey"]))
-            if not row or row.get("fields", {}) != item:
+            key = str(item["ReviewKey"])
+            row = by_key.get(key)
+            stored = dict(row.get("fields", {})) if row else {}
+            stored_evidence = decode_grist_any_object(stored.get("SemanticEvidence"))
+            if stored_evidence is not None:
+                try:
+                    stored["SemanticEvidence"] = canonical_grist_json_cell(stored_evidence)
+                except (TypeError, ValueError):
+                    stored_evidence = None
+            if not row or stored_evidence is None or stored != expected_by_key[key]:
                 raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm every Part mapping row after Save.")
             result.append(row)
         return result

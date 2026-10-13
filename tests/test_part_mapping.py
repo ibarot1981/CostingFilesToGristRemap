@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -365,6 +366,22 @@ class PartMappingTests(unittest.TestCase):
             def fetch_table_records_with_ids(self, table):
                 return deepcopy(self.tables.get(table, []))
             def create_table_records(self, table, records):
+                def assert_cell_value(value):
+                    if value is None or isinstance(value, (str, int, float, bool)):
+                        return
+                    if isinstance(value, list) and value and value[0] == "O" and len(value) == 2 and isinstance(value[1], dict):
+                        for nested in value[1].values():
+                            assert_cell_value(nested)
+                        return
+                    if isinstance(value, list) and value and value[0] == "L":
+                        for nested in value[1:]:
+                            assert_cell_value(nested)
+                        return
+                    raise AssertionError(f"Invalid Grist REST CellValue: {value!r}")
+
+                for record in records:
+                    for value in record["fields"].values():
+                        assert_cell_value(value)
                 rows = self.tables.setdefault(table, [])
                 next_id = len(rows) + 1
                 for item in records:
@@ -375,6 +392,9 @@ class PartMappingTests(unittest.TestCase):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as temp:
             client = IsolatedGrist()
+            for invalid_cell in ({"fields": []}, ["untyped", "array"]):
+                with self.assertRaises(AssertionError):
+                    client.create_table_records("PartMappingReview", [{"fields": {"SemanticEvidence": invalid_cell}}])
             registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
             registry._verify_writer = lambda: None
             registry.mapping_evidence_schema_available = lambda: True
@@ -390,7 +410,9 @@ class PartMappingTests(unittest.TestCase):
             persisted = client.tables["PartMappingReview"][0]["fields"]
             self.assertEqual(persisted["SemanticPolicyVersion"], "part-mapping-semantic-v1")
             self.assertTrue(persisted["SemanticFingerprint"])
-            self.assertIn("fields", persisted["SemanticEvidence"])
+            self.assertIsInstance(persisted["SemanticEvidence"], str)
+            source_evidence = groups[0]["semanticEvidence"][42]
+            self.assertEqual(json.loads(persisted["SemanticEvidence"]), source_evidence)
             fresh_registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
             fresh_registry._verify_writer = lambda: None
             fresh_registry.mapping_evidence_schema_available = lambda: True
@@ -399,6 +421,38 @@ class PartMappingTests(unittest.TestCase):
                 association=self.association, groups=groups)
             self.assertTrue(recovered["groups"][0]["reviewed"])
             self.assertEqual(recovered["groups"][0]["part"]["id"], "stable-bracket")
+
+            # A retry from a fresh registry compares equivalent decoded and
+            # stored forms and must not create a duplicate history row.
+            retry_fields = dict(persisted)
+            retry_fields["SemanticEvidence"] = source_evidence
+            fresh_registry.append_mapping_records([retry_fields])
+            self.assertEqual(len(client.tables["PartMappingReview"]), 1)
+
+            # Read compatibility covers Grist's documented typed Any-object
+            # form, including nested object/list tags.
+            def encode_typed(value):
+                if isinstance(value, dict):
+                    return ["O", {key: encode_typed(nested) for key, nested in value.items()}]
+                if isinstance(value, list):
+                    return ["L", *(encode_typed(nested) for nested in value)]
+                return value
+
+            from app.part_mapping import _snapshot_lines_from_records
+            typed_row = {**persisted, "SemanticEvidence": encode_typed(source_evidence)}
+            typed_lines, typed_fingerprint = _snapshot_lines_from_records([typed_row], "CNC Cut List")
+            self.assertEqual(typed_lines, [source_evidence])
+            self.assertEqual(typed_fingerprint, persisted["SemanticFingerprint"])
+
+            # Corrupt persisted evidence cannot silently retain the prior Part.
+            corrupt_row = {**persisted, "SemanticEvidence": "{invalid json"}
+            self.assertEqual(_snapshot_lines_from_records([corrupt_row], "CNC Cut List"), (None, None))
+            client.tables["PartMappingReview"][0]["fields"]["SemanticEvidence"] = "{invalid json"
+            corrupt_detail = mapping_detail(fresh_store, file_id="file:pilot.ods", source_hash="hash-resaved",
+                association=self.association, groups=groups)
+            self.assertFalse(corrupt_detail["groups"][0]["reviewed"])
+            self.assertEqual(corrupt_detail["groups"][0]["semanticComparison"]["status"], "legacy_evidence_missing")
+
             replay = save_mapping(store, file_id="file:pilot.ods", source_hash="hash-grist", association=self.association,
                 groups=groups, decisions={groups[0]["key"]: "stable-bracket"}, expected_hash="hash-grist",
                 expected_version=0, expected_association="association-1", expected_association_version=1,

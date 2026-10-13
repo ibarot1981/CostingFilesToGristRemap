@@ -11,7 +11,7 @@ import unicodedata
 from typing import Any
 from app.domain import utc_now
 from app.exceptions import GristError
-from app.grist_types import grist_datetime, datetime_text
+from app.grist_types import decode_grist_any_object, grist_datetime, datetime_text
 from app.part_identity import PartIdentityError
 
 
@@ -200,13 +200,8 @@ def _snapshot_lines_from_records(rows: list[dict[str, Any]], sheet: str) -> tupl
     lines = []
     coordinates = set()
     for row in rows:
-        evidence = row.get("SemanticEvidence")
-        if isinstance(evidence, str):
-            try:
-                evidence = json.loads(evidence)
-            except (ValueError, TypeError):
-                return None, None
-        if not isinstance(evidence, dict) or not isinstance(evidence.get("fields"), list):
+        evidence = decode_grist_any_object(row.get("SemanticEvidence"))
+        if evidence is None or not isinstance(evidence.get("fields"), list):
             return None, None
         projected = [{"field": item.get("field"), "state": item.get("state"), "value": item.get("value")}
             for item in evidence["fields"] if isinstance(item, dict)]
