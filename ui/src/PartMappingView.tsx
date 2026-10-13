@@ -8,8 +8,14 @@ import "./partMapping.css";
 
 type Part = { id: string; name: string; description?: string; variant?: string; selectable: boolean; duplicateName: boolean; partNumber?: string | null; engineeringRevision?: string | null; legacy?: boolean; outOfScopeCodes?: { id: string; code: string }[] };
 type SourceRow = { sheet: string; row: number; fields: Record<string, unknown>; sourceHeaders: Record<string, string>; sourceHeaderCells: Record<string, string>; sourceCells: Record<string, { cell?: string }>; headerRow?: number; availableFields: string[] };
-type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: { partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number; assignedPartIds?: string[]; hasPriorAssignment?: boolean; contextChanged?: boolean; groupingPolicyChanged?: boolean }; needsCompatibilityReview?: boolean; version: number };
-type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; unresolvedGroups: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; NameUsed?: string; PartNumberUsed?: string }[] };
+type SemanticField = { field: string; state: string; value?: string | null; display?: string | null };
+type SemanticLine = { fingerprint: string; fields: SemanticField[] };
+type SemanticDifference = { type: string; previous: SemanticLine | null; current: SemanticLine | null; reason?: string; fieldDifferences?: { field: string; previous?: SemanticField; current?: SemanticField }[] };
+type SemanticComparison = { status: string; previousFingerprint?: string | null; currentFingerprint?: string | null; previousPolicyVersion?: string; sourceHashChanged?: boolean; associationChanged?: boolean; groupingPolicyChanged?: boolean; differences: SemanticDifference[]; requiresReview: boolean };
+type PreviousAssignment = { partId?: string | null; partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number; assignedPartIds?: string[]; hasPriorAssignment?: boolean; contextChanged?: boolean; groupingPolicyChanged?: boolean; evidenceStatus?: string };
+type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; semanticFingerprint?: string; semanticComparison?: SemanticComparison; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment; needsCompatibilityReview?: boolean; version: number };
+type RemovedGroup = { key: string; sheet: string; description: string; removed: true; previousAssignment?: PreviousAssignment; semanticComparison?: SemanticComparison };
+type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; schemaMessage?: string | null; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; semanticPolicyVersion?: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; removedGroups?: RemovedGroup[]; unresolvedGroups: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; NameUsed?: string; PartNumberUsed?: string }[] };
 type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[] };
 type StaleDraft = { groupKey: string; sheet: string; description: string; rowCount: number; decision: string; part: Part | null; sourceHash: string; evidenceFingerprint: string; reason?: string };
 type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; groupReasons?: Record<string, string>; expandedGroups?: Record<string, boolean>; expandedSourceDetails?: Record<string, boolean>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
@@ -61,6 +67,50 @@ function sheetFamilyClass(sheet: string) {
 }
 function groupTitle(group: Group) {
   return group.blankDescription ? "Blank Part label · individual source row" : group.description;
+}
+function semanticFieldLabel(field: string) {
+  return field.replaceAll("_", " ").replace(/\b\w/g, letter => letter.toUpperCase());
+}
+function semanticFieldValue(value?: SemanticField) {
+  if (!value) return "Not recorded";
+  if (value.state === "unavailable") return "Column unavailable in source";
+  if (value.state === "blank") return "Blank in source";
+  return String(value.display ?? value.value ?? "(blank)");
+}
+function mappingRefreshNotice(saved: Draft, result: Detail) {
+  const associationChanged = saved.associationKey !== result.associationKey || saved.associationVersion !== result.associationVersion;
+  const statuses = result.groups.map(group => group.semanticComparison?.status || "");
+  const affected = statuses.filter(status => ["changed", "ambiguous_correspondence", "ambiguous_identity", "assignment_conflict", "grouping_policy_changed"].includes(status)).length;
+  const groupingChanged = statuses.filter(status => status === "grouping_policy_changed").length;
+  const legacy = statuses.filter(status => status === "legacy_evidence_missing").length;
+  const preserved = result.groups.filter(group => group.reviewed && group.semanticComparison?.status === "unchanged").length;
+  const removed = result.removedGroups?.length || 0;
+  if (associationChanged) {
+    return `The file’s Product/Model association changed. Prior Part assignments remain proposals and need explicit review for this association; ${affected} group(s) also have changed or ambiguous manufacturing evidence. Pending choices were held for explicit review and not applied.`;
+  }
+  if (saved.sourceHash !== result.sourceHash) {
+    return `Workbook hash changed: ${preserved} group(s) retain their saved Part assignment because relevant manufacturing evidence matches; ${affected - groupingChanged} group(s) need review for relevant line or correspondence changes; ${groupingChanged} group(s) need review because grouping policy changed; ${legacy} group(s) need one-time evidence confirmation; ${removed} saved group(s) no longer occur in this workbook. Rate/price totals, formatting and document metadata do not trigger remapping. Pending choices were held for explicit review and not applied.`;
+  }
+  return "The saved mapping version changed. Grist assignments were refreshed; unsaved choices were held and not applied.";
+}
+function SemanticDifferenceList({ comparison }: { comparison?: SemanticComparison }) {
+  if (!comparison?.differences?.length) return null;
+  return <details className="part-semantic-differences" open={comparison.requiresReview}>
+    <summary>Relevant manufacturing differences · {comparison.differences.length}</summary>
+    <div>{comparison.differences.map((difference, index) => {
+      const line = difference.current || difference.previous;
+      const values = new Map((line?.fields || []).map(value => [value.field, value]));
+      return <article key={`${difference.type}:${line?.fingerprint || index}`}>
+        <strong>{difference.type === "modified" ? "Modified source line" : difference.type === "added" ? "Added source line" : difference.type === "deleted" ? "Deleted source line" : "Ambiguous source-line match"}</strong>
+        {difference.reason && <span>{difference.reason}</span>}
+        {difference.fieldDifferences?.length ? <dl>{difference.fieldDifferences.map(change => <div key={change.field}>
+          <dt>{semanticFieldLabel(change.field)}</dt><dd>{semanticFieldValue(change.previous)} → {semanticFieldValue(change.current)}</dd>
+        </div>)}</dl> : line && <dl>{[...values.values()].map(value => <div key={value.field}>
+          <dt>{semanticFieldLabel(value.field)}</dt><dd>{semanticFieldValue(value)}</dd>
+        </div>)}</dl>}
+      </article>;
+    })}</div>
+  </details>;
 }
 function narrowScreen() {
   return typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 1000px)").matches : window.innerWidth <= 1000;
@@ -194,11 +244,10 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         setMappingAttempt(saved?.mappingAttempt || null);
         if (saved) {
           window.requestAnimationFrame(() => { if (tableScroll.current) tableScroll.current.scrollTop = saved.scrollTop || 0; });
+          const refreshNotice = mappingRefreshNotice(saved, result);
           setNotice(heldDrafts.length
-            ? "The review evidence changed. Pending choices were held for explicit review and were not applied to current source groups."
-            : sameSourceContext
-              ? "The saved review version changed. Saved Grist assignments are current; no unsaved choices were reapplied."
-              : "The workbook or association changed. Saved Grist assignments are shown for the current evidence; previous choices were not reapplied.");
+            ? `${refreshNotice} ${heldDrafts.length} unsaved choice(s) remain listed for explicit review.`
+            : refreshNotice);
         }
       }
       if (saved) {
@@ -524,7 +573,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
       <div className="part-context-scroll">
         <section className="part-context-summary" aria-label="Extended mapping statistics"><div><strong>{allGroups.filter(group => !group.reviewed && !groupPending(group)).length}</strong><span>groups needing review</span></div><div><strong>{pendingGroups.length}</strong><span>unsaved changes</span></div><div><strong>{totalRows}</strong><span>active source rows</span></div><div><strong>{detail.version}</strong><span>saved review version</span></div></section>
         <details className="part-review-details" open><summary>Review details</summary><div><p>Workbook SHA-256 · <code>{detail.sourceHash}</code></p><p>Mapping policy · {detail.mappingPolicyVersion} · review version {detail.version} · saved workbook evidence</p>
-          {!detail.schemaAvailable && <p role="alert">Part review storage is unavailable.</p>}
+          {!detail.schemaAvailable && <p role="alert">{detail.schemaMessage || "Part review storage is unavailable."}</p>}
           {detail.legacyHistoryAvailable === false && <p role="alert">Legacy Grist Part assignment history is unavailable. Existing history must be reconciled before those assignments can be relied on.</p>}
           {!detail.associationKey && <p role="alert">Save a file association before saving Part assignments.</p>}
           {Object.entries(detail.sourceSheets || {}).map(([sheet, diagnostic]) => <p key={sheet}><strong>{sheet}:</strong> {diagnostic.status === "ok" ? `${diagnostic.labelField === "part_category" ? "Part Category" : "Machine Piece Description"} from ${diagnostic.labelHeader} at ${diagnostic.labelHeaderCell}` : diagnostic.status === "sheet_missing" ? "Sheet is not present in this workbook." : diagnostic.status === "header_missing" ? "A source header row was not found." : diagnostic.status === "label_column_ambiguous" ? `Multiple possible Part label columns were found: ${diagnostic.ambiguousLabelHeaders.join(", ")}.` : "The configured Part label column is missing; blank rows cannot be mapped by substitution."}</p>)}
@@ -558,6 +607,13 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
           const current = allGroups.find(group => group.key === stale.groupKey);
           return <article key={`${stale.groupKey}:${stale.sourceHash}`}><div><strong>{stale.sheet} · {stale.description || "Blank Part label"}</strong><span>{stale.rowCount} prior source row(s) · previous choice: {stale.decision ? formatPart(stale.part) : "Clear saved Part assignment"} · from workbook {stale.sourceHash.slice(0,12)}…</span></div>{current ? <button className="button" onClick={() => reapplyStaleDraft(stale)}>Reapply after reviewing current rows</button> : <span className="part-stale-missing">This group no longer exists; search and assign a current group manually.</span>}</article>;
         })}</section>}
+        {Boolean(detail.removedGroups?.length) && <section className="part-removed-groups" aria-label="Saved groups removed from the workbook">
+          <h2>Saved groups removed from this workbook · {detail.removedGroups?.length}</h2>
+          <p>These groups have no current source lines. Their previous Part assignments remain historical proposals and were not reused for another group.</p>
+          {detail.removedGroups?.map(group => <article key={group.key}><header><strong>{group.sheet} · {group.description || "Blank Part label"}</strong>
+            <span>{group.previousAssignment?.partNumber ? `${group.previousAssignment.partNumber} · ` : ""}{group.previousAssignment?.name || "No prior Part assignment"}</span></header>
+            <SemanticDifferenceList comparison={group.semanticComparison}/></article>)}
+        </section>}
         <p className="part-counts"><strong>Showing {visibleGroups.length} of {allGroups.length} source groups</strong> · {visibleGroups.reduce((sum, group) => sum + group.rows.length, 0)} displayed source rows. Filters never discard hidden drafts.</p>
         <div className="part-source-table" ref={tableScroll} onScroll={() => { const draft = readDraft(path); if (draft && tableScroll.current) sessionStorage.setItem(draftKey(path), JSON.stringify({ ...draft, scrollTop: tableScroll.current.scrollTop })); }}>
           {visibleGroups.length ? visibleGroups.map(group => {
@@ -565,11 +621,26 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
             const needsReason = pendingReasonRequired(group);
             const groupReason = groupReasons[group.key] || "";
             const selectedPart = selectedPartFor(group);
-            const blocker = !detail.schemaAvailable ? "Part review storage is unavailable; saving is blocked." : !detail.associationKey ? "Save a file association before assigning Parts." : group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" ? "Resolve the source label column before saving." : groupPending(group) ? "" : !selectedPart ? "Choose a canonical Part before saving." : "";
+            const proposedPart = group.previousAssignment?.partId ? detail.parts.find(part => part.id === group.previousAssignment?.partId) || null : null;
+            const semanticStatus = group.semanticComparison?.status || "";
+            const compatibilityMessage = semanticStatus === "legacy_evidence_missing"
+              ? "The saved mapping has no versioned manufacturing snapshot. This is a one-time confirmation; old manufacturing data was not inferred from the current workbook."
+              : semanticStatus === "association_changed"
+                ? "The file association changed. Review this prior assignment in the current Product/Model context before confirming it."
+              : semanticStatus === "grouping_policy_changed"
+                ? "Source grouping policy changed. The prior Part remains a proposal and needs explicit review; group identity is not a Part revision."
+                : semanticStatus === "ambiguous_identity" || semanticStatus === "ambiguous_correspondence"
+                  ? "The source label or line correspondence is ambiguous. The prior Part remains a proposal and needs explicit review."
+              : semanticStatus === "assignment_conflict"
+                    ? "The saved rows disagree about their canonical Part. Resolve the assignment explicitly."
+                    : "Relevant manufacturing evidence changed. The prior Part remains a proposal until you review and save this group.";
+            const blocker = !detail.schemaAvailable ? (detail.schemaMessage || "Part review storage is unavailable; saving is blocked.") : !detail.associationKey ? "Save a file association before assigning Parts." : group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" ? "Resolve the source label column before saving." : groupPending(group) ? "" : !selectedPart ? "Choose a canonical Part before saving." : "";
             return <article className={`part-source-group ${groupIsExpanded ? "is-expanded" : "is-collapsed"}`} key={group.key}>
-              {group.previousAssignment && !group.reviewed && <div className="part-compatibility-note" role="status"><strong>Older assignment needs review.</strong>{group.previousAssignment.previousRowsAgree === false
-                ? " Previous row assignments differ or do not cover every current source row; review the source-row history before assigning this group."
-                : <> The previous group used {group.previousAssignment.sourceDescription || "a different source label"}{group.previousAssignment.partNumber ? ` and ${group.previousAssignment.partNumber}` : ""}{group.previousAssignment.name ? ` · ${group.previousAssignment.name}` : ""}.</>} It remains in history and was not carried into this sheet-specific group.</div>}
+              {group.previousAssignment && !group.reviewed && <div className="part-compatibility-note" role="status"><strong>{semanticStatus === "legacy_evidence_missing" ? "One-time source evidence confirmation required." : semanticStatus === "association_changed" ? "Prior assignment needs association review." : semanticStatus === "grouping_policy_changed" ? "Prior assignment needs grouping-policy review." : "Prior assignment needs source review."}</strong>
+                <span>{compatibilityMessage}{group.previousAssignment.name ? ` Prior canonical Part: ${group.previousAssignment.partNumber ? `${group.previousAssignment.partNumber} · ` : ""}${group.previousAssignment.name}.` : ""}</span>
+                {proposedPart?.selectable && !proposedPart.duplicateName && <button type="button" className="button" disabled={locked} onClick={() => selectPart(group, proposedPart)}>Use proposed Part in draft</button>}
+                {group.previousAssignment.previousRowsAgree === false && <small>Previous source-row assignments disagree or do not cover every current row.</small>}
+              </div>}
               {group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" && <div className="part-compatibility-note" role="alert">Part label source is {group.sourceDiagnostic.status.replaceAll("_", " ")}. Resolve the source header before saving a Part assignment.</div>}
               <header className="part-group-heading">
                 <button type="button" className="part-group-toggle" aria-label={`${groupIsExpanded ? "Collapse" : "Expand"} source evidence · ${groupTitle(group)}`} aria-expanded={groupIsExpanded} aria-controls={`part-group-content-${group.key}`} onClick={() => setExpandedGroups(old => ({ ...old, [group.key]: !Boolean(old[group.key]) }))}>
@@ -590,6 +661,8 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
                 </div>
               </header>
               {needsReason && <div className="part-group-reason-row"><label className="part-group-reason">Reason for mapping change<input name={`mapping-change-reason-${group.key}`} autoComplete="off" spellCheck={false} autoCapitalize="sentences" aria-label={`Reason for mapping change · ${groupTitle(group)}`} value={groupReason} disabled={locked} onChange={event => setGroupReasons(old => ({ ...old, [group.key]: event.target.value }))} placeholder="Required for replacement or clear"/></label></div>}
+              {group.semanticComparison?.status === "unchanged" && group.reviewed && group.semanticComparison.sourceHashChanged && <p className="part-semantic-stable" role="status">Relevant manufacturing evidence is unchanged; this saved Part assignment remains valid across the workbook hash change. Rates, prices, totals, formatting and document metadata are excluded.</p>}
+              <SemanticDifferenceList comparison={group.semanticComparison}/>
               {selectedPart?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: this assignment remains saveable for {selectedPart.outOfScopeCodes.map(code => code.code).join(", ")}.</small> : null}
               {group.explicitlyUnassigned && <small className="part-unassigned-note">The last saved action explicitly cleared the Part. Historical assignments remain in History.</small>}
               {blocker && <small className="part-save-blocker">{blocker}</small>}

@@ -574,6 +574,33 @@ it("keeps collapsed-group and source-detail expansion per workbook across reload
   expect(screen.getByRole("button", {name:"Show key fields"})).toBeTruthy();
 });
 
+it("shows normalized source differences and the prior canonical Part without changing its baseline", async () => {
+  const changed = group("mcl-shaft", "5. Material Cut List Price", "Shaft", 10, {
+    reviewed:false,
+    previousAssignment:{partId:bracket.id, partNumber:bracket.partNumber, name:bracket.name, previousRowsAgree:true, requiresReview:true},
+    semanticComparison:{status:"changed", previousFingerprint:"old", currentFingerprint:"new", sourceHashChanged:true,
+      differences:[{type:"modified", previous:{fingerprint:"old-line",fields:[]}, current:{fingerprint:"new-line",fields:[]},
+        fieldDifferences:[{field:"qty",previous:{field:"qty",state:"value",value:"2",display:"2"},current:{field:"qty",state:"value",value:"3",display:"3"}}]}], requiresReview:true},
+  });
+  mocks.partMappings.mockResolvedValue(detail([changed], {parts:[bracket], unresolvedGroups:1}));
+  render(<PartMappingView path="pilot.ods"/>);
+  expect(await screen.findByText("Prior assignment needs source review.")).toBeTruthy();
+  expect(screen.getByText(/Prior canonical Part: SM-P-000002 · S1KHF — Bracket/)).toBeTruthy();
+  expect(screen.getByText("Relevant manufacturing differences · 1")).toBeTruthy();
+  expect(screen.getByText("2 → 3")).toBeTruthy();
+  expect(screen.getByRole("button", {name:"Use proposed Part in draft"})).toBeTruthy();
+  expect(mocks.establishPartBaseline).not.toHaveBeenCalled();
+});
+
+it("keeps mapping history readable and disables Save when Grist v14 evidence columns are missing", async () => {
+  mocks.partMappings.mockResolvedValue(detail([group()], {schemaAvailable:false,
+    schemaMessage:"Part mapping history is readable, but Save requires Grist schema v14 semantic evidence columns."}));
+  render(<PartMappingView path="pilot.ods"/>);
+  const schemaAlert = await screen.findByRole("alert");
+  expect(schemaAlert.textContent).toMatch(/Save requires Grist schema v14 semantic evidence columns/);
+  expect((screen.getByRole("button", {name:"Save pending mappings"}) as HTMLButtonElement).disabled).toBe(true);
+});
+
 it("does not show or select stale search results while a newer query is loading", async () => {
   let resolveShaft!: (value: any) => void;
   let resolveBracket!: (value: any) => void;

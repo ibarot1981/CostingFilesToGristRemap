@@ -295,3 +295,32 @@
   .part-sticky-save .button { grid-column: 1; grid-row: auto; }
   .part-create-dialog>header { align-items: flex-start; }
 }
+
+.part-compatibility-note { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 5px 9px; }
+.part-compatibility-note strong { flex: 0 0 100%; }
+.part-compatibility-note span { flex: 1 1 360px; }
+.part-compatibility-note small { flex: 0 0 100%; }
+.part-compatibility-note .button { flex: none; padding: 5px 8px; font-size: 9px; }
+.part-semantic-stable { margin: 7px 0; padding: 7px 9px; color: #38644e; background: #eef6f0; border-left: 3px solid #74a886; font-size: 9px; line-height: 1.45; }
+.part-semantic-differences { margin: 7px 0; border: 1px solid #e2ded6; border-radius: 7px; background: #fbfaf8; }
+.part-semantic-differences summary { cursor: pointer; padding: 7px 9px; color: #526176; font-size: 9px; font-weight: 700; }
+.part-semantic-differences>div { display: grid; gap: 6px; padding: 0 8px 8px; }
+.part-semantic-differences article { padding: 7px 8px; border-left: 3px solid #c67845; background: #fff; }
+.part-semantic-differences article>strong,.part-semantic-differences article>span { display: block; color: #58677b; font-size: 9px; line-height: 1.45; }
+.part-semantic-differences article>strong { color: #394b65; text-transform: capitalize; }
+.part-semantic-differences dl { display: grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap: 5px 10px; margin: 6px 0 0; }
+.part-semantic-differences dl>div { min-width: 0; padding-top: 4px; border-top: 1px solid #eff0f2; }
+.part-semantic-differences dt { color: #818b99; font-size: 8px; text-transform: uppercase; }
+.part-semantic-differences dd { margin: 2px 0 0; color: #46556b; font-size: 9px; overflow-wrap: anywhere; }
+.part-removed-groups { max-width: 1480px; margin: 9px auto; padding: 10px 12px; border: 1px solid #ecd5b7; border-radius: 8px; background: #fff8ec; }
+.part-removed-groups h2 { margin: 0; color: #76522d; font-size: 12px; }
+.part-removed-groups>p { margin: 4px 0 8px; color: #8b6a42; font-size: 9px; line-height: 1.45; }
+.part-removed-groups article { padding: 8px 0; border-top: 1px solid #f0e2cf; }
+.part-removed-groups article>header { display: flex; justify-content: space-between; gap: 10px; color: #55432d; font-size: 9px; }
+.part-removed-groups article>header span { color: #7b6040; text-align: right; }
+.part-removed-groups .part-semantic-differences { margin-bottom: 0; }
+@media(max-width:650px) {
+  .part-compatibility-note span { flex-basis: 100%; }
+  .part-removed-groups article>header { flex-direction: column; }
+  .part-removed-groups article>header span { text-align: left; }
+}

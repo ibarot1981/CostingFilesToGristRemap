@@ -8,3 +8,31 @@
 
 @media(max-width:700px){.parts-cascade-filters{grid-template-columns:1fr}.parts-selected-code-summary{align-items:flex-start;flex-direction:column}}
 .parts-section-card>summary{display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none;user-select:none}.parts-section-card>summary::-webkit-details-marker{display:none}.parts-section-card>summary::marker{content:""}.parts-section-card>summary>svg{flex:none;color:#758092;transition:transform .15s ease}.parts-section-card[open]>summary>svg{transform:rotate(90deg)}.parts-section-card>summary h3{flex:1;margin:0;font-size:13px;color:#34435a}.parts-section-card[open]>summary{margin-bottom:12px}.parts-section-card>summary:focus-visible{outline:3px solid #d4936180;outline-offset:3px;border-radius:4px}
+
+/* Keep the Parts explorer view stretched across its cached flex wrapper. */
+.app-cached-view > .parts-page {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex: 1 1 0%;
+  align-self: stretch;
+  grid-template-columns: clamp(240px, 24vw, 292px) minmax(0, 1fr);
+}
+.parts-explorer { min-width: 0; min-height: 0; }
+.parts-work-panel {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+}
+@media(max-width:850px) {
+  .app-cached-view > .parts-page {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: calc(100vh - 64px);
+    height: auto;
+  }
+  .parts-work-panel { width: 100%; min-width: 0; }
+}

@@ -51,6 +51,8 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.client = MemoryGrist()
         self.registry = GristPartRegistry(self.client, Path(self.temp.name) / "parts.sqlite3")
         self.registry._verify_writer = lambda: None
+        # This in-memory Grist fixture models the reviewed additive v14 schema.
+        self.registry.mapping_evidence_schema_available = lambda: True
         self.part = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
             description="Chassis", variant="Standard", expected_name="S1K — Chassis — Standard",
             actor="test operator", reason="isolated baseline fixture", request_key="create-baseline-fixture",

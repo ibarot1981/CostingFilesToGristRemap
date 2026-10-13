@@ -1,5 +1,7 @@
 """Canonical Parts and immutable, source-scoped mapping review."""
 from __future__ import annotations
+from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 import sqlite3
@@ -16,10 +18,40 @@ from app.part_identity import PartIdentityError
 PART_SHEETS = {"5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"}
 MAPPING_TABLE = "PartMappingReview"
 MAPPING_POLICY_VERSION = "part-source-labels-v2"
+MAPPING_SEMANTIC_POLICY_VERSION = "part-mapping-semantic-v1"
 MAPPING_LABEL_FIELD = {
     "5. Material Cut List Price": "product_part_name",
     "Tool Shop Items": "product_part_name",
     "CNC Cut List": "part_category",
+}
+
+# This policy deliberately names the source-owned manufacturing fields used to
+# preserve mappings. Rates, calculated totals, presentation formatting, remarks
+# that are not engineering attributes, CR-log metadata and document properties
+# remain provenance/costing evidence and do not invalidate a Part assignment.
+_MAPPING_SEMANTIC_FIELDS = {
+    "5. Material Cut List Price": (
+        "product_part_name", "material_to_cut", "dimension_to_cut_mm",
+        "dimension_to_cut_inches", "qty", "optional_item_group_1", "in_use",
+    ),
+    "Tool Shop Items": (
+        "product_part_name", "item_name", "material_to_cut", "dimension_to_cut_mm",
+        "weight_per_meter_kg", "total_weight_kg", "qty", "optional_item_group_1", "in_use",
+        "toolshop_part_name", "toolshop_remarks", "job_remarks",
+    ),
+    "CNC Cut List": (
+        "part_category", "product_part_name", "material_to_cut", "length", "width",
+        "thickness", "part_weight_kg", "total_weight_kg", "qty", "optional_item_group_1", "in_use",
+    ),
+}
+_MAPPING_NUMERIC_FIELDS = frozenset({
+    "dimension_to_cut_mm", "dimension_to_cut_inches", "weight_per_meter_kg", "total_weight_kg",
+    "part_weight_kg", "qty", "length", "width", "thickness",
+})
+_MAPPING_MODIFICATION_ANCHORS = {
+    "5. Material Cut List Price": ("material_to_cut", "dimension_to_cut_mm", "dimension_to_cut_inches"),
+    "Tool Shop Items": ("item_name", "material_to_cut", "dimension_to_cut_mm", "toolshop_part_name"),
+    "CNC Cut List": ("product_part_name", "material_to_cut", "length", "width", "thickness"),
 }
 
 # Part searches happen on each debounced keystroke. Keep the combined registry
@@ -60,6 +92,217 @@ def name_key(name: str) -> str:
 
 def fingerprint(value: Any) -> str:
     return sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _mapping_display(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value)).split())
+
+
+def _mapping_normalized(value: Any, field: str) -> str:
+    display = _mapping_display(value)
+    if field in _MAPPING_NUMERIC_FIELDS:
+        try:
+            number = Decimal(display.replace(",", ""))
+            if number.is_finite():
+                normalized = format(number.normalize(), "f")
+                return "0" if normalized in {"-0", ""} else normalized
+        except (InvalidOperation, ValueError):
+            pass
+    if field == "in_use":
+        folded = display.casefold()
+        if not folded or folded in {"yes", "y", "true", "1", "active", "in use", "used"}:
+            return "active"
+        if folded in {"no", "n", "false", "0", "inactive", "not in use", "unused", "delete"}:
+            return "inactive"
+        return "unexpected:" + folded
+    return display.casefold()
+
+
+def _quantity_unit(row: dict[str, Any]) -> str:
+    # These three configured Part sheets describe counts of physical pieces.
+    # The header is retained in provenance; the semantic convention is Nos.
+    return "nos"
+
+
+def _line_semantic_evidence(sheet: str, row: dict[str, Any]) -> dict[str, Any]:
+    fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+    available = row.get("available_fields", row.get("availableFields"))
+    available_fields = set(available) if isinstance(available, (list, tuple, set)) else set(fields)
+    values: list[dict[str, Any]] = []
+    for field in _MAPPING_SEMANTIC_FIELDS[sheet]:
+        if field not in available_fields:
+            values.append({"field": field, "state": "unavailable", "value": None, "display": None})
+            continue
+        raw = fields.get(field)
+        display = _mapping_display(raw) if raw is not None else ""
+        if field == "in_use":
+            # Blank and explicit active flags have the same effective meaning;
+            # sourceState still preserves which representation was observed.
+            state = "known"
+            normalized = _mapping_normalized(raw or "", field)
+            values.append({"field": field, "state": state, "sourceState": "blank" if not display else "value",
+                "value": normalized, "display": display or None})
+        elif raw is None or not display:
+            values.append({"field": field, "state": "blank", "value": None, "display": None})
+        else:
+            values.append({"field": field, "state": "value", "value": _mapping_normalized(raw, field), "display": display})
+    if "qty" in available_fields:
+        values.append({"field": "quantity_uom", "state": "known", "value": _quantity_unit(row), "display": "Nos"})
+    else:
+        values.append({"field": "quantity_uom", "state": "unavailable", "value": None, "display": None})
+    if sheet == "CNC Cut List":
+        for dimension in ("length", "width", "thickness"):
+            values.append({"field": dimension + "_uom", "state": "value" if dimension in available_fields else "unavailable",
+                "value": "mm" if dimension in available_fields else None,
+                "display": "mm" if dimension in available_fields else None})
+    values.sort(key=lambda item: item["field"])
+    line_projection = [{"field": item["field"], "state": item["state"], "value": item.get("value")}
+        for item in values]
+    return {"fields": values, "fingerprint": fingerprint([MAPPING_SEMANTIC_POLICY_VERSION, sheet, line_projection])}
+
+
+def _group_semantic_fingerprint(sheet: str, lines: list[dict[str, Any]]) -> str:
+    return fingerprint([MAPPING_SEMANTIC_POLICY_VERSION, sheet, sorted(str(line.get("fingerprint") or "") for line in lines)])
+
+
+def _ensure_group_semantic_evidence(groups: list[dict[str, Any]]) -> None:
+    """Normalize API-shaped source groups before review or persistence.
+
+    The normal extractor attaches these fields directly. A few supported
+    callers build ``PartSourceGroups`` from already-extracted rows; deriving
+    their current snapshot here preserves the same policy without weakening
+    the completeness check on persisted evidence.
+    """
+    for group in groups:
+        sheet = str(group.get("sheet") or "")
+        if sheet not in _MAPPING_SEMANTIC_FIELDS:
+            continue
+        rows = group.get("rows") if isinstance(group.get("rows"), list) else []
+        evidence: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                source_row = int(row.get("row", row.get("source_row")))
+            except (TypeError, ValueError):
+                continue
+            evidence[source_row] = _line_semantic_evidence(sheet, row)
+        group["semanticPolicyVersion"] = MAPPING_SEMANTIC_POLICY_VERSION
+        group["semanticEvidence"] = evidence
+        group["semanticFingerprint"] = _group_semantic_fingerprint(sheet, list(evidence.values()))
+
+
+def _snapshot_lines_from_records(rows: list[dict[str, Any]], sheet: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if not rows:
+        return None, None
+    policy_versions = {str(row.get("SemanticPolicyVersion") or "") for row in rows}
+    fingerprints = {str(row.get("SemanticFingerprint") or "") for row in rows}
+    if policy_versions != {MAPPING_SEMANTIC_POLICY_VERSION} or len(fingerprints) != 1 or not next(iter(fingerprints)):
+        return None, None
+    lines = []
+    coordinates = set()
+    for row in rows:
+        evidence = row.get("SemanticEvidence")
+        if isinstance(evidence, str):
+            try:
+                evidence = json.loads(evidence)
+            except (ValueError, TypeError):
+                return None, None
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("fields"), list):
+            return None, None
+        projected = [{"field": item.get("field"), "state": item.get("state"), "value": item.get("value")}
+            for item in evidence["fields"] if isinstance(item, dict)]
+        if len(projected) != len(evidence["fields"]) or evidence.get("fingerprint") != fingerprint([MAPPING_SEMANTIC_POLICY_VERSION, sheet, projected]):
+            return None, None
+        coordinate = (str(row.get("SheetName") or ""), int(row.get("SourceRow") or 0))
+        if coordinate in coordinates:
+            return None, None
+        coordinates.add(coordinate)
+        lines.append(evidence)
+    expected = next(iter(fingerprints))
+    if len(lines) != len(rows) or _group_semantic_fingerprint(sheet, lines) != expected:
+        return None, None
+    return lines, expected
+
+
+def _line_field_map(line: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(item.get("field")): item for item in line.get("fields", []) if isinstance(item, dict)}
+
+
+def _semantic_differences(previous: list[dict[str, Any]], current: list[dict[str, Any]], sheet: str, *, blank_label: bool = False) -> list[dict[str, Any]]:
+    """Compare line multisets, pairing only unique, explainable modifications."""
+    old_by_fp: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    new_by_fp: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for line in previous:
+        old_by_fp[str(line.get("fingerprint") or "")].append(line)
+    for line in current:
+        new_by_fp[str(line.get("fingerprint") or "")].append(line)
+    duplicate_signatures = any(len(rows) > 1 for rows in old_by_fp.values()) or any(len(rows) > 1 for rows in new_by_fp.values())
+    matched_old: set[int] = set()
+    matched_new: set[int] = set()
+    for key in set(old_by_fp) & set(new_by_fp):
+        old_rows, new_rows = old_by_fp[key], new_by_fp[key]
+        for old, new in zip(old_rows, new_rows):
+            matched_old.add(id(old)); matched_new.add(id(new))
+    old_left = [line for line in previous if id(line) not in matched_old]
+    new_left = [line for line in current if id(line) not in matched_new]
+    paired_old: set[int] = set()
+    paired_new: set[int] = set()
+    candidates: dict[int, list[int]] = {}
+    reverse: dict[int, list[int]] = defaultdict(list)
+    anchors = _MAPPING_MODIFICATION_ANCHORS.get(sheet, ())
+    for n_idx, incoming in enumerate(new_left):
+        incoming_fields = _line_field_map(incoming)
+        hits = []
+        if not blank_label:
+            for b_idx, baseline in enumerate(old_left):
+                baseline_fields = _line_field_map(baseline)
+                shared = [name for name in anchors if baseline_fields.get(name, {}).get("state") == "value"
+                    and incoming_fields.get(name, {}).get("state") == "value"]
+                if shared and all(baseline_fields[name].get("value") == incoming_fields[name].get("value") for name in shared):
+                    hits.append(b_idx)
+        candidates[n_idx] = hits
+        for b_idx in hits:
+            reverse[b_idx].append(n_idx)
+    differences: list[dict[str, Any]] = []
+    for n_idx, hits in candidates.items():
+        if len(hits) == 1 and len(reverse[hits[0]]) == 1 and not duplicate_signatures:
+            b_idx = hits[0]
+            baseline, incoming = old_left[b_idx], new_left[n_idx]
+            old_fields, new_fields = _line_field_map(baseline), _line_field_map(incoming)
+            changes = [{"field": name, "previous": old_fields.get(name), "current": new_fields.get(name)}
+                for name in sorted(set(old_fields) | set(new_fields)) if old_fields.get(name) != new_fields.get(name)]
+            differences.append({"type": "modified", "previous": baseline, "current": incoming, "fieldDifferences": changes})
+            paired_old.add(b_idx); paired_new.add(n_idx)
+    remaining_old = [index for index in range(len(old_left)) if index not in paired_old]
+    remaining_new = [index for index in range(len(new_left)) if index not in paired_new]
+    if not blank_label and not duplicate_signatures and len(remaining_old) == 1 and len(remaining_new) == 1:
+        b_idx, n_idx = remaining_old[0], remaining_new[0]
+        baseline, incoming = old_left[b_idx], new_left[n_idx]
+        old_fields, new_fields = _line_field_map(baseline), _line_field_map(incoming)
+        changes = [{"field": name, "previous": old_fields.get(name), "current": new_fields.get(name)}
+            for name in sorted(set(old_fields) | set(new_fields)) if old_fields.get(name) != new_fields.get(name)]
+        differences.append({"type": "modified", "previous": baseline, "current": incoming, "fieldDifferences": changes})
+        paired_old.add(b_idx); paired_new.add(n_idx)
+    unmatched_old = [index for index in range(len(old_left)) if index not in paired_old]
+    unmatched_new = [index for index in range(len(new_left)) if index not in paired_new]
+    duplicate_match_is_ambiguous = duplicate_signatures and any(candidates.get(index) for index in unmatched_new)
+    if (blank_label or duplicate_match_is_ambiguous) and unmatched_old and unmatched_new:
+        differences.extend({"type": "ambiguous", "previous": old_left[index], "current": None,
+            "fieldDifferences": [], "reason": "Blank labels or duplicate source lines prevent a unique correspondence."} for index in unmatched_old)
+        differences.extend({"type": "ambiguous", "previous": None, "current": new_left[index],
+            "fieldDifferences": [], "reason": "Blank labels or duplicate source lines prevent a unique correspondence."} for index in unmatched_new)
+    elif unmatched_old and unmatched_new and (len(unmatched_old) > 1 or len(unmatched_new) > 1):
+        for index in unmatched_old:
+            differences.append({"type": "ambiguous", "previous": old_left[index], "current": None,
+                "fieldDifferences": [], "reason": "Several unmatched source lines prevent a unique correspondence."})
+        for index in unmatched_new:
+            differences.append({"type": "ambiguous", "previous": None, "current": new_left[index],
+                "fieldDifferences": [], "reason": "Several unmatched source lines prevent a unique correspondence."})
+    else:
+        differences.extend({"type": "deleted", "previous": old_left[index], "current": None, "fieldDifferences": []} for index in unmatched_old)
+        differences.extend({"type": "added", "previous": None, "current": new_left[index], "fieldDifferences": []} for index in unmatched_new)
+    order = {"modified": 0, "added": 1, "deleted": 2, "ambiguous": 3}
+    return sorted(differences, key=lambda item: (order.get(item["type"], 9),
+        str((item.get("previous") or item.get("current") or {}).get("fingerprint") or "")))
 
 
 class MemoryPartStore:
@@ -111,6 +354,8 @@ class PartRegistryMappingStore:
         self.identity_store = identity_store
         self.lock = identity_store.lock
         self.available = True
+        self.schema_message = None
+        self.schema_message = None
         self.legacy_history_available = True
         self.legacy_parts_available = True
         self.document_key = str(getattr(getattr(identity_store, "client", None), "doc_id", ""))
@@ -169,6 +414,15 @@ class PartRegistryMappingStore:
             else:
                 result = self.legacy_part_records()
         elif table == MAPPING_TABLE:
+            schema_check = getattr(self.identity_store, "mapping_evidence_schema_available", None)
+            if callable(schema_check):
+                try:
+                    if not schema_check():
+                        self.available = False
+                        self.schema_message = "Part mapping history is readable, but Save requires Grist schema v14 semantic evidence columns."
+                except Exception:
+                    self.available = False
+                    self.schema_message = "Part mapping schema could not be verified; Save is disabled until schema v14 is confirmed."
             if self._same_grist_document() and hasattr(self.identity_store, "mapping_records"):
                 return self.identity_store.mapping_records()
             legacy = self.legacy_store.records(MAPPING_TABLE)
@@ -277,7 +531,7 @@ def source_groups(process_lists: dict[str, list[dict[str, Any]]], *, sheet_diagn
             group["rows"].append({"sheet": sheet, "row": number, "fields": row.get("fields", {}),
                 "sourceHeaders": row.get("source_headers", {}), "sourceHeaderCells": row.get("source_header_cells", {}),
                 "sourceCells": row.get("source_cells", {}), "headerRow": row.get("header_row"),
-                "availableFields": row.get("available_fields", [])})
+                "availableFields": row.get("available_fields", list(row.get("fields") or {}))})
             group["legacyGroupKeys"].add(legacy_key)
     for group in groups.values():
         diagnostic = (sheet_diagnostics or {}).get(group["sheet"], {})
@@ -287,6 +541,19 @@ def source_groups(process_lists: dict[str, list[dict[str, Any]]], *, sheet_diagn
             [row["sheet"], row["row"], row["fields"], row["sourceHeaders"], row["sourceHeaderCells"], row["sourceCells"]]
             for row in group["rows"]
         ])
+        by_row = {}
+        semantic_lines = []
+        for row in group["rows"]:
+            source_row = {"fields": row["fields"], "available_fields": row["availableFields"],
+                "source_headers": row["sourceHeaders"]}
+            line = _line_semantic_evidence(group["sheet"], source_row)
+            by_row[row["row"]] = line
+            semantic_lines.append(line)
+        semantic_lines.sort(key=lambda item: str(item.get("fingerprint") or ""))
+        group["semanticPolicyVersion"] = MAPPING_SEMANTIC_POLICY_VERSION
+        group["semanticFingerprint"] = _group_semantic_fingerprint(group["sheet"], semantic_lines)
+        group["semanticEvidence"] = by_row
+        group["semanticLineCount"] = len(semantic_lines)
     return PartSourceGroups(groups.values(), sheet_diagnostics)
 
 
@@ -339,94 +606,153 @@ def _group_records_by_key(rows: list[dict[str, Any]]) -> dict[str, list[dict[str
 
 
 def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
+    _ensure_group_semantic_evidence(groups)
     parts = list_parts(store, refresh=refresh_parts)
     history = _history(store, file_id)
-    current = [row for row in history if row["fields"].get("SourceHash") == source_hash
-               and association and row["fields"].get("AssociationKey") == association.id
-               and row["fields"].get("AssociationVersion") == association.version]
-    by_group: dict[str, list[dict[str, Any]]] = {}
-    for row in current:
-        by_group.setdefault(row["fields"]["GroupKey"], []).append(row)
+    rows_by_group = _group_records_by_key([row["fields"] for row in history if row["fields"].get("GroupKey")])
+    latest_by_group = {}
+    for key, rows in rows_by_group.items():
+        latest_version = max((int(row.get("Version") or 0) for row in rows), default=0)
+        latest_by_group[key] = [row for row in rows if int(row.get("Version") or 0) == latest_version]
     resolved = []
     resolved_parts: dict[str, dict[str, Any]] = {}
     for group in groups:
-        candidates = by_group.get(group["key"], [])
-        version = max((row["fields"]["Version"] for row in candidates), default=0)
-        latest = [row["fields"] for row in candidates if row["fields"]["Version"] == version]
+        latest = latest_by_group.get(group["key"], [])
+        version = max((int(row.get("Version") or 0) for row in latest), default=0)
         refs = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart"))) for row in latest}
-        expected = {(row["sheet"], row["row"]) for row in group["rows"]}
-        actual = {(row["SheetName"], int(row["SourceRow"])) for row in latest}
-        part = next((part for part in parts if len(refs) == 1 and part["id"] in refs), None)
-        valid = bool(part and part["selectable"] and not part["duplicateName"] and expected == actual)
+        prior_part = next((candidate for candidate in parts if len(refs) == 1 and next(iter(refs)) and candidate["id"] in refs), None)
+        saved_lines, saved_fingerprint = _snapshot_lines_from_records(latest, group["sheet"])
+        saved_association_matches = bool(latest and association and all(
+            row.get("AssociationKey") == association.id and int(row.get("AssociationVersion") or 0) == int(association.version)
+            for row in latest))
+        current_semantic_fingerprint = str(group.get("semanticFingerprint") or "")
+        semantic_unchanged = bool(saved_lines is not None and saved_fingerprint == current_semantic_fingerprint)
+        blank_identity = bool(group.get("blankDescription"))
+        if not latest:
+            semantic_status = "no_prior_evidence"
+            semantic_differences = []
+        elif saved_lines is None:
+            semantic_status = "legacy_evidence_missing"
+            semantic_differences = []
+        elif blank_identity:
+            semantic_status = "ambiguous_identity"
+            semantic_differences = _semantic_differences(saved_lines, list(group.get("semanticEvidence", {}).values()), group["sheet"], blank_label=True)
+        elif not semantic_unchanged:
+            semantic_differences = _semantic_differences(saved_lines, list(group.get("semanticEvidence", {}).values()), group["sheet"])
+            semantic_status = "ambiguous_correspondence" if any(item["type"] == "ambiguous" for item in semantic_differences) else "changed"
+        elif not saved_association_matches:
+            semantic_status = "association_changed"
+            semantic_differences = []
+        elif len(refs) != 1:
+            semantic_status = "assignment_conflict"
+            semantic_differences = []
+        else:
+            semantic_status = "unchanged"
+            semantic_differences = []
+        part = prior_part if semantic_status == "unchanged" else None
+        valid = bool(part and part["selectable"] and not part["duplicateName"])
         if valid and part:
             resolved_parts[part["id"]] = part
-        # Older reviews grouped by description alone and used Plate Part to Cut on CNC.
-        # Keep them immutable and visible as review evidence; never apply them to the new
-        # sheet-scoped identity without an explicit new Save.
         source_refs = {(row["sheet"], row["row"]) for row in group["rows"]}
-        prior_rows = [row["fields"] for row in history
-            if (row["fields"].get("SheetName"), int(row["fields"].get("SourceRow") or 0)) in source_refs
-            and (row["fields"].get("GroupKey") != group["key"]
-                or row["fields"].get("SourceHash") != source_hash
-                or not association or row["fields"].get("AssociationKey") != association.id
-                or row["fields"].get("AssociationVersion") != association.version)]
+        prior_rows = []
+        if not latest:
+            prior_rows = [row["fields"] for row in history
+                if (str(row["fields"].get("SheetName") or ""), int(row["fields"].get("SourceRow") or 0)) in source_refs]
         prior_rows.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or ""), str(row.get("RequestKey") or "")))
-        # Old groups may have spanned several sheets or several current groups.
-        # Resolve their latest decision independently for each source coordinate;
-        # slicing the last N records can accidentally borrow a neighboring row's
-        # Part when history was interleaved across groups.
         latest_by_source: dict[tuple[str, int], dict[str, Any]] = {}
         for prior in prior_rows:
             coordinate = (str(prior.get("SheetName") or ""), int(prior.get("SourceRow") or 0))
             if coordinate in source_refs:
                 latest_by_source[coordinate] = prior
-        latest_prior_rows = list(latest_by_source.values())
-        prior_ids = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")))
-            for row in latest_prior_rows if row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")}
-        all_coordinates_reviewed = source_refs.issubset(latest_by_source)
-        all_coordinates_agree = bool(latest_prior_rows) and len(prior_ids) == 1 and all(
-            bool(row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")) for row in latest_prior_rows)
-        prior_part = next((candidate for candidate in parts if all_coordinates_reviewed and all_coordinates_agree
-            and len(prior_ids) == 1 and candidate["id"] in prior_ids), None)
+        fallback_rows = list(latest_by_source.values())
+        assignment_rows = latest or fallback_rows
+        assigned_ids = sorted({str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")))
+            for row in assignment_rows if row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")})
+        assignment_refs = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart"))) for row in assignment_rows}
+        assignments_agree = bool(assignment_rows and len(assignment_refs) == 1)
+        proposal_part = prior_part
+        if not latest and assignments_agree and assigned_ids:
+            proposal_part = next((candidate for candidate in parts if candidate["id"] == assigned_ids[0]), None)
+        if proposal_part:
+            resolved_parts[proposal_part["id"]] = proposal_part
+        sample = max(assignment_rows, key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or ""))) if assignment_rows else None
         prior_evidence = None
-        if latest_prior_rows:
-            sample = max(latest_prior_rows, key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or "")))
-            latest_assigned_ids = sorted({str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")))
-                for row in latest_prior_rows if row.get("StablePartId") or row.get("PartIdentity") or row.get("ProductPart")})
-            # Reason requirements are based on the most recent persisted action
-            # for each source coordinate across hashes, associations and group
-            # policy versions. New source rows have no prior assignment and do
-            # not by themselves turn an initial assignment into a replacement.
-            prior_context_changed = any(row.get("SourceHash") != source_hash
-                or (association and (row.get("AssociationKey") != association.id
-                    or int(row.get("AssociationVersion") or 0) != int(association.version)))
-                or row.get("GroupKey") != group["key"] for row in latest_prior_rows)
-            prior_evidence = {"partNumber": ((prior_part or {}).get("partNumber") or sample.get("PartNumberUsed")) if all_coordinates_agree else None,
-                "name": ((prior_part or {}).get("name") or sample.get("NameUsed")) if all_coordinates_agree else None,
-                "sourceDescription": sample.get("SourceDescription") or "", "version": sample.get("Version"),
-                "sourceChanged": sample.get("SourceHash") != source_hash,
-                "associationChanged": bool(association and (sample.get("AssociationKey") != association.id
-                    or sample.get("AssociationVersion") != association.version)), "requiresReview": True,
-                "previousRowsReviewed": len(latest_prior_rows), "currentRows": len(source_refs),
-                "previousRowsAgree": all_coordinates_reviewed and all_coordinates_agree,
-                "assignedPartIds": latest_assigned_ids,
-                "hasPriorAssignment": bool(latest_assigned_ids),
-                "contextChanged": prior_context_changed,
-                "groupingPolicyChanged": any(row.get("GroupKey") != group["key"] for row in latest_prior_rows)}
-        if prior_part:
-            resolved_parts[prior_part["id"]] = prior_part
-        explicit_unassigned = bool(latest and all(not str(value or "") for value in refs)
-            and expected == actual and len(latest) == len(expected))
+        if assignment_rows:
+            source_context_changed = any(row.get("SourceHash") != source_hash for row in assignment_rows)
+            association_context_changed = bool(association and any(
+                row.get("AssociationKey") != association.id or int(row.get("AssociationVersion") or 0) != int(association.version)
+                for row in assignment_rows))
+            group_context_changed = any(str(row.get("GroupKey") or "") != str(group["key"]) for row in assignment_rows)
+            prior_evidence = {"partId": proposal_part["id"] if proposal_part and assignments_agree else None,
+                "partNumber": ((proposal_part or {}).get("partNumber") or (sample or {}).get("PartNumberUsed")) if assignments_agree else None,
+                "name": ((proposal_part or {}).get("name") or (sample or {}).get("NameUsed")) if assignments_agree else None,
+                "sourceDescription": (sample or {}).get("SourceDescription") or "", "version": (sample or {}).get("Version"),
+                "sourceChanged": source_context_changed, "associationChanged": association_context_changed,
+                "requiresReview": not valid, "previousRowsReviewed": len(assignment_rows), "currentRows": len(source_refs),
+                "previousRowsAgree": assignments_agree and (bool(latest) or source_refs.issubset(latest_by_source)),
+                "assignedPartIds": assigned_ids, "hasPriorAssignment": bool(assigned_ids),
+                "contextChanged": source_context_changed or association_context_changed or group_context_changed,
+                "groupingPolicyChanged": group_context_changed,
+                "evidenceStatus": "verified" if saved_lines is not None else "legacy_unverified",
+                "sourceRows": sorted({int(row.get("SourceRow") or 0) for row in assignment_rows})}
+        if not latest and prior_evidence and prior_evidence.get("groupingPolicyChanged"):
+            # Row coordinates may locate a proposal after a grouping-policy
+            # change, but they do not make that prior assignment equivalent.
+            semantic_status = "grouping_policy_changed"
+        # Older reviews grouped by description alone and used Plate Part to Cut on CNC.
+        # Keep them immutable and visible as review evidence; never apply them to the new
+        # sheet-scoped identity without an explicit new Save.
+        explicit_unassigned = bool(latest and assignment_refs == {""} and semantic_unchanged and saved_association_matches)
+        group["semanticComparison"] = {"status": semantic_status, "previousFingerprint": saved_fingerprint,
+            "currentFingerprint": current_semantic_fingerprint, "previousPolicyVersion": next((str(row.get("SemanticPolicyVersion") or "") for row in latest), ""),
+            "sourceHashChanged": bool(latest and any(row.get("SourceHash") != source_hash for row in latest)),
+            "associationChanged": bool(latest and not saved_association_matches),
+            "groupingPolicyChanged": bool(prior_evidence and prior_evidence.get("groupingPolicyChanged")),
+            "differences": semantic_differences,
+            "requiresReview": semantic_status != "unchanged"}
         resolved.append({**group, "part": part if valid else None, "reviewed": valid, "version": version,
             "explicitlyUnassigned": explicit_unassigned, "previousAssignment": prior_evidence,
             "needsCompatibilityReview": bool(prior_evidence and not valid)})
+    current_keys = {str(group.get("key") or "") for group in groups}
+    removed_groups = []
+    if association:
+        for key, latest in latest_by_group.items():
+            if key in current_keys or not latest or not all(row.get("AssociationKey") == association.id
+                    and int(row.get("AssociationVersion") or 0) == int(association.version) for row in latest):
+                continue
+            sheet = str(latest[0].get("SheetName") or "")
+            if sheet not in _MAPPING_SEMANTIC_FIELDS:
+                continue
+            lines, saved_fingerprint = _snapshot_lines_from_records(latest, sheet)
+            refs = {str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart"))) for row in latest}
+            part = next((candidate for candidate in parts if len(refs) == 1 and next(iter(refs)) and candidate["id"] in refs), None)
+            sample = latest[0]
+            previous_assignment = {"partId": part["id"] if part and len(refs) == 1 else None,
+                "partNumber": (part or {}).get("partNumber") or sample.get("PartNumberUsed"),
+                "name": (part or {}).get("name") or sample.get("NameUsed"), "assignedPartIds": sorted(value for value in refs if value),
+                "hasPriorAssignment": any(refs), "previousRowsAgree": len(refs) == 1,
+                "previousRowsReviewed": len(latest), "currentRows": 0, "sourceDescription": sample.get("SourceDescription") or "",
+                "evidenceStatus": "verified" if lines is not None else "legacy_unverified",
+                "contextChanged": False, "sourceChanged": sample.get("SourceHash") != source_hash,
+                "associationChanged": False, "groupingPolicyChanged": False}
+            removed_differences = ([{"type": "deleted", "previous": line, "current": None, "fieldDifferences": []} for line in lines]
+                if lines is not None else [])
+            removed_groups.append({"key": key, "sheet": sheet, "description": str(sample.get("SourceDescription") or ""),
+                "removed": True, "rows": [], "part": None, "reviewed": False, "previousAssignment": previous_assignment,
+                "semanticComparison": {"status": "group_removed" if lines is not None else "legacy_evidence_missing",
+                    "previousFingerprint": saved_fingerprint, "currentFingerprint": None,
+                    "previousPolicyVersion": sample.get("SemanticPolicyVersion") or "", "sourceHashChanged": True,
+                    "associationChanged": False, "differences": removed_differences, "requiresReview": True}})
+    removed_groups.sort(key=lambda item: (item["sheet"], item["description"].casefold(), item["key"]))
     return {"fileId": file_id, "sourceHash": source_hash, "sourceBasis": "saved_workbook",
             "associationKey": association.id if association else "", "associationVersion": association.version if association else 0,
             "version": max((int(row["fields"]["Version"]) for row in history), default=0),
-            "schemaAvailable": store.available, "legacyHistoryAvailable": getattr(store, "legacy_history_available", True),
+            "schemaAvailable": store.available, "schemaMessage": getattr(store, "schema_message", None),
+            "legacyHistoryAvailable": getattr(store, "legacy_history_available", True),
             "mappingPolicyVersion": MAPPING_POLICY_VERSION, "sourceSheets": getattr(groups, "diagnostics", {}),
-            "parts": list(resolved_parts.values()), "groups": resolved,
-            "unresolvedGroups": sum(not group["reviewed"] for group in resolved), "authorityChanged": False,
+            "semanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
+            "parts": list(resolved_parts.values()), "groups": resolved, "removedGroups": removed_groups,
+            "unresolvedGroups": sum(not group["reviewed"] for group in resolved) + len(removed_groups), "authorityChanged": False,
             "history": [{**row["fields"], "OccurredAt": datetime_text(row["fields"].get("OccurredAt"))} for row in history]}
 
 
@@ -435,6 +761,7 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                  expected_association: str, expected_association_version: int,
                  actor: str, reason: str = "", group_reasons: dict[str, str] | None = None,
                  request_key: str, before_write=None):
+    _ensure_group_semantic_evidence(groups)
     group_reasons = group_reasons or {}
     if not decisions or not request_key.strip() or not actor.strip():
         raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one group and provide a request identity")
@@ -442,6 +769,8 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
         raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify groups included in this save")
     payload_hash = fingerprint([file_id, expected_hash, expected_version, expected_association,
                                 expected_association_version, decisions,
+                                {key: str(next((group.get("semanticFingerprint") for group in groups if group.get("key") == key), ""))
+                                    for key in sorted(decisions)},
                                 {key: str(value or "").strip() for key, value in sorted(group_reasons.items())},
                                 reason.strip(), actor])
     with store.lock:
@@ -489,6 +818,10 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             diagnostic = known[key].get("sourceDiagnostic", {})
             if diagnostic and diagnostic.get("status") not in {None, "ok"}:
                 raise PartConflict("PART_SOURCE_LABEL_UNAVAILABLE", "The source Part label column is missing or ambiguous; resolve its header before saving this group")
+            if (known[key].get("semanticPolicyVersion") != MAPPING_SEMANTIC_POLICY_VERSION
+                    or not known[key].get("semanticFingerprint")
+                    or len(known[key].get("semanticEvidence") or {}) != len(known[key].get("rows") or [])):
+                raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "The current source group lacks complete versioned manufacturing evidence; refresh before saving")
             current = current_by_key.get(key, {})
             evidence = current.get("previousAssignment") or {}
             previous_ids = set(evidence.get("assignedPartIds") or [])
@@ -516,6 +849,9 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                 "requiresUserReason": replacing, "partId": selected_id or None}
             for source in known[key]["rows"]:
                 selected = parts.get(part_id) if part_id else None
+                line_evidence = (known[key].get("semanticEvidence") or {}).get(source["row"])
+                if not isinstance(line_evidence, dict):
+                    raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "A source line is missing its normalized manufacturing evidence")
                 rows.append({"ReviewKey": "part-review:" + fingerprint([request_key, key, source]),
                              "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
                              "AssociationVersion": association.version, "GroupKey": key,
@@ -530,7 +866,11 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                              "PartNumberUsed": str(selected.get("partNumber") or "") if selected else "",
                              "NameUsed": str(selected.get("name") or "") if selected else "",
                              "Version": version, "Actor": actor, "Reason": audit_reason, "ActionType": action_type,
-                             "MappingPolicyVersion": MAPPING_POLICY_VERSION, "OccurredAt": grist_datetime(utc_now()),
+                             "MappingPolicyVersion": MAPPING_POLICY_VERSION,
+                             "SemanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
+                             "SemanticFingerprint": known[key]["semanticFingerprint"],
+                             "SemanticEvidence": line_evidence,
+                             "OccurredAt": grist_datetime(utc_now()),
                              "RequestKey": request_key, "RequestFingerprint": payload_hash})
         for row in rows:
             if not (row.get("ProductPart") is None and row.get("PartIdentity")):

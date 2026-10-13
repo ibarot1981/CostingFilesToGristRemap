@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest import mock
 from fastapi import HTTPException
 from starlette.requests import Request
-from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, source_groups, list_parts, search_parts, mapping_detail, save_mapping, attach_mapping_evidence, fingerprint, MAPPING_POLICY_VERSION
+from app.part_mapping import MemoryPartStore, GristPartStore, PartConflict, PartRegistryMappingStore, source_groups, list_parts, search_parts, mapping_detail, save_mapping, attach_mapping_evidence, fingerprint, MAPPING_POLICY_VERSION
 from test_grist_repository import FakeGristClient
 
 
@@ -34,6 +34,18 @@ class PartMappingTests(unittest.TestCase):
         args = dict(file_id="file:pilot.ods", source_hash="hash1", association=self.association, groups=self.groups)
         args.update(overrides)
         return mapping_detail(self.store, **args)
+
+    def manufacturing_groups(self, sheet, entries):
+        return source_groups({sheet: [{"status": "active", "source_row": row, "fields": fields,
+            "available_fields": list(fields), "source_headers": {"qty": "Quantity Nos"},
+            "source_cells": {name: {"value": value, "style": "test"} for name, value in fields.items()}}
+            for row, fields in entries]})
+
+    def save_groups(self, groups, source_hash="hash1", request_key="semantic-map", decisions=None):
+        return save_mapping(self.store, file_id="file:pilot.ods", source_hash=source_hash,
+            association=self.association, groups=groups, decisions=decisions or {group["key"]: "1" for group in groups},
+            expected_hash=source_hash, expected_version=0, expected_association="association-1",
+            expected_association_version=1, actor="Irshad", request_key=request_key)
 
     def test_groups_preserve_individual_blank_rows(self):
         self.assertEqual(len(self.groups), 3)
@@ -170,15 +182,243 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["fields"]["Actor"], "Irshad")
         self.assertEqual(self.detail()["unresolvedGroups"], 2)
         changed_source = self.detail(source_hash="hash2")
-        self.assertEqual(changed_source["unresolvedGroups"], 3)
+        self.assertEqual(changed_source["unresolvedGroups"], 2)
+        self.assertTrue(changed_source["groups"][0]["reviewed"])
+        self.assertEqual(changed_source["groups"][0]["semanticComparison"]["status"], "unchanged")
         self.assertTrue(changed_source["groups"][0]["previousAssignment"]["sourceChanged"])
         changed_association = self.detail(association=SimpleNamespace(id="association-1", version=2))
         self.assertTrue(changed_association["groups"][0]["previousAssignment"]["associationChanged"])
+        self.assertFalse(changed_association["groups"][0]["reviewed"])
+        self.assertEqual(changed_association["groups"][0]["semanticComparison"]["status"], "association_changed")
         self.assertTrue(self.save()["idempotent"])
         for overrides in ({"expected_hash": "old"}, {"expected_version": 0}, {"expected_version": 1, "expected_association_version": 2}):
             with self.assertRaises(PartConflict):
                 self.save(request_key="next", **overrides)
         self.assertEqual(len(rows), 2)
+
+    def test_grouping_policy_change_keeps_prior_part_as_review_proposal(self):
+        self.create(name="Mapped Shaft")
+        groups = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"product_part_name": "Shaft", "material_to_cut": "MS", "qty": 2}),
+        ])
+        self.save_groups(groups)
+        changed_policy = [dict(groups[0], key="future-grouping-policy:group-1")]
+        detail = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-policy",
+            association=self.association, groups=changed_policy)
+        group = detail["groups"][0]
+        self.assertFalse(group["reviewed"])
+        self.assertIsNone(group["part"])
+        self.assertEqual(group["previousAssignment"]["name"], "Mapped Shaft")
+        self.assertTrue(group["semanticComparison"]["groupingPolicyChanged"])
+        self.assertEqual(group["semanticComparison"]["status"], "grouping_policy_changed")
+
+    def test_price_only_resave_and_reordered_rows_preserve_assignment_without_write(self):
+        part = self.create(name="Mapped Bracket")
+        before = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"product_part_name": "Bracket", "material_to_cut": "MS", "dimension_to_cut_mm": "10.0", "qty": "2.00", "optional_item_group_1": "", "in_use": "Yes", "rate": 5, "amount": 10}),
+            (11, {"product_part_name": "Bracket", "material_to_cut": "MS", "dimension_to_cut_mm": "20", "qty": 1, "optional_item_group_1": "", "in_use": "Yes", "rate": 7, "amount": 7}),
+        ])
+        self.save_groups(before)
+        mapping_count = len(self.store.tables["PartMappingReview"])
+        after = self.manufacturing_groups("5. Material Cut List Price", [
+            (90, {"product_part_name": "Bracket", "material_to_cut": "MS", "dimension_to_cut_mm": 20.0, "qty": "1.0", "optional_item_group_1": None, "in_use": "active", "rate": 99, "amount": 99}),
+            (77, {"product_part_name": "Bracket", "material_to_cut": "MS", "dimension_to_cut_mm": 10, "qty": 2, "optional_item_group_1": "", "in_use": "true", "rate": 150, "amount": 300}),
+        ])
+        self.assertEqual(before[0]["semanticFingerprint"], after[0]["semanticFingerprint"])
+        current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-price-resave",
+            association=self.association, groups=after)
+        self.assertTrue(current["groups"][0]["reviewed"])
+        self.assertEqual(current["groups"][0]["part"]["id"], str(part["id"]))
+        self.assertEqual(current["groups"][0]["semanticComparison"]["status"], "unchanged")
+        self.assertEqual(len(self.store.tables["PartMappingReview"]), mapping_count)
+
+    def test_relevant_quantity_change_flags_only_affected_group_and_proposes_prior_part(self):
+        self.create(name="Part A")
+        self.create(name="Part B", part_key="part-b")
+        before = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"product_part_name": "A", "material_to_cut": "MS", "dimension_to_cut_mm": "10", "qty": 1}),
+            (20, {"product_part_name": "B", "material_to_cut": "Aluminium", "dimension_to_cut_mm": "8", "qty": 2}),
+        ])
+        self.save_groups(before, decisions={group["key"]: "1" if group["description"] == "A" else "2" for group in before})
+        after = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"product_part_name": "A", "material_to_cut": "MS", "dimension_to_cut_mm": "10", "qty": 3}),
+            (20, {"product_part_name": "B", "material_to_cut": "Aluminium", "dimension_to_cut_mm": "8", "qty": 2, "rate": 500, "amount": 1000}),
+        ])
+        current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-relevant-change",
+            association=self.association, groups=after)
+        group_a = next(group for group in current["groups"] if group["description"] == "A")
+        group_b = next(group for group in current["groups"] if group["description"] == "B")
+        self.assertFalse(group_a["reviewed"])
+        self.assertIsNone(group_a["part"])
+        self.assertEqual(group_a["previousAssignment"]["name"], "Part A")
+        self.assertEqual(group_a["semanticComparison"]["status"], "changed")
+        self.assertEqual(group_a["semanticComparison"]["differences"][0]["type"], "modified")
+        self.assertIn("qty", [item["field"] for item in group_a["semanticComparison"]["differences"][0]["fieldDifferences"]])
+        self.assertTrue(group_b["reviewed"])
+        self.assertEqual(group_b["part"]["name"], "Part B")
+
+    def test_add_delete_and_ambiguous_duplicate_line_differences(self):
+        self.create(name="Bracket")
+        baseline = self.manufacturing_groups("Tool Shop Items", [
+            (10, {"product_part_name": "Bracket", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+            (11, {"product_part_name": "Bracket", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+        ])
+        self.save_groups(baseline)
+        changed = self.manufacturing_groups("Tool Shop Items", [
+            (20, {"product_part_name": "Bracket", "item_name": "Pin", "material_to_cut": "Steel", "qty": 2}),
+        ])
+        detail = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-ambiguous",
+            association=self.association, groups=changed)
+        comparison = detail["groups"][0]["semanticComparison"]
+        self.assertEqual(comparison["status"], "ambiguous_correspondence")
+        self.assertTrue(all(item["type"] == "ambiguous" for item in comparison["differences"]))
+
+        added = self.manufacturing_groups("Tool Shop Items", [
+            (20, {"product_part_name": "Bracket", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+            (21, {"product_part_name": "Bracket", "item_name": "Bush", "material_to_cut": "Bronze", "qty": 1}),
+        ])
+        addition_detail = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-addition",
+            association=self.association, groups=added)
+        additions = addition_detail["groups"][0]["semanticComparison"]["differences"]
+        self.assertEqual({item["type"] for item in additions}, {"added", "deleted"})
+
+    def test_price_totals_formatting_and_document_metadata_do_not_change_semantics(self):
+        first = self.manufacturing_groups("CNC Cut List", [
+            (10, {"part_category": "Frame", "product_part_name": "Frame side", "material_to_cut": "MS",
+                "length": "120.00", "width": "20", "thickness": "2", "qty": "2", "rate": 12, "amount": 24}),
+        ])
+        second = self.manufacturing_groups("CNC Cut List", [
+            (44, {"part_category": " frame ", "product_part_name": "FRAME SIDE", "material_to_cut": "ms",
+                "length": 120, "width": "20.0", "thickness": "2.000", "qty": 2.0, "rate": 99, "amount": 198,
+                "workbook_title": "new metadata", "cell_format": "currency-red"}),
+        ])
+        self.assertEqual(first[0]["semanticFingerprint"], second[0]["semanticFingerprint"])
+        self.assertNotEqual(first[0]["evidenceFingerprint"], second[0]["evidenceFingerprint"])
+
+    def test_v14_schema_introspection_is_read_only_cached_and_fails_closed(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from app.grist_parts import GristPartRegistry
+
+        class SchemaClient:
+            api_key = "isolated-schema-fixture"
+            base_url = "http://isolated.invalid"
+
+        with TemporaryDirectory() as temp:
+            registry = GristPartRegistry(SchemaClient(), path=Path(temp) / "schema.sqlite3")
+            with mock.patch("app.grist_parts.GristAdminClientShim") as admin:
+                admin.return_value.list_columns.return_value = [{"id": name} for name in (
+                    "SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence")]
+                self.assertTrue(registry.mapping_evidence_schema_available())
+                self.assertTrue(registry.mapping_evidence_schema_available())
+                admin.assert_called_once_with(registry.client)
+                admin.return_value.list_columns.assert_called_once_with("PartMappingReview")
+
+            older_registry = GristPartRegistry(SchemaClient(), path=Path(temp) / "schema.sqlite3")
+            with mock.patch("app.grist_parts.GristAdminClientShim") as admin:
+                admin.return_value.list_columns.return_value = [{"id": "SemanticFingerprint"}]
+                self.assertFalse(older_registry.mapping_evidence_schema_available())
+
+            unknown_registry = GristPartRegistry(SchemaClient(), path=Path(temp) / "schema.sqlite3")
+            with mock.patch("app.grist_parts.GristAdminClientShim", side_effect=RuntimeError("offline")):
+                self.assertFalse(unknown_registry.mapping_evidence_schema_available())
+
+    def test_legacy_mapping_requires_one_time_confirmation_and_blank_label_is_not_reused(self):
+        self.create(name="Legacy mapping")
+        group = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"product_part_name": "Bracket", "material_to_cut": "MS", "qty": 1}),
+        ])[0]
+        self.store.append("PartMappingReview", [{"ReviewKey": "legacy-mapping", "FileKey": "file:pilot.ods",
+            "SourceHash": "hash1", "AssociationKey": "association-1", "AssociationVersion": 1,
+            "GroupKey": group["key"], "SheetName": group["sheet"], "SourceRow": 10,
+            "SourceDescription": group["description"], "ProductPart": 1, "Version": 1, "Actor": "Irshad",
+            "Reason": "Legacy assignment", "OccurredAt": "2026-10-01T00:00:00Z", "RequestKey": "legacy-request",
+            "RequestFingerprint": "legacy-fingerprint", "RequestRowCount": 1}])
+        legacy = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1",
+            association=self.association, groups=[group])["groups"][0]
+        self.assertFalse(legacy["reviewed"])
+        self.assertEqual(legacy["semanticComparison"]["status"], "legacy_evidence_missing")
+        self.assertEqual(legacy["previousAssignment"]["name"], "Legacy mapping")
+
+        blank = self.manufacturing_groups("5. Material Cut List Price", [
+            (10, {"material_to_cut": "MS", "qty": 1}),
+        ])[0]
+        blank_result = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1",
+            association=self.association, groups=[blank])["groups"][0]
+        self.assertFalse(blank_result["reviewed"])
+
+    def test_grist_mapping_evidence_is_durable_and_recovers_after_fresh_registry_read(self):
+        from copy import deepcopy
+        from pathlib import Path
+        from app.grist_parts import GristPartRegistry
+
+        class IsolatedGrist:
+            doc_id = "isolated-mapping-fixture"
+            def __init__(self):
+                self.tables = {"ProductPart": [{"id": 1, "fields": {"StablePartId": "stable-bracket",
+                    "PartKey": "stable-bracket", "DisplayName": "Bracket", "PartNumber": "SM-P-000001",
+                    "EngineeringRevision": "A", "ScopeType": "product", "ScopeTargetLabel": "Safari 1000",
+                    "Description": "Bracket", "Status": "canonical", "PublishStatus": "published"}}],
+                    "PartMappingReview": []}
+            def validate_safari_write_target(self):
+                return None
+            def fetch_table_records_with_ids(self, table):
+                return deepcopy(self.tables.get(table, []))
+            def create_table_records(self, table, records):
+                rows = self.tables.setdefault(table, [])
+                next_id = len(rows) + 1
+                for item in records:
+                    rows.append({"id": next_id, "fields": deepcopy(item["fields"])})
+                    next_id += 1
+                return {"records": deepcopy(rows[-len(records):])}
+
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as temp:
+            client = IsolatedGrist()
+            registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
+            registry._verify_writer = lambda: None
+            registry.mapping_evidence_schema_available = lambda: True
+            store = PartRegistryMappingStore(GristPartStore(client), registry)
+            groups = self.manufacturing_groups("CNC Cut List", [
+                (42, {"part_category": "Bracket", "product_part_name": "Plate", "material_to_cut": "MS",
+                    "length": "12.0", "width": "8", "thickness": "3", "qty": 1}),
+            ])
+            save_mapping(store, file_id="file:pilot.ods", source_hash="hash-grist", association=self.association,
+                groups=groups, decisions={groups[0]["key"]: "stable-bracket"}, expected_hash="hash-grist",
+                expected_version=0, expected_association="association-1", expected_association_version=1,
+                actor="Irshad", request_key="grist-semantic-save")
+            persisted = client.tables["PartMappingReview"][0]["fields"]
+            self.assertEqual(persisted["SemanticPolicyVersion"], "part-mapping-semantic-v1")
+            self.assertTrue(persisted["SemanticFingerprint"])
+            self.assertIn("fields", persisted["SemanticEvidence"])
+            fresh_registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
+            fresh_registry._verify_writer = lambda: None
+            fresh_registry.mapping_evidence_schema_available = lambda: True
+            fresh_store = PartRegistryMappingStore(GristPartStore(client), fresh_registry)
+            recovered = mapping_detail(fresh_store, file_id="file:pilot.ods", source_hash="hash-resaved",
+                association=self.association, groups=groups)
+            self.assertTrue(recovered["groups"][0]["reviewed"])
+            self.assertEqual(recovered["groups"][0]["part"]["id"], "stable-bracket")
+            replay = save_mapping(store, file_id="file:pilot.ods", source_hash="hash-grist", association=self.association,
+                groups=groups, decisions={groups[0]["key"]: "stable-bracket"}, expected_hash="hash-grist",
+                expected_version=0, expected_association="association-1", expected_association_version=1,
+                actor="Irshad", request_key="grist-semantic-save")
+            self.assertTrue(replay["idempotent"])
+            old_schema_registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
+            old_schema_registry._verify_writer = lambda: None
+            old_schema_registry.mapping_evidence_schema_available = lambda: False
+            old_schema_store = PartRegistryMappingStore(GristPartStore(client), old_schema_registry)
+            blocked_detail = mapping_detail(old_schema_store, file_id="file:pilot.ods", source_hash="hash-resaved",
+                association=self.association, groups=groups)
+            self.assertFalse(blocked_detail["schemaAvailable"])
+            self.assertIn("schema v14", blocked_detail["schemaMessage"])
+            with self.assertRaises(PartConflict) as blocked_save:
+                save_mapping(old_schema_store, file_id="file:pilot.ods", source_hash="hash-resaved",
+                    association=self.association, groups=groups, decisions={groups[0]["key"]: "stable-bracket"},
+                    expected_hash="hash-resaved", expected_version=1, expected_association="association-1",
+                    expected_association_version=1, actor="Irshad", request_key="old-schema-blocked-save")
+            self.assertEqual(blocked_save.exception.code, "PART_SCHEMA_UNAVAILABLE")
+            self.assertEqual(len(client.tables["PartMappingReview"]), 1)
 
     def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)

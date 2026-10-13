@@ -247,15 +247,24 @@ class PartIdentityStore:
                     OccurredAt TEXT NOT NULL,
                     RequestKey TEXT NOT NULL,
                     RequestFingerprint TEXT NOT NULL,
-                    RequestRowCount INTEGER NOT NULL
+                    RequestRowCount INTEGER NOT NULL,
+                    SemanticPolicyVersion TEXT,
+                    SemanticFingerprint TEXT,
+                    SemanticEvidence TEXT
                 );
                 CREATE INDEX IF NOT EXISTS part_mapping_review_file_version ON part_mapping_review(FileKey, Version);
                 CREATE INDEX IF NOT EXISTS part_mapping_review_request ON part_mapping_review(RequestKey);
-                INSERT OR IGNORE INTO part_registry_meta(key, value) VALUES ('schema_version', '1');
+                INSERT OR IGNORE INTO part_registry_meta(key, value) VALUES ('schema_version', '2');
             """)
             version = connection.execute("SELECT value FROM part_registry_meta WHERE key='schema_version'").fetchone()
-            if not version or version["value"] != "1":
+            if not version or version["value"] not in {"1", "2"}:
                 raise PartIdentityError("PART_DATABASE_VERSION", "The Part registry database version is not supported.")
+            mapping_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(part_mapping_review)")}
+            for column in ("SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"):
+                if column not in mapping_columns:
+                    connection.execute(f"ALTER TABLE part_mapping_review ADD COLUMN {column} TEXT")
+            if version["value"] == "1":
+                connection.execute("UPDATE part_registry_meta SET value='2' WHERE key='schema_version'")
 
     @staticmethod
     def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -315,6 +324,11 @@ class PartIdentityStore:
             result = []
             for row in rows:
                 fields = {key: row[key] for key in row.keys() if key not in {"review_id", "ProductPartLegacyId"}}
+                if fields.get("SemanticEvidence"):
+                    try:
+                        fields["SemanticEvidence"] = json.loads(fields["SemanticEvidence"])
+                    except (TypeError, ValueError):
+                        pass
                 fields["ProductPart"] = row["ProductPartLegacyId"]
                 result.append({"id": row["review_id"], "fields": fields})
             return result
@@ -337,11 +351,14 @@ class PartIdentityStore:
                     fields.get("SourceDescription") or "", int(fields["ProductPart"]) if fields.get("ProductPart") not in (None, "") else None,
                     fields.get("PartIdentity") or None, int(fields.get("Version") or 0), fields.get("Actor") or "", fields.get("Reason") or "",
                     fields.get("OccurredAt") or utc_now(), fields.get("RequestKey") or "", fields.get("RequestFingerprint") or "",
-                    int(fields.get("RequestRowCount") or len(rows)))
+                    int(fields.get("RequestRowCount") or len(rows)), fields.get("SemanticPolicyVersion"),
+                    fields.get("SemanticFingerprint"), json.dumps(fields.get("SemanticEvidence"), sort_keys=True, ensure_ascii=False)
+                        if fields.get("SemanticEvidence") is not None else None)
                 cursor = connection.execute("""
                     INSERT INTO part_mapping_review(ReviewKey,FileKey,SourceHash,AssociationKey,AssociationVersion,GroupKey,SheetName,SourceRow,
-                        SourceDescription,ProductPartLegacyId,PartIdentity,Version,Actor,Reason,OccurredAt,RequestKey,RequestFingerprint,RequestRowCount)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        SourceDescription,ProductPartLegacyId,PartIdentity,Version,Actor,Reason,OccurredAt,RequestKey,RequestFingerprint,RequestRowCount,
+                        SemanticPolicyVersion,SemanticFingerprint,SemanticEvidence)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, values)
                 saved_fields = {key: value for key, value in fields.items()}
                 saved_fields.setdefault("ProductPart", values[9])

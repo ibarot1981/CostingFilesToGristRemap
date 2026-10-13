@@ -90,6 +90,7 @@ class GristPartRegistry:
             f"part-registry-read-scope-{id(self)}", default=None)
         self._initialize_journal()
         self.lock = _SQLiteJournalLock(self, self._thread_lock)
+        self._mapping_evidence_schema_cache: bool | None = None
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=45, isolation_level=None)
@@ -133,6 +134,25 @@ class GristPartRegistry:
         columns = {str(item.get("id")) for item in GristAdminClientShim(self.client).list_columns("ProductPart")}
         if required - columns:
             raise PartIdentityError("PART_SCHEMA_UNAVAILABLE", "Safari Grist ProductPart is missing required managed identity columns.")
+
+    def mapping_evidence_schema_available(self) -> bool:
+        """Check the additive semantic evidence columns without mutating Grist.
+
+        Mapping history can be read on an older document, but semantic mapping
+        writes must wait for schema v14 so Grist cannot silently discard or
+        reject the immutable line evidence. Cache this read-only check for this
+        registry instance; schema rollouts are followed by an app restart.
+        """
+        if self._mapping_evidence_schema_cache is None:
+            required = {"SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"}
+            try:
+                columns = {str(item.get("id")) for item in GristAdminClientShim(self.client).list_columns("PartMappingReview")}
+                self._mapping_evidence_schema_cache = required.issubset(columns)
+            except Exception:
+                # Read-only schema introspection must fail closed for writes;
+                # callers can still display existing history.
+                self._mapping_evidence_schema_cache = False
+        return self._mapping_evidence_schema_cache
 
     def sync_legacy_names(self, rows: list[dict[str, Any]]) -> None:
         """Compatibility hook; legacy names are checked directly in Grist."""
@@ -1117,6 +1137,8 @@ class GristPartRegistry:
         return {"items": rows, "fingerprint": request_fingerprint(rows)}
 
     def append_mapping_records(self, fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if fields and not self.mapping_evidence_schema_available():
+            raise PartIdentityError("PART_SCHEMA_UNAVAILABLE", "Safari Grist PartMappingReview is missing schema v14 semantic evidence columns. Apply the reviewed additive schema plan before saving Part mappings.")
         self._verify_writer()
         if not fields:
             return []
