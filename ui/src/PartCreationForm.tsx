@@ -13,6 +13,8 @@ export type PartCreationOrigin = {
   associationKey: string;
   associationVersion: number;
   evidenceFingerprint: string;
+  lineKeys?: string[];
+  selectedLineEvidenceFingerprint?: string;
 };
 type NamePreview = { name: string; available: boolean; collision: { source: string; id: string; number: string | null; status: string }[] };
 export type PartCreateAttempt = { key: string; payload: Record<string, unknown>; origin?: PartCreationOrigin | null;
@@ -313,8 +315,8 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
 
   const form = <section className="parts-form-card part-creation-form" aria-label="Create a canonical Part">
     <div><span className="eyebrow">Guided creation</span><h2>Create a Part</h2><p>Create a stable canonical identity. The source mapping remains unsaved until you confirm it separately.</p></div>
-    {origin && <section className="part-creation-origin" aria-label="Originating workbook and source group"><strong>Originating source · read only</strong><span>Workbook · {origin.workbookPath || "Unavailable"}</span><span>Sheet · {origin.sheet || "Unavailable"}</span><span>Source description · {origin.sourceDescription || "Blank Part label"}</span>{associationMessage && <small role="status">{associationMessage}</small>}</section>}
-    {origin && !originContextCurrent && <p className="parts-validation warning" role="alert">This workbook or source group changed after the dialog opened. Part creation/recovery is safe, but this Part will not be assigned to the changed group. Review current source evidence before assigning it.</p>}
+    {origin && <section className="part-creation-origin" aria-label="Originating workbook and source group"><strong>Originating source · read only</strong><span>Workbook · {origin.workbookPath || "Unavailable"}</span><span>Sheet · {origin.sheet || "Unavailable"}</span><span>Source description · {origin.sourceDescription || "Blank Part label"}</span>{origin.lineKeys?.length ? <span>Selected lines · {origin.lineKeys.length}</span> : null}{associationMessage && <small role="status">{associationMessage}</small>}</section>}
+    {origin && !originContextCurrent && <p className="parts-validation warning" role="alert">This workbook, source group or selected line set changed after the dialog opened. Part creation/recovery is safe, but this Part will not be assigned to the changed lines. Review current source evidence before assigning it.</p>}
     <div className="parts-cascade-card"><h3>Suggested intended sharing</h3><p>These editable suggestions record intent only. They do not configure Model Codes, set quantities or create costing history.</p><CascadeCodePicker scopes={scopes} productId={productId} modelId={modelId} selectedIds={intendedIds}
       onProductChange={changeProduct} onModelChange={changeModel} onSelectedChange={ids => { userEdited.current = true; setIntendedIds(ids); }} disabled={locked} restrictSelectionToContext/></div>
     <label>Name derives from<select name="part-name-scope" autoComplete="off" disabled={locked} value={scope} onChange={event => { userEdited.current = true; nameAnchorTouched.current = true; setScope(event.target.value as PartScope); }}><option value="global">Global</option><option value="product">Product</option><option value="product_model">Product Model</option><option value="model_code">Model Code</option></select></label>

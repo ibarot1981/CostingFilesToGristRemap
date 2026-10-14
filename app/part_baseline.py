@@ -116,6 +116,17 @@ def _part_row_key(value: Any) -> str:
     return str(value or "")
 
 
+def _mapping_row_part(row: dict[str, Any], group: dict[str, Any]) -> dict[str, Any] | None:
+    # The line-level projection deliberately includes ``part=None`` for an
+    # unresolved row in a mixed group. Fall back to the group only for callers
+    # still supplying the legacy group-only shape.
+    return row.get("part") if "part" in row else group.get("part")
+
+
+def _mapping_row_reviewed(row: dict[str, Any], group: dict[str, Any]) -> bool:
+    return bool(row.get("reviewed")) if "reviewed" in row else bool(group.get("reviewed"))
+
+
 def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict[str, Any]]:
     groups_by_family = {family: [] for family in FAMILY_ORDER}
     for group in mapping.get("groups", []):
@@ -127,7 +138,26 @@ def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict
     for family in FAMILY_ORDER:
         sheet = FAMILIES[family]["sheet"]
         family_groups = groups_by_family[family]
-        mapped = [group for group in family_groups if group.get("reviewed") and (group.get("part") or {}).get("id") == part_id]
+        mapped = []
+        unresolved_lines = 0
+        assigned_elsewhere_lines = 0
+        fully_mapped_groups = 0
+        for group in family_groups:
+            group_rows = group.get("rows") or []
+            assigned_rows = [row for row in group_rows
+                if _mapping_row_reviewed(row, group) and (_mapping_row_part(row, group) or {}).get("id") == part_id]
+            unresolved_lines += sum(not _mapping_row_reviewed(row, group)
+                or not (_mapping_row_part(row, group) or {}).get("id") for row in group_rows)
+            assigned_elsewhere_lines += sum(_mapping_row_reviewed(row, group)
+                and bool((_mapping_row_part(row, group) or {}).get("id"))
+                and (_mapping_row_part(row, group) or {}).get("id") != part_id for row in group_rows)
+            if group_rows and all(_mapping_row_reviewed(row, group) and (_mapping_row_part(row, group) or {}).get("id") for row in group_rows):
+                fully_mapped_groups += 1
+            if assigned_rows:
+                mapped.append({**group, "rows": assigned_rows, "reviewed": True,
+                    "mappedLineCount": len(assigned_rows), "sourceLineCount": len(group_rows),
+                    "hasUnresolvedLines": any(not _mapping_row_reviewed(row, group)
+                        or not (_mapping_row_part(row, group) or {}).get("id") for row in group_rows)})
         diag = diagnostics.get(sheet) or {}
         result[family] = {
             "family": family,
@@ -136,7 +166,12 @@ def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict
             "labelHeader": diag.get("labelHeader"),
             "groupCount": len(family_groups),
             "mappedGroupCount": len(mapped),
-            "unreviewedGroupCount": sum(not group.get("reviewed") for group in family_groups),
+            "fullyMappedGroupCount": fully_mapped_groups,
+            "unreviewedGroupCount": sum(any(not _mapping_row_reviewed(row, group)
+                or not (_mapping_row_part(row, group) or {}).get("id") for row in group.get("rows") or []) for group in family_groups),
+            "mappedLineCount": sum(len(group["rows"]) for group in mapped),
+            "unmappedLineCount": unresolved_lines,
+            "assignedElsewhereLineCount": assigned_elsewhere_lines,
             "requirementCount": sum(len(group.get("rows") or []) for group in mapped),
             "groups": mapped,
         }
@@ -172,6 +207,8 @@ def _family_confirmations(mapping: dict[str, Any], part_id: str, submitted: Any,
             errors.append(f"{evidence['sheet']}: this Part has mapped source rows, so the family cannot be marked not applicable.")
         elif status == "not_applicable" and not confirmed:
             errors.append(f"{evidence['sheet']}: confirm that this source family does not apply to the Part.")
+        if strict and evidence["unmappedLineCount"]:
+            errors.append(f"{evidence['sheet']}: {evidence['unmappedLineCount']} source line(s) remain unassigned or need review before the Part baseline can be established.")
         if strict and status == "applicable" and evidence["mappedGroupCount"] == 0:
             errors.append(f"{evidence['sheet']}: Applicable requires at least one saved, current Part mapping.")
         result[family] = {**evidence, "applicabilityStatus": status or "unconfirmed", "completenessConfirmed": confirmed}
@@ -223,6 +260,9 @@ def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) ->
         "family": family, "processType": FAMILIES[family]["process"], "sheet": sheet,
         "row": int(row.get("row") or 0), "source": row, "group": group,
         "groupKey": str(group.get("key") or ""), "description": str(group.get("description") or ""),
+        "mappingLineKey": str(row.get("lineKey") or ""),
+        "mappingLineFingerprint": str((row.get("semanticEvidence") or {}).get("fingerprint") or ""),
+        "mappingGroupFingerprint": str(group.get("evidenceFingerprint") or ""),
         "quantity": quantity, "weightKg": weight_kg, "weightGrams": weight_grams,
         "dimension": str(dimension) if dimension not in (None, "") else None,
         "dimensionMM": _decimal(dimension) if physical["dimension_uom"] == "mm" else None,
@@ -240,9 +280,12 @@ def _requirements_for_part(mapping: dict[str, Any], part_id: str) -> list[dict[s
     requirements = []
     for group in mapping.get("groups", []):
         family = FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))
-        if family and group.get("reviewed") and (group.get("part") or {}).get("id") == part_id:
-            for row in group.get("rows") or []:
-                requirements.append(_raw_requirement(row, family, group))
+        if not family:
+            continue
+        for row in group.get("rows") or []:
+            part = _mapping_row_part(row, group)
+            if _mapping_row_reviewed(row, group) and (part or {}).get("id") == part_id:
+                requirements.append(_raw_requirement(row, family, {**group, "part": part, "reviewed": True}))
     requirements.sort(key=lambda item: (FAMILY_ORDER.index(item["family"]), _digest(item["physical"]), item["row"]))
     return requirements
 
@@ -432,9 +475,15 @@ class PartBaselineService:
                 "mappingPolicyVersion": mapping.get("mappingPolicyVersion"), "mappingVersion": mapping.get("version")},
             "families": family_states,
             "mapping": {"unresolvedGroups": mapping.get("unresolvedGroups", 0),
+                "unresolvedLines": mapping.get("unresolvedLines", 0),
                 "groups": [{"key": item.get("key"), "sheet": item.get("sheet"), "description": item.get("description"),
                     "rows": len(item.get("rows") or []), "reviewed": item.get("reviewed"),
-                    "partId": (item.get("part") or {}).get("id")} for item in mapping.get("groups", [])]},
+                    "partId": (item.get("part") or {}).get("id"),
+                    "assignmentSummary": item.get("assignmentSummary"),
+                    "lineAssignments": [{"lineKey": row.get("lineKey"), "row": row.get("row"),
+                        "partId": (row.get("part") or {}).get("id"), "reviewed": bool(row.get("reviewed")),
+                        "semanticStatus": (row.get("semanticComparison") or {}).get("status")}
+                        for row in item.get("rows") or []]} for item in mapping.get("groups", [])]},
             "existingContent": {"processRequirements": len(active_revision_lines), "components": len(component_rows),
                 "purchaseSpecifications": len(purchase_rows),
                 "requiresAppendConfirmation": bool(active_revision_lines or component_rows or purchase_rows)},
@@ -614,7 +663,10 @@ class PartBaselineService:
                 "SourceHash": source_hash, "DependencyHashes": _json({}), "ParserVersion": COMPARISON_POLICY,
                 "SheetName": item["sheet"], "SourceRow": item["row"], "Status": "accepted_baseline",
                 "Cells": _json({"sourceCells": row.get("sourceCells") or {}, "sourceHeaders": row.get("sourceHeaders") or {},
-                    "sourceHeaderCells": row.get("sourceHeaderCells") or {}, "headerRow": row.get("headerRow")}),
+                    "sourceHeaderCells": row.get("sourceHeaderCells") or {}, "headerRow": row.get("headerRow"),
+                    "partMapping": {"lineKey": item.get("mappingLineKey"),
+                        "lineFingerprint": item.get("mappingLineFingerprint"),
+                        "groupFingerprint": item.get("mappingGroupFingerprint"), "partId": part_id}}),
                 "ObservedFields": _json(item["rawFields"]), "PartDisplayName": item["description"],
                 "WorkbookName": workbook_name, "WorkbookPath": workbook_path, "AssociationKey": association.id,
                 "AssociationVersion": association.version, "MappingGroupKey": item["groupKey"],
@@ -650,7 +702,9 @@ class PartBaselineService:
                 "ExactQuantityText": _decimal_text(item["quantity"]), "ExactWeightKgText": _decimal_text(item["weightKg"]),
                 "WeightUOM": "kg" if item["weightKg"] is not None else "g" if item["weightGrams"] is not None else "",
                 "EngineeringAttributes": _json({"comparisonFields": item["physical"], "optionalItemGroup1": fields.get("optional_item_group_1"),
-                    "sourcePartLabel": item["description"], "sourceSheet": item["sheet"]}),
+                    "sourcePartLabel": item["description"], "sourceSheet": item["sheet"],
+                    "sourceMappingLineKey": item.get("mappingLineKey"),
+                    "sourceMappingLineFingerprint": item.get("mappingLineFingerprint"), "canonicalPartId": part_id}),
                 "RequestKey": request_key, "RequestFingerprint": detail_fp})
             source_mapping_key = f"part-baseline-source-map:{_digest([item['observationKey'], item['lineKey']])}"
             source_mapping_rows.append({"MappingKey": source_mapping_key, "Observation": observation_id, "LineMaster": master_id,
@@ -740,6 +794,7 @@ class PartBaselineService:
             cells = _unjson(_row_fields(observation or {}).get("Cells"))
             observed = observed if isinstance(observed, dict) else {}
             cell_evidence = cells if isinstance(cells, dict) else {}
+            mapping_evidence = cell_evidence.get("partMapping") if isinstance(cell_evidence.get("partMapping"), dict) else {}
             source_headers = cell_evidence.get("sourceHeaders") if isinstance(cell_evidence.get("sourceHeaders"), dict) else {}
             legacy_remarks_present = "toolshop_part_name" in observed and (
                 normalize_header(source_headers.get("toolshop_part_name")) == "remarks")
@@ -764,6 +819,9 @@ class PartBaselineService:
                         "sourceStatus": "missing" if not plate_part_present else "blank" if not _source_text(plate_part_value).strip() else "present"},
                 },
                 "sheet": _row_fields(observation or {}).get("SheetName"), "row": _row_fields(observation or {}).get("SourceRow"),
+                "sourceMappingLineKey": mapping_evidence.get("lineKey"),
+                "sourceMappingLineFingerprint": mapping_evidence.get("lineFingerprint"),
+                "sourceMappingPartId": mapping_evidence.get("partId"),
                 "lineMasterId": master_id, "lineRevisionId": line_revision_id, "requirementLineId": int(link_row["id"]),
                 "lineKey": _row_fields(masters.get(master_id or -1, {})).get("LineKey"),
                 "revisionKey": _row_fields(revisions.get(line_revision_id or -1, {})).get("RevisionKey")})
@@ -801,7 +859,11 @@ class PartBaselineService:
         # Incomplete evidence is retained and explicitly classified; it cannot
         # generate deletion proposals.
         for family, state in family_states.items():
-            state["complete"] = state["sourceEvidenceStatus"] == "ok" and state["completenessConfirmed"] and state["applicabilityStatus"] in {"applicable", "not_applicable"}
+            state["complete"] = (state["sourceEvidenceStatus"] == "ok" and state["completenessConfirmed"]
+                and state["applicabilityStatus"] in {"applicable", "not_applicable"}
+                and int(state.get("unmappedLineCount") or 0) == 0)
+            if int(state.get("unmappedLineCount") or 0):
+                family_errors.append(f"{state['sheet']}: {state['unmappedLineCount']} source line(s) still need an individual Part assignment; unmatched rows remain outstanding and cannot support additions or deletions.")
         baseline_requirements = self._baseline_requirements(part, revision, baseline)
         comparison_fp = _digest([part_id, baseline_id, file_id, source_hash, association.id, association.version,
             mapping.get("version"), mapping.get("mappingPolicyVersion"), source_families, actor, reason.strip(), COMPARISON_POLICY])
@@ -842,7 +904,7 @@ class PartBaselineService:
                 "ProductPart": int(part["gristRecordId"]), "Family": family,
                 "ApplicabilityStatus": state["applicabilityStatus"], "SourceEvidenceStatus": state["sourceEvidenceStatus"],
                 "MappedGroupCount": state["mappedGroupCount"], "RequirementCount": state["requirementCount"],
-                "CompletenessConfirmed": bool(state["completenessConfirmed"]), "RequestKey": request_key,
+                "CompletenessConfirmed": bool(state["completenessConfirmed"] and not state.get("unmappedLineCount")), "RequestKey": request_key,
                 "RequestFingerprint": _digest([family_key, state, comparison_fp])})
         self._upsert_many("PartComparisonFamily", family_rows)
 
@@ -857,7 +919,10 @@ class PartBaselineService:
                 "DependencyHashes": _json({}), "ParserVersion": COMPARISON_POLICY, "SheetName": item["sheet"],
                 "SourceRow": item["row"], "Status": "incoming_comparison", "Cells": _json({
                     "sourceCells": source.get("sourceCells") or {}, "sourceHeaders": source.get("sourceHeaders") or {},
-                    "sourceHeaderCells": source.get("sourceHeaderCells") or {}, "headerRow": source.get("headerRow")}),
+                    "sourceHeaderCells": source.get("sourceHeaderCells") or {}, "headerRow": source.get("headerRow"),
+                    "partMapping": {"lineKey": item.get("mappingLineKey"),
+                        "lineFingerprint": item.get("mappingLineFingerprint"),
+                        "groupFingerprint": item.get("mappingGroupFingerprint"), "partId": part_id}}),
                 "ObservedFields": _json(item["rawFields"]), "PartDisplayName": item["description"],
                 "WorkbookName": workbook_name, "WorkbookPath": workbook_path,
                 "AssociationKey": association.id, "AssociationVersion": association.version,
@@ -888,7 +953,8 @@ class PartBaselineService:
                 "IncomingObservation": (inc or {}).get("observationId"),
                 "IncomingRequirementKey": _digest((inc or {}).get("physical") or {}) if inc else "",
                 "MappingGroupKey": (inc or {}).get("groupKey") or "",
-                "MappingEvidenceFingerprint": (inc or {}).get("group", {}).get("evidenceFingerprint") or "",
+                "MappingEvidenceFingerprint": (inc or {}).get("mappingLineFingerprint")
+                    or (inc or {}).get("group", {}).get("evidenceFingerprint") or "",
                 "SourceSheet": (inc or {}).get("sheet") or (base or {}).get("sheet") or FAMILIES[family]["sheet"],
                 "SourceRow": int(inc.get("row") or 0) if inc else None,
                 "SourceCellEvidence": _json((inc or {}).get("source", {}).get("sourceCells") or (base or {}).get("cellEvidence") or {}),
@@ -1043,24 +1109,52 @@ class PartBaselineService:
 
         groups = mapping.get("groups") or []
         current_groups = {}
-        assigned_context = set()
+        current_lines = {}
+        current_line_context = set()
         for group in groups:
             family = FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))
             if not family:
                 continue
             if group.get("reviewed") and str((group.get("part") or {}).get("id") or "") == stable_part_id:
                 key = str(group.get("key") or "")
-                fingerprint = str(group.get("evidenceFingerprint") or "")
                 current_groups[key] = group
-                assigned_context.add((family, key, fingerprint))
-        recorded_context = set()
+            for line in group.get("rows") or []:
+                line_part = _mapping_row_part(line, group) or {}
+                line_key = str(line.get("lineKey") or "")
+                if not line_key or not _mapping_row_reviewed(line, group) or str(line_part.get("id") or "") != stable_part_id:
+                    continue
+                line_fingerprint = str((line.get("semanticEvidence") or {}).get("fingerprint") or "")
+                context = (family, str(group.get("key") or ""), line_key, line_fingerprint)
+                current_lines[line_key] = (group, line, context)
+                current_line_context.add(context)
+        observation_by_id = {int(row.get("id", -1)): _row_fields(row)
+            for row in self.registry._rows("SourceLineObservation") if int(row.get("id", -1)) >= 0}
+        recorded_line_context = set()
+        recorded_legacy_context = set()
         for row in all_differences:
             fields = _row_fields(row)
             if _ref_id(fields.get("IncomingObservation")) and fields.get("MappingGroupKey"):
-                recorded_context.add((str(fields.get("Family") or ""), str(fields.get("MappingGroupKey") or ""),
-                    str(fields.get("MappingEvidenceFingerprint") or "")))
-        if assigned_context != recorded_context:
-            raise PartIdentityError("PART_COMPARISON_STALE", "The set of source groups assigned to this Part changed after comparison. Recompare current workbook evidence before resolving this difference.")
+                observation = observation_by_id.get(_ref_id(fields.get("IncomingObservation")) or -1, {})
+                cells = _unjson(observation.get("Cells"))
+                line_evidence = cells.get("partMapping") if isinstance(cells, dict) else None
+                if isinstance(line_evidence, dict) and line_evidence.get("lineKey") and line_evidence.get("lineFingerprint"):
+                    recorded_line_context.add((str(fields.get("Family") or ""), str(fields.get("MappingGroupKey") or ""),
+                        str(line_evidence["lineKey"]), str(line_evidence["lineFingerprint"])))
+                else:
+                    # Comparisons saved before line identity was added retain
+                    # their group-level evidence boundary.
+                    recorded_legacy_context.add((str(fields.get("Family") or ""), str(fields.get("MappingGroupKey") or ""),
+                        str(fields.get("MappingEvidenceFingerprint") or "")))
+        if recorded_line_context:
+            if recorded_legacy_context or current_line_context != recorded_line_context:
+                raise PartIdentityError("PART_COMPARISON_STALE", "The set of source lines assigned to this Part changed after comparison. Recompare current evidence before resolving this difference.")
+        else:
+            assigned_context = {(family, key, str(group.get("evidenceFingerprint") or ""))
+                for key, group in current_groups.items()
+                if group.get("reviewed") and str((group.get("part") or {}).get("id") or "") == stable_part_id
+                for family in [FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))] if family}
+            if assigned_context != recorded_legacy_context:
+                raise PartIdentityError("PART_COMPARISON_STALE", "The set of source groups assigned to this Part changed after comparison. Recompare current workbook evidence before resolving this difference.")
 
         family_rows = [row for row in self.registry._rows("PartComparisonFamily")
             if _ref_id(_row_fields(row).get("WorkbookComparison")) == comparison_id]
@@ -1087,10 +1181,21 @@ class PartBaselineService:
                     raise PartIdentityError("PART_COMPARISON_STALE", "A baseline-only deletion can be resolved only from a complete, current incoming source family. Recompare after confirming complete evidence.")
                 continue
             group_key = str(fields.get("MappingGroupKey") or "")
-            group = current_groups.get(group_key)
-            if (not group or str(group.get("evidenceFingerprint") or "") != str(fields.get("MappingEvidenceFingerprint") or "")
-                    or FAMILY_TO_SHEET.get(str(group.get("sheet") or "")) != str(fields.get("Family") or "")):
-                raise PartIdentityError("PART_COMPARISON_STALE", "The selected source group or its Part assignment changed after comparison. Recompare current evidence before resolving this difference.")
+            observation = observation_by_id.get(_ref_id(fields.get("IncomingObservation")) or -1, {})
+            cells = _unjson(observation.get("Cells"))
+            line_evidence = cells.get("partMapping") if isinstance(cells, dict) else None
+            if isinstance(line_evidence, dict) and line_evidence.get("lineKey"):
+                current = current_lines.get(str(line_evidence.get("lineKey")))
+                if (not current or current[0].get("key") != group_key
+                        or current[2][0] != str(fields.get("Family") or "")
+                        or current[2][3] != str(line_evidence.get("lineFingerprint") or "")
+                        or str((_mapping_row_part(current[1], current[0]) or {}).get("id") or "") != stable_part_id):
+                    raise PartIdentityError("PART_COMPARISON_STALE", "The selected source line or its canonical Part assignment changed after comparison. Recompare current evidence before resolving this difference.")
+            else:
+                group = current_groups.get(group_key)
+                if (not group or str(group.get("evidenceFingerprint") or "") != str(fields.get("MappingEvidenceFingerprint") or "")
+                        or FAMILY_TO_SHEET.get(str(group.get("sheet") or "")) != str(fields.get("Family") or "")):
+                    raise PartIdentityError("PART_COMPARISON_STALE", "The selected source group or its Part assignment changed after comparison. Recompare current evidence before resolving this difference.")
 
     @_serialized
     def decide(self, *, comparison_key: str, action: str, difference_keys: list[str],
@@ -1295,13 +1400,25 @@ class PartBaselineService:
                 "ModificationCount": int(cf.get("ModificationCount") or 0) + 1})
         self._update_confirmed("PartWorkbookComparison", comparison, "ComparisonKey", comparison_key,
             comparison_values)
-        result = {**self.get_comparison(comparison_key), "proposalResult": proposal_result,
-            "replacementMapping": ({"partId": replacement_part_id, "path": cf.get("WorkbookPath") or "",
-                "sourceSheet": _row_fields(selected[0]).get("SourceSheet"), "sourceRow": _row_fields(selected[0]).get("SourceRow"),
-                "groupKey": _row_fields(selected[0]).get("MappingGroupKey") or "",
-                "evidenceFingerprint": _row_fields(selected[0]).get("MappingEvidenceFingerprint") or "",
+        replacement_mapping = None
+        if replacement:
+            selected_fields = _row_fields(selected[0])
+            observation_id = _ref_id(selected_fields.get("IncomingObservation"))
+            observation = next((row for row in self.registry._rows("SourceLineObservation")
+                if observation_id and int(row.get("id", -1)) == observation_id), None)
+            cells = _unjson(_row_fields(observation or {}).get("Cells"))
+            line_evidence = cells.get("partMapping") if isinstance(cells, dict) else {}
+            replacement_mapping = {"partId": replacement_part_id, "path": cf.get("WorkbookPath") or "",
+                "sourceSheet": selected_fields.get("SourceSheet"), "sourceRow": selected_fields.get("SourceRow"),
+                "groupKey": selected_fields.get("MappingGroupKey") or "",
+                "evidenceFingerprint": (line_evidence or {}).get("groupFingerprint")
+                    or selected_fields.get("MappingEvidenceFingerprint") or "",
+                "lineKey": (line_evidence or {}).get("lineKey"),
+                "lineEvidenceFingerprint": (line_evidence or {}).get("lineFingerprint"),
                 "sourceHash": cf.get("SourceHash"), "fileKey": cf.get("FileKey"),
-                "associationKey": cf.get("AssociationKey") or "", "associationVersion": cf.get("AssociationVersion") or 0} if replacement else None),
+                "associationKey": cf.get("AssociationKey") or "", "associationVersion": cf.get("AssociationVersion") or 0}
+        result = {**self.get_comparison(comparison_key), "proposalResult": proposal_result,
+            "replacementMapping": replacement_mapping,
             "idempotent": bool(existing_request)}
         self.registry._complete_request(req, result)
         return result

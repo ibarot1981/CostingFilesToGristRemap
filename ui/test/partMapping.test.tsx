@@ -9,7 +9,8 @@ vi.mock("../src/api", async () => ({...(await vi.importActual<typeof import("../
 
 const chassis = {id:"part-1", partNumber:"SM-P-000001", name:"S1KHF — Chassis", description:"Chassis", variant:"Standard", engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
 const bracket = {id:"part-2", partNumber:"SM-P-000002", name:"S1KHF — Bracket", description:"Bracket", variant:"Folded", engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
-const group = (key = "mcl-shaft", sheet = "5. Material Cut List Price", description = "Shaft", row = 10, overrides = {}) => ({
+const group = (key = "mcl-shaft", sheet = "5. Material Cut List Price", description = "Shaft", row = 10, overrides = {}) => {
+  const value:any = {
   key, mappingPolicyVersion:"part-source-labels-v2", evidenceFingerprint:`evidence-${key}`, sheet,
   labelField:sheet === "CNC Cut List" ? "part_category" : "product_part_name", description, blankDescription:false,
   rows:[{sheet,row,fields:{material_to_cut:"MS Plate",dimension_to_cut_mm:"3 x 25",qty:"2",optional_item_group_1:"HF",in_use:"Yes",product_part_name:"Plate 1",part_category:"Frame"},
@@ -17,7 +18,15 @@ const group = (key = "mcl-shaft", sheet = "5. Material Cut List Price", descript
     sourceHeaderCells:{material_to_cut:"B8",part_category:"C8"},sourceCells:{material_to_cut:{cell:`B${row}`},dimension_to_cut_mm:{cell:`C${row}`},qty:{cell:`D${row}`}},headerRow:8,
     availableFields:["material_to_cut","dimension_to_cut_mm","qty","optional_item_group_1","in_use","product_part_name","part_category"]}],
   part:null, reviewed:false, version:0, ...overrides,
-});
+  };
+  value.rows = value.rows.map((sourceRow:any, index:number) => ({...sourceRow,
+    lineKey:sourceRow.lineKey || `${key}:line:${sourceRow.row ?? index}`,
+    semanticEvidence:sourceRow.semanticEvidence || {fingerprint:`semantic-${key}-${sourceRow.row ?? index}`},
+    part:sourceRow.part === undefined ? (value.reviewed ? value.part || null : null) : sourceRow.part,
+    reviewed:sourceRow.reviewed ?? Boolean(value.reviewed),
+  }));
+  return value;
+};
 const detail = (groups = [group()], overrides = {}) => ({sourceHash:"hash1", associationKey:"assoc1", associationVersion:2,
   version:0, schemaAvailable:true, legacyHistoryAvailable:true, mappingPolicyVersion:"part-source-labels-v2",
   sourceSheets:{"5. Material Cut List Price":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A8",ambiguousLabelHeaders:[],headerRow:8},
@@ -41,13 +50,27 @@ beforeEach(() => {
   localStorage.removeItem("part-mapping:context-open");
   mocks.partMappings.mockResolvedValue(detail());
   mocks.searchParts.mockResolvedValue({items:[chassis,bracket],total:2,offset:0,limit:30,hasMore:false});
-  mocks.savePartMappings.mockImplementation(async (payload:any) => ({savedRows:Object.keys(payload.decisions).length,
-    version:payload.expectedVersion + 1,idempotent:false,sourceHash:payload.expectedHash,
-    associationKey:payload.expectedAssociationKey,associationVersion:payload.expectedAssociationVersion,
-    assignments:Object.fromEntries(Object.entries(payload.decisions).map(([key,partId]) => [key,{
+  mocks.savePartMappings.mockImplementation(async (payload:any) => {
+    const current = await Promise.resolve(mocks.partMappings.mock.results.at(-1)?.value || detail());
+    const lineAssignments:any = {};
+    for (const [groupKey, partId] of Object.entries(payload.decisions || {})) {
+      const sourceGroup = current.groups.find((item:any) => item.key === groupKey);
+      for (const row of sourceGroup?.rows || []) if (row.lineKey) lineAssignments[row.lineKey] = {
+        actionType:partId ? "initial_assignment" : "clear_assignment",partId:partId || null,
+        reason:partId ? "Initial Part assignment" : payload.reasons?.[groupKey] || "Assignment was made in error",requiresUserReason:false,
+      };
+    }
+    for (const [lineKey, partId] of Object.entries(payload.lineDecisions || {})) lineAssignments[lineKey] = {
       actionType:partId ? "initial_assignment" : "clear_assignment",partId:partId || null,
-      reason:partId ? "Initial Part assignment" : "Assignment was made in error",requiresUserReason:!partId,
-    }])),confirmedRows:[]}));
+      reason:payload.lineReasons?.[lineKey] || "Initial Part assignment",requiresUserReason:false,
+    };
+    const assignments = Object.fromEntries(Object.entries(payload.decisions || {}).map(([key,partId]) => [key,{
+      actionType:partId ? "initial_assignment" : "clear_assignment",partId:partId || null,
+      reason:partId ? "Initial Part assignment" : payload.reasons?.[key] || "Assignment was made in error",requiresUserReason:false,
+    }]));
+    return {savedRows:Object.keys(lineAssignments).length,version:payload.expectedVersion + 1,idempotent:false,sourceHash:payload.expectedHash,
+      associationKey:payload.expectedAssociationKey,associationVersion:payload.expectedAssociationVersion,assignments,lineAssignments,confirmedRows:[]};
+  });
   mocks.partBaselineReview.mockResolvedValue({});
   mocks.establishPartBaseline.mockResolvedValue({baselineStatus:"established"});
   mocks.comparePartBaseline.mockResolvedValue({});
@@ -147,7 +170,8 @@ it("saves only one group, retries the identical request, and reloads saved state
   render(<PartMappingView path="pilot.ods"/>);
   await choosePart();
   expect(screen.queryByRole("textbox", {name:/Reason for mapping change/})).toBeNull();
-  fireEvent.click(screen.getByRole("button", {name:"Save"}));
+  expect(screen.getByRole("button", {name:/Unsaved · SM-P-000001 .* · 1 mapped line · 0 unassigned/})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Save group"}));
   await screen.findByRole("alert");
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).disabled).toBe(true);
   fireEvent.click(screen.getByRole("button", {name:"Retry save"}));
@@ -155,6 +179,48 @@ it("saves only one group, retries the identical request, and reloads saved state
   expect(mocks.savePartMappings.mock.calls[1]).toEqual(mocks.savePartMappings.mock.calls[0]);
   expect(mocks.savePartMappings.mock.calls[0][0]).toMatchObject({path:"pilot.ods",expectedHash:"hash1",expectedVersion:0,
     expectedAssociationKey:"assoc1",expectedAssociationVersion:2,decisions:{"mcl-shaft":"part-1"},reasons:{}});
+});
+
+it("saves selected source lines to different Parts and leaves the untouched line unassigned", async () => {
+  const rows = [10,11,12].map(row => group("mcl-shaft","5. Material Cut List Price","Shaft",row).rows[0]);
+  const sourceGroup = group("mcl-shaft","5. Material Cut List Price","Shaft",10,{rows});
+  mocks.partMappings.mockResolvedValue(detail([sourceGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Split assignments"}));
+  const card = screen.getByRole("button", {name:/source evidence · Shaft/i}).closest(".part-source-group")!;
+  fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
+  const row10 = within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 10 for Part assignment"});
+  const row11 = within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 11 for Part assignment"});
+  const row12 = within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 12 for Part assignment"});
+  fireEvent.click(row10);
+  const firstPicker = await screen.findByRole("combobox", {name:"Canonical Part for 1 selected lines"});
+  fireEvent.focus(firstPicker);
+  fireEvent.click(await screen.findByRole("option", {name:/SM-P-000001/}));
+  fireEvent.click(row10);
+  fireEvent.click(row12);
+  const secondPicker = await screen.findByRole("combobox", {name:"Canonical Part for 1 selected lines"});
+  fireEvent.change(secondPicker, {target:{value:"Bracket"}});
+  await waitFor(() => expect(mocks.searchParts.mock.calls.some(([query, offset, limit, path]) => query === "Bracket" && offset === 0 && limit === 30 && path === "pilot.ods")).toBe(true));
+  fireEvent.click(await screen.findByRole("option", {name:/SM-P-000002/}));
+  expect((row11 as HTMLInputElement).checked).toBe(false);
+  expect(within(card).getByRole("button", {name:/2 unsaved · 2 Parts · 2 mapped lines · 1 unassigned/})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Save pending mappings"}));
+  const confirmation = await screen.findByRole("dialog", {name:"Save pending line assignments?"});
+  const pendingText = confirmation.textContent || "";
+  expect(pendingText).toContain("Source row 10 → SM-P-000001");
+  expect(pendingText).toContain("Source row 12 → SM-P-000002");
+  expect(pendingText).not.toContain("Source row 11 →");
+  fireEvent.click(within(confirmation).getByRole("button", {name:"Confirm save 2 lines"}));
+  await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
+  expect(mocks.savePartMappings.mock.calls[0][0].decisions).toEqual({});
+  expect(mocks.savePartMappings.mock.calls[0][0].lineDecisions).toEqual({"mcl-shaft:line:10":"part-1","mcl-shaft:line:12":"part-2"});
+  expect(within(card).getByRole("button", {name:/2 Parts · 2 mapped lines · 1 unassigned/})).toBeTruthy();
+  expect((row11 as HTMLInputElement).checked).toBe(false);
+  const row11Element = row11.closest("tr")!;
+  expect(row11Element.textContent).toContain("Unassigned");
+  expect(row11Element.textContent).toContain("2");
+  fireEvent.change(screen.getByLabelText("Review status"), {target:{value:"unassigned"}});
+  expect(screen.getByText("Shaft")).toBeTruthy();
 });
 
 it("keeps hidden drafts and names every pending group in batch confirmation", async () => {
@@ -166,10 +232,10 @@ it("keeps hidden drafts and names every pending group in batch confirmation", as
   fireEvent.change(screen.getByLabelText("Source sheet"), {target:{value:"toolshop"}});
   expect(screen.queryByText("Shaft")).toBeNull();
   fireEvent.click(screen.getByRole("button", {name:"Save pending mappings"}));
-  const dialog = await screen.findByRole("dialog", {name:"Save all pending mappings?"});
+  const dialog = await screen.findByRole("dialog", {name:"Save pending line assignments?"});
   expect(within(dialog).getByText("5. Material Cut List Price · Shaft")).toBeTruthy();
   expect(within(dialog).getByText("Tool Shop Items · Bracket")).toBeTruthy();
-  fireEvent.click(within(dialog).getByRole("button", {name:"Confirm save 2 groups"}));
+  fireEvent.click(within(dialog).getByRole("button", {name:"Confirm save 2 lines"}));
   await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
   expect(mocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mcl-shaft":"part-1","tool-bracket":"part-2"});
 });
@@ -201,12 +267,73 @@ it("opens contextual creation without leaving Mapping and assigns the created Pa
   expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
   expect(mocks.partMappings).toHaveBeenCalledTimes(reloadCount);
   expect(screen.getByText("Unsaved")).toBeTruthy();
-  expect(screen.getByText(/created in Grist and added as an unsaved mapping selection/)).toBeTruthy();
+  expect(screen.getByText(/created in Grist and added as an unsaved whole-group mapping/)).toBeTruthy();
   expect(JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).toMatchObject({decisions:{"mcl-shaft":"created-part","tool-bracket":"part-2"},query:"MS Plate",sheetFilter:"mcl",scrollTop:37});
   expect(table.scrollTop).toBe(37);
   expect(document.querySelector(".part-context-panel")?.classList.contains("closed")).toBe(true);
   expect(screen.queryByRole("combobox", {name:"Part assignment for Bracket"})).toBeNull();
   view.unmount();
+});
+
+it("keeps selected line creation tied to its exact source line evidence until explicit save", async () => {
+  const rows = [10,11,12].map(row => group("mcl-shaft","5. Material Cut List Price","Shaft",row).rows[0]);
+  mocks.partMappings.mockResolvedValue(detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{rows})]));
+  const pendingCreation = deferred<{part: typeof chassis}>();
+  mocks.createManagedPart.mockReturnValue(pendingCreation.promise);
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 1 of 1 source groups");
+  const beforeLoads = mocks.partMappings.mock.calls.length;
+  fireEvent.click(await screen.findByRole("button", {name:"Split assignments"}));
+  const card = screen.getByRole("button", {name:/source evidence · Shaft/i}).closest(".part-source-group")!;
+  fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
+  fireEvent.click(within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 10 for Part assignment"}));
+  fireEvent.click(within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 12 for Part assignment"}));
+  fireEvent.click(await within(card).findByRole("button", {name:"Create Part for selected lines"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  expect(within(dialog).getByText("Selected lines · 2")).toBeTruthy();
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"One Part for the selected source lines"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  const attempt = JSON.parse(sessionStorage.getItem("part-mapping:create-attempt") || "{}");
+  expect(attempt.origin).toMatchObject({lineKeys:["mcl-shaft:line:10","mcl-shaft:line:12"],selectedLineEvidenceFingerprint:JSON.stringify([
+    {lineKey:"mcl-shaft:line:10",fingerprint:"semantic-mcl-shaft-10"},
+    {lineKey:"mcl-shaft:line:12",fingerprint:"semantic-mcl-shaft-12"},
+  ])});
+  await act(async () => { pendingCreation.resolve({part:{...chassis,id:"created-part",partNumber:"SM-P-000003",name:"S1KHF — Shaft"}}); await pendingCreation.promise; });
+  expect((JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).lineDecisions)
+    .toEqual({"mcl-shaft:line:10":"created-part","mcl-shaft:line:12":"created-part"});
+  expect(mocks.partMappings).toHaveBeenCalledTimes(beforeLoads);
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+  expect(screen.getByText(/added to 2 selected lines as an unsaved mapping/)).toBeTruthy();
+});
+
+it("does not apply a created Part when selected-line semantic evidence changed", async () => {
+  const rows = [10,11,12].map(row => group("mcl-shaft","5. Material Cut List Price","Shaft",row).rows[0]);
+  const initial = detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{rows})]);
+  const changedRows = rows.map(row => row.row === 10 ? {...row,semanticEvidence:{fingerprint:"changed-semantic-line-10"}} : row);
+  const changed = detail([group("mcl-shaft","5. Material Cut List Price","Shaft",10,{rows:changedRows})]);
+  mocks.partMappings.mockReset().mockResolvedValueOnce(initial).mockResolvedValueOnce(changed);
+  const pendingCreation = deferred<{part: typeof chassis}>();
+  mocks.createManagedPart.mockReturnValue(pendingCreation.promise);
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 1 of 1 source groups");
+  fireEvent.click(screen.getByRole("button", {name:/Split assignments/}));
+  const card = screen.getByRole("button", {name:/source evidence · Shaft/i}).closest(".part-source-group")!;
+  fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
+  fireEvent.click(within(card).getByRole("checkbox", {name:"Select 5. Material Cut List Price row 10 for Part assignment"}));
+  fireEvent.click(within(card).getByRole("button", {name:"Create Part for selected lines"}));
+  const dialog = await screen.findByRole("dialog", {name:"Create and assign a Part"});
+  fireEvent.change(within(dialog).getByLabelText("Why is this Part needed?"), {target:{value:"Retain identity after source change"}});
+  await waitFor(() => expect(within(dialog).getByText("S1KHF — Shaft")).toBeTruthy());
+  fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", {name:"Reload review"}));
+  await waitFor(() => expect(mocks.partMappings).toHaveBeenCalledTimes(2));
+  await act(async () => { pendingCreation.resolve({part:{...chassis,id:"created-after-line-change",partNumber:"SM-P-000013",name:"S1KHF — Shaft"}}); await pendingCreation.promise; });
+  expect(await screen.findByText(/originating workbook or source group changed, so it was not assigned/)).toBeTruthy();
+  expect((JSON.parse(sessionStorage.getItem("part-mapping:pilot.ods") || "{}")).lineDecisions || {}).toEqual({});
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
 });
 
 it("restores an uncertain contextual creation with the exact Grist request and group context", async () => {
@@ -249,7 +376,7 @@ it("refuses to apply the created Part when the originating workbook changes", as
   fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
   await waitFor(() => expect(screen.getByText(/originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
   expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
-  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(screen.queryByText("Unsaved")).toBeNull();
 });
 
 it("preserves a published Part without assigning it when the originating group evidence changes", async () => {
@@ -266,7 +393,7 @@ it("preserves a published Part without assigning it when the originating group e
   fireEvent.click(within(dialog).getByRole("button", {name:"Create and assign"}));
   await waitFor(() => expect(screen.getByText(/exists in Grist\. The originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
   expect(mocks.createManagedPart).toHaveBeenCalledTimes(1);
-  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(screen.queryByText("Unsaved")).toBeNull();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
 });
 
@@ -294,7 +421,7 @@ it.each([
   await waitFor(() => expect(screen.queryByText(/Refreshing workbook and saved mapping evidence/)).toBeNull());
   await act(async () => { pending.resolve({part:{...chassis,id:"created-after-refresh",partNumber:"SM-P-000010",name:"S1KHF — Shaft"}}); await pending.promise; });
   await waitFor(() => expect(screen.getByText(/exists in Grist\. The originating workbook or source group changed, so it was not assigned/)).toBeTruthy());
-  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(screen.queryByText("Unsaved")).toBeNull();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
   expect(sessionStorage.getItem("part-mapping:create-attempt")).toBeNull();
 });
@@ -317,7 +444,7 @@ it("withholds a colliding Part when its lookup resolves after group evidence cha
   await waitFor(() => expect(screen.queryByText(/Refreshing workbook and saved mapping evidence/)).toBeNull());
   await act(async () => { pending.resolve({items:[chassis]}); await pending.promise; });
   await waitFor(() => expect(screen.getByText(/is selectable, but the originating source context changed/)).toBeTruthy());
-  expect(screen.getByText("0 unsaved groups")).toBeTruthy();
+  expect(screen.queryByText("Unsaved")).toBeNull();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
 });
 
@@ -396,7 +523,7 @@ it("refreshes a missing shortcode in the mounted contextual form and preserves o
   expect(mocks.createManagedPart.mock.calls[0][0]).toMatchObject({scope:"product_model",targetId:"model-1",description:"Shaft updated",variant:"Forged",expectedName:"HFNEW — Shaft updated — Forged",intendedModelCodeIds:["code-1"]});
   await act(async () => { pendingCreate.resolve({part:{...chassis,id:"shortcode-created",partNumber:"SM-P-000012",name:"HFNEW — Shaft updated — Forged"}}); await pendingCreate.promise; });
   await waitFor(() => expect(screen.getByText("Unsaved")).toBeTruthy());
-  expect(screen.getByText(/created in Grist and added as an unsaved mapping selection/)).toBeTruthy();
+  expect(screen.getByText(/created in Grist and added as an unsaved whole-group mapping/)).toBeTruthy();
   expect(mocks.savePartMappings).not.toHaveBeenCalled();
 });
 
@@ -477,7 +604,7 @@ it("keeps assignment and Save actionable while source evidence stays collapsed",
   fireEvent.click(within(card).getByRole("button", {name:"Create Part"}));
   fireEvent.click(await screen.findByRole("button", {name:"Cancel before creation"}));
   expect(card.classList.contains("is-collapsed")).toBe(true);
-  fireEvent.click(within(card).getByRole("button", {name:"Save"}));
+  fireEvent.click(within(card).getByRole("button", {name:"Save group"}));
   await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
   expect(card.classList.contains("is-collapsed")).toBe(true);
   expect(within(card).getByRole("button", {name:/Expand source evidence/}).getAttribute("aria-expanded")).toBe("false");
@@ -497,13 +624,13 @@ it("holds stale selections until the refreshed source is explicitly reviewed", a
   mocks.savePartMappings.mockRejectedValueOnce(new Error("PART_REVIEW_STALE: The workbook changed; reload the review"));
   render(<PartMappingView path="pilot.ods"/>);
   await choosePart();
-  fireEvent.click(screen.getByRole("button", {name:"Save"}));
+  fireEvent.click(screen.getByRole("button", {name:"Save group"}));
   await screen.findByRole("alert");
   fireEvent.click(screen.getByRole("button", {name:"Review current source"}));
   expect(await screen.findByRole("region", {name:"Drafts held for source review"})).toBeTruthy();
-  expect(screen.getByText(/previous choice: SM-P-000001/)).toBeTruthy();
+  expect(screen.getByText(/Whole group · SM-P-000001/)).toBeTruthy();
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toBe("No Part selected");
-  fireEvent.click(screen.getByRole("button", {name:"Reapply after reviewing current rows"}));
+  fireEvent.click(screen.getByRole("button", {name:"Review current rows and reapply"}));
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toContain("SM-P-000001");
   expect(mocks.savePartMappings).toHaveBeenCalledTimes(1);
 });
@@ -709,7 +836,7 @@ it("keeps saved assignments distinct from an explicit audited clear", async () =
   expect(screen.getByText("Unsaved")).toBeTruthy();
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toBe("No Part selected");
   fireEvent.change(screen.getByLabelText("Reason for mapping change · Shaft"), {target:{value:"Assignment was made in error"}});
-  fireEvent.click(screen.getByRole("button", {name:"Save"}));
+  fireEvent.click(screen.getByRole("button", {name:"Save group"}));
   await waitFor(() => expect(mocks.savePartMappings).toHaveBeenCalledTimes(1));
   expect(mocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mcl-shaft":""});
 });
@@ -722,7 +849,7 @@ it("shows a compact reason only when replacing an existing mapping", async () =>
   expect(screen.queryByRole("textbox", {name:/Reason for mapping change/})).toBeNull();
   await choosePart("Shaft",1);
   expect(screen.getByLabelText("Reason for mapping change · Shaft")).toBeTruthy();
-  expect((screen.getByRole("button", {name:"Save"}) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", {name:"Save group"}) as HTMLButtonElement).disabled).toBe(true);
 });
 
 it("retracts the context panel without unmounting an unresolved baseline publication", async () => {

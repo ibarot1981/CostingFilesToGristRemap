@@ -10,7 +10,7 @@ from threading import Barrier
 
 from app.grist_parts import GristPartRegistry
 from app.part_baseline import PartBaselineService
-from app.part_baseline import _family_confirmations, _raw_requirement
+from app.part_baseline import _family_confirmations, _family_review_rows, _raw_requirement, _requirements_for_part
 from app.part_identity import PartIdentityError
 from app.part_mapping import MemoryPartStore, PartConflict, PartRegistryMappingStore, PartSourceGroups, mapping_detail, save_mapping
 from test_grist_parts_recovery import MemoryGrist
@@ -151,6 +151,56 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             expected_hash=source_hash, expected_association=self.association.id,
             expected_association_version=self.association.version, expected_mapping_version=mapping_result["version"],
             append_existing=append_existing)
+
+    def test_mixed_group_requirements_follow_each_line_part_and_unassigned_rows_stay_incomplete(self):
+        other = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
+            description="Engine Mount", variant="Standard", expected_name="S1K — Engine Mount — Standard",
+            actor="test operator", reason="isolated mixed mapping fixture", request_key="create-mixed-part",
+            revision_assertion="A")["part"]
+        rows = [source_row(10, quantity="2", dimension="3 x 25"),
+            source_row(11, quantity="1", dimension="5 x 25", material="Aluminum"),
+            source_row(12, quantity="4", dimension="8 x 20", material="Copper")]
+        groups = self.groups(rows)
+        before = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="mixed-partial",
+            association=self.association, groups=groups)
+        line_keys = [row["lineKey"] for row in before["groups"][0]["rows"]]
+        saved = save_mapping(self.mapping_store, file_id="pilot.ods", source_hash="mixed-partial",
+            association=self.association, groups=groups,
+            line_decisions={line_keys[0]: self.part["id"], line_keys[1]: other["id"]},
+            expected_hash="mixed-partial", expected_version=0, expected_association=self.association.id,
+            expected_association_version=self.association.version, actor="mapping reviewer",
+            request_key="mixed-partial-line-save")
+        mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="mixed-partial",
+            association=self.association, groups=groups)
+        self.assertEqual(saved["savedRows"], 2)
+        part_a = _requirements_for_part(mapping, self.part["id"])
+        part_b = _requirements_for_part(mapping, other["id"])
+        self.assertEqual([(item["row"], item["mappingLineKey"]) for item in part_a], [(10, line_keys[0])])
+        self.assertEqual([(item["row"], item["mappingLineKey"]) for item in part_b], [(11, line_keys[1])])
+        family_a = _family_review_rows(mapping, self.part["id"])["mcl"]
+        self.assertEqual((family_a["mappedGroupCount"], family_a["mappedLineCount"], family_a["requirementCount"]), (1, 1, 1))
+        self.assertEqual(family_a["unmappedLineCount"], 1)
+        self.assertEqual(family_a["assignedElsewhereLineCount"], 1)
+        choices = {"mcl": {"status": "applicable", "confirmedComplete": True},
+            "toolshop": {"status": "not_applicable", "confirmedComplete": True},
+            "cnc": {"status": "not_applicable", "confirmedComplete": True}}
+        states, errors = _family_confirmations(mapping, self.part["id"], choices, strict=False)
+        self.assertFalse(errors)
+        self.assertFalse(states["mcl"]["unmappedLineCount"] == 0)
+        incomplete = {**states, "mcl": {**states["mcl"], "complete": False},
+            "toolshop": {**states["toolshop"], "complete": True}, "cnc": {**states["cnc"], "complete": True}}
+        old_requirement = {**part_a[0], "key": "previous-requirement",
+            "physical": {**part_a[0]["physical"], "material": "Stainless"}}
+        classified = self.service._classify([old_requirement], part_a, incomplete)
+        self.assertEqual([item["type"] for item in classified], ["incomplete_evidence", "incomplete_evidence"])
+        with self.assertRaises(PartIdentityError) as blocked:
+            self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
+                workbook_path="C:/isolated/pilot.ods", source_hash="mixed-partial", association=self.association,
+                groups=groups, mapping_store=self.mapping_store, source_families=choices, actor="baseline reviewer",
+                reason="Check partial mixed group", request_key="mixed-partial-baseline",
+                expected_hash="mixed-partial", expected_association=self.association.id,
+                expected_association_version=self.association.version, expected_mapping_version=saved["version"])
+        self.assertEqual(blocked.exception.code, "PART_BASELINE_INCOMPLETE")
 
     def compare_rows(self, rows, *, source_hash, request_key):
         groups, mapped = self.save_rows(rows, source_hash, request_key=f"map:{source_hash}")
@@ -609,8 +659,12 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         result = self.service.decide(comparison_key=comparison["comparison"]["ComparisonKey"], action="use_different_part",
             difference_keys=[difference["DifferenceKey"]], replacement_part_id=replacement["id"], actor="reviewer",
             reason="The incoming design is a separate Part", request_key="decision-separate-frame")
+        current_mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="hash-distinct-design",
+            association=self.association, groups=groups)
+        current_line = current_mapping["groups"][0]["rows"][0]
         self.assertEqual(result["replacementMapping"], {"partId": replacement["id"], "path": "C:/isolated/pilot-new-design.ods",
             "sourceSheet": MCL, "sourceRow": 10, "groupKey": "mcl:chassis", "evidenceFingerprint": "evidence:10",
+            "lineKey": current_line["lineKey"], "lineEvidenceFingerprint": current_line["semanticEvidence"]["fingerprint"],
             "sourceHash": "hash-distinct-design", "fileKey": "pilot.ods", "associationKey": "association:pilot", "associationVersion": 1})
         self.assertEqual(self.registry.get_part(self.part["id"])["engineeringRevision"], "A")
         self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)

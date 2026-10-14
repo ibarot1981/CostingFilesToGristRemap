@@ -674,6 +674,9 @@ def part_mappings(path: str):
         for group in detail["groups"]:
             if group["part"]:
                 group["part"]["outOfScopeCodes"] = warnings.get(group["part"]["id"], [])
+            for row in group.get("rows") or []:
+                if row.get("part"):
+                    row["part"]["outOfScopeCodes"] = warnings.get(row["part"]["id"], [])
         detail["scopeAdvisoryOnly"] = True
         detail["sourceEvidenceCacheHit"] = bool(getattr(groups, "source_cache_hit", False))
         return detail
@@ -1032,12 +1035,16 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
     from app.processing import processing_detail
     version = payload.get("expectedVersion")
     association_version = payload.get("expectedAssociationVersion")
-    decisions = payload.get("decisions")
+    decisions = payload.get("decisions", {})
+    line_decisions = payload.get("lineDecisions", {})
     group_reasons = payload.get("reasons", {})
+    line_reasons = payload.get("lineReasons", {})
     if (type(version) is not int or type(association_version) is not int or not isinstance(decisions, dict)
-            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in decisions.items())
+            or not isinstance(line_decisions, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for mapping in (decisions, line_decisions) for key, value in mapping.items())
             or not isinstance(group_reasons, dict)
-            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in group_reasons.items())):
+            or not isinstance(line_reasons, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for mapping in (group_reasons, line_reasons) for key, value in mapping.items())):
         raise _error(422, "PART_REVIEW_INPUT_INVALID", "Mapping versions and selected Parts are required")
     path = str(payload.get("path") or "")
     try:
@@ -1050,12 +1057,14 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
             state = processing_detail(fresh_repo.processing_store, file_id, fresh_association, fresh_hash)
             if state["state"] == "processed":
                 raise PartConflict("PART_REOPEN_REQUIRED", "Record Changes Pending before revising Parts for a processed file")
-        store = _part_mapping_store(repository) if repository.adapter_name == "grist-safari" or any(not value.isdigit() for value in decisions.values()) else repository.part_store
+        selected_ids = [*decisions.values(), *line_decisions.values()]
+        store = _part_mapping_store(repository) if repository.adapter_name == "grist-safari" or any(not value.isdigit() for value in selected_ids if value) else repository.part_store
         return save_mapping(store, file_id=file_id, source_hash=source_hash, association=association,
-            groups=groups, decisions=decisions, expected_hash=str(payload.get("expectedHash") or ""),
+            groups=groups, decisions=decisions, line_decisions=line_decisions, expected_hash=str(payload.get("expectedHash") or ""),
             expected_version=version, expected_association=str(payload.get("expectedAssociationKey") or ""),
             expected_association_version=association_version, actor=_request_actor(request),
             reason=str(payload.get("reason") or ""), group_reasons=group_reasons,
+            line_reasons=line_reasons,
             request_key=idempotency_key or "", before_write=verify_current)
     except PartConflict as exc:
         raise _error(409, exc.code, str(exc))

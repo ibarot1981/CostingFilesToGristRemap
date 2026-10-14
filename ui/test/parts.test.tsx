@@ -49,6 +49,7 @@ it("collapses and expands scope targets, then opens the selected Part details", 
   render(<PartsView/>);
   const modelScope = await screen.findByRole("treeitem", {name:/Product Model/});
   expect(screen.queryByRole("treeitem", {name:/Unmatched \/ retired target/})).toBeNull();
+  await screen.findByRole("treeitem", {name:/Safari 1000 1/});
   const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
   expect(productParent).toBeTruthy();
   fireEvent.click(productParent!);

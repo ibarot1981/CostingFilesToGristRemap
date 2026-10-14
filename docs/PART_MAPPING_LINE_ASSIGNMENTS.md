@@ -1,0 +1,31 @@
+# Part mapping line assignments
+
+The source description grouping in Part Mapping is a way to browse related rows. It is not the assignment boundary. Every active MS, Tool Shop or CNC source row can have one canonical Part or remain explicitly unassigned. Source quantities and workbook values remain read-only, and mapping never creates a component or configuration relationship.
+
+## Grist records and recovery
+
+`PartMappingReview` remains the append-only authority for source-to-Part assignments. A saved line choice appends one record for that source line with its canonical Part reference/stable identity, file key and source hash, association key/version, display group key, sheet and row provenance, source description, Part number/name/revision/metadata used, actor, reason, action type, timestamp, batch version, and request key/fingerprint/row count. `SemanticEvidence` holds that line's versioned normalized manufacturing evidence as canonical JSON text in the Grist `Any` cell. The line key is recorded in that evidence; sheet/row are provenance and are never the business identity.
+
+Reads reconstruct the latest decision for each line independently. A partial save therefore leaves prior records for untouched lines authoritative. Whole-group assignment is expanded to the group's current lines and writes the same per-line records. A mixed group has no single Part projection. Retrying the same idempotency key and payload returns the original batch; a reused key with changed payload, concurrent version, incomplete record set, changed source hash, or changed association fails closed. A fresh registry can recover the result from Grist's confirmed rows without duplicating history. The local SQLite journal coordinates request recovery and the single writer; it is not a copy of Part business data.
+
+The payload keeps `decisions` for existing whole-group controls and adds `lineDecisions` keyed by stable line key. `lineReasons` applies to an affected line; a group reason is a fallback for its changed lines. Initial assignment needs no user reason. Replacing or clearing a previously assigned line needs a reason only for that line. Every request still supplies the expected workbook hash, mapping version, association key/version and idempotency key, and the server repeats those guards immediately before append and verifies the complete response afterward.
+
+The reviewed v14 schema plan adds `SemanticPolicyVersion`, `SemanticFingerprint` and `SemanticEvidence` to `PartMappingReview`. Those semantic columns are the only schema addition needed by line assignments. Mapping reads remain available if the columns are absent, but semantic saves stay disabled until the reviewed additive plan is applied and verified. This task did not write production Grist records or schema.
+
+## Semantic continuity
+
+Line evidence uses the existing sheet-specific semantic fields and policy version. It includes manufacturing identity, dimensions, quantities and relevant options, while excluding prices, rates, calculated costing totals, workbook formatting and document metadata. Reordering or moving an unchanged line preserves its Part only when correspondence is unique. Added lines start unassigned. Changed or deleted lines, duplicate ambiguity, missing evidence, changed ownership, or changed grouping policy require explicit review. Older mapping rows without complete semantic evidence remain visible as proposals; current workbook data is not used to invent historical evidence.
+
+Part Mapping checks the workbook hash, saved association and review version before and immediately before saving. Contextual Part creation captures the selected line keys and their semantic fingerprints. If those lines change while the creation dialog is open, the new canonical Part remains available in Grist but the changed lines are not assigned automatically. Filtering and navigation retain uncommitted line choices for explicit review. The batch confirmation lists affected lines even when they are hidden by the current filters.
+
+## Review screens and downstream use
+
+The existing whole-group Part selector and Save action remain. **Split assignments** exposes checkboxes, a searchable Part selector and contextual Part creation. These controls only update a draft. The row shows its effective saved or draft Part, and group summaries count distinct Parts, mapped lines, unassigned lines and pending line choices from those line states. The unassigned filter includes groups that still contain at least one unassigned line. No quantity editor is introduced.
+
+Baseline establishment, workbook comparison and processing/import review resolve each source requirement to the Part on that line. A partially mapped group can be saved, while its unassigned or changed lines remain outstanding. Baselines still require an explicit action, and assignment does not revise a Part from Rev A or create an assembly.
+
+## Verification record
+
+The line mapping tests exercise mixed Parts, partial save and recovery, reason rules for replacement/clear, whole-group compatibility, idempotent retry, incomplete and concurrent batches, stale hash/association checks, semantic row movement/change/ambiguity, and strict isolated Grist cell encoding. Baseline and processing tests verify that each line's requirements follow its assigned Part and that unassigned lines stay incomplete.
+
+The isolated rendered-browser harness stores its disposable fixture records in session storage and reports assignment writes, version, history rows and quantity edits. It verifies a selected-line save and full-page recovery, mixed summary and unassigned filtering, a hidden cross-sheet draft through reload and Parts navigation, explicit batch scope, and stale-origin rejection. This browser harness is not evidence of a production Grist write.

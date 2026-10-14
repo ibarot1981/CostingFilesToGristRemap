@@ -5,7 +5,7 @@ import "./partBaseline.css";
 
 type Part = { id: string; partNumber?: string | null; name: string; description?: string; variant?: string; engineeringRevision?: string | null; legacy?: boolean; status?: string; publishStatus?: string; selectable: boolean; duplicateName: boolean; outOfScopeCodes?: { id: string; code: string }[] };
 type Group = { key: string; sheet: string; evidenceFingerprint: string; rows: unknown[]; description: string };
-type Family = { family: string; sheet: string; sourceEvidenceStatus: string; mappedGroupCount: number; requirementCount: number; applicabilityStatus: string; completenessConfirmed: boolean };
+type Family = { family: string; sheet: string; sourceEvidenceStatus: string; mappedGroupCount: number; fullyMappedGroupCount?: number; mappedLineCount?: number; unmappedLineCount?: number; assignedElsewhereLineCount?: number; requirementCount: number; applicabilityStatus: string; completenessConfirmed: boolean };
 type Review = { baselineStatus: string; source: { fileId: string; workbookPath: string; sourceHash: string; associationKey: string; associationVersion: number; mappingVersion: number; mappingPolicyVersion: string }; families: Record<string, Family>; existingContent: { processRequirements: number; components: number; purchaseSpecifications: number; requiresAppendConfirmation: boolean } };
 type Comparison = { comparison: Record<string, any>; families: Record<string, any>[]; differences: Record<string, any>[]; decisions: Record<string, any>[]; proposals: Record<string, any>[]; evidenceWarnings?: string[] };
 type Attempt = { operation: "establish" | "compare"; key: string; partId: string; payload: Record<string, unknown> };
@@ -29,7 +29,7 @@ const pretty = (value: unknown) => {
   return JSON.stringify(value, null, 2);
 };
 
-export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: { path: string; parts: Part[]; groups: Group[]; onUseDifferentPart: (groupKey: string, part: Part) => void }) {
+export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: { path: string; parts: Part[]; groups: Group[]; onUseDifferentPart: (groupKey: string, part: Part, lineKey?: string, lineFingerprint?: string) => void }) {
   const choices = useMemo(() => [...new Map(parts.filter(part => !part.legacy && part.status !== "retired").map(part => [part.id, part])).values()], [parts]);
   const [open, setOpen] = useState(false);
   const [partId, setPartId] = useState("");
@@ -116,6 +116,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
         issues.push(`${label}: source evidence is missing or unreadable.`);
         continue;
       }
+      if (family.unmappedLineCount) issues.push(`${label}: ${family.unmappedLineCount} source line(s) remain unassigned or need review.`);
       if (!["applicable", "not_applicable"].includes(choice.status)) {
         issues.push(`${label}: choose Applicable or Confirmed not applicable.`);
       } else if (choice.status === "applicable") {
@@ -191,7 +192,12 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
           ? Boolean(current.payload.oldData) ? "The incoming workbook was recorded as old data; its observed differences remain preserved." : "The existing accepted baseline was retained and incoming differences remain preserved."
           : "The decision was saved. Any replacement mapping draft remains separate from the Part baseline.");
       if (current.action === "use_different_part" && current.replacement && result.replacementMapping?.groupKey) {
-        onUseDifferentPart(String(result.replacementMapping.groupKey), current.replacement);
+        if (result.replacementMapping.lineKey) {
+          onUseDifferentPart(String(result.replacementMapping.groupKey), current.replacement,
+            String(result.replacementMapping.lineKey), String(result.replacementMapping.lineEvidenceFingerprint || ""));
+        } else {
+          setNotice("This saved comparison predates line identity. Its replacement was recorded, but no whole-group mapping was drafted; select the current source line manually.");
+        }
       }
   } catch (cause) {
       if (["safe_to_edit", "refresh_required"].includes(errorDisposition(cause))) {
@@ -243,12 +249,13 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
         <div className="part-baseline-families"><h3>Confirm applicable source families</h3>{familyOrder.map(key => {
           const family = review.families[key]; const choice = families[key] || { status: "", confirmedComplete: false };
           const readable = family?.sourceEvidenceStatus === "ok";
-          return <article className="part-baseline-family" key={key}><div><strong>{family?.sheet || familyNames[key]}</strong><span>{readable ? `${family.mappedGroupCount} mapped groups · ${family.requirementCount} mapped requirement rows` : `Evidence ${family?.sourceEvidenceStatus?.replaceAll("_", " ") || "missing"}`}</span></div>
+          return <article className="part-baseline-family" key={key}><div><strong>{family?.sheet || familyNames[key]}</strong><span>{readable ? `${family.mappedLineCount ?? family.requirementCount} mapped lines in ${family.mappedGroupCount} group${family.mappedGroupCount === 1 ? "" : "s"} · ${family.requirementCount} Part requirements${family.unmappedLineCount ? ` · ${family.unmappedLineCount} unassigned lines` : ""}${family.assignedElsewhereLineCount ? ` · ${family.assignedElsewhereLineCount} lines assigned to other Parts` : ""}` : `Evidence ${family?.sourceEvidenceStatus?.replaceAll("_", " ") || "missing"}`}</span></div>
             <label>Applicability<select name={`part-baseline-applicability-${key}`} autoComplete="off" value={choice.status} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, status: event.target.value, confirmedComplete: false } }))}>
               <option value="">Choose…</option><option value="applicable">Applicable</option><option value="not_applicable" disabled={(family?.mappedGroupCount || 0) > 0}>Confirmed not applicable</option></select></label>
-            {choice.status === "applicable" && <label className="part-baseline-confirm"><input type="checkbox" checked={choice.confirmedComplete} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable || !family?.mappedGroupCount} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, confirmedComplete: event.target.checked } }))}/>All applicable rows for this Part are mapped and complete</label>}
+            {choice.status === "applicable" && <label className="part-baseline-confirm"><input type="checkbox" checked={choice.confirmedComplete} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !readable || !family?.mappedGroupCount || Boolean(family?.unmappedLineCount)} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, confirmedComplete: event.target.checked } }))}/>All applicable rows for this Part are mapped and complete</label>}
             {choice.status === "not_applicable" && <label className="part-baseline-confirm"><input type="checkbox" checked={choice.confirmedComplete} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setFamilies(old => ({ ...old, [key]: { ...choice, confirmedComplete: event.target.checked } }))}/>I confirm this source family does not apply</label>}
             {readable && choice.status === "applicable" && !family?.mappedGroupCount && <small className="part-baseline-warning-text">Applicable but incomplete: map this Part’s rows before establishing the baseline.</small>}
+            {readable && family?.unmappedLineCount ? <small className="part-baseline-warning-text">{family.unmappedLineCount} source line(s) are unassigned or need review; keep this family incomplete until line assignments are resolved.</small> : null}
           </article>;
         })}</div>
         <label className="part-baseline-reason">Processing reason<input name="part-baseline-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setReason(event.target.value)} placeholder="Optional audit context"/></label>

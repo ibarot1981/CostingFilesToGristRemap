@@ -12,7 +12,8 @@ const part = {id:"part-1", partNumber:"SM-P-000001", name:"S1KHF — Chassis", d
   engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
 const replacement = {id:"part-2", partNumber:"SM-P-000002", name:"S1KHF — Alternate Chassis", description:"Alternate Chassis", variant:"Standard",
   engineeringRevision:"A", selectable:true, duplicateName:false, outOfScopeCodes:[]};
-const group = {key:"mcl:chassis", sheet:"5. Material Cut List Price", evidenceFingerprint:"evidence-chassis", rows:[], description:"Chassis"};
+const group = {key:"mcl:chassis", sheet:"5. Material Cut List Price", evidenceFingerprint:"evidence-chassis",
+  rows:[{lineKey:"mcl:chassis:line:10",semanticEvidence:{fingerprint:"semantic-chassis-10"},sheet:"5. Material Cut List Price",row:10,fields:{}}],description:"Chassis"};
 
 function review(baselineStatus = "not_established", requiresAppendConfirmation = false) {
   return {baselineStatus, source:{fileId:"pilot.ods", workbookPath:"C:/isolated/pilot.ods", sourceHash:"workbook-hash",
@@ -174,7 +175,8 @@ it.each(["keep_existing_baseline", "match_correspondence", "propose_part_change"
   "retains and retries the exact %s decision after a lost response", async action => {
     const initialComparison = comparison(action === "match_correspondence" ? "ambiguous_correspondence" : "proposed_modification");
     const recoveredComparison = {...initialComparison, idempotent:true,
-      ...(action === "use_different_part" ? {replacementMapping:{groupKey:group.key}} : {})};
+      ...(action === "use_different_part" ? {replacementMapping:{groupKey:group.key,lineKey:group.rows[0].lineKey,
+        lineEvidenceFingerprint:group.rows[0].semanticEvidence.fingerprint}} : {})};
     apiMocks.partBaselineReview.mockResolvedValue(review("established"));
     apiMocks.comparePartBaseline.mockResolvedValue(initialComparison);
     apiMocks.decidePartManufacturingComparison.mockRejectedValueOnce(new Error("decision response was lost"))
@@ -212,6 +214,7 @@ it.each(["keep_existing_baseline", "match_correspondence", "propose_part_change"
     expect(apiMocks.decidePartManufacturingComparison).toHaveBeenCalledTimes(2);
     expect(apiMocks.decidePartManufacturingComparison.mock.calls[1]).toEqual(apiMocks.decidePartManufacturingComparison.mock.calls[0]);
     expect(localStorage.getItem("part-baseline-decision-attempt:pilot.ods:part-1")).toBeNull();
-    if (action === "use_different_part") expect(onUseDifferentPart).toHaveBeenCalledWith(group.key, replacement);
+    if (action === "use_different_part") expect(onUseDifferentPart).toHaveBeenCalledWith(group.key, replacement,
+      group.rows[0].lineKey,group.rows[0].semanticEvidence.fingerprint);
   },
 );

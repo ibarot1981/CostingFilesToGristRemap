@@ -19,6 +19,7 @@ PART_SHEETS = {"5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"}
 MAPPING_TABLE = "PartMappingReview"
 MAPPING_POLICY_VERSION = "part-source-labels-v2"
 MAPPING_SEMANTIC_POLICY_VERSION = "part-mapping-semantic-v1"
+MAPPING_LINE_EVIDENCE_VERSION = "part-mapping-line-v1"
 MAPPING_LABEL_FIELD = {
     "5. Material Cut List Price": "product_part_name",
     "Tool Shop Items": "product_part_name",
@@ -600,7 +601,7 @@ def _group_records_by_key(rows: list[dict[str, Any]]) -> dict[str, list[dict[str
     return grouped
 
 
-def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
+def _group_mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
     _ensure_group_semantic_evidence(groups)
     parts = list_parts(store, refresh=refresh_parts)
     history = _history(store, file_id)
@@ -751,23 +752,271 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             "history": [{**row["fields"], "OccurredAt": datetime_text(row["fields"].get("OccurredAt"))} for row in history]}
 
 
+def _stored_line_key(row: dict[str, Any]) -> str:
+    evidence = decode_grist_any_object(row.get("SemanticEvidence")) or {}
+    return str(evidence.get("lineKey") or "")
+
+
+def _stored_line_evidence(row: dict[str, Any], sheet: str) -> dict[str, Any] | None:
+    evidence = decode_grist_any_object(row.get("SemanticEvidence"))
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("fields"), list):
+        return None
+    projected = [{"field": item.get("field"), "state": item.get("state"), "value": item.get("value")}
+        for item in evidence["fields"] if isinstance(item, dict)]
+    if len(projected) != len(evidence["fields"]):
+        return None
+    expected = fingerprint([MAPPING_SEMANTIC_POLICY_VERSION, sheet, projected])
+    return evidence if evidence.get("fingerprint") == expected else None
+
+
+def _stored_part_id(row: dict[str, Any]) -> str:
+    return str(row.get("StablePartId") or row.get("PartIdentity") or _record_ref(row.get("ProductPart")) or "")
+
+
+def _current_line_key(file_id: str, source_hash: str, group: dict[str, Any], source: dict[str, Any], line_evidence: dict[str, Any]) -> str:
+    return "part-line:" + fingerprint([MAPPING_LINE_EVIDENCE_VERSION, file_id, source_hash,
+        group.get("key"), source.get("sheet"), source.get("row"), line_evidence.get("fingerprint")])
+
+
+def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
+    """Return group display data with independently resolved source-line assignments.
+
+    Legacy group snapshots remain readable. New records carry their line identity
+    inside the already schema-v14 ``Any`` evidence cell, so no new Grist column is
+    needed for line-level history.
+    """
+    detail = _group_mapping_detail(store, file_id=file_id, source_hash=source_hash,
+        association=association, groups=groups, refresh_parts=refresh_parts)
+    history = [row["fields"] for row in _history(store, file_id)]
+    all_parts = list_parts(store, refresh=refresh_parts)
+    parts_by_id = {part["id"]: part for part in all_parts}
+    line_events: dict[str, dict[str, Any]] = {}
+    legacy_events: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for record in history:
+        line_key = _stored_line_key(record)
+        if line_key:
+            current = line_events.get(line_key)
+            if current and int(current.get("Version") or 0) == int(record.get("Version") or 0):
+                raise PartConflict("PART_REVIEW_CONFLICT", "A line assignment was recorded more than once in one mapping version")
+            if current is None or int(record.get("Version") or 0) > int(current.get("Version") or 0):
+                line_events[line_key] = record
+            continue
+        coordinate = (str(record.get("GroupKey") or ""), str(record.get("SheetName") or ""), int(record.get("SourceRow") or 0))
+        current = legacy_events.get(coordinate)
+        if current is None or int(record.get("Version") or 0) > int(current.get("Version") or 0):
+            legacy_events[coordinate] = record
+
+    current_lines: list[dict[str, Any]] = []
+    for group in detail["groups"]:
+        group["mappingMode"] = "line"
+        for source in group.get("rows") or []:
+            line_evidence = (group.get("semanticEvidence") or {}).get(source.get("row"))
+            if not isinstance(line_evidence, dict):
+                continue
+            source["semanticEvidence"] = line_evidence
+            source["lineKey"] = _current_line_key(file_id, source_hash, group, source, line_evidence)
+            source["part"] = None
+            source["reviewed"] = False
+            source["explicitlyUnassigned"] = False
+            source["semanticComparison"] = {"status": "new", "requiresReview": False}
+            source["previousAssignment"] = None
+            current_lines.append({"group": group, "source": source, "evidence": line_evidence})
+
+    def context_matches(record: dict[str, Any]) -> bool:
+        return bool(association and record.get("AssociationKey") == association.id
+            and int(record.get("AssociationVersion") or 0) == int(association.version))
+
+    current_by_sheet_fp: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    old_by_sheet_fp: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+    for item in current_lines:
+        current_by_sheet_fp[(item["group"]["sheet"], str(item["evidence"].get("fingerprint") or ""))].append(item)
+    for record in [*line_events.values(), *legacy_events.values()]:
+        sheet = str(record.get("SheetName") or "")
+        evidence = _stored_line_evidence(record, sheet)
+        if evidence:
+            old_by_sheet_fp[(sheet, str(evidence.get("fingerprint") or ""))].append((record, evidence))
+
+    matched_record_keys: set[tuple[str, str]] = set()
+    ambiguous_current: set[int] = set()
+    for item in current_lines:
+        group, source, evidence = item["group"], item["source"], item["evidence"]
+        sheet_fp = (str(group["sheet"]), str(evidence.get("fingerprint") or ""))
+        candidates = old_by_sheet_fp.get(sheet_fp, [])
+        allowed_group_keys = {str(group.get("key") or ""), *(str(key) for key in group.get("legacyGroupKeys") or [])}
+        same_context = [record for record, _ in candidates if record.get("SourceHash") == source_hash
+            and int(record.get("SourceRow") or 0) == int(source.get("row") or 0)
+            and (_stored_line_key(record) or str(record.get("GroupKey") or "") in allowed_group_keys)]
+        selected_record = max(same_context, key=lambda row: int(row.get("Version") or 0)) if same_context else None
+        if selected_record is None and candidates:
+            # A moved line is reusable only when its semantic signature is unique
+            # on both sides. Duplicate rows cannot lend an assignment by order.
+            current_matches = current_by_sheet_fp.get(sheet_fp, [])
+            line_candidates = [candidate for candidate in candidates if _stored_line_key(candidate[0])]
+            legacy_candidates = [candidate for candidate in candidates if not _stored_line_key(candidate[0])
+                and str(candidate[0].get("GroupKey") or "") in allowed_group_keys]
+            preferred = line_candidates or legacy_candidates
+            if len(preferred) == 1 and len(current_matches) == 1:
+                selected_record = preferred[0][0]
+            else:
+                ambiguous_current.add(id(item))
+                source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
+                    "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
+        if selected_record is None:
+            continue
+        event_key = ("line", _stored_line_key(selected_record)) if _stored_line_key(selected_record) else (
+            "legacy", str(selected_record.get("ReviewKey") or ""))
+        if event_key in matched_record_keys:
+            ambiguous_current.add(id(item))
+            continue
+        matched_record_keys.add(event_key)
+        source["lineKey"] = _stored_line_key(selected_record) or source["lineKey"]
+        part_id = _stored_part_id(selected_record)
+        part = parts_by_id.get(part_id)
+        association_ok = context_matches(selected_record)
+        valid_part = bool(part and part.get("selectable") and not part.get("duplicateName"))
+        legacy_policy_change = not _stored_line_key(selected_record) and str(selected_record.get("GroupKey") or "") != str(group.get("key") or "")
+        explicitly_unassigned = not part_id
+        if association_ok and valid_part and not legacy_policy_change:
+            source["part"] = part
+            source["reviewed"] = True
+            source["semanticComparison"] = {"status": "unchanged",
+                "sourceHashChanged": selected_record.get("SourceHash") != source_hash, "requiresReview": False}
+        elif association_ok and explicitly_unassigned and selected_record.get("ActionType") in {"clear_assignment", "initial_unassigned"}:
+            source["reviewed"] = True
+            source["explicitlyUnassigned"] = True
+            source["semanticComparison"] = {"status": "unchanged", "requiresReview": False}
+        elif part_id:
+            source["previousAssignment"] = {"partId": part["id"] if part else None,
+                "partNumber": (part or {}).get("partNumber") or selected_record.get("PartNumberUsed"),
+                "name": (part or {}).get("name") or selected_record.get("NameUsed"),
+                "assignedPartIds": [part_id], "hasPriorAssignment": True,
+                "sourceChanged": selected_record.get("SourceHash") != source_hash,
+                "associationChanged": not association_ok, "requiresReview": True,
+                "evidenceStatus": "verified" if _stored_line_evidence(selected_record, str(group["sheet"])) else "legacy_unverified"}
+            source["semanticComparison"] = {"status": "association_changed" if not association_ok else
+                "grouping_policy_changed" if legacy_policy_change else "part_unavailable", "requiresReview": True}
+        source["semanticEvidenceRecordKey"] = event_key[1]
+        source["lastSavedVersion"] = int(selected_record.get("Version") or 0)
+        source["explicitlyUnassigned"] = explicitly_unassigned and association_ok
+
+    # Older v14 rows have no line key. Exact source coordinates are safe only
+    # under the identical workbook hash; otherwise validated semantic evidence
+    # above must establish a unique correspondence.
+    for item in current_lines:
+        group, source = item["group"], item["source"]
+        if source.get("reviewed") or source.get("previousAssignment") or id(item) in ambiguous_current:
+            continue
+        allowed_group_keys = {str(group.get("key") or ""), *(str(key) for key in group.get("legacyGroupKeys") or [])}
+        candidates = [record for (group_key, sheet, row), record in legacy_events.items()
+            if sheet == group["sheet"] and row == int(source.get("row") or 0) and group_key in allowed_group_keys
+            and record.get("SourceHash") == source_hash and context_matches(record)]
+        if not candidates:
+            continue
+        record = max(candidates, key=lambda row: int(row.get("Version") or 0))
+        part_id = _stored_part_id(record)
+        part = parts_by_id.get(part_id)
+        if part_id:
+            source["previousAssignment"] = {"partId": (part or {}).get("id"),
+                "partNumber": (part or {}).get("partNumber") or record.get("PartNumberUsed"),
+                "name": (part or {}).get("name") or record.get("NameUsed"), "assignedPartIds": [part_id],
+                "hasPriorAssignment": True, "requiresReview": True, "sourceChanged": False,
+                "associationChanged": False, "evidenceStatus": "legacy_unverified"}
+            source["semanticComparison"] = {"status": "legacy_evidence_missing", "requiresReview": True}
+        else:
+            source["explicitlyUnassigned"] = True
+            source["semanticComparison"] = {"status": "legacy_evidence_missing", "requiresReview": True}
+
+    # Pair a changed line with prior evidence only as a proposal. It never
+    # inherits the previous Part without an explicit user save.
+    for item in current_lines:
+        if item["source"].get("reviewed") or item["source"].get("previousAssignment") or id(item) in ambiguous_current:
+            continue
+        group, source, evidence = item["group"], item["source"], item["evidence"]
+        current_fields = _line_field_map(evidence)
+        candidates = []
+        for records in (line_events.values(), legacy_events.values()):
+            for record in records:
+                if str(record.get("SheetName") or "") != str(group["sheet"]):
+                    continue
+                previous_evidence = _stored_line_evidence(record, str(group["sheet"]))
+                if not previous_evidence or previous_evidence.get("fingerprint") == evidence.get("fingerprint"):
+                    continue
+                previous_fields = _line_field_map(previous_evidence)
+                anchors = _MAPPING_MODIFICATION_ANCHORS.get(str(group["sheet"]), ())
+                shared = next((name for name in anchors if previous_fields.get(name, {}).get("state") == "value"
+                    and current_fields.get(name, {}).get("state") == "value"), None)
+                if shared and previous_fields[shared].get("value") == current_fields[shared].get("value"):
+                    candidates.append((record, previous_evidence))
+        unique = {(_stored_line_key(record) or str(record.get("ReviewKey") or "")): (record, old)
+            for record, old in candidates}
+        if len(unique) == 1:
+            record, previous = next(iter(unique.values()))
+            part_id = _stored_part_id(record)
+            part = parts_by_id.get(part_id)
+            source["previousAssignment"] = {"partId": (part or {}).get("id") or None,
+                "partNumber": (part or {}).get("partNumber") or record.get("PartNumberUsed"),
+                "name": (part or {}).get("name") or record.get("NameUsed"),
+                "assignedPartIds": [part_id] if part_id else [], "hasPriorAssignment": bool(part_id),
+                "sourceChanged": record.get("SourceHash") != source_hash, "associationChanged": not context_matches(record),
+                "requiresReview": True, "evidenceStatus": "verified"}
+            source["semanticComparison"] = {"status": "changed", "requiresReview": True,
+                "previous": previous, "current": evidence}
+        elif candidates:
+            ambiguous_current.add(id(item))
+            source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
+                "reason": "Several previous source lines have the same modification anchors."}
+        elif old_by_sheet_fp.get((str(group["sheet"]), str(evidence.get("fingerprint") or ""))):
+            source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
+                "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
+
+    for group in detail["groups"]:
+        rows = group.get("rows") or []
+        assigned = [row["part"] for row in rows if row.get("reviewed") and row.get("part")]
+        part_ids = {part["id"] for part in assigned}
+        mapped_count = len(assigned)
+        group["assignmentSummary"] = {"partCount": len(part_ids), "mappedLineCount": mapped_count,
+            "unassignedLineCount": max(0, len(rows) - mapped_count)}
+        group["part"] = assigned[0] if rows and all(row.get("reviewed") and row.get("part") for row in rows) and len(part_ids) == 1 else None
+        group["reviewed"] = bool(rows) and all(row.get("reviewed") for row in rows)
+        group["explicitlyUnassigned"] = bool(rows) and all(row.get("explicitlyUnassigned") for row in rows)
+        group["pendingLineKeys"] = [row["lineKey"] for row in rows if not row.get("reviewed")]
+        statuses = {str(row.get("semanticComparison", {}).get("status") or "") for row in rows}
+        if rows and group["reviewed"] and statuses.issubset({"", "new", "unchanged"}):
+            group["semanticComparison"] = {**(group.get("semanticComparison") or {}),
+                "status": "unchanged", "differences": [], "requiresReview": False,
+                "groupingPolicyChanged": False}
+        elif "ambiguous_correspondence" in statuses:
+            group["semanticComparison"] = {**(group.get("semanticComparison") or {}), "status": "ambiguous_correspondence", "requiresReview": True}
+        elif "changed" in statuses:
+            group["semanticComparison"] = {**(group.get("semanticComparison") or {}), "status": "changed", "requiresReview": True}
+        group["needsCompatibilityReview"] = any(row.get("previousAssignment") for row in rows)
+        for part in assigned:
+            if all(existing["id"] != part["id"] for existing in detail["parts"]):
+                detail["parts"].append(part)
+    detail["unresolvedGroups"] = sum(not group["reviewed"] for group in detail["groups"]) + len(detail.get("removedGroups") or [])
+    detail["unresolvedLines"] = sum(1 for item in current_lines if not item["source"].get("reviewed"))
+    return detail
+
+
 def save_mapping(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]],
-                 decisions: dict[str, str], expected_hash: str, expected_version: int,
-                 expected_association: str, expected_association_version: int,
-                 actor: str, reason: str = "", group_reasons: dict[str, str] | None = None,
+                 decisions: dict[str, str] | None = None, line_decisions: dict[str, str] | None = None,
+                 expected_hash: str, expected_version: int, expected_association: str,
+                 expected_association_version: int, actor: str, reason: str = "",
+                 group_reasons: dict[str, str] | None = None, line_reasons: dict[str, str] | None = None,
                  request_key: str, before_write=None):
     _ensure_group_semantic_evidence(groups)
+    decisions = decisions or {}
+    line_decisions = line_decisions or {}
     group_reasons = group_reasons or {}
-    if not decisions or not request_key.strip() or not actor.strip():
-        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one group and provide a request identity")
-    if set(group_reasons) - set(decisions):
-        raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify groups included in this save")
+    line_reasons = line_reasons or {}
+    if not (decisions or line_decisions) or not request_key.strip() or not actor.strip():
+        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one source line and provide a request identity")
+    if any(not isinstance(key, str) or not isinstance(value, str) for mapping in (decisions, line_decisions) for key, value in mapping.items()):
+        raise PartConflict("PART_REVIEW_INPUT_INVALID", "Line and group assignments must use text keys and Part identities")
     payload_hash = fingerprint([file_id, expected_hash, expected_version, expected_association,
-                                expected_association_version, decisions,
-                                {key: str(next((group.get("semanticFingerprint") for group in groups if group.get("key") == key), ""))
-                                    for key in sorted(decisions)},
-                                {key: str(value or "").strip() for key, value in sorted(group_reasons.items())},
-                                reason.strip(), actor])
+        expected_association_version, sorted(decisions.items()), sorted(line_decisions.items()),
+        {key: str(value or "").strip() for key, value in sorted(group_reasons.items())},
+        {key: str(value or "").strip() for key, value in sorted(line_reasons.items())}, reason.strip(), actor])
     with store.lock:
         all_rows = store.records(MAPPING_TABLE)
         replay = [row["fields"] for row in all_rows if row["fields"].get("RequestKey") == request_key]
@@ -776,110 +1025,133 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             if len(replay) != expected_count or any(row.get("RequestFingerprint") != payload_hash for row in replay):
                 raise PartConflict("PART_REQUEST_CONFLICT", "This mapping request key has a different or incomplete saved payload")
             _history(store, file_id)
-            assignments = {}
-            for key, records in _group_records_by_key(replay).items():
-                sample = records[0]
-                assignments[key] = {"actionType": sample.get("ActionType") or "legacy_review",
-                    "reason": sample.get("Reason") or "", "partId": sample.get("StablePartId") or sample.get("PartIdentity") or _record_ref(sample.get("ProductPart")) or None,
-                    "requiresUserReason": sample.get("ActionType") in {"replace_assignment", "clear_assignment"}}
             return {"idempotent": True, "version": replay[0]["Version"], "savedRows": len(replay),
-                "assignments": assignments, "confirmedRows": replay, "sourceHash": source_hash,
-                "associationKey": association.id if association else "",
+                "assignments": {}, "lineAssignments": {_stored_line_key(row): {"partId": _stored_part_id(row) or None,
+                    "actionType": row.get("ActionType") or "legacy_review", "requiresUserReason": row.get("ActionType") in {"replace_assignment", "clear_assignment"}}
+                    for row in replay if _stored_line_key(row)},
+                "confirmedRows": replay, "sourceHash": source_hash, "associationKey": association.id if association else "",
                 "associationVersion": association.version if association else 0}
-        detail = mapping_detail(store, file_id=file_id, source_hash=source_hash, association=association, groups=groups, refresh_parts=True)
+        detail = mapping_detail(store, file_id=file_id, source_hash=source_hash, association=association,
+            groups=groups, refresh_parts=True)
         if not detail["schemaAvailable"]:
             raise PartConflict("PART_SCHEMA_UNAVAILABLE", "The Part review schema is unavailable")
         if expected_hash != source_hash or expected_version != detail["version"]:
             raise PartConflict("PART_REVIEW_STALE", "The workbook or mapping version changed; reload the review")
         if not association or association.id != expected_association or association.version != expected_association_version:
             raise PartConflict("PART_ASSOCIATION_STALE", "The saved association changed; reload the review")
-        # Validate new choices against the complete canonical registry even though
-        # GET mapping responses only return Parts already attached to visible groups.
+
+        current_groups = {group["key"]: group for group in detail["groups"]}
+        current_lines: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for group in detail["groups"]:
+            for source in group.get("rows") or []:
+                if source.get("lineKey"):
+                    current_lines[str(source["lineKey"])] = (group, source)
+        expanded: dict[str, str] = {}
+        source_groups: dict[str, str] = {}
+        for group_key, part_id in decisions.items():
+            group = current_groups.get(group_key)
+            if group is None:
+                raise PartConflict("PART_GROUP_UNKNOWN", "A selected source group is no longer available")
+            for source in group.get("rows") or []:
+                line_key = str(source.get("lineKey") or "")
+                if not line_key:
+                    raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "A source line has no safe current identity")
+                expanded[line_key] = part_id
+                source_groups[line_key] = group_key
+        for line_key, part_id in line_decisions.items():
+            if line_key not in current_lines:
+                raise PartConflict("PART_LINE_UNKNOWN", "A selected source line is no longer available; reload before saving")
+            if line_key in expanded and expanded[line_key] != part_id:
+                raise PartConflict("PART_REVIEW_INPUT_INVALID", "The same source line has conflicting group and line assignments")
+            expanded[line_key] = part_id
+            source_groups[line_key] = current_lines[line_key][0]["key"]
+        if set(line_reasons) - set(expanded):
+            raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify lines included in this save")
+        if set(group_reasons) - set(decisions) and set(group_reasons) - set(source_groups.values()):
+            raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify groups included in this save")
+
         parts = {part["id"]: part for part in list_parts(store, refresh=True)}
-        known = {group["key"]: group for group in groups}
-        if set(decisions) - set(known):
-            raise PartConflict("PART_GROUP_UNKNOWN", "A selected source group is no longer available")
-        for part_id in decisions.values():
-            if not part_id:
-                continue
-            part = parts.get(part_id)
-            if not part or not part["selectable"] or part["duplicateName"]:
-                raise PartConflict("PART_SELECTION_INVALID", "Select a canonical Part with an unambiguous name")
+        for part_id in expanded.values():
+            if part_id:
+                part = parts.get(part_id)
+                if not part or not part["selectable"] or part["duplicateName"]:
+                    raise PartConflict("PART_SELECTION_INVALID", "Select a canonical Part with an unambiguous name")
         version = detail["version"] + 1
         rows = []
-        saved_actions: dict[str, dict[str, Any]] = {}
-        current_by_key = {item["key"]: item for item in detail["groups"]}
-        for key, part_id in sorted(decisions.items()):
-            diagnostic = known[key].get("sourceDiagnostic", {})
+        line_actions: dict[str, dict[str, Any]] = {}
+        grouped_actions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for line_key, part_id in sorted(expanded.items()):
+            group, source = current_lines[line_key]
+            diagnostic = group.get("sourceDiagnostic", {})
             if diagnostic and diagnostic.get("status") not in {None, "ok"}:
-                raise PartConflict("PART_SOURCE_LABEL_UNAVAILABLE", "The source Part label column is missing or ambiguous; resolve its header before saving this group")
-            if (known[key].get("semanticPolicyVersion") != MAPPING_SEMANTIC_POLICY_VERSION
-                    or not known[key].get("semanticFingerprint")
-                    or len(known[key].get("semanticEvidence") or {}) != len(known[key].get("rows") or [])):
-                raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "The current source group lacks complete versioned manufacturing evidence; refresh before saving")
-            current = current_by_key.get(key, {})
-            evidence = current.get("previousAssignment") or {}
-            previous_ids = set(evidence.get("assignedPartIds") or [])
-            if current.get("part"):
-                previous_ids.add(str(current["part"]["id"]))
+                raise PartConflict("PART_SOURCE_LABEL_UNAVAILABLE", "The source Part label column is missing or ambiguous; resolve its header before saving")
+            line_evidence = source.get("semanticEvidence")
+            if (not isinstance(line_evidence, dict) or not line_evidence.get("fingerprint")
+                    or len(line_evidence.get("fields") or []) == 0):
+                raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "A source line is missing its normalized manufacturing evidence")
+            previous = source.get("previousAssignment") or {}
+            old_part = source.get("part") or {}
+            prior_ids = set(previous.get("assignedPartIds") or [])
+            if old_part.get("id"):
+                prior_ids.add(str(old_part["id"]))
             selected_id = str(part_id or "")
-            replacing = bool(previous_ids and (not selected_id or any(prior != selected_id for prior in previous_ids)))
-            user_reason = str(group_reasons.get(key) or reason or "").strip()
+            replacing = bool(prior_ids and (not selected_id or any(prior != selected_id for prior in prior_ids)))
+            user_reason = str(line_reasons.get(line_key) or group_reasons.get(group["key"]) or reason or "").strip()
             if replacing and not user_reason:
                 action = "clear_assignment" if not selected_id else "replace_assignment"
                 description = "Cleared saved Part assignment" if not selected_id else "Replaced saved Part assignment"
-                raise PartConflict("PART_REVIEW_REASON_REQUIRED", f"{description} for {known[key]['description'] or key} requires a reason")
+                raise PartConflict("PART_REVIEW_REASON_REQUIRED", f"{description} for {group['description'] or group['sheet'] + ' row ' + str(source['row'])} requires a reason")
             if not selected_id:
                 action_type = "clear_assignment" if replacing else "initial_unassigned"
                 audit_reason = user_reason if replacing else "Initial explicit unassigned review"
             elif replacing:
                 action_type, audit_reason = "replace_assignment", user_reason
-            elif evidence.get("contextChanged"):
-                action_type, audit_reason = "context_reconfirmation", "Reconfirmed unchanged Part assignment against refreshed workbook or association evidence"
-            elif current.get("part") and current["part"]["id"] == selected_id:
-                action_type, audit_reason = "reconfirmation", "Reconfirmed existing Part assignment"
+            elif (previous.get("contextChanged") or previous.get("sourceChanged") or previous.get("associationChanged")
+                    or (source.get("semanticComparison") or {}).get("sourceHashChanged")
+                    or (source.get("semanticComparison") or {}).get("associationChanged")):
+                action_type, audit_reason = "context_reconfirmation", "Reconfirmed source-line assignment against refreshed workbook or association evidence"
+            elif old_part.get("id") == selected_id:
+                action_type, audit_reason = "reconfirmation", "Reconfirmed existing source-line Part assignment"
             else:
                 action_type, audit_reason = "initial_assignment", "Initial Part assignment"
-            saved_actions[key] = {"actionType": action_type, "reason": audit_reason,
-                "requiresUserReason": replacing, "partId": selected_id or None}
-            for source in known[key]["rows"]:
-                selected = parts.get(part_id) if part_id else None
-                line_evidence = (known[key].get("semanticEvidence") or {}).get(source["row"])
-                if not isinstance(line_evidence, dict):
-                    raise PartConflict("PART_SEMANTIC_EVIDENCE_UNAVAILABLE", "A source line is missing its normalized manufacturing evidence")
-                rows.append({"ReviewKey": "part-review:" + fingerprint([request_key, key, source]),
-                             "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
-                             "AssociationVersion": association.version, "GroupKey": key,
-                             "SheetName": source["sheet"], "SourceRow": source["row"],
-                             "SourceDescription": known[key]["description"],
-                             "ProductPart": (int(selected["gristRecordId"]) if selected and selected.get("gristRecordId") is not None
-                                else (None if not selected or selected.get("stableIdentity") else int(part_id))),
-                             "StablePartId": part_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is not None else "",
-                             "PartIdentity": part_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is None else None,
-                             "PartRevision": _grist_ref(selected.get("partRevisionRecordId")) if selected and selected.get("gristRecordId") is not None else None,
-                             "PartMetadataVersion": _grist_ref(selected.get("partMetadataRecordId")) if selected and selected.get("gristRecordId") is not None else None,
-                             "PartNumberUsed": str(selected.get("partNumber") or "") if selected else "",
-                             "NameUsed": str(selected.get("name") or "") if selected else "",
-                             "Version": version, "Actor": actor, "Reason": audit_reason, "ActionType": action_type,
-                             "MappingPolicyVersion": MAPPING_POLICY_VERSION,
-                             "SemanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
-                             "SemanticFingerprint": known[key]["semanticFingerprint"],
-                             "SemanticEvidence": line_evidence,
-                             "OccurredAt": grist_datetime(utc_now()),
-                             "RequestKey": request_key, "RequestFingerprint": payload_hash})
-        for row in rows:
+            selected = parts.get(selected_id) if selected_id else None
+            line_actions[line_key] = {"actionType": action_type, "reason": audit_reason,
+                "partId": selected_id or None, "requiresUserReason": replacing}
+            grouped_actions[group["key"]].append(line_actions[line_key])
+            persisted_evidence = {**line_evidence, "lineKey": line_key,
+                "linePolicyVersion": MAPPING_LINE_EVIDENCE_VERSION}
+            row = {"ReviewKey": "part-review:" + fingerprint([request_key, line_key]),
+                "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
+                "AssociationVersion": association.version, "GroupKey": group["key"],
+                "SheetName": source["sheet"], "SourceRow": source["row"],
+                "SourceDescription": group["description"],
+                "ProductPart": (int(selected["gristRecordId"]) if selected and selected.get("gristRecordId") is not None
+                    else (None if not selected or selected.get("stableIdentity") else int(selected_id))),
+                "StablePartId": selected_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is not None else "",
+                "PartIdentity": selected_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is None else None,
+                "PartRevision": _grist_ref(selected.get("partRevisionRecordId")) if selected and selected.get("gristRecordId") is not None else None,
+                "PartMetadataVersion": _grist_ref(selected.get("partMetadataRecordId")) if selected and selected.get("gristRecordId") is not None else None,
+                "PartNumberUsed": str(selected.get("partNumber") or "") if selected else "",
+                "NameUsed": str(selected.get("name") or "") if selected else "",
+                "Version": version, "Actor": actor, "Reason": audit_reason, "ActionType": action_type,
+                "MappingPolicyVersion": MAPPING_POLICY_VERSION,
+                "SemanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
+                "SemanticFingerprint": group["semanticFingerprint"], "SemanticEvidence": persisted_evidence,
+                "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": payload_hash, "RequestRowCount": len(expanded)}
             if not (row.get("ProductPart") is None and row.get("PartIdentity")):
                 row.pop("PartIdentity", None)
-            row["RequestRowCount"] = len(rows)
+            rows.append(row)
         if before_write:
             before_write()
         store.append(MAPPING_TABLE, rows)
         confirmed_history = _history(store, file_id)
         confirmed_rows = [row["fields"] for row in confirmed_history if row["fields"].get("RequestKey") == request_key]
         if len(confirmed_rows) != len(rows) or any(row.get("RequestFingerprint") != payload_hash for row in confirmed_rows):
-            raise PartConflict("PART_WRITE_UNCONFIRMED", "Grist did not confirm every source-row mapping record after Save")
-        return {"idempotent": False, "version": version, "savedRows": len(rows),
-            "assignments": saved_actions, "confirmedRows": confirmed_rows, "sourceHash": source_hash,
+            raise PartConflict("PART_WRITE_UNCONFIRMED", "Grist did not confirm every source-line mapping record after Save")
+        assignments = {key: actions[0] for key, actions in grouped_actions.items() if len(actions) == 1}
+        return {"idempotent": False, "version": version, "savedRows": len(rows), "assignments": assignments,
+            "lineAssignments": line_actions, "confirmedRows": confirmed_rows, "sourceHash": source_hash,
             "associationKey": association.id if association else "",
             "associationVersion": association.version if association else 0}
 
@@ -899,8 +1171,9 @@ def _grist_ref(value: Any):
 
 
 def attach_mapping_evidence(evidence: dict[str, Any], detail: dict[str, Any]):
-    """Only current, source-scoped assignments reduce the outstanding review rows."""
-    reviewed = {(row["sheet"], row["row"]) for group in detail["groups"] if group["reviewed"] for row in group["rows"]}
+    """Only lines with a current canonical Part reduce downstream review work."""
+    reviewed = {(row["sheet"], row["row"]) for group in detail["groups"] for row in group["rows"]
+        if row.get("reviewed", group.get("reviewed")) and (row.get("part") or {}).get("id")}
     rows = evidence["partRowsRequiringReview"]
     evidence["partRowsRequiringReview"] = [row for row in rows if (row["sheet"], row["row"]) not in reviewed]
     evidence["partMapping"] = {"version": detail["version"], "schemaAvailable": detail["schemaAvailable"],

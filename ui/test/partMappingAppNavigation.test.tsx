@@ -28,7 +28,8 @@ function makeGroup(index: number, overrides: Record<string, unknown> = {}) {
   return {
     key, mappingPolicyVersion: "part-source-labels-v2", evidenceFingerprint: `evidence-${key}`, sheet,
     labelField: "product_part_name", description: `Item ${index}`, blankDescription: false,
-    rows: [{sheet, row: index + 10, fields: {material_to_cut: "MS Plate", dimension_to_cut_mm: "3 x 25", qty: "2", product_part_name: `Item ${index}`},
+    rows: [{sheet, row: index + 10, lineKey: `${key}:line:${index + 10}`, semanticEvidence: {fingerprint: `semantic-${key}`},
+      fields: {material_to_cut: "MS Plate", dimension_to_cut_mm: "3 x 25", qty: "2", product_part_name: `Item ${index}`},
       sourceHeaders: {material_to_cut: "Material to Cut", dimension_to_cut_mm: "Dimension to Cut (mm)", qty: "Quantity Nos", product_part_name: "Plate Part to Cut"},
       sourceHeaderCells: {material_to_cut: "B8"}, sourceCells: {material_to_cut: {cell: `B${index + 10}`}}, headerRow: 8,
       availableFields: ["material_to_cut", "dimension_to_cut_mm", "qty", "product_part_name"]}],
@@ -72,16 +73,38 @@ beforeEach(() => {
   apiMocks.savePartMappings.mockImplementation(async (payload: any) => {
     const nextVersion = Number(payload.expectedVersion) + 1;
     const savedKeys = Object.keys(payload.decisions);
+    const lineAssignments: Record<string, any> = {};
+    for (const [groupKey, partId] of Object.entries(payload.decisions) as [string, string | null][]) {
+      const sourceGroup = (persistedDetail.groups as any[]).find(group => group.key === groupKey);
+      for (const row of sourceGroup?.rows || []) if (row.lineKey) lineAssignments[row.lineKey] = {
+        actionType: partId ? "initial_assignment" : "clear_assignment", partId: partId || null,
+        reason: partId ? "Initial Part assignment" : payload.reasons?.[groupKey] || "Assignment was made in error", requiresUserReason: false,
+      };
+    }
+    for (const [lineKey, partId] of Object.entries(payload.lineDecisions || {}) as [string, string | null][]) lineAssignments[lineKey] = {
+      actionType: partId ? "initial_assignment" : "clear_assignment", partId: partId || null,
+      reason: payload.lineReasons?.[lineKey] || "Initial Part assignment", requiresUserReason: false,
+    };
     const groups = (persistedDetail.groups as any[]).map(group => {
-      if (!savedKeys.includes(group.key)) return group;
-      const partId = payload.decisions[group.key];
-      const part = [...existingParts, newPart].find(item => item.id === partId) || null;
-      return {...group, part, reviewed: Boolean(partId), explicitlyUnassigned: !partId, version: nextVersion};
+      const rows = group.rows.map((row: any) => {
+        const assignment = lineAssignments[row.lineKey];
+        if (!assignment) return row;
+        const part = [...existingParts, newPart].find(item => item.id === assignment.partId) || null;
+        return {...row, part, reviewed: true, explicitlyUnassigned: !part};
+      });
+      if (!rows.some((row: any, index: number) => row !== group.rows[index])) return group;
+      const mapped = rows.filter((row: any) => row.part);
+      const partIds = new Set(mapped.map((row: any) => row.part.id));
+      const reviewed = rows.every((row: any) => row.reviewed);
+      return {...group, rows, part: reviewed && mapped.length === rows.length && partIds.size === 1 ? mapped[0].part : null,
+        reviewed, explicitlyUnassigned: reviewed && mapped.length === 0,
+        assignmentSummary: {partCount: partIds.size, mappedLineCount: mapped.length, unassignedLineCount: rows.length - mapped.length}, version: nextVersion};
     });
     persistedDetail = {...persistedDetail, version: nextVersion, groups, unresolvedGroups: groups.filter((group: any) => !group.reviewed).length};
-    return {savedRows: savedKeys.length, version: nextVersion, idempotent: false, sourceHash: payload.expectedHash,
+    return {savedRows: Object.keys(lineAssignments).length, version: nextVersion, idempotent: false, sourceHash: payload.expectedHash,
       associationKey: payload.expectedAssociationKey, associationVersion: payload.expectedAssociationVersion,
-      assignments: Object.fromEntries(savedKeys.map(key => [key, {actionType: "initial_assignment", partId: payload.decisions[key], requiresUserReason: false}])), confirmedRows: []};
+      assignments: Object.fromEntries(savedKeys.map(key => [key, {actionType: "initial_assignment", partId: payload.decisions[key], requiresUserReason: false}])),
+      lineAssignments, confirmedRows: []};
   });
   apiMocks.partBaselineReview.mockResolvedValue({});
   apiMocks.partScopeTargets.mockResolvedValue({scopes: [
@@ -113,7 +136,7 @@ async function chooseExistingPart(groupIndex: number, partIndex: number) {
 
 function expectPendingChanges(count: number) {
   const summary = screen.getByRole("region", {name: "Save Part mapping drafts"});
-  expect(within(summary).getByText(`${count} unsaved group${count === 1 ? "" : "s"}`)).toBeTruthy();
+  expect(summary.textContent).toContain(`${count} group${count === 1 ? "" : "s"} · ${count} unsaved line${count === 1 ? "" : "s"}`);
 }
 
 it("keeps four App-level mapping choices through Part creation and navigation, then saves one and the remaining three", async () => {
@@ -146,7 +169,7 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
 
   const firstToggle = await expandGroup(1);
-  fireEvent.click(within(firstToggle.closest(".part-source-group")!).getByRole("button", {name: "Save", exact: true}));
+  fireEvent.click(within(firstToggle.closest(".part-source-group")!).getByRole("button", {name: "Save group", exact: true}));
   await waitFor(() => expect(within(firstToggle.closest(".part-source-group")!).getByText("Saved")).toBeTruthy());
   expect(apiMocks.savePartMappings).toHaveBeenCalledTimes(1);
   expect(apiMocks.savePartMappings.mock.calls[0][0].decisions).toEqual({"mapping-1": "part-1"});
@@ -176,11 +199,11 @@ it("keeps four App-level mapping choices through Part creation and navigation, t
   }
 
   fireEvent.click(screen.getByRole("button", {name: "Save pending mappings"}));
-  const dialog = await screen.findByRole("dialog", {name: "Save all pending mappings?"});
+  const dialog = await screen.findByRole("dialog", {name: "Save pending line assignments?"});
   expect(within(dialog).getByText("5. Material Cut List Price · Item 2")).toBeTruthy();
   expect(within(dialog).getByText("5. Material Cut List Price · Item 3")).toBeTruthy();
   expect(within(dialog).getByText("5. Material Cut List Price · Item 4")).toBeTruthy();
-  fireEvent.click(within(dialog).getByRole("button", {name: "Confirm save 3 groups"}));
+  fireEvent.click(within(dialog).getByRole("button", {name: "Confirm save 3 lines"}));
   await waitFor(() => expect(apiMocks.savePartMappings).toHaveBeenCalledTimes(2));
   expect(apiMocks.savePartMappings.mock.calls[1][0].decisions).toEqual({"mapping-2": "part-2", "mapping-3": "part-3", "mapping-4": "part-created"});
   expect(apiMocks.savePartMappings.mock.calls[1][0].expectedVersion).toBe(1);
