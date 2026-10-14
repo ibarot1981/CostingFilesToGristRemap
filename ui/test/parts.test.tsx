@@ -5,7 +5,7 @@ import {PartsView} from "../src/PartsView";
 
 const mocks = vi.hoisted(() => ({
   parts: vi.fn(), partScopeTargets: vi.fn(), partDetails: vi.fn(),
-  partNamePreview: vi.fn(), createManagedPart: vi.fn(), maintainPartShortcode: vi.fn(), savePartIntendedSharing: vi.fn(),
+  partNamePreview: vi.fn(), createManagedPart: vi.fn(), createAssembly: vi.fn(), maintainPartShortcode: vi.fn(), savePartIntendedSharing: vi.fn(),
   addPartComponent: vi.fn(), recordPartPurchase: vi.fn(),
 }));
 vi.mock("../src/api", async () => ({...(await vi.importActual<typeof import("../src/api")>("../src/api")), api: mocks}));
@@ -38,6 +38,7 @@ beforeEach(() => {
   ]});
   mocks.partNamePreview.mockImplementation(async (scope, targetId, description, variant) => ({name:`${targetId === "model-1" ? "S1KHF" : "S1K"} — ${description}${variant ? ` — ${variant}` : ""}`,available:true,collision:[]}));
   mocks.createManagedPart.mockResolvedValue({part:{...part,id:"new-part",partNumber:"SM-P-000002",name:"S1KHF — Chassis — Standard"}});
+  mocks.createAssembly.mockResolvedValue({part:{...part,id:"new-assembly",partNumber:"SM-A-000001",identityKind:"assembly",name:"S1KHF — Main Assembly"}});
   mocks.maintainPartShortcode.mockResolvedValue({shortcode:"S1KHF",version:1});
   mocks.savePartIntendedSharing.mockResolvedValue({partId:part.id,version:1,activeCodeIds:["code-2"]});
   mocks.parts.mockResolvedValue({items:[part],legacyItems:[],storage:"Grist Safari Manufacturing"});
@@ -342,7 +343,7 @@ it("shows component navigation and actual purchase capture affordances", async (
   fireEvent.click(await screen.findByRole("button", {name:/Open full Part details/}));
   fireEvent.click(await screen.findByRole("button", {name:"Purchase details"}));
   await screen.findByRole("heading", {name:/Purchased Part details/});
-  expect(screen.getByText(/2 each · Rev A/)).toBeTruthy();
+  expect(screen.getByText(/Component Part · pinned Rev A · 2 each/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", {name:/Record actual purchase/}));
   expect(screen.getByLabelText("Transaction reference")).toBeTruthy();
   expect(screen.getByText(/MaterialRateLog and Default Material rates are not used/)).toBeTruthy();
@@ -369,6 +370,91 @@ it("uses stable app-specific names and autofill hints in the standalone shared c
   expect((within(form).getByLabelText("Search intended Model Codes") as HTMLInputElement).getAttribute("spellcheck")).toBe("false");
 });
 
+it("creates an explicit SM-A Assembly without exposing intended Model Code assignment", async () => {
+  render(<PartsView/>);
+  fireEvent.click(screen.getAllByRole("button", {name:"New Assembly"})[0]);
+  const form = await screen.findByRole("region", {name:"Create a canonical Assembly"});
+  const description = within(form).getByLabelText("What is the Assembly called?") as HTMLInputElement;
+  await waitFor(() => expect(description.disabled).toBe(false));
+  fireEvent.change(description, {target:{value:"Main Assembly"}});
+  fireEvent.change(within(form).getByLabelText("Why is this Assembly needed?"), {target:{value:"Create the first assembly identity"}});
+  await waitFor(() => expect(screen.getByText("S1K — Main Assembly")).toBeTruthy());
+  expect(within(form).queryByLabelText("Intended sharing Product filter")).toBeNull();
+  expect(within(form).queryByLabelText("Search intended Model Codes")).toBeNull();
+  fireEvent.click(within(form).getByRole("button", {name:"Save Assembly"}));
+  await waitFor(() => expect(mocks.createAssembly).toHaveBeenCalledTimes(1));
+  expect(mocks.createAssembly.mock.calls[0][0]).toMatchObject({
+    scope:"global", targetId:"global", description:"Main Assembly", identityKind:"assembly",
+    reason:"Create the first assembly identity",
+  });
+  expect(mocks.createManagedPart).not.toHaveBeenCalled();
+});
+
+it("shows accepted baseline provenance from the Part and preserves blank versus missing source fields", async () => {
+  const baselineDetails = {
+    ...details,
+    manufacturingBaseline:{status:"established",sourceHash:"workbook-hash",revisionLabel:"A",
+      baseline:{WorkbookName:"S1KHF.ods",WorkbookPath:"pilot/S1KHF.ods",SourceHash:"workbook-hash"},
+      families:[{FamilyKey:"MCL",Family:"MCL",ApplicabilityStatus:"applicable",SourceEvidenceStatus:"complete",RequirementCount:1,CompletenessConfirmed:true}],
+      requirements:[
+        {key:"mcl",family:"mcl",sheet:"5. Material Cut List Price",row:12,lineKey:"mcl:line",physical:{item_name:"Plate 1",quantity:2,quantity_uom:"Nos",material:"MS plate",dimension:"3 x 25",weight_kg:0.105}},
+        {key:"toolshop",family:"toolshop",sheet:"Tool Shop Items",row:18,lineKey:"toolshop:line",physical:{item_name:"Weld fixture",quantity:1,quantity_uom:"Nos"},lineDetail:{toolShopItemsRemarks:{sourceStatus:"blank",value:null}}},
+        {key:"cnc",family:"cnc",sheet:"CNC Cut List",row:27,lineKey:"cnc:line",physical:{plate_part:"Frame",quantity:1,quantity_uom:"Nos",length:25,width:3,thickness:2},lineDetail:{platePartToCut:{sourceStatus:"missing",value:null}}},
+      ]},
+  };
+  mocks.partDetails.mockResolvedValue(baselineDetails);
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline/}));
+  await screen.findByText("S1KHF.ods · pilot/S1KHF.ods");
+  expect(screen.getByText(/5\. Material Cut List Price · row 12 · quantity 2 Nos · material MS plate/)).toBeTruthy();
+  expect(screen.getByText("Tool Shop Items Remarks: (blank in source)")).toBeTruthy();
+  expect(screen.getByText("Plate Part to Cut: Column not in source")).toBeTruthy();
+  expect(mocks.addPartComponent).not.toHaveBeenCalled();
+  expect(mocks.recordPartPurchase).not.toHaveBeenCalled();
+});
+
+it("drills through three assembly levels to a leaf Part and returns along the saved parent path", async () => {
+  const root = {...part, id:"assembly-root", identityKind:"assembly" as const, partNumber:"SM-A-000001", name:"S1K — Root Assembly", scope:"global", scopeTargetId:"global", scopeTarget:"Safari Manufacturing"};
+  const middle = {...root, id:"assembly-middle", partNumber:"SM-A-000002", name:"S1K — Middle Assembly"};
+  const inner = {...root, id:"assembly-inner", partNumber:"SM-A-000003", name:"S1K — Inner Assembly"};
+  const leaf = {...part, id:"leaf-part", partNumber:"SM-P-000001", name:"S1K — Leaf Part"};
+  const items = [root, middle, inner, leaf];
+  const components:Record<string, any[]> = {
+    [root.id]:[{componentKey:"root-middle",childPartId:middle.id,childPartNumber:middle.partNumber,childName:middle.name,childIdentityKind:"assembly",relationshipStatus:"available",childRevisionLabel:"A",quantity:2,uom:"each"}],
+    [middle.id]:[{componentKey:"middle-inner",childPartId:inner.id,childPartNumber:inner.partNumber,childName:inner.name,childIdentityKind:"assembly",relationshipStatus:"available",childRevisionLabel:"A",quantity:3,uom:"set"}],
+    [inner.id]:[{componentKey:"inner-leaf",childPartId:leaf.id,childPartNumber:leaf.partNumber,childName:leaf.name,childIdentityKind:"part",relationshipStatus:"available",childRevisionLabel:"A",quantity:4,uom:"each"}],
+  };
+  mocks.parts.mockResolvedValue({items,legacyItems:[],storage:"Grist Safari Manufacturing"});
+  mocks.partDetails.mockImplementation(async (id:string) => ({...details,
+    part:{...items.find(item => item.id === id),compositionStatus:"draft",metadataHistory:[],lifecycleHistory:[]},
+    components:{status:"available",items:components[id] || []},
+    manufacturingBaseline:{status:"unavailable",message:"Assembly requirements are represented by pinned child composition."},
+    processLines:{status:"available",items:[]},purchases:{specifications:[],vendorCatalog:[]},
+  }));
+  render(<PartsView/>);
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-A-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Open composition/}));
+  const middleLink = await screen.findByRole("button", {name:/SM-A-000002 · S1K — Middle Assembly/});
+  expect(screen.getByText(/Subassembly · pinned Rev A · 2 each/)).toBeTruthy();
+  fireEvent.click(middleLink);
+  expect(await screen.findByRole("button", {name:"Back to S1K — Root Assembly"})).toBeTruthy();
+  fireEvent.click(await screen.findByRole("button", {name:/SM-A-000003 · S1K — Inner Assembly/}));
+  expect(await screen.findByRole("button", {name:"Back to S1K — Middle Assembly"})).toBeTruthy();
+  fireEvent.click(await screen.findByRole("button", {name:/SM-P-000001 · S1K — Leaf Part/}));
+  expect(await screen.findByRole("button", {name:"Back to S1K — Inner Assembly"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Back to S1K — Inner Assembly"}));
+  expect(await screen.findByRole("button", {name:/SM-P-000001 · S1K — Leaf Part/})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Back to S1K — Middle Assembly"}));
+  expect(await screen.findByRole("button", {name:/SM-A-000003 · S1K — Inner Assembly/})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Back to S1K — Root Assembly"}));
+  expect(await screen.findByRole("button", {name:/SM-A-000002 · S1K — Middle Assembly/})).toBeTruthy();
+});
+
 it("keeps Part detail sections collapsed until opened, and section shortcuts reopen them", async () => {
   render(<PartsView/>);
   await screen.findByRole("treeitem", {name:/Product Model/});
@@ -387,8 +473,8 @@ it("keeps Part detail sections collapsed until opened, and section shortcuts reo
 
   fireEvent.click(screen.getByText("Overview", {selector:"summary h3"}));
   expect(overview.open).toBe(false);
-  fireEvent.click(screen.getByRole("button", {name:"Manufacturing baseline"}));
-  expect(baseline.open).toBe(true);
+  fireEvent.click(screen.getAllByRole("button", {name:"Manufacturing baseline"})[0]);
+  await waitFor(() => expect(baseline.open).toBe(true));
   fireEvent.click(screen.getByRole("button", {name:"Intended sharing"}));
   expect(sharing.open).toBe(true);
   expect(screen.getByText(/Advisory links only/)).toBeTruthy();

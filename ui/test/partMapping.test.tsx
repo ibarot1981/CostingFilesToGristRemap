@@ -117,6 +117,17 @@ it("uses a sheet-specific label and shows bounded source values with workbook pr
   expect(screen.getByText("row 42 · headers row 8")).toBeTruthy();
 });
 
+it("keeps Canonical Part visible before, during, and after line selection mode", async () => {
+  render(<PartMappingView path="pilot.ods"/>);
+  await expandGroup();
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Split assignments"}));
+  expect(screen.getByRole("checkbox", {name:"Select 5. Material Cut List Price row 10 for Part assignment"})).toBeTruthy();
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Done selecting"}));
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+});
+
 it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-family treatments", async () => {
   const toolGroup = group("toolshop-jig", "Tool Shop Items", "Inspection jig", 18, {rows:[
     {sheet:"Tool Shop Items",row:18,fields:{item_name:"Jig",material_to_cut:"Steel",dimension_to_cut_mm:"80",qty:"1",toolshop_remarks:"Deburr\ninside",job_remarks:"Job only"},

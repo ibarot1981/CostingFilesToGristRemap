@@ -605,6 +605,38 @@ def create_canonical_part(request: Request, payload: dict[str, Any] = Body(...),
         raise _part_http_error(exc)
 
 
+@app.post("/api/assemblies")
+def create_canonical_assembly(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    """Create a managed SM-A identity without assigning it to a workbook or Model Code."""
+    from app.part_identity import PartIdentityError
+    repository = _get_repository()
+    scope = str(payload.get("scope") or "")
+    target_id = str(payload.get("targetId") or "")
+    client_payload = {**payload, "identityKind": "assembly"}
+    if payload.get("identityKind") not in (None, "assembly"):
+        raise _error(422, "PART_IDENTITY_KIND_INVALID", "The assembly endpoint accepts only an explicit Assembly identity.")
+    if payload.get("intendedModelCodeIds") not in (None, []):
+        raise _error(422, "COST_CONFIGURATION_ASSEMBLY_DEFERRED", "Assembly assignment to Model Codes is deferred.")
+    try:
+        registry = _part_registry()
+        if not hasattr(registry, "create_assembly") or not hasattr(registry, "prepare_create_recovery"):
+            raise PartIdentityError("PART_ASSEMBLY_REQUIRES_GRIST", "Assembly creation requires the authoritative Safari Manufacturing Grist registry.")
+        recovery = registry.prepare_create_recovery(idempotency_key or "", client_payload, identity_kind="assembly")
+        if recovery:
+            scope = str(recovery.get("scopeType") or scope)
+            target_id = str(recovery.get("targetId") or target_id)
+            target = {"id": target_id, "label": str(recovery.get("targetLabel") or "")}
+        else:
+            target = _scope_target(repository, scope, target_id)
+        return registry.create_assembly(scope_type=scope, target_id=target_id, target_label=target["label"],
+            description=str(payload.get("description") or ""), variant=str(payload.get("variant") or ""),
+            expected_name=str(payload.get("expectedName") or ""), actor=_request_actor(request),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+            revision_assertion=payload.get("engineeringRevision", payload.get("revision")), request_payload=client_payload)
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
 @app.post("/api/parts/{part_id}/metadata")
 def update_part_metadata(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     from app.part_identity import PartIdentityError

@@ -24,8 +24,10 @@ export type ExistingPart = { id: string; name: string; partNumber?: string | nul
 const scopeLabels: Record<PartScope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 export const MAPPING_PART_CREATE_ATTEMPT_KEY = "part-mapping:create-attempt";
 const STANDALONE_PART_CREATE_ATTEMPT_KEY = "parts:create-attempt";
+const STANDALONE_ASSEMBLY_CREATE_ATTEMPT_KEY = "assemblies:create-attempt";
 const STANDALONE_SHORTCODE_ATTEMPT_STORAGE_KEY = "part-shortcode:attempt";
 const MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY = "part-mapping:shortcode-attempt";
+const STANDALONE_ASSEMBLY_SHORTCODE_ATTEMPT_STORAGE_KEY = "assembly-shortcode:attempt";
 
 function readAttempt(key: string): PartCreateAttempt | null {
   try {
@@ -99,10 +101,10 @@ export function CascadeCodePicker({ scopes, productId, modelId, selectedIds, onP
   </div>;
 }
 
-export function PartCreationForm({ origin = null, originContextCurrent = true, onCreated, onUseExisting, onCancel, onAttemptStateChange, cancelLabel = "Cancel" }:
-  { origin?: PartCreationOrigin | null; originContextCurrent?: boolean; onCreated: (part: ExistingPart, attempt: PartCreateAttempt) => void; onUseExisting: (part: ExistingPart) => void; onCancel: () => void; onAttemptStateChange?: (pending: boolean) => void; cancelLabel?: string }) {
-  const storageKey = origin ? MAPPING_PART_CREATE_ATTEMPT_KEY : STANDALONE_PART_CREATE_ATTEMPT_KEY;
-  const shortcodeStorageKey = origin ? MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY : STANDALONE_SHORTCODE_ATTEMPT_STORAGE_KEY;
+export function PartCreationForm({ kind = "part", origin = null, originContextCurrent = true, onCreated, onUseExisting, onCancel, onAttemptStateChange, cancelLabel = "Cancel" }:
+  { kind?: "part" | "assembly"; origin?: PartCreationOrigin | null; originContextCurrent?: boolean; onCreated: (part: ExistingPart, attempt: PartCreateAttempt) => void; onUseExisting: (part: ExistingPart) => void; onCancel: () => void; onAttemptStateChange?: (pending: boolean) => void; cancelLabel?: string }) {
+  const storageKey = origin ? MAPPING_PART_CREATE_ATTEMPT_KEY : kind === "assembly" ? STANDALONE_ASSEMBLY_CREATE_ATTEMPT_KEY : STANDALONE_PART_CREATE_ATTEMPT_KEY;
+  const shortcodeStorageKey = origin ? MAPPING_SHORTCODE_ATTEMPT_STORAGE_KEY : kind === "assembly" ? STANDALONE_ASSEMBLY_SHORTCODE_ATTEMPT_STORAGE_KEY : STANDALONE_SHORTCODE_ATTEMPT_STORAGE_KEY;
   const initialAttempt = useMemo(() => readAttempt(storageKey), [storageKey]);
   const initialShortcodeAttempt = useMemo(() => readAttempt(shortcodeStorageKey), [shortcodeStorageKey]);
   const restoredForm = initialShortcodeAttempt?.formState;
@@ -230,15 +232,17 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
 
   async function submit() {
     if (loading || busy || shortcodeAttempt || (!attempt && (!preview?.available || !reason.trim()))) return;
-    const next: PartCreateAttempt = attempt || { key: crypto.randomUUID(), payload: { scope, targetId, description, variant, expectedName: preview?.name || "", reason,
-      selectedProductId: productId || null, selectedProductModelId: modelId || null, intendedModelCodeIds: [...intendedIds] }, origin };
+    const basePayload = { scope, targetId, description, variant, expectedName: preview?.name || "", reason };
+    const payload = kind === "assembly" ? { ...basePayload, identityKind: "assembly" } : { ...basePayload,
+      selectedProductId: productId || null, selectedProductModelId: modelId || null, intendedModelCodeIds: [...intendedIds] };
+    const next: PartCreateAttempt = attempt || { key: crypto.randomUUID(), payload, origin };
     attemptRef.current = next;
     sessionStorage.setItem(storageKey, JSON.stringify(next));
     setAttempt(next); setBusy(true); setError("");
     try {
-      const result = await api.createManagedPart(next.payload, next.key);
+      const result = kind === "assembly" ? await api.createAssembly(next.payload, next.key) : await api.createManagedPart(next.payload, next.key);
       const part = result?.part;
-      if (!part || !part.id || !part.partNumber || !part.name) throw new Error("The Part publication response was incomplete. The outcome may be uncertain; retry the saved request.");
+      if (!part || !part.id || !part.partNumber || !part.name) throw new Error(`The ${kind === "assembly" ? "Assembly" : "Part"} publication response was incomplete. The outcome may be uncertain; retry the saved request.`);
       sessionStorage.removeItem(storageKey); attemptRef.current = null; setAttempt(null);
       onCreated(part as ExistingPart, next);
     } catch (cause) {
@@ -313,12 +317,13 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
     finally { setBusy(false); }
   }
 
-  const form = <section className="parts-form-card part-creation-form" aria-label="Create a canonical Part">
-    <div><span className="eyebrow">Guided creation</span><h2>Create a Part</h2><p>Create a stable canonical identity. The source mapping remains unsaved until you confirm it separately.</p></div>
+  const identityLabel = kind === "assembly" ? "Assembly" : "Part";
+  const form = <section className="parts-form-card part-creation-form" aria-label={`Create a canonical ${identityLabel}`}>
+    <div><span className="eyebrow">Guided creation</span><h2>Create {kind === "assembly" ? "an" : "a"} {identityLabel}</h2><p>{kind === "assembly" ? "Create a stable assembly identity. It can start empty, then receive Parts or subassemblies with explicit quantities. Workbook and Model Code assignment is deferred." : "Create a stable canonical identity. The source mapping remains unsaved until you confirm it separately."}</p></div>
     {origin && <section className="part-creation-origin" aria-label="Originating workbook and source group"><strong>Originating source · read only</strong><span>Workbook · {origin.workbookPath || "Unavailable"}</span><span>Sheet · {origin.sheet || "Unavailable"}</span><span>Source description · {origin.sourceDescription || "Blank Part label"}</span>{origin.lineKeys?.length ? <span>Selected lines · {origin.lineKeys.length}</span> : null}{associationMessage && <small role="status">{associationMessage}</small>}</section>}
     {origin && !originContextCurrent && <p className="parts-validation warning" role="alert">This workbook, source group or selected line set changed after the dialog opened. Part creation/recovery is safe, but this Part will not be assigned to the changed lines. Review current source evidence before assigning it.</p>}
-    <div className="parts-cascade-card"><h3>Suggested intended sharing</h3><p>These editable suggestions record intent only. They do not configure Model Codes, set quantities or create costing history.</p><CascadeCodePicker scopes={scopes} productId={productId} modelId={modelId} selectedIds={intendedIds}
-      onProductChange={changeProduct} onModelChange={changeModel} onSelectedChange={ids => { userEdited.current = true; setIntendedIds(ids); }} disabled={locked} restrictSelectionToContext/></div>
+    {kind === "part" && <div className="parts-cascade-card"><h3>Suggested intended sharing</h3><p>These editable suggestions record intent only. They do not configure Model Codes, set quantities or create costing history.</p><CascadeCodePicker scopes={scopes} productId={productId} modelId={modelId} selectedIds={intendedIds}
+      onProductChange={changeProduct} onModelChange={changeModel} onSelectedChange={ids => { userEdited.current = true; setIntendedIds(ids); }} disabled={locked} restrictSelectionToContext/></div>}
     <label>Name derives from<select name="part-name-scope" autoComplete="off" disabled={locked} value={scope} onChange={event => { userEdited.current = true; nameAnchorTouched.current = true; setScope(event.target.value as PartScope); }}><option value="global">Global</option><option value="product">Product</option><option value="product_model">Product Model</option><option value="model_code">Model Code</option></select></label>
     {scope !== "global" && <label>Scope target<select name="part-name-target" autoComplete="off" disabled={locked} value={targetId} onChange={event => { userEdited.current = true; nameAnchorTouched.current = true; setTargetId(event.target.value); }}><option value="">Choose {scopeLabels[scope]}</option>{targets.map(item => <option key={item.id} value={item.id}>{item.label}{item.shortcode ? ` · ${item.shortcode}` : " · shortcode needed"}</option>)}</select></label>}
     {scope === "global" && <p className="parts-target-line">Safari Manufacturing · Global scope</p>}
@@ -327,13 +332,13 @@ export function PartCreationForm({ origin = null, originContextCurrent = true, o
       {target.shortcode && !editingShortcode && <button type="button" className="button ghost" disabled={locked} onClick={() => { setShortcode(target.shortcode || ""); setEditingShortcode(true); }}>Review shortcode</button>}
     </div>}
     {shortcodeMissing && <p className="parts-validation warning">Resolve the missing shortcode before generating a Part name. The app will not guess it.</p>}
-    <label>What is the Part called?<input name="part-description" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={description} maxLength={120} onChange={event => { userEdited.current = true; setDescription(event.target.value); }} placeholder="For example, Chassis" disabled={locked}/></label>
+    <label>What is the {identityLabel} called?<input name="part-description" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={description} maxLength={120} onChange={event => { userEdited.current = true; setDescription(event.target.value); }} placeholder={kind === "assembly" ? "For example, Main Assembly" : "For example, Chassis"} disabled={locked}/></label>
     <label>What distinguishes this design?<input name="part-design-variant" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={variant} maxLength={120} onChange={event => { userEdited.current = true; setVariant(event.target.value); }} placeholder="Optional, such as Standard or Reinforced" disabled={locked}/></label>
     {preview && <div className={`parts-name-preview ${preview.available ? "available" : "collision"}`} role="status"><span>Generated name · server validated</span><strong>{preview.name}</strong>{!preview.available && <><p>{preview.collision.some(item => item.source === "legacy") ? "A legacy Part already uses this name. Review its identity or add a meaningful distinction." : "A current or historical Part name already uses this name. Select the existing Part or add a meaningful distinction."}</p><div className="parts-collision-list">{preview.collision.map((collision, index) => <button type="button" key={`${collision.source}:${collision.id}:${index}`} className="button" onClick={() => void useCollision(collision)}>{collision.number ? `${collision.number} · ` : collision.source === "legacy" ? "Legacy · " : ""}{origin ? "Use existing Part" : "Open existing Part"}</button>)}</div></>}</div>}
-    <div className="parts-readonly-facts"><span>Part number <strong>Allocated on Save</strong></span><span>Engineering revision <strong>Rev A</strong></span></div>
-    <label>Why is this Part needed?<textarea name="part-creation-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} onChange={event => { userEdited.current = true; setReason(event.target.value); }} rows={3} maxLength={2000} disabled={locked}/></label>
-    {error && <div className="parts-error" role="alert">{error}{attempt && <small>The canonical Part may already exist. Retry uses the original request key and payload; do not start another creation.</small>}</div>}
-    <div className="parts-form-actions"><button type="button" className="button" disabled={busy || Boolean(attempt) || Boolean(shortcodeAttempt)} onClick={onCancel}>{attempt || shortcodeAttempt ? "Recovery is required" : cancelLabel}</button><button type="button" className="button primary" disabled={busy || loading || !associationLoaded || Boolean(shortcodeAttempt) || (!attempt && (!preview?.available || !reason.trim()))} onClick={() => void submit()}>{busy ? "Creating Part in Grist…" : attempt ? "Retry same creation request" : origin ? "Create and assign" : "Save Part"}</button></div>
+    <div className="parts-readonly-facts"><span>{kind === "assembly" ? "Assembly number" : "Part number"} <strong>{kind === "assembly" ? "SM-A sequence allocated on Save" : "SM-P sequence allocated on Save"}</strong></span><span>Engineering revision <strong>Rev A</strong></span></div>
+    <label>Why is this {identityLabel} needed?<textarea name="part-creation-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} onChange={event => { userEdited.current = true; setReason(event.target.value); }} rows={3} maxLength={2000} disabled={locked}/></label>
+    {error && <div className="parts-error" role="alert">{error}{attempt && <small>The canonical {identityLabel.toLowerCase()} may already exist. Retry uses the original request key and payload; do not start another creation.</small>}</div>}
+    <div className="parts-form-actions"><button type="button" className="button" disabled={busy || Boolean(attempt) || Boolean(shortcodeAttempt)} onClick={onCancel}>{attempt || shortcodeAttempt ? "Recovery is required" : cancelLabel}</button><button type="button" className="button primary" disabled={busy || loading || !associationLoaded || Boolean(shortcodeAttempt) || (!attempt && (!preview?.available || !reason.trim()))} onClick={() => void submit()}>{busy ? `Creating ${identityLabel} in Grist…` : attempt ? "Retry same creation request" : origin ? "Create and assign" : `Save ${identityLabel}`}</button></div>
   </section>;
 
   return form;

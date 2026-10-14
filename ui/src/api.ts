@@ -54,6 +54,7 @@ export const api = {
   partScopeTargets: () => get<any>("/api/parts/scope-targets"),
   partNamePreview: (scope: string, targetId: string, description: string, variant: string, excludeId = "") => get<any>(`/api/parts/preview?${new URLSearchParams({ scope, target_id: targetId, description, variant, exclude_id: excludeId })}`),
   createManagedPart: (payload: unknown, key: string) => send<any>("/api/parts", payload, { "Idempotency-Key": key }),
+  createAssembly: (payload: unknown, key: string) => send<any>("/api/assemblies", payload, { "Idempotency-Key": key }),
   maintainPartShortcode: (payload: unknown, key: string) => send<any>("/api/parts/shortcodes", payload, { "Idempotency-Key": key }),
   partDetails: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}`),
   savePartIntendedSharing: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/intended-sharing`, payload, { "Idempotency-Key": key }, "PUT"),

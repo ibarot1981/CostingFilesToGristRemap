@@ -322,28 +322,37 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
-    def test_schema_v14_plans_only_additive_part_mapping_semantic_evidence_columns(self) -> None:
+    def test_schema_v15_plans_only_additive_identity_kind_and_mapping_evidence_columns(self) -> None:
         client = _SchemaClient()
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
                 {"id": column["id"], "fields": {"type": column["type"]}}
                 for column in table["columns"]
-                if not (table["id"] == "PartMappingReview" and column["id"] in {
-                    "SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"})
+                if not (
+                    table["id"] == "PartMappingReview" and column["id"] in {
+                        "SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"
+                    }
+                    or table["id"] in {"ProductPart", "PartRegistryRequest"} and column["id"] == "IdentityKind"
+                )
             ]}
             for table in FOUNDATION_TABLES
         ]
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-part-baseline-reconciliation-grist-2026-10-13.v14")
+        self.assertEqual(SCHEMA_VERSION, "safari-part-baseline-reconciliation-grist-2026-10-14.v15")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
-        self.assertEqual(plan.add_columns, ({"tableId": "PartMappingReview", "columns": [
-            {"id": "SemanticPolicyVersion", "type": "Text"},
-            {"id": "SemanticFingerprint", "type": "Text"},
-            {"id": "SemanticEvidence", "type": "Any"},
-        ]},))
+        additions = {item["tableId"]: item["columns"] for item in plan.add_columns}
+        self.assertEqual(additions, {
+            "PartMappingReview": [
+                {"id": "SemanticPolicyVersion", "type": "Text"},
+                {"id": "SemanticFingerprint", "type": "Text"},
+                {"id": "SemanticEvidence", "type": "Any"},
+            ],
+            "ProductPart": [{"id": "IdentityKind", "type": "Text"}],
+            "PartRegistryRequest": [{"id": "IdentityKind", "type": "Text"}],
+        })
         self.assertEqual(client.writes, [])
 
     def test_schema_plan_accepts_grist_text_inference_for_legacy_engineering_attributes(self) -> None:

@@ -36,3 +36,4 @@
   }
   .parts-work-panel { width: 100%; min-width: 0; }
 }
+.parts-new-actions{display:grid;gap:0}.parts-new-actions .parts-new-button{margin-top:5px}.parts-new-button.assembly{background:#f3f1fb;border-color:#d8d1ee;color:#554775}.parts-tree-row.assembly .parts-row-number{color:#5d4b83}.parts-tree-row.assembly strong{color:#43365e}.parts-summary-actions{flex-wrap:wrap}.parts-welcome-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:8px}
