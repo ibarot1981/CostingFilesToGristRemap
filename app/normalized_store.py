@@ -19,7 +19,7 @@ TABLES: tuple[tuple[str, str, str, dict[str, str]], ...] = (
     ("work_centers", "WorkCenter", "CenterKey", {"name": "Name", "status": "Status"}),
     ("line_masters", "LineMaster", "LineKey", {"part_key": "ProductPart", "process_type": "ProcessType", "identity": "Identity", "status": "Status", "source_part_name": "SourcePartName"}),
     ("line_revisions", "LineRevision", "RevisionKey", {"master_key": "LineMaster", "previous_key": "PreviousRevision", "physical_signature": "PhysicalSignature", "status": "Status", "snapshot_key": "Snapshot", "actor": "Actor", "reason": "Reason"}),
-    ("line_details", "LineDetail", "DetailKey", {"revision_key": "LineRevision", "process_type": "ProcessType", "material_key": "Material", "purchase_item_key": "PurchaseItem", "operation_key": "ProcessOperation", "work_center_key": "WorkCenter", "source_department": "SourceDepartment", "issue_route": "IssueRoute", "activity_kind": "ActivityKind", "quantity": "Quantity", "quantity_uom": "QuantityUOM", "dimension_mm": "DimensionMM", "dimension_inches": "DimensionInches", "weight_grams": "WeightGrams", "weight_kg": "WeightKg", "part_weight_kg": "PartWeightKg", "length": "Length", "width": "Width", "thickness": "Thickness", "issue_slip_no": "IssueSlipNo", "issue_slip_desc": "IssueSlipDesc", "internal_making_cost": "InternalMakingCost", "external_machining_cost": "ExternalMachiningCost", "rate_cached": "RateCached", "cost_cached": "CostCached", "item_name": "ItemName", "material_display_name": "MaterialDisplayName", "option_group": "OptionGroup"}),
+    ("line_details", "LineDetail", "DetailKey", {"revision_key": "LineRevision", "process_type": "ProcessType", "material_key": "Material", "purchase_item_key": "PurchaseItem", "operation_key": "ProcessOperation", "work_center_key": "WorkCenter", "source_department": "SourceDepartment", "issue_route": "IssueRoute", "activity_kind": "ActivityKind", "quantity": "Quantity", "quantity_uom": "QuantityUOM", "dimension_mm": "DimensionMM", "dimension_inches": "DimensionInches", "weight_grams": "WeightGrams", "weight_kg": "WeightKg", "part_weight_kg": "PartWeightKg", "length": "Length", "width": "Width", "thickness": "Thickness", "issue_slip_no": "IssueSlipNo", "issue_slip_desc": "IssueSlipDesc", "internal_making_cost": "InternalMakingCost", "external_machining_cost": "ExternalMachiningCost", "rate_cached": "RateCached", "cost_cached": "CostCached", "item_name": "ItemName", "material_display_name": "MaterialDisplayName", "plate_part": "PlatePart", "toolshop_remarks": "ToolShopRemarks", "option_group": "OptionGroup"}),
     ("source_observations", "SourceLineObservation", "ObservationKey", {"snapshot_key": "Snapshot", "source_hash": "SourceHash", "dependency_hashes": "DependencyHashes", "parser_version": "ParserVersion", "sheet": "SheetName", "row": "SourceRow", "status": "Status", "cells": "Cells", "observed_fields": "ObservedFields", "part_display_name": "PartDisplayName", "cached_cost": "CachedCost", "current_cost": "CurrentCost", "cr_reference": "CRReference"}),
     ("source_mappings", "SourceLineMapping", "MappingKey", {"observation_key": "Observation", "master_key": "LineMaster", "status": "Status"}),
     ("audit", "LineAuditItem", "AuditKey", {"master_key": "LineMaster", "revision_key": "LineRevision", "previous_key": "PreviousRevision", "observation_key": "Observation", "actor": "Actor", "reason": "Reason", "cr_reference": "CRReference"}),
@@ -126,6 +126,9 @@ class GristNormalizedStore:
             observation = by_id["SourceLineObservation"].get(ref(mapping.get("Observation")))
             if not observation or ref(observation.get("Snapshot")) != sid:
                 continue
+            observed_fields = obj(observation.get("ObservedFields")) or {}
+            if not isinstance(observed_fields, dict):
+                observed_fields = {}
             master_id = ref(mapping.get("LineMaster"))
             master = by_id["LineMaster"].get(master_id) if master_id is not None else None
             revision_id, revision = max(revisions.get(master_id, []), default=(None, None),
@@ -134,16 +137,27 @@ class GristNormalizedStore:
             row = {"mapping": {"status": mapping.get("Status"), "master_key": master.get("LineKey") if master else None},
                    "observation": {"sheet": observation.get("SheetName"), "row": observation.get("SourceRow"),
                        "status": observation.get("Status"), "part_display_name": observation.get("PartDisplayName") or "",
-                       "cells": obj(observation.get("Cells")) or {}, "cached_cost": observation.get("CachedCost"),
+                        "cells": obj(observation.get("Cells")) or {}, "observed_fields": observed_fields,
+                        "cached_cost": observation.get("CachedCost"),
                        "dependency_hashes": obj(observation.get("DependencyHashes")) or {}},
                    "master": {"key": master.get("LineKey"), "process_type": master.get("ProcessType")} if master else None,
                    "revision": {"key": revision.get("RevisionKey"), "previous_key": (
                        by_id["LineRevision"].get(ref(revision.get("PreviousRevision")) or -1, {}).get("RevisionKey"))}
                        if revision else None,
-                   "detail": {"material_display_name": detail.get("MaterialDisplayName") or "",
-                       "quantity": detail.get("Quantity"), "cost_cached": detail.get("CostCached"),
-                       "activity_kind": detail.get("ActivityKind")} if detail else None,
+                    "detail": {"material_display_name": detail.get("MaterialDisplayName") or "",
+                        "quantity": detail.get("Quantity"), "cost_cached": detail.get("CostCached"),
+                        "activity_kind": detail.get("ActivityKind"), "plate_part": detail.get("PlatePart"),
+                        "toolshop_remarks": detail.get("ToolShopRemarks")} if detail else None,
                    "audit": audits.get(master_id, [])}
+            if row["detail"] is not None:
+                # Descriptive source fields do not change engineering revisions.
+                # Read them from the exact snapshot observation when available;
+                # older snapshots keep their own observed values even when they
+                # reuse an immutable LineRevision/LineDetail.
+                if "product_part_name" in observed_fields:
+                    row["detail"]["plate_part"] = observed_fields["product_part_name"]
+                if "toolshop_remarks" in observed_fields:
+                    row["detail"]["toolshop_remarks"] = observed_fields["toolshop_remarks"]
             if filters.get("sheet") and row["observation"]["sheet"] != filters["sheet"]: continue
             if filters.get("process") and (row["master"] or {}).get("process_type") != filters["process"]: continue
             if filters.get("master") and (row["master"] or {}).get("key") != filters["master"]: continue

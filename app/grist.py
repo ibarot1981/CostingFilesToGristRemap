@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -148,3 +149,30 @@ class GristClient:
             raise GristError(f"Grist API create returned {response.status_code}: {response.text[:500]}")
 
         return response.json().get("records", [])
+
+    def download_document_backup(self) -> bytes:
+        """Download the configured document as a native .grist SQLite file."""
+        url = f"{self.base_url}/api/docs/{self.doc_id}/download"
+        try:
+            response = requests.get(url, headers={"Authorization": f"Bearer {self.api_key}"}, timeout=120)
+        except requests.RequestException as exc:
+            raise GristError(f"Could not download a Grist document backup: {exc}") from exc
+        if response.status_code >= 400:
+            raise GristError(f"Grist backup download returned {response.status_code}: {response.text[:500]}")
+        data = response.content
+        if not data.startswith(b"SQLite format 3\x00"):
+            raise GristValidationError("Grist backup did not contain a SQLite .grist document.")
+        return data
+
+    def apply_user_actions(self, actions: list[list[Any]]) -> Any:
+        """Apply an ordered Grist user-action batch to the configured document."""
+        if not actions:
+            return None
+        url = f"{self.base_url}/api/docs/{self.doc_id}/apply"
+        try:
+            response = requests.post(url, headers={"Authorization": f"Bearer {self.api_key}"}, json={"actions": actions}, timeout=60)
+        except requests.RequestException as exc:
+            raise GristError(f"Could not apply Grist user actions: {exc}") from exc
+        if response.status_code >= 400:
+            raise GristError(f"Grist apply returned {response.status_code}: {response.text[:500]}")
+        return response.json()

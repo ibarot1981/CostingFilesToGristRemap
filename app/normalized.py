@@ -62,6 +62,13 @@ def _number(value: Any) -> str | None:
         return None
 
 
+def _source_text(fields: dict[str, Any], name: str) -> str | None:
+    if name not in fields:
+        return None
+    value = fields[name]
+    return "" if value is None else str(value)
+
+
 def _activity_kind(value: str) -> str:
     low = value.casefold()
     hits = [kind for kind, words in {
@@ -247,6 +254,8 @@ def project_snapshot(
                 "external_machining_cost": _number(fields.get("external_machining_cost")),
                 "rate_cached": _number(fields.get("rate")), "cost_cached": _number(fields.get("amount")),
                 "item_name": item_name, "material_display_name": material_name,
+                "plate_part": _source_text(fields, "product_part_name") if sheet == "CNC Cut List" else None,
+                "toolshop_remarks": _source_text(fields, "toolshop_remarks") if sheet == "Tool Shop Items" else None,
                 "option_group": fields.get("optional_item_group_1"),
             }
             if not prior or prior["physical_signature"] != signature:

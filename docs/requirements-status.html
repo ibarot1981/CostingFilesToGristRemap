@@ -48,11 +48,11 @@
 
 </head>
 
-<body data-generated="2026-10-02">
+<body data-generated="2026-10-07">
 
   <header>
 
-    <div class="eyebrow">Living delivery register · Phase 0</div>
+    <div class="eyebrow">Living delivery register · Phases 0–1</div>
 
     <h1>Safari Manufacturing</h1>
 
@@ -337,9 +337,11 @@
     rows.push(
       ["FILE-009","Restore saved associations with separate Validate/Save.","Association","Phase 1","Implemented","Read-only path lookup, saved selections/status/history, async guards and audited Save.","Owner visual acceptance remains separate."],
       ["PRE-003","Automatically refreshed full-width workbook preview.","Workbook preview","Phase 1","Implemented","Disposable-copy refresh on tab selection; progress, hashes, timestamp, explicit errors and no-link result.","Verify the live pilot and source hashes."],
-      ["PART-003","Part engineering revisions follow CR; all Parts remain Rev A until CR flow exists.","Parts","Phase 1","Planned","Accepted 6 October 2026. Metadata/source histories are distinct from engineering revision and do not imply approval.","Enforce Rev A in creation/mapping services and reject later revisions until approved CR support is implemented."],
-      ["PART-002","Permanent Part numbers; automatic scope/description/variant naming; advisory scope and metadata history.","Parts","Phase 1","Planned","Accepted 6 October 2026. Scope never restricts Model Code configuration. Multiple shared chassis designs retain separate identities and explicit uses. Existing screen is a prototype.","Implement PART_IDENTITY_REQUIREMENTS.md before advancing Part mapping screens or reviewed-Part imports."],
-      ["FLOW-001","Audited processing states distinct from costing authority.","Processing","Phase 1","Partial","Safari v6 lifecycle/audit storage and selected-file UI implemented; source/version/association checks and retries verified. Both Explorer paths and stored-only Code inspection are implemented. Completion gates remain unavailable.","Sheet coverage, physical rules and nonblocking Costing-New rate evidence are visible. Part mapping UI and typed audited storage implemented in v7. First implement PART-002 identity/numbering/naming/history before advancing Part mapping; then integrate reviewed references and finish configuration/spares/completion gates."]
+      ["PART-003","Managed Part engineering definitions start and remain Rev A until an approved CR workflow exists.","Parts","Phase 1","Implemented","Grist stores an explicit Rev A baseline. Draft-to-finalized control locks the physical definition; no Rev B+ path is exposed. Legacy numeric revision evidence remains unchanged and unclassified.","Build the approved CR workflow before enabling later revisions; review legacy numeric revisions separately."],
+      ["PART-002","Permanent Part numbers; generated scope/description/variant names; advisory scope; immutable metadata and alias history in Grist.","Parts","Phase 1","Implemented","Schema v8 and GristPartRegistry store canonical Part UUID/number, typed target, generated name, metadata versions/aliases, shortcode history, mapping references and requests. SQLite is only a single-host allocator/recovery journal. Isolated real-Grist writes/readback/restart passed; production migration was additive and introduced no synthetic Parts.","Keep the single writer bound to its shared local allocator. Classify/migrate legacy identity only through a separate reviewed plan; do not infer per-code configuration from scope or mappings."],
+      ["PART-004","One canonical purchased Part supports reviewed vendor equivalence, actual purchase history and latest eligible cross-vendor rate evidence.","Purchased Parts","Phase 1","Partial","Grist stores specifications, VendorPartMapping, immutable PartPurchaseRecord, explicit conversions and PurchasedPartCostEvidence. The resolver chooses by transaction time, blocks ambiguity/incomparable latest evidence, and preserves historical selection. Detail/capture UI and isolated real-Grist verification passed; MaterialRateLog/default behavior is unchanged.","Connect explicit per-code configuration and purchased-Part evidence to the full Summary costing engine. Current cost-run consumer integration is not complete."],
+      ["PART-005","Parts support optional mixed MCL/Toolshop/CNC requirements, pinned child Parts, optional drawings, and a collapsible explorer.","Parts UI and composition","Phase 1","Implemented","PartRevisionLine pins exact normalized line revisions; PartComponentRevision stores child revision/quantity/UOM with cycle checks; drawings are optional/revision-specific. Isolated browser check verified the collapsible tree, mixed line detail, child navigation and purchase detail/capture.","Implement explicit per-Model-Code ConfigurationPartSelection before reporting `Used in` or Summary usage; the current UI labels that gate as deferred."],
+      ["FLOW-001","Audited processing states distinct from costing authority.","Processing","Phase 1","Partial","Safari v6 lifecycle/audit storage and selected-file UI implemented; source/version/association checks and retries verified. Both Explorer paths and stored-only Code inspection are implemented. Stable Part business data and mappings now persist in Grist.","Sheet coverage, physical rules, nonblocking Costing-New rates and Part-scope evidence are visible. Integrate reviewed Part references with typed imports and per-code configuration, then finish spares/completion gates."]
     );
 
     const body=document.getElementById('requirements');

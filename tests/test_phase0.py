@@ -17,7 +17,7 @@ from app.grist_admin import GristAdminClient, GristConnectivityError, GristDocum
 from app.grist_admin import GristWorkspace
 from app.grist import GristClient
 from app.repository import AssociationConflict, AssociationProposal, InMemorySafariRepository
-from app.schema import FOUNDATION_TABLES, apply_schema, plan_schema, validate_schema_target
+from app.schema import FOUNDATION_TABLES, SCHEMA_VERSION, apply_schema, plan_schema, validate_schema_target
 
 
 class Phase0Tests(unittest.TestCase):
@@ -322,6 +322,53 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
+    def test_schema_v14_plans_only_additive_part_mapping_semantic_evidence_columns(self) -> None:
+        client = _SchemaClient()
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": column["type"]}}
+                for column in table["columns"]
+                if not (table["id"] == "PartMappingReview" and column["id"] in {
+                    "SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"})
+            ]}
+            for table in FOUNDATION_TABLES
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual(SCHEMA_VERSION, "safari-part-baseline-reconciliation-grist-2026-10-13.v14")
+        self.assertEqual(plan.create_tables, ())
+        self.assertEqual(plan.update_columns, ())
+        self.assertEqual(plan.add_columns, ({"tableId": "PartMappingReview", "columns": [
+            {"id": "SemanticPolicyVersion", "type": "Text"},
+            {"id": "SemanticFingerprint", "type": "Text"},
+            {"id": "SemanticEvidence", "type": "Any"},
+        ]},))
+        self.assertEqual(client.writes, [])
+
+    def test_schema_plan_accepts_grist_text_inference_for_legacy_engineering_attributes(self) -> None:
+        client = _SchemaClient()
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": (
+                    "Text" if table["id"] == "LineDetail" and column["id"] == "EngineeringAttributes"
+                    else "Bool" if table["id"] == "PartWorkbookComparison" and column["id"] == "Status"
+                    else column["type"]
+                )}}
+                for column in table["columns"]
+            ]}
+            for table in FOUNDATION_TABLES
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual(plan.create_tables, ())
+        self.assertEqual(plan.add_columns, ())
+        self.assertEqual(plan.update_columns, ({"tableId": "PartWorkbookComparison", "columns": [
+            {"id": "Status", "type": "Text"},
+        ]},))
+        self.assertEqual(client.writes, [])
+
     def test_schema_apply_revalidates_remote_identity_before_writes(self) -> None:
         client = _SchemaClient()
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
@@ -383,6 +430,14 @@ class _SchemaClient:
 
 
 class GristAdminTests(unittest.TestCase):
+    def test_list_tables_can_skip_column_enrichment_for_existence_checks(self) -> None:
+        session = _Session([_Response({"tables": [{"id": "Product"}, {"id": "ProductPart"}]})])
+        tables = GristAdminClient("secret", "https://grist.test", session=session).list_tables("safari-doc", include_columns=False)
+
+        self.assertEqual(tables, [{"id": "Product"}, {"id": "ProductPart"}])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][1], "https://grist.test/api/docs/safari-doc/tables")
+
     def test_workspace_discovery_and_exact_name_duplicate_refusal(self) -> None:
         session = _Session([
             _Response({"orgs": [{"id": "org1", "name": "Safari"}]}),

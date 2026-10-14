@@ -1,0 +1,1 @@
+Read protocol and role instructions. Claim the task before working. For this coordination-only example run the workflow tests, record the designated PR, branch, worktree and exact SHA, and publish an implementation report. Do not edit application source or perform production operations.

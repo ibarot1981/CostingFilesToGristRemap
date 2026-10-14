@@ -21,6 +21,48 @@ from app.utils import display_text, is_blank, is_zero_or_blank, normalize_header
 Row = list[Any]
 
 
+def _read_ods_with_invalid_dates_as_text(path: Path) -> OrderedDict[str, list[Row]]:
+    """Read an ODS when a malformed date cell blocks pyexcel's normal parser.
+
+    ezodf exposes the stored text for ODS date cells. Keep normal conversions
+    unchanged and preserve only invalid typed dates as strings so unrelated
+    workbook preview and processing can continue.
+    """
+    import ezodf
+    from pyexcel_io import service
+
+    document = ezodf.opendoc(str(path))
+    result: OrderedDict[str, list[Row]] = OrderedDict()
+    for native_sheet in document.sheets:
+        rows: list[Row] = []
+        for row_index in range(native_sheet.nrows()):
+            values: Row = []
+            for column_index in range(native_sheet.ncols()):
+                cell = native_sheet.get_cell((row_index, column_index))
+                cell_type = cell.value_type
+                if cell_type == "currency":
+                    cell_value = cell.value
+                    if service.has_no_digits_in_float(cell_value):
+                        cell_value = int(cell_value)
+                    value = f"{cell_value} {cell.currency}"
+                elif cell_type in service.ODS_FORMAT_CONVERSION:
+                    raw_value = cell.value
+                    try:
+                        value = service.VALUE_CONVERTERS[cell_type](raw_value)
+                    except Exception as exc:
+                        if cell_type != "date" or not str(exc).startswith("Bad date value "):
+                            raise
+                        value = raw_value
+                    if cell_type == "float" and service.has_no_digits_in_float(value):
+                        value = int(value)
+                else:
+                    value = "" if cell.value is None else cell.value
+                values.append(value)
+            rows.append(values)
+        result[native_sheet.name] = rows
+    return result
+
+
 @dataclass(frozen=True)
 class RowInfo:
     """A row with its one-based row number."""
@@ -72,7 +114,13 @@ class OdsWorkbook:
         try:
             data = get_data(str(path))
         except Exception as exc:
-            raise WorkbookError(f"Could not read ODS file {path}: {exc}") from exc
+            if "Bad date value " in str(exc):
+                try:
+                    data = _read_ods_with_invalid_dates_as_text(path)
+                except Exception as fallback_exc:
+                    raise WorkbookError(f"Could not read ODS file {path}: {fallback_exc}") from fallback_exc
+            else:
+                raise WorkbookError(f"Could not read ODS file {path}: {exc}") from exc
         return cls(path=path, sheets=OrderedDict((name, list(rows)) for name, rows in data.items()))
 
     def save_as(self, path: Path) -> None:

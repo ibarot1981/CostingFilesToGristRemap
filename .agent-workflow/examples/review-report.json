@@ -1,0 +1,6 @@
+{
+  "task_id":"example-001", "round":1,
+  "reviewed_commit":"REPLACE_WITH_EXACT_SUBMITTED_SHA",
+  "criteria":[{"id":"c1","status":"pass","verified":true,"evidence":"Replace with independent command/output and committed-code inspection evidence."}],
+  "findings":[], "unverified_checks":[]
+}

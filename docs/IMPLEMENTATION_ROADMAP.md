@@ -689,8 +689,48 @@ Stage 5 is partial: required-sheet coverage, exact quantity/2-decimal kg evidenc
 
 Stage 6 Part review slice implemented: canonical selection/unique creation, individual blank rows, audited typed assignment batches, stale-evidence checks and durable retries. Live v7 adds one review table and six Part creation fields; no business assignments made. Pilot has 55 unresolved groups / 100 active rows. Next gate: reviewed Part references in typed import plans and per-code Summary/Paint/Packing configuration. Completion remains gated; stages 5-8 are still partial.
 
-### 6 October prerequisite before further Part mapping
+### 6 October prerequisite before further Part mapping — completed 7 October
 
-PART-002 / D066 takes precedence over the previously stated next import gate. First implement permanent Part identity and SM-P sequence allocation, maintained master shortcodes, automatically generated scope/description/variant names, metadata history/aliases and separate engineering revisions. Sharing scope only determines naming and advisory warnings; it must not restrict Model Code configuration or auto-assign codes. Verify multiple designs shared by different subsets of one Model. Then adapt/advance Part mapping and import integration. Existing stage 6 work is preserved as a prototype and must not be treated as satisfying this prerequisite. See PART_IDENTITY_REQUIREMENTS.md.
+Historical sequencing note: PART-002 / D066 took precedence over the next import gate. That prerequisite—permanent Part identity/number, maintained shortcodes, generated names, metadata/alias history, Rev A, advisory scope, and distinct designs shared by different code subsets—was delivered in the 7 October Grist-backed slice below. Part mapping is now Grist-persisted. Typed imports and per-code configuration remain later work. See PART_IDENTITY_REQUIREMENTS.md.
 
 PART-003 / D067: the upcoming Part creation/mapping work must initialize all managed Parts at Rev A and prohibit later engineering revisions until the governed CR flow is implemented. Metadata naming/scope versions remain distinct. The implementation handoff is docs/PART_CREATION_MAPPING_IMPLEMENTATION_PROMPT.md; implement creation first, then mapping, before resuming later workflow stages.
+
+### 7 October Part registry and purchase-history implementation status
+
+PR #3 now implements Grist-canonical Part business records under schema
+`safari-parts-grist-2026-10-07.v8`. Permanent numbering and request recovery use
+a local journal on one bound writer host; Grist stores ProductPart, Rev A,
+generated-name/metadata/alias history, source mapping references, composition,
+line/drawing links, vendor specifications/equivalences, actual purchase records
+and cost evidence. The v8 migration was additive after a native backup passed
+hash and integrity checks. Production keeps its one legacy Part, numeric
+revision and 313 line masters unchanged; no managed test records were added.
+
+An isolated real-Grist fixture verified Part creation/readback, metadata rename
+and old alias, source mapping, child quantity, exact process line, multiple
+vendors, historical as-of selection, latest current purchase selection,
+persisted cost evidence and a fresh-adapter restart. The fixture document was
+moved to Grist Trash after verification. A local mock-browser check exercised
+the collapsible explorer, mixed MCL/Toolshop/CNC detail, child Part navigation,
+latest purchased rate/history and purchase capture UI.
+
+Updated verification: 174 Python tests passed (one platform skip), 25 Vitest
+tests passed, TypeScript and production build passed. The purchase policy is
+transaction-time ordering, posted/completed-only eligibility, net merchandise
+less discount, exclusion of tax/freight/other charges, explicit conversions,
+and a visible conflict/unavailable state for tied or incomparable latest
+transactions. MaterialRateLog/default selection is unchanged.
+
+**Still open:** legacy Part/numeric-revision classification and migration;
+explicit Model Code `CostingConfiguration`/`ConfigurationPartSelection`;
+automatic Summary extraction and end-to-end purchased-Part cost consumption;
+the approved CR workflow for Rev B+; costing completion and authority cutover.
+Passing this Part slice does not close those gates.
+
+### Owner scope update, 8 October: Live Cost + explicit Cost Snapshots
+
+D070 supersedes the old historical-cost-selection correction. The implementation adds explicit Model Code configuration, a read-only disposable Live Cost evaluator, normalized explicit snapshot Save/read/recovery, inherited reminder policy, and attributable comparisons. It also fixes the four reviewed purchase/metadata/physical-closure/reversal defects while retaining dynamic child metadata propagation and Rev A physical control. The prior `PurchasedPartCostEvidence` endpoint now returns 410; saved rate evidence belongs to CostSnapshot.
+
+Schema `safari-cost-snapshots-grist-2026-10-08.v9` is applied to the validated production Safari document after an integrity-checked native backup. The plan created ten new tables and added `PartComponentRevision.SourcingRoute`; it made no type changes and existing row counts remained unchanged. Backup: `%TEMP%/CostingFilesToGristRemap/safari-grist-backups/safari-manufacturing-live-cost-20261008T063022Z.grist`, SHA-256 `09d732cfe016d0e4a2f61a7886c6b73f581355a5698c51b5d77d8d4e78acea6f`. A temporary real-Grist document verified Live no-write, policy inheritance/Manual suppression, purchase selection, partial-save recovery after an actual committed-row timeout, frozen historical reads, and 40 INR rate attribution; it was moved to Trash. A production browser read selected Safari 500 / Safari 500 M / S500M1.5MS and refreshed Live Cost: the absent configuration showed incomplete/unavailable and disabled snapshot Save. Requests were GET-only. Readback after that browser pass showed zero rows in all ten new D070 tables, zero PartPurchaseRecord/PurchasedPartCostEvidence rows, and the pre-existing one workbook `CostingSnapshot` row. Python: 190 tests, one platform skip; Vitest: 27 tests; TypeScript and production build pass.
+
+Still gated: automatic ODS Summary-to-configuration import and authority integration, approved CR workflow for revisions beyond A, classification/migration of legacy numeric Part evidence, and purchasing/production planning beyond the captured purchase evidence. This is not a completion claim for costing authority. See [accepted Live Cost and snapshot requirements](LIVE_COST_AND_SNAPSHOT_REQUIREMENTS.md) and [the defect review and resolution status](PARTS_COMPLETION_REVIEW_2026_10_07.md).

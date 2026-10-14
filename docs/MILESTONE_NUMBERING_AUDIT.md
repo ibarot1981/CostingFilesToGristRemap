@@ -61,3 +61,24 @@ whole numbers. Existing filenames are kept to preserve history.
    exit item with owner evidence.
 
 The detailed implementation brief is `MILESTONE_3_IMPLEMENTATION_PROMPT.md`.
+
+## Part identity and allocation — 7 October 2026
+
+The accepted D066/D067 identity and Rev A rules are implemented in the
+Grist-backed Part slice on `codex/part-identity-foundation`. Safari schema v8
+stores permanent `SM-P-######` numbers, stable UUIDs, generated names and
+metadata history, aliases, shortcodes, Rev A baselines, mappings, composition,
+drawings and vendor/purchase evidence. A local SQLite journal coordinates the
+one bound writer host and reserves monotonic numbers; it is not the canonical
+Part store. A separate isolated real-Grist fixture verified persistence,
+readback, restart and recovery.
+
+The production schema migration was additive after a native Grist backup
+passed SHA-256 and SQLite integrity checks. Existing ProductPart identity,
+numeric PartRevision values and 313 LineMaster references were left unchanged.
+No managed Part or purchase fixtures were added to production; one coordinator
+row binds the supported writer. Legacy identity/revision classification and
+migration remain a separate review gate. Explicit per-code configuration,
+Summary costing integration and the approved CR flow are not complete. See
+`PART_IDENTITY_REQUIREMENTS.md`, `PARTS_ENTITY_DIAGRAM.md` and
+`WORKFLOW_IMPLEMENTATION.md` for current boundaries.
