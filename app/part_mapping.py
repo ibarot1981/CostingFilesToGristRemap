@@ -806,6 +806,23 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         if current is None or int(record.get("Version") or 0) > int(current.get("Version") or 0):
             legacy_events[coordinate] = record
 
+    # A later explicit line decision may have different semantic evidence and
+    # therefore a different line key.  Follow event-level supersession links
+    # so the older event stays in the audit log without remaining eligible to
+    # restore a Part when the source semantics later revert.
+    superseded_review_keys: set[str] = set()
+    for record in history:
+        evidence = _stored_line_evidence(record, str(record.get("SheetName") or ""))
+        if not evidence:
+            continue
+        linked = evidence.get("supersedesReviewKeys")
+        if isinstance(linked, list):
+            superseded_review_keys.update(str(key) for key in linked if isinstance(key, str) and key)
+    line_events = {key: record for key, record in line_events.items()
+        if str(record.get("ReviewKey") or "") not in superseded_review_keys}
+    legacy_events = {key: record for key, record in legacy_events.items()
+        if str(record.get("ReviewKey") or "") not in superseded_review_keys}
+
     current_lines: list[dict[str, Any]] = []
     for group in detail["groups"]:
         group["mappingMode"] = "line"
@@ -870,6 +887,8 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             continue
         matched_record_keys.add(event_key)
         source["lineKey"] = _stored_line_key(selected_record) or source["lineKey"]
+        source["authoritativeReviewKey"] = str(selected_record.get("ReviewKey") or "")
+        source["authoritativeReviewKeys"] = [source["authoritativeReviewKey"]] if source["authoritativeReviewKey"] else []
         part_id = _stored_part_id(selected_record)
         part = parts_by_id.get(part_id)
         association_ok = context_matches(selected_record)
@@ -892,6 +911,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 "assignedPartIds": [part_id], "hasPriorAssignment": True,
                 "sourceChanged": selected_record.get("SourceHash") != source_hash,
                 "associationChanged": not association_ok, "requiresReview": True,
+                "reviewKey": source["authoritativeReviewKey"], "reviewKeys": source["authoritativeReviewKeys"],
                 "evidenceStatus": "verified" if _stored_line_evidence(selected_record, str(group["sheet"])) else "legacy_unverified"}
             source["semanticComparison"] = {"status": "association_changed" if not association_ok else
                 "grouping_policy_changed" if legacy_policy_change else "part_unavailable", "requiresReview": True}
@@ -899,9 +919,10 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         source["lastSavedVersion"] = int(selected_record.get("Version") or 0)
         source["explicitlyUnassigned"] = explicitly_unassigned and association_ok
 
-    # Older v14 rows have no line key. Exact source coordinates are safe only
-    # under the identical workbook hash; otherwise validated semantic evidence
-    # above must establish a unique correspondence.
+    # Older rows without semantic evidence cannot be matched as verified line
+    # identity.  A same-group/sheet/row proposal may still expose the known
+    # prior Part after a hash change, but it always remains unverified and
+    # requires an explicit user confirmation before it affects the line.
     for item in current_lines:
         group, source = item["group"], item["source"]
         if source.get("reviewed") or source.get("previousAssignment") or id(item) in ambiguous_current:
@@ -909,18 +930,33 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         allowed_group_keys = {str(group.get("key") or ""), *(str(key) for key in group.get("legacyGroupKeys") or [])}
         candidates = [record for (group_key, sheet, row), record in legacy_events.items()
             if sheet == group["sheet"] and row == int(source.get("row") or 0) and group_key in allowed_group_keys
-            and record.get("SourceHash") == source_hash and context_matches(record)]
+            and context_matches(record)]
         if not candidates:
             continue
-        record = max(candidates, key=lambda row: int(row.get("Version") or 0))
+        latest_version = max(int(record.get("Version") or 0) for record in candidates)
+        latest_candidates = [record for record in candidates if int(record.get("Version") or 0) == latest_version]
+        latest_part_ids = {_stored_part_id(record) for record in latest_candidates}
+        if len(latest_part_ids) > 1:
+            ambiguous_current.add(id(item))
+            source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
+                "reason": "Legacy row history contains conflicting prior Part assignments."}
+            continue
+        record = max(latest_candidates, key=lambda row: (
+            str(row.get("GroupKey") or "") == str(group.get("key") or ""), str(row.get("ReviewKey") or "")))
+        prior_review_keys = sorted({str(candidate.get("ReviewKey") or "") for candidate in latest_candidates
+            if candidate.get("ReviewKey")})
         part_id = _stored_part_id(record)
         part = parts_by_id.get(part_id)
+        source["authoritativeReviewKey"] = str(record.get("ReviewKey") or "")
+        source["authoritativeReviewKeys"] = prior_review_keys
         if part_id:
             source["previousAssignment"] = {"partId": (part or {}).get("id"),
                 "partNumber": (part or {}).get("partNumber") or record.get("PartNumberUsed"),
                 "name": (part or {}).get("name") or record.get("NameUsed"), "assignedPartIds": [part_id],
-                "hasPriorAssignment": True, "requiresReview": True, "sourceChanged": False,
-                "associationChanged": False, "evidenceStatus": "legacy_unverified"}
+                "hasPriorAssignment": True, "requiresReview": True,
+                "sourceChanged": record.get("SourceHash") != source_hash,
+                "associationChanged": False, "reviewKey": source["authoritativeReviewKey"],
+                "reviewKeys": prior_review_keys, "evidenceStatus": "legacy_unverified"}
             source["semanticComparison"] = {"status": "legacy_evidence_missing", "requiresReview": True}
         else:
             source["explicitlyUnassigned"] = True
@@ -951,6 +987,9 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             for record, old in candidates}
         if len(unique) == 1:
             record, previous = next(iter(unique.values()))
+            authoritative_review_key = str(record.get("ReviewKey") or "")
+            source["authoritativeReviewKey"] = authoritative_review_key
+            source["authoritativeReviewKeys"] = [authoritative_review_key] if authoritative_review_key else []
             part_id = _stored_part_id(record)
             part = parts_by_id.get(part_id)
             source["previousAssignment"] = {"partId": (part or {}).get("id") or None,
@@ -958,7 +997,8 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 "name": (part or {}).get("name") or record.get("NameUsed"),
                 "assignedPartIds": [part_id] if part_id else [], "hasPriorAssignment": bool(part_id),
                 "sourceChanged": record.get("SourceHash") != source_hash, "associationChanged": not context_matches(record),
-                "requiresReview": True, "evidenceStatus": "verified"}
+                "requiresReview": True, "reviewKey": authoritative_review_key,
+                "reviewKeys": source["authoritativeReviewKeys"], "evidenceStatus": "verified"}
             source["semanticComparison"] = {"status": "changed", "requiresReview": True,
                 "previous": previous, "current": evidence}
         elif candidates:
@@ -1120,6 +1160,12 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             grouped_actions[group["key"]].append(line_actions[line_key])
             persisted_evidence = {**line_evidence, "lineKey": line_key,
                 "linePolicyVersion": MAPPING_LINE_EVIDENCE_VERSION}
+            supersedes_review_keys = previous.get("reviewKeys") or source.get("authoritativeReviewKeys") or (
+                [previous.get("reviewKey")] if previous.get("reviewKey") else
+                ([source["authoritativeReviewKey"]] if source.get("authoritativeReviewKey") else []))
+            supersedes_review_keys = sorted({str(key) for key in supersedes_review_keys if isinstance(key, str) and key})
+            if supersedes_review_keys:
+                persisted_evidence["supersedesReviewKeys"] = supersedes_review_keys
             row = {"ReviewKey": "part-review:" + fingerprint([request_key, line_key]),
                 "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
                 "AssociationVersion": association.version, "GroupKey": group["key"],

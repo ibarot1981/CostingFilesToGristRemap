@@ -152,6 +152,92 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(changed_detail["rows"][1]["previousAssignment"]["partId"], "1")
         self.assertIsNone(changed_detail["rows"][2]["part"])
 
+    def test_semantic_reversion_uses_latest_remap_or_clear_decision(self):
+        from copy import deepcopy
+
+        for final_decision, expected_part_id in (("2", "2"), ("", None)):
+            with self.subTest(final_decision=final_decision):
+                self.store = MemoryPartStore()
+                self.create(name="Part A", part_key="part-a")
+                self.create(name="Part B", part_key="part-b")
+                original = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+                ])
+                original_row = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash1",
+                    association=self.association, groups=original)["groups"][0]["rows"][0]
+                self.save_lines(original, {original_row["lineKey"]: "1"}, request_key="f1-original")
+                original_record = deepcopy(self.store.tables["PartMappingReview"][0])
+
+                edited = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 2}),
+                ])
+                edited_row = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash2",
+                    association=self.association, groups=edited)["groups"][0]["rows"][0]
+                self.assertEqual(edited_row["semanticComparison"]["status"], "changed")
+                self.assertEqual(edited_row["previousAssignment"]["partId"], "1")
+                second_key = edited_row["lineKey"]
+                self.save_lines(edited, {second_key: final_decision}, source_hash="hash2", expected_version=1,
+                    request_key="f1-latest-decision", line_reasons={second_key: "Reviewed the changed source line"})
+                latest_record = deepcopy(self.store.tables["PartMappingReview"][-1])
+
+                reverted = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+                ])
+                current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash3",
+                    association=self.association, groups=reverted)["groups"][0]["rows"][0]
+                self.assertFalse(current["reviewed"])
+                self.assertIsNone(current["part"], "a reversion must not silently resurrect an older Part")
+                self.assertEqual(current["semanticComparison"]["status"], "changed")
+                self.assertEqual(current["previousAssignment"]["reviewKey"], latest_record["fields"]["ReviewKey"])
+                self.assertEqual(current["previousAssignment"]["partId"], expected_part_id)
+                self.assertEqual(self.store.tables["PartMappingReview"][0], original_record,
+                    "supersession is additive; prior audit evidence remains immutable")
+                replay = self.save_lines(edited, {second_key: final_decision}, source_hash="hash2", expected_version=1,
+                    request_key="f1-latest-decision", line_reasons={second_key: "Reviewed the changed source line"})
+                self.assertTrue(replay["idempotent"])
+                self.assertEqual(len(self.store.tables["PartMappingReview"]), 2)
+
+    def test_legacy_line_proposal_survives_hash_change_and_enforces_replacement_reasons(self):
+        for operation in ("replace", "clear", "confirm"):
+            with self.subTest(operation=operation):
+                self.store = MemoryPartStore()
+                self.create(name="Part A", part_key="part-a")
+                self.create(name="Part B", part_key="part-b")
+                legacy_groups = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+                ])
+                group = legacy_groups[0]
+                self.store.append("PartMappingReview", [{"ReviewKey": "legacy-line-assignment", "FileKey": "file:pilot.ods",
+                    "SourceHash": "hash1", "AssociationKey": "association-1", "AssociationVersion": 1,
+                    "GroupKey": group["key"], "SheetName": group["sheet"], "SourceRow": 10,
+                    "SourceDescription": group["description"], "ProductPart": 1, "Version": 1, "Actor": "Irshad",
+                    "Reason": "Legacy assignment", "OccurredAt": "2026-10-01T00:00:00Z", "RequestKey": "legacy-request",
+                    "RequestFingerprint": "legacy-fingerprint", "RequestRowCount": 1}])
+                current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash2",
+                    association=self.association, groups=legacy_groups)["groups"][0]["rows"][0]
+                self.assertFalse(current["reviewed"])
+                self.assertIsNone(current["part"], "legacy evidence remains a proposal, not an automatic match")
+                self.assertEqual(current["semanticComparison"]["status"], "legacy_evidence_missing")
+                self.assertEqual(current["previousAssignment"]["partId"], "1")
+                self.assertEqual(current["previousAssignment"]["evidenceStatus"], "legacy_unverified")
+                self.assertEqual(current["previousAssignment"]["reviewKey"], "legacy-line-assignment")
+                line_key = current["lineKey"]
+
+                selection = {"replace": "2", "clear": "", "confirm": "1"}[operation]
+                if operation in {"replace", "clear"}:
+                    with self.assertRaises(PartConflict) as missing_reason:
+                        self.save_lines(legacy_groups, {line_key: selection}, source_hash="hash2",
+                            expected_version=1, request_key="legacy-no-reason")
+                    self.assertEqual(missing_reason.exception.code, "PART_REVIEW_REASON_REQUIRED")
+                reasons = {line_key: "Reviewed legacy assignment"} if operation in {"replace", "clear"} else None
+                self.save_lines(legacy_groups, {line_key: selection}, source_hash="hash2", expected_version=1,
+                    request_key="legacy-confirmed", line_reasons=reasons)
+                saved = self.store.tables["PartMappingReview"][-1]["fields"]
+                self.assertIn("supersedesReviewKeys", saved["SemanticEvidence"])
+                self.assertEqual(saved["SemanticEvidence"]["supersedesReviewKeys"], ["legacy-line-assignment"])
+                self.assertEqual(saved["ActionType"], {"replace": "replace_assignment", "clear": "clear_assignment",
+                    "confirm": "context_reconfirmation"}[operation])
+
     def test_group_identity_is_sheet_and_mapping_label_with_source_details(self):
         groups = source_groups({
             "5. Material Cut List Price": [{"status": "active", "source_row": 10,
@@ -609,6 +695,50 @@ class PartMappingTests(unittest.TestCase):
                     expected_association_version=1, actor="Irshad", request_key="old-schema-blocked-save")
             self.assertEqual(blocked_save.exception.code, "PART_SCHEMA_UNAVAILABLE")
             self.assertEqual(len(client.tables["PartMappingReview"]), 2)
+
+            # A later semantic decision explicitly supersedes its predecessor
+            # inside the persisted Any evidence. A fresh registry must honor
+            # that edge when an older semantic value is seen again.
+            edited_groups = self.manufacturing_groups("CNC Cut List", [
+                (42, {"part_category": "Bracket", "product_part_name": "Plate 42", "material_to_cut": "MS",
+                    "length": "12.0", "width": "8", "thickness": "3", "qty": 4}),
+            ])
+            edited_row = mapping_detail(store, file_id="file:pilot.ods", source_hash="hash-grist-edit",
+                association=self.association, groups=edited_groups)["groups"][0]["rows"][0]
+            self.assertEqual(edited_row["previousAssignment"]["partId"], "stable-bracket")
+            save_mapping(store, file_id="file:pilot.ods", source_hash="hash-grist-edit", association=self.association,
+                groups=edited_groups, line_decisions={edited_row["lineKey"]: "stable-mount"}, expected_hash="hash-grist-edit",
+                expected_version=2, expected_association="association-1", expected_association_version=1,
+                actor="Irshad", line_reasons={edited_row["lineKey"]: "Reviewed changed CNC quantity"},
+                request_key="grist-superseding-save")
+            persisted_latest = client.tables["PartMappingReview"][-1]["fields"]
+            latest_evidence = persisted_latest["SemanticEvidence"]
+            if isinstance(latest_evidence, str):
+                latest_evidence = json.loads(latest_evidence)
+            self.assertEqual(latest_evidence["supersedesReviewKeys"], [persisted["ReviewKey"]])
+            replay_superseding = save_mapping(store, file_id="file:pilot.ods", source_hash="hash-grist-edit",
+                association=self.association, groups=edited_groups, line_decisions={edited_row["lineKey"]: "stable-mount"},
+                expected_hash="hash-grist-edit", expected_version=2, expected_association="association-1",
+                expected_association_version=1, actor="Irshad", line_reasons={edited_row["lineKey"]: "Reviewed changed CNC quantity"},
+                request_key="grist-superseding-save")
+            self.assertTrue(replay_superseding["idempotent"])
+            self.assertEqual(len(client.tables["PartMappingReview"]), 3)
+
+            recovered_registry = GristPartRegistry(client, path=Path(temp) / "journal.sqlite3")
+            recovered_registry._verify_writer = lambda: None
+            recovered_registry.mapping_evidence_schema_available = lambda: True
+            recovered_store = PartRegistryMappingStore(GristPartStore(client), recovered_registry)
+            reverted_groups = self.manufacturing_groups("CNC Cut List", [
+                (42, {"part_category": "Bracket", "product_part_name": "Plate 42", "material_to_cut": "MS",
+                    "length": "12.0", "width": "8", "thickness": "3", "qty": 1}),
+            ])
+            reverted = mapping_detail(recovered_store, file_id="file:pilot.ods", source_hash="hash-grist-revert",
+                association=self.association, groups=reverted_groups)["groups"][0]["rows"][0]
+            self.assertFalse(reverted["reviewed"])
+            self.assertIsNone(reverted["part"])
+            self.assertEqual(reverted["previousAssignment"]["partId"], "stable-mount")
+            self.assertEqual(reverted["previousAssignment"]["reviewKey"], persisted_latest["ReviewKey"])
+            self.assertEqual(reverted["semanticComparison"]["status"], "changed")
 
     def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)
