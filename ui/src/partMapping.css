@@ -318,10 +318,28 @@
 .part-removed-groups article>header { display: flex; justify-content: space-between; gap: 10px; color: #55432d; font-size: 9px; }
 .part-removed-groups article>header span { color: #7b6040; text-align: right; }
 .part-removed-groups .part-semantic-differences { margin-bottom: 0; }
+.part-deleted-lines-banner { max-width: 1480px; margin: 8px auto; padding: 9px 11px; border: 1px solid #e4b685; border-left: 4px solid #c56f35; border-radius: 7px; color: #70421f; background: #fff6e9; font-size: 10px; line-height: 1.45; }
+.part-deleted-lines { display: grid; gap: 7px; margin: 9px 0; padding: 9px; border: 1px solid #e4b685; border-radius: 8px; background: #fff9f0; }
+.part-deleted-lines h3 { margin: 0; color: #754a28; font-size: 10px; }
+.part-deleted-line-review { display: grid; gap: 6px; padding: 8px; border: 1px solid #ead7c1; border-radius: 7px; background: #fff; }
+.part-deleted-line-review.needs-review { border-left: 3px solid #bd6a35; }
+.part-deleted-line-review.is-reviewed { border-left: 3px solid #4a9a70; }
+.part-deleted-line-review>header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; color: #4b5667; font-size: 9px; }
+.part-deleted-line-review>header span { color: #334761; font-weight: 700; }
+.part-deleted-line-review>p { margin: 0; color: #667386; font-size: 9px; line-height: 1.4; }
+.part-deleted-line-review>details { color: #65748a; font-size: 8px; }
+.part-deleted-line-review>details small { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+.part-deleted-line-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 7px; }
+.part-deleted-line-actions label { display: grid; flex: 1 1 300px; gap: 3px; color: #665640; font-size: 9px; }
+.part-deleted-line-actions input { min-width: 0; padding: 6px 8px; border: 1px solid #c9ced5; border-radius: 5px; font: inherit; }
+.part-deleted-line-actions .button { min-height: 31px; padding: 6px 9px; font-size: 9px; }
+.part-deleted-line-resolved { padding: 6px 8px; border-radius: 5px; color: #2c6848 !important; background: #edf8f1; }
 @media(max-width:650px) {
   .part-compatibility-note span { flex-basis: 100%; }
   .part-removed-groups article>header { flex-direction: column; }
   .part-removed-groups article>header span { text-align: left; }
+  .part-deleted-line-review>header { flex-direction: column; }
+  .part-deleted-line-actions { align-items: stretch; }
 }
 
 .part-line-assignment-editor { display: grid; gap: 8px; margin: 8px 0; padding: 9px; border: 1px solid #d7dfe9; border-radius: 8px; background: #f4f7fa; }

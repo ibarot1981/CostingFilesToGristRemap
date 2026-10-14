@@ -129,7 +129,10 @@ def _mapping_row_reviewed(row: dict[str, Any], group: dict[str, Any]) -> bool:
 
 def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict[str, Any]]:
     groups_by_family = {family: [] for family in FAMILY_ORDER}
-    for group in mapping.get("groups", []):
+    # Entirely removed groups still carry outstanding per-line deletion evidence.
+    # Include them in applicability/gating so a removed group cannot disappear
+    # from the baseline review merely because no current source rows remain.
+    for group in [*mapping.get("groups", []), *(mapping.get("removedGroups") or [])]:
         family = FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))
         if family:
             groups_by_family[family].append(group)
@@ -144,6 +147,8 @@ def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict
         fully_mapped_groups = 0
         for group in family_groups:
             group_rows = group.get("rows") or []
+            pending_deleted = [line for line in group.get("deletedLines") or []
+                if not line.get("reviewed") and (line.get("previousAssignment") or {}).get("partId") == part_id]
             assigned_rows = [row for row in group_rows
                 if _mapping_row_reviewed(row, group) and (_mapping_row_part(row, group) or {}).get("id") == part_id]
             unresolved_lines += sum(not _mapping_row_reviewed(row, group)
@@ -151,11 +156,14 @@ def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict
             assigned_elsewhere_lines += sum(_mapping_row_reviewed(row, group)
                 and bool((_mapping_row_part(row, group) or {}).get("id"))
                 and (_mapping_row_part(row, group) or {}).get("id") != part_id for row in group_rows)
-            if group_rows and all(_mapping_row_reviewed(row, group) and (_mapping_row_part(row, group) or {}).get("id") for row in group_rows):
+            if group_rows and not pending_deleted and all(_mapping_row_reviewed(row, group) and (_mapping_row_part(row, group) or {}).get("id") for row in group_rows):
                 fully_mapped_groups += 1
-            if assigned_rows:
+            if assigned_rows or pending_deleted:
                 mapped.append({**group, "rows": assigned_rows, "reviewed": True,
                     "mappedLineCount": len(assigned_rows), "sourceLineCount": len(group_rows),
+                    "deletedLines": [*pending_deleted, *(line for line in group.get("deletedLines") or [] if line.get("reviewed")
+                        and (line.get("previousAssignment") or {}).get("partId") == part_id)],
+                    "hasUnresolvedDeletedLines": bool(pending_deleted),
                     "hasUnresolvedLines": any(not _mapping_row_reviewed(row, group)
                         or not (_mapping_row_part(row, group) or {}).get("id") for row in group_rows)})
         diag = diagnostics.get(sheet) or {}
@@ -168,9 +176,13 @@ def _family_review_rows(mapping: dict[str, Any], part_id: str) -> dict[str, dict
             "mappedGroupCount": len(mapped),
             "fullyMappedGroupCount": fully_mapped_groups,
             "unreviewedGroupCount": sum(any(not _mapping_row_reviewed(row, group)
-                or not (_mapping_row_part(row, group) or {}).get("id") for row in group.get("rows") or []) for group in family_groups),
+                or not (_mapping_row_part(row, group) or {}).get("id") for row in group.get("rows") or [])
+                or any(not line.get("reviewed") and (line.get("previousAssignment") or {}).get("partId") == part_id
+                    for line in group.get("deletedLines") or []) for group in family_groups),
             "mappedLineCount": sum(len(group["rows"]) for group in mapped),
             "unmappedLineCount": unresolved_lines,
+            "pendingDeletedLineCount": sum(1 for group in family_groups for line in group.get("deletedLines") or []
+                if not line.get("reviewed") and (line.get("previousAssignment") or {}).get("partId") == part_id),
             "assignedElsewhereLineCount": assigned_elsewhere_lines,
             "requirementCount": sum(len(group.get("rows") or []) for group in mapped),
             "groups": mapped,
@@ -209,6 +221,8 @@ def _family_confirmations(mapping: dict[str, Any], part_id: str, submitted: Any,
             errors.append(f"{evidence['sheet']}: confirm that this source family does not apply to the Part.")
         if strict and evidence["unmappedLineCount"]:
             errors.append(f"{evidence['sheet']}: {evidence['unmappedLineCount']} source line(s) remain unassigned or need review before the Part baseline can be established.")
+        if strict and evidence.get("pendingDeletedLineCount"):
+            errors.append(f"{evidence['sheet']}: {evidence['pendingDeletedLineCount']} previously mapped source line(s) were removed and need explicit review before the Part baseline can be established.")
         if strict and status == "applicable" and evidence["mappedGroupCount"] == 0:
             errors.append(f"{evidence['sheet']}: Applicable requires at least one saved, current Part mapping.")
         result[family] = {**evidence, "applicabilityStatus": status or "unconfirmed", "completenessConfirmed": confirmed}
@@ -476,10 +490,20 @@ class PartBaselineService:
             "families": family_states,
             "mapping": {"unresolvedGroups": mapping.get("unresolvedGroups", 0),
                 "unresolvedLines": mapping.get("unresolvedLines", 0),
+                "unresolvedDeletedLines": mapping.get("unresolvedDeletedLines", 0),
+                "deletedLines": [{"groupKey": line.get("groupKey"), "sheet": line.get("sheet"),
+                    "description": line.get("description"), "row": line.get("row"), "reviewKey": line.get("reviewKey"),
+                    "previousAssignment": line.get("previousAssignment"), "reviewed": line.get("reviewed"),
+                    "semanticComparison": line.get("semanticComparison")}
+                    for group in [*mapping.get("groups", []), *(mapping.get("removedGroups") or [])]
+                    for line in group.get("deletedLines") or []
+                    if (line.get("previousAssignment") or {}).get("partId") == part_id],
                 "groups": [{"key": item.get("key"), "sheet": item.get("sheet"), "description": item.get("description"),
                     "rows": len(item.get("rows") or []), "reviewed": item.get("reviewed"),
                     "partId": (item.get("part") or {}).get("id"),
                     "assignmentSummary": item.get("assignmentSummary"),
+                    "deletedLines": [line for line in item.get("deletedLines") or []
+                        if (line.get("previousAssignment") or {}).get("partId") == part_id],
                     "lineAssignments": [{"lineKey": row.get("lineKey"), "row": row.get("row"),
                         "partId": (row.get("part") or {}).get("id"), "reviewed": bool(row.get("reviewed")),
                         "semanticStatus": (row.get("semanticComparison") or {}).get("status")}

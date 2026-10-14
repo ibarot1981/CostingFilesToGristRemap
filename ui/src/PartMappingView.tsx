@@ -13,12 +13,13 @@ type SemanticLine = { fingerprint: string; fields: SemanticField[] };
 type SemanticDifference = { type: string; previous: SemanticLine | null; current: SemanticLine | null; reason?: string; fieldDifferences?: { field: string; previous?: SemanticField; current?: SemanticField }[] };
 type SemanticComparison = { status: string; previousFingerprint?: string | null; currentFingerprint?: string | null; previousPolicyVersion?: string; sourceHashChanged?: boolean; associationChanged?: boolean; groupingPolicyChanged?: boolean; differences: SemanticDifference[]; requiresReview: boolean };
 type PreviousAssignment = { partId?: string | null; partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number; assignedPartIds?: string[]; hasPriorAssignment?: boolean; contextChanged?: boolean; groupingPolicyChanged?: boolean; evidenceStatus?: string };
-type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; semanticFingerprint?: string; semanticComparison?: SemanticComparison; assignmentSummary?: { partCount: number; mappedLineCount: number; unassignedLineCount: number }; pendingLineKeys?: string[]; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment; needsCompatibilityReview?: boolean; version: number };
-type RemovedGroup = { key: string; sheet: string; description: string; removed: true; previousAssignment?: PreviousAssignment; semanticComparison?: SemanticComparison };
-type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; schemaMessage?: string | null; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; semanticPolicyVersion?: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; removedGroups?: RemovedGroup[]; unresolvedGroups: number; unresolvedLines?: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; NameUsed?: string; PartNumberUsed?: string }[] };
-type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[]; lineKeys?: string[] };
+type DeletedLineReview = { reviewKey: string; priorReviewKey?: string; lineKey?: string; groupKey: string; sheet: string; description: string; row: number | null; semanticEvidence: SemanticLine; previousAssignment: PreviousAssignment; semanticComparison: SemanticComparison; provenance?: { reviewKey?: string; version?: number; actor?: string; reason?: string; occurredAt?: string; sourceHash?: string }; reviewed?: boolean; resolution?: { actor?: string; reason?: string; version?: number } | null };
+type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; semanticFingerprint?: string; semanticComparison?: SemanticComparison; assignmentSummary?: { partCount: number; mappedLineCount: number; unassignedLineCount: number }; pendingLineKeys?: string[]; deletedLines?: DeletedLineReview[]; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment; needsCompatibilityReview?: boolean; version: number };
+type RemovedGroup = { key: string; sheet: string; description: string; removed: true; reviewed?: boolean; deletedLines?: DeletedLineReview[]; previousAssignment?: PreviousAssignment; semanticComparison?: SemanticComparison };
+type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; schemaMessage?: string | null; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; semanticPolicyVersion?: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; removedGroups?: RemovedGroup[]; unresolvedGroups: number; unresolvedLines?: number; unresolvedDeletedLines?: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; ActionType?: string; NameUsed?: string; PartNumberUsed?: string }[] };
+type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[]; lineKeys?: string[]; deletedLineReviewKeys?: string[] };
 type StaleDraft = { groupKey: string; sheet: string; description: string; rowCount: number; decision: string; hasGroupDecision?: boolean; part: Part | null; sourceHash: string; evidenceFingerprint: string; reason?: string; lineDecisions?: Record<string, string>; lineParts?: Record<string, Part>; lineEvidence?: Record<string, string>; lineReasons?: Record<string, string> };
-type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; lineDecisions?: Record<string, string>; lineDraftParts?: Record<string, Part>; selectedLineKeys?: string[]; splitModes?: Record<string, boolean>; lineReasons?: Record<string, string>; groupReasons?: Record<string, string>; expandedGroups?: Record<string, boolean>; expandedSourceDetails?: Record<string, boolean>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string; lineKeys?: string[]; lineEvidence?: Record<string, string>}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
+type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; lineDecisions?: Record<string, string>; lineDraftParts?: Record<string, Part>; selectedLineKeys?: string[]; splitModes?: Record<string, boolean>; lineReasons?: Record<string, string>; deletedLineReasons?: Record<string, string>; groupReasons?: Record<string, string>; expandedGroups?: Record<string, boolean>; expandedSourceDetails?: Record<string, boolean>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string; lineKeys?: string[]; lineEvidence?: Record<string, string>}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
 type ReturnSelection = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string; lineKeys?: string[]; selectedLineEvidenceFingerprint?: string };
 type SheetFilter = "all" | "mcl" | "toolshop" | "cnc";
 type ReviewFilter = "all" | "needs-review" | "saved" | "unsaved" | "unassigned";
@@ -90,11 +91,12 @@ function mappingRefreshNotice(saved: Draft, result: Detail) {
   const legacy = statuses.filter(status => status === "legacy_evidence_missing").length;
   const preserved = result.groups.filter(group => group.reviewed && group.semanticComparison?.status === "unchanged").length;
   const removed = result.removedGroups?.length || 0;
+  const deletedLines = result.unresolvedDeletedLines || 0;
   if (associationChanged) {
     return `The file’s Product/Model association changed. Prior Part assignments remain proposals and need explicit review for this association; ${affected} group(s) also have changed or ambiguous manufacturing evidence. Pending choices were held for explicit review and not applied.`;
   }
   if (saved.sourceHash !== result.sourceHash) {
-    return `Workbook hash changed: ${preserved} group(s) retain their saved Part assignment because relevant manufacturing evidence matches; ${affected - groupingChanged} group(s) need review for relevant line or correspondence changes; ${groupingChanged} group(s) need review because grouping policy changed; ${legacy} group(s) need one-time evidence confirmation; ${removed} saved group(s) no longer occur in this workbook. Rate/price totals, formatting and document metadata do not trigger remapping. Pending choices were held for explicit review and not applied.`;
+    return `Workbook hash changed: ${preserved} group(s) retain their saved Part assignment because relevant manufacturing evidence matches; ${affected - groupingChanged} group(s) need review for relevant line or correspondence changes; ${groupingChanged} group(s) need review because grouping policy changed; ${legacy} group(s) need one-time evidence confirmation; ${removed} saved group(s) no longer occur in this workbook; ${deletedLines} previously mapped line(s) require explicit removal review. Rate/price totals, formatting and document metadata do not trigger remapping. Pending choices were held for explicit review and not applied.`;
   }
   return "The saved mapping version changed. Grist assignments were refreshed; unsaved choices were held and not applied.";
 }
@@ -117,6 +119,31 @@ function SemanticDifferenceList({ comparison }: { comparison?: SemanticCompariso
     })}</div>
   </details>;
 }
+function DeletedLineReviewCard({ line, reason, disabled, onReasonChange, onReview }: {
+  line: DeletedLineReview; reason: string; disabled: boolean;
+  onReasonChange: (value: string) => void; onReview: () => void;
+}) {
+  const prior = line.previousAssignment;
+  const part = prior.partNumber ? `${prior.partNumber} · ${prior.name || "Prior Part"}` : prior.name || "No verified prior Part";
+  const location = `${line.sheet} · row ${line.row ?? "not recorded"}`;
+  return <article className={`part-deleted-line-review ${line.reviewed ? "is-reviewed" : "needs-review"}`}>
+    <header><strong>{location} · {line.description || "Blank Part label"}</strong><span>{part}</span></header>
+    <p>{line.reviewed
+      ? "This previously mapped source line was explicitly reviewed as removed. Its Part requirements and quantities were not changed."
+      : line.semanticComparison.status === "deleted"
+        ? "This mapped line is absent from the current workbook. Confirm its removal only after checking the prior evidence."
+        : "This previously mapped line has no current semantic match. Check whether it was removed before recording that review."}</p>
+    <SemanticDifferenceList comparison={line.semanticComparison}/>
+    <details><summary>Prior mapping provenance</summary><small>{line.provenance?.reviewKey || line.priorReviewKey || "Legacy evidence"}
+      {line.provenance?.version ? ` · review version ${line.provenance.version}` : ""}
+      {line.provenance?.actor ? ` · ${line.provenance.actor}` : ""}
+      {line.provenance?.sourceHash ? ` · workbook ${line.provenance.sourceHash.slice(0,12)}…` : ""}
+      {line.provenance?.reason ? ` · ${line.provenance.reason}` : ""}</small></details>
+    {line.reviewed ? <p className="part-deleted-line-resolved" role="status">Removal review recorded{line.resolution?.actor ? ` by ${line.resolution.actor}` : ""}{line.resolution?.reason ? `: ${line.resolution.reason}` : ""}.</p>
+      : <div className="part-deleted-line-actions"><label>Reason for confirming this source line was removed<input name={`deleted-line-reason-${line.reviewKey}`} autoComplete="off" spellCheck={false} aria-label={`Reason for confirming removed source line · ${location}`} value={reason} disabled={disabled} onChange={event => onReasonChange(event.target.value)} placeholder="Required for the audit record"/></label>
+        <button type="button" className="button primary" disabled={disabled || !reason.trim()} onClick={onReview}>Confirm source line removed</button></div>}
+  </article>;
+}
 function narrowScreen() {
   return typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 1000px)").matches : window.innerWidth <= 1000;
 }
@@ -130,6 +157,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   const [selectedLineKeys, setSelectedLineKeys] = useState<string[]>([]);
   const [splitModes, setSplitModes] = useState<Record<string, boolean>>({});
   const [lineReasons, setLineReasons] = useState<Record<string, string>>({});
+  const [deletedLineReasons, setDeletedLineReasons] = useState<Record<string, string>>({});
   const [staleDrafts, setStaleDrafts] = useState<StaleDraft[]>([]);
   const [reason, setReason] = useState("");
   const [groupReasons, setGroupReasons] = useState<Record<string, string>>({});
@@ -238,6 +266,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         setSelectedLineKeys((saved.selectedLineKeys || []).filter(key => result.groups.some(group => group.rows.some(row => row.lineKey === key))));
         setSplitModes(saved.splitModes || {});
         setLineReasons(saved.lineReasons || {});
+        setDeletedLineReasons(saved.deletedLineReasons || {});
         setGroupReasons(saved.groupReasons || {});
         setStaleDrafts(saved.staleDrafts || []);
         setReason(saved.reason || ""); setQuery(saved.query || "");
@@ -262,6 +291,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         setStaleDrafts([...(saved?.staleDrafts || []), ...heldDrafts]);
         setDecisions({}); setDraftParts({});
         setLineDecisions({}); setLineDraftParts({}); setSelectedLineKeys([]); setSplitModes({}); setLineReasons({});
+        setDeletedLineReasons({});
         setGroupReasons({});
         setReason(saved?.reason || ""); setQuery(saved?.query || "");
         setSheetFilter((saved?.sheetFilter || "all") as SheetFilter); setReviewFilter((saved?.reviewFilter || "all") as ReviewFilter);
@@ -325,7 +355,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     const revision = ++generation.current;
     const returningToSamePath = loadedPath.current === path && Boolean(detail);
     if (!returningToSamePath) {
-      setDetail(null); setDecisions({}); setDraftParts({}); setLineDecisions({}); setLineDraftParts({}); setSelectedLineKeys([]); setSplitModes({}); setLineReasons({}); setStaleDrafts([]); setReason("");
+      setDetail(null); setDecisions({}); setDraftParts({}); setLineDecisions({}); setLineDraftParts({}); setSelectedLineKeys([]); setSplitModes({}); setLineReasons({}); setDeletedLineReasons({}); setStaleDrafts([]); setReason("");
       setGroupReasons({}); setExpandedGroups({}); setExpanded({}); setNotice(""); setError(""); setBusy(false);
       setMappingAttempt(null); setConfirmBatch(false); inFlight.current = false;
     }
@@ -343,10 +373,10 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         sheet:group.sheet, description:group.description, rowCount:group.rows.length, evidenceFingerprint:group.evidenceFingerprint,
         lineKeys:group.rows.flatMap(row => row.lineKey ? [row.lineKey] : []),
         lineEvidence:Object.fromEntries(group.rows.flatMap(row => row.lineKey && row.semanticEvidence?.fingerprint ? [[row.lineKey, row.semanticEvidence.fingerprint]] : []))})),
-      staleDrafts, scrollTop: tableScroll.current?.scrollTop || 0, mappingAttempt };
+      deletedLineReasons, staleDrafts, scrollTop: tableScroll.current?.scrollTop || 0, mappingAttempt };
     sessionStorage.setItem(draftKey(path), JSON.stringify(saved));
   }, [path, detail, decisions, draftParts, lineDecisions, lineDraftParts, selectedLineKeys, splitModes, lineReasons,
-    groupReasons, expandedGroups, expanded, staleDrafts, reason, query, sheetFilter, reviewFilter, mappingAttempt]);
+    deletedLineReasons, groupReasons, expandedGroups, expanded, staleDrafts, reason, query, sheetFilter, reviewFilter, mappingAttempt]);
 
   function openParts(group: Group | null, partId: string | null, mode: "select" | "view", selectedRows: SourceRow[] = []) {
     if (!detail) return;
@@ -511,7 +541,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     if (!detail || !groupKeys.length || inFlight.current) return;
     let attempt = mappingAttempt;
     if (attempt) {
-      if (attempt.groupKeys.join("\0") !== groupKeys.join("\0")) return;
+      if (attempt.deletedLineReviewKeys?.length || attempt.groupKeys.join("\0") !== groupKeys.join("\0")) return;
     } else {
       const payloadDecisions = Object.fromEntries(groupKeys.flatMap(key => Object.prototype.hasOwnProperty.call(decisions, key) ? [[key, decisions[key]]] : []));
       const payloadLineDecisions = Object.fromEntries(groupKeys.flatMap(key => {
@@ -626,6 +656,35 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     finally { inFlight.current = false; if (requestRevision === generation.current) setBusy(false); }
   }
 
+  async function reviewDeletedLine(reviewKey: string) {
+    if (!detail || busy || loading || inFlight.current) return;
+    let attempt = mappingAttempt;
+    if (attempt) {
+      if (!attempt.deletedLineReviewKeys?.includes(reviewKey)) return;
+    } else {
+      const deleted = [...detail.groups.flatMap(group => group.deletedLines || []), ...(detail.removedGroups || []).flatMap(group => group.deletedLines || [])]
+        .find(line => line.reviewKey === reviewKey && !line.reviewed);
+      const lineReason = (deletedLineReasons[reviewKey] || "").trim();
+      if (!deleted || !lineReason) return;
+      attempt = { key: crypto.randomUUID(), groupKeys: [], lineKeys: [], deletedLineReviewKeys: [reviewKey], payload: {
+        path, expectedHash: detail.sourceHash, expectedVersion: detail.version, expectedAssociationKey: detail.associationKey,
+        expectedAssociationVersion: detail.associationVersion, decisions: {}, lineDecisions: {}, deletedLineReviews: { [reviewKey]: lineReason },
+      } };
+    }
+    const requestRevision = generation.current;
+    inFlight.current = true; setMappingAttempt(attempt); setBusy(true); setError("");
+    try {
+      const result = await api.savePartMappings(attempt.payload, attempt.key);
+      if (requestRevision !== generation.current) return;
+      const fresh = await api.partMappings(path) as Detail;
+      if (requestRevision !== generation.current) return;
+      setDetail(fresh); setMappingAttempt(null);
+      setDeletedLineReasons(old => { const next = { ...old }; delete next[reviewKey]; return next; });
+      setNotice(`Grist recorded the explicit source-line removal review in mapping version ${result.version}. The prior Part and its requirements remain unchanged.`);
+    } catch (cause) { if (requestRevision === generation.current) setError(String(cause)); }
+    finally { inFlight.current = false; if (requestRevision === generation.current) setBusy(false); }
+  }
+
   async function reviewCurrentEvidence() {
     if (!detail || busy || loading || !mappingAttempt) return;
     const requestRevision = generation.current;
@@ -635,6 +694,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     const oldLineDecisions = lineDecisions;
     const oldLineParts = lineDraftParts;
     const oldLineReasons = lineReasons;
+    const oldDeletedLineReviewKeys = mappingAttempt.deletedLineReviewKeys || [];
     setLoading(true); setError("");
     try {
       const fresh = await api.partMappings(path) as Detail;
@@ -693,8 +753,12 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         }
       }
       const movedToReview = [...movedByGroup.values()];
+      const freshDeletedKeys = new Set([...fresh.groups.flatMap(group => group.deletedLines || []),
+        ...(fresh.removedGroups || []).flatMap(group => group.deletedLines || [])].filter(line => !line.reviewed).map(line => line.reviewKey));
       setDetail(fresh); setDecisions(nextDecisions); setDraftParts(nextParts);
       setLineDecisions(nextLineDecisions); setLineDraftParts(nextLineParts); setLineReasons(nextLineReasons);
+      setDeletedLineReasons(old => Object.fromEntries(Object.entries(old).filter(([key]) => freshDeletedKeys.has(key)
+        || !oldDeletedLineReviewKeys.includes(key))));
       setStaleDrafts(old => [...old.filter(item => !movedToReview.some(moved => moved.groupKey === item.groupKey)), ...movedToReview]);
       setMappingAttempt(null); setNotice(movedToReview.length
         ? `${movedToReview.length} stale draft group(s) were held for explicit review. Current source values are shown below; use Reapply only after reviewing them.`
@@ -790,7 +854,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     return true;
   });
   const locked = busy || loading || Boolean(mappingAttempt);
-  const canRefreshConflict = Boolean(mappingAttempt && /PART_REVIEW_STALE|PART_ASSOCIATION_STALE|PART_GROUP_UNKNOWN|PART_LINE_UNKNOWN|PART_SEMANTIC_EVIDENCE_UNAVAILABLE|PART_SOURCE_LABEL_UNAVAILABLE/.test(error));
+  const canRefreshConflict = Boolean(mappingAttempt && /PART_REVIEW_STALE|PART_ASSOCIATION_STALE|PART_GROUP_UNKNOWN|PART_LINE_UNKNOWN|PART_DELETED_LINE_UNKNOWN|PART_DELETED_LINE_ALREADY_REVIEWED|PART_SEMANTIC_EVIDENCE_UNAVAILABLE|PART_SOURCE_LABEL_UNAVAILABLE/.test(error));
   const totalRows = allGroups.reduce((total, group) => total + group.rows.length, 0);
   const selectedPartFor = (group: Group) => groupPending(group) ? (decisions[group.key] ? draftParts[group.key] : null) : group.part;
   const selectedLinesFor = (group: Group) => group.rows.filter(row => row.lineKey && selectedLineKeys.includes(row.lineKey));
@@ -864,7 +928,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
             setSelectedLineKeys(old => [...new Set([...old, currentLineKey])]);
             assignPartToLines(target, part, [currentLineKey]);
           }}/>
-        {detail.history.length > 0 && <details className="part-history"><summary>Assignment history · {detail.history.length} source rows</summary>{detail.history.map(row => <p key={row.ReviewKey}><strong>v{row.Version} · {row.SheetName} row {row.SourceRow}</strong> · {row.SourceDescription || "Blank description"} · {row.PartNumberUsed || "No Part assigned"}{row.NameUsed ? ` · ${row.NameUsed}` : ""}<br/>{row.Actor} · {row.OccurredAt}<br/>{row.Reason}</p>)}</details>}
+        {detail.history.length > 0 && <details className="part-history"><summary>Assignment and removal review history · {detail.history.length} events</summary>{detail.history.map(row => <p key={row.ReviewKey}><strong>v{row.Version} · {row.ActionType === "source_deletion_review" ? "Source line removal review" : "Part assignment"} · {row.SheetName} row {row.SourceRow}</strong> · {row.SourceDescription || "Blank description"} · {row.PartNumberUsed || "No Part assigned"}{row.NameUsed ? ` · ${row.NameUsed}` : ""}<br/>{row.Actor} · {row.OccurredAt}<br/>{row.Reason}</p>)}</details>}
       </div>
     </aside>}
     {detail && narrowViewport && <button type="button" ref={contextToggle} className="part-context-mobile-toggle" aria-controls="part-mapping-context" aria-expanded={contextOpen} onClick={() => setContextOpen(open => !open)}>{contextOpen ? "Hide supporting information" : "Show supporting information"}</button>}
@@ -876,6 +940,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
       {loading && <p role="status" className="part-loading-status">{detail ? "Refreshing workbook and saved mapping evidence… Draft selections remain unconfirmed until this check completes." : "Loading Part review…"}</p>}
       {!detail && !loading && !error && <p role="status">Part Mapping has no current workbook evidence.</p>}
       {detail && <>
+        {Boolean(detail.unresolvedDeletedLines) && <p className="part-deleted-lines-banner" role="alert">{detail.unresolvedDeletedLines} previously mapped source line(s) are absent or unmatched and need an explicit, reasoned review. Current line assignments and Part requirements remain unchanged until reviewed.</p>}
         <section className="part-mapping-toolbar" aria-label="Filter Part mappings">
           <label className="part-search-label">Search descriptions or source fields<input name="part-mapping-source-search" autoComplete="off" spellCheck={false} autoCapitalize="none" aria-label="Search descriptions or source fields" value={query} onChange={event => setQuery(event.target.value)} placeholder="Part description, material, row…"/></label>
           <label>Source sheet<select name="part-mapping-sheet-filter" autoComplete="off" aria-label="Source sheet" value={sheetFilter} onChange={event => setSheetFilter(event.target.value as SheetFilter)}>{(["all", "mcl", "toolshop", "cnc"] as SheetFilter[]).map(value => { const count = perSheet(value); return <option key={value} value={value}>{familyLabel(value)} · {count.groups} groups · {count.rows} rows</option>; })}</select></label>
@@ -899,8 +964,15 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
           <h2>Saved groups removed from this workbook · {detail.removedGroups?.length}</h2>
           <p>These groups have no current source lines. Their previous Part assignments remain historical proposals and were not reused for another group.</p>
           {detail.removedGroups?.map(group => <article key={group.key}><header><strong>{group.sheet} · {group.description || "Blank Part label"}</strong>
-            <span>{group.previousAssignment?.partNumber ? `${group.previousAssignment.partNumber} · ` : ""}{group.previousAssignment?.name || "No prior Part assignment"}</span></header>
-            <SemanticDifferenceList comparison={group.semanticComparison}/></article>)}
+            <span>{group.reviewed ? "Removed source group reviewed" : "Removal review required"} · {group.previousAssignment?.partNumber ? `${group.previousAssignment.partNumber} · ` : ""}{group.previousAssignment?.name || "No prior Part assignment"}</span></header>
+            <SemanticDifferenceList comparison={group.semanticComparison}/>
+            {(group.deletedLines || []).map(line => <DeletedLineReviewCard key={line.reviewKey} line={line}
+              reason={deletedLineReasons[line.reviewKey] || ""}
+              disabled={busy || loading || !detail.schemaAvailable || !detail.associationKey
+                || Boolean(mappingAttempt && !mappingAttempt.deletedLineReviewKeys?.includes(line.reviewKey))}
+              onReasonChange={value => setDeletedLineReasons(old => ({ ...old, [line.reviewKey]: value }))}
+              onReview={() => void reviewDeletedLine(line.reviewKey)}/>)}
+          </article>)}
         </section>}
         <p className="part-counts"><strong>Showing {visibleGroups.length} of {allGroups.length} source groups</strong> · {visibleGroups.reduce((sum, group) => sum + group.rows.length, 0)} displayed source rows. Filters never discard hidden drafts.</p>
         <div className="part-source-table" ref={tableScroll} onScroll={() => { const draft = readDraft(path); if (draft && tableScroll.current) sessionStorage.setItem(draftKey(path), JSON.stringify({ ...draft, scrollTop: tableScroll.current.scrollTop })); }}>
@@ -968,6 +1040,15 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
                 {needsReason && <label className="part-group-reason">Reason for changing previously assigned selected lines<input name={`mapping-selected-line-reason-${group.key}`} autoComplete="off" spellCheck={false} autoCapitalize="sentences" aria-label={`Reason for selected line mapping change · ${groupTitle(group)}`} value={groupReason} disabled={locked} onChange={event => setGroupReasons(old => ({ ...old, [group.key]: event.target.value }))} placeholder="Required only where an existing assignment changes or clears"/></label>}
               </section>}
               {group.semanticComparison?.status === "unchanged" && group.reviewed && group.semanticComparison.sourceHashChanged && <p className="part-semantic-stable" role="status">Relevant manufacturing evidence is unchanged; this saved Part assignment remains valid across the workbook hash change. Rates, prices, totals, formatting and document metadata are excluded.</p>}
+              {(group.deletedLines || []).length > 0 && <section className="part-deleted-lines" aria-label={`Previously mapped lines removed from ${groupTitle(group)}`}>
+                <h3>Previously mapped lines absent from the workbook · {(group.deletedLines || []).length}</h3>
+                {(group.deletedLines || []).map(line => <DeletedLineReviewCard key={line.reviewKey} line={line}
+                  reason={deletedLineReasons[line.reviewKey] || ""}
+                  disabled={busy || loading || !detail.schemaAvailable || !detail.associationKey
+                    || Boolean(mappingAttempt && !mappingAttempt.deletedLineReviewKeys?.includes(line.reviewKey))}
+                  onReasonChange={value => setDeletedLineReasons(old => ({ ...old, [line.reviewKey]: value }))}
+                  onReview={() => void reviewDeletedLine(line.reviewKey)}/>)}
+              </section>}
               <SemanticDifferenceList comparison={group.semanticComparison}/>
               {selectedPart?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: this assignment remains saveable for {selectedPart.outOfScopeCodes.map(code => code.code).join(", ")}.</small> : null}
               {group.explicitlyUnassigned && <small className="part-unassigned-note">The last saved action explicitly cleared the Part. Historical assignments remain in History.</small>}
@@ -979,7 +1060,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         </div>
         <div className="part-sticky-save" role="region" aria-label="Save Part mapping drafts"><div><strong>{pendingGroups.length} group{pendingGroups.length === 1 ? "" : "s"} · {pendingLineCount} unsaved line{pendingLineCount === 1 ? "" : "s"}</strong><span>{requiredReasonGroups.length} group{requiredReasonGroups.length === 1 ? "" : "s"} have affected prior assignments</span></div>
           <small>Initial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.</small>
-          <button type="button" className="button primary" disabled={busy || loading || (mappingAttempt ? false : (!detail.schemaAvailable || !detail.associationKey || !pendingGroups.length || requiredReasonGroups.some(group => !(groupReasons[group.key] || "").trim())))} onClick={() => mappingAttempt ? void saveGroups(mappingAttempt.groupKeys) : setConfirmBatch(true)}>{mappingAttempt ? "Retry saving pending mappings" : "Save pending mappings"}</button>
+          <button type="button" className="button primary" disabled={busy || loading || (mappingAttempt ? false : (!detail.schemaAvailable || !detail.associationKey || !pendingGroups.length || requiredReasonGroups.some(group => !(groupReasons[group.key] || "").trim())))} onClick={() => mappingAttempt?.deletedLineReviewKeys?.length ? void reviewDeletedLine(mappingAttempt.deletedLineReviewKeys[0]) : mappingAttempt ? void saveGroups(mappingAttempt.groupKeys) : setConfirmBatch(true)}>{mappingAttempt?.deletedLineReviewKeys?.length ? "Retry deleted-line review" : mappingAttempt ? "Retry saving pending mappings" : "Save pending mappings"}</button>
         </div>
         {confirmBatch && <div className="part-modal-backdrop" role="presentation"><section className="part-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="part-confirm-title" aria-describedby="part-confirm-help">
           <h2 id="part-confirm-title">Save pending line assignments?</h2><p id="part-confirm-help">This includes every pending line, including lines in groups hidden by the current filters. Review which lines will be appended to mapping history.</p>

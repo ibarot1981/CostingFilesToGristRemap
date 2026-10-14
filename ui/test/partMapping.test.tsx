@@ -728,6 +728,43 @@ it("keeps mapping history readable and disables Save when Grist v14 evidence col
   expect((screen.getByRole("button", {name:"Save pending mappings"}) as HTMLButtonElement).disabled).toBe(true);
 });
 
+it("shows per-line deletion evidence and recovers an explicit review with the same request after a lost response", async () => {
+  const deletedLine = {reviewKey:"prior-review-2",priorReviewKey:"prior-review-2",lineKey:"old-line-2",groupKey:"tool-shaft",
+    sheet:"Tool Shop Items",description:"Shaft",row:11,
+    semanticEvidence:{fingerprint:"prior-semantic-2",fields:[{field:"item_name",state:"value",value:"Rear",display:"Rear"}]},
+    previousAssignment:{partId:bracket.id,partNumber:bracket.partNumber,name:bracket.name,requiresReview:true,evidenceStatus:"verified"},
+    semanticComparison:{status:"deleted",differences:[{type:"deleted",previous:{fingerprint:"prior-semantic-2",fields:[]},current:null}],requiresReview:true},
+    provenance:{reviewKey:"prior-review-2",version:4,actor:"mapping operator",reason:"Initial line map",occurredAt:"2026-10-10T12:00:00Z",sourceHash:"old-hash"},reviewed:false};
+  const currentGroup = group("tool-shaft","Tool Shop Items","Shaft",10,{reviewed:false,
+    rows:[{...group("tool-shaft","Tool Shop Items","Shaft",10).rows[0],part:chassis,reviewed:true}],deletedLines:[deletedLine]});
+  const pending = detail([currentGroup],{parts:[chassis,bracket],unresolvedGroups:1,unresolvedDeletedLines:1});
+  const resolvedLine = {...deletedLine,reviewed:true,resolution:{actor:"mapping reviewer",reason:"Verified row 11 removed",version:5}};
+  const resolvedGroup = group("tool-shaft","Tool Shop Items","Shaft",10,{part:chassis,reviewed:true,
+    rows:[{...group("tool-shaft","Tool Shop Items","Shaft",10).rows[0],part:chassis,reviewed:true}],deletedLines:[resolvedLine]});
+  const resolved = detail([resolvedGroup],{parts:[chassis,bracket],version:5,unresolvedGroups:0,unresolvedDeletedLines:0,
+    history:[{ReviewKey:"review-delete-1",Version:5,SourceDescription:"Shaft",SheetName:"Tool Shop Items",SourceRow:11,
+      Actor:"mapping reviewer",Reason:"Verified row 11 removed",OccurredAt:"2026-10-14T00:00:00Z",ActionType:"source_deletion_review",PartNumberUsed:bracket.partNumber,NameUsed:bracket.name}]});
+  mocks.partMappings.mockResolvedValueOnce(pending).mockResolvedValueOnce(resolved);
+  mocks.savePartMappings.mockRejectedValueOnce(new Error("response lost after Grist commit"));
+  render(<PartMappingView path="pilot.ods"/>);
+
+  expect(await screen.findByText(/1 previously mapped source line\(s\) are absent or unmatched/)).toBeTruthy();
+  expect(screen.getByText(/SM-P-000002 · S1KHF — Bracket/)).toBeTruthy();
+  expect(screen.getByText(/Initial line map/)).toBeTruthy();
+  fireEvent.change(screen.getByRole("textbox", {name:/Reason for confirming removed source line/}),
+    {target:{value:"Verified row 11 removed"}});
+  fireEvent.click(screen.getByRole("button", {name:"Confirm source line removed"}));
+  await screen.findByText(/Error: response lost after Grist commit/);
+  fireEvent.click(screen.getByRole("button", {name:"Retry deleted-line review"}));
+
+  await screen.findByText(/Removal review recorded by mapping reviewer: Verified row 11 removed/);
+  expect(mocks.savePartMappings).toHaveBeenCalledTimes(2);
+  expect(mocks.savePartMappings.mock.calls[0]).toEqual(mocks.savePartMappings.mock.calls[1]);
+  expect(mocks.savePartMappings.mock.calls[0][0].deletedLineReviews).toEqual({"prior-review-2":"Verified row 11 removed"});
+  fireEvent.click(screen.getByText(/Assignment and removal review history/));
+  expect(screen.getByText(/Source line removal review · Tool Shop Items row 11/)).toBeTruthy();
+});
+
 it("does not show or select stale search results while a newer query is loading", async () => {
   let resolveShaft!: (value: any) => void;
   let resolveBracket!: (value: any) => void;

@@ -497,6 +497,30 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             "cnc": {"status": "not_applicable", "confirmedComplete": True}})
         self.assertTrue(any("cannot be called not applicable" in error for error in errors))
 
+    def test_removed_mapped_group_keeps_its_deleted_line_in_baseline_gate(self):
+        before = PartSourceGroups([self.family_group("mcl", 45, description="Plate 1")], all_source_diagnostics())
+        self.save_group_set(before, "deleted-baseline-before")
+        current_groups = PartSourceGroups([], all_source_diagnostics())
+        mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="deleted-baseline-after",
+            association=self.association, groups=current_groups)
+        self.assertEqual(mapping["unresolvedDeletedLines"], 1)
+        family = _family_review_rows(mapping, self.part["id"])["mcl"]
+        self.assertEqual(family["pendingDeletedLineCount"], 1)
+        self.assertEqual(family["mappedGroupCount"], 1,
+            "a wholly removed group still needs its prior line disposition reviewed")
+        _, errors = _family_confirmations(mapping, self.part["id"], self.family_choices(), strict=True)
+        self.assertTrue(any("previously mapped source line(s) were removed" in error for error in errors))
+        with self.assertRaises(PartIdentityError) as blocked:
+            self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
+                workbook_path="C:/isolated/pilot.ods", source_hash="deleted-baseline-after", association=self.association,
+                groups=current_groups, mapping_store=self.mapping_store, source_families=self.family_choices(),
+                actor="baseline reviewer", reason="Must review removed source line", request_key="baseline-deleted-line-gate",
+                expected_hash="deleted-baseline-after", expected_association=self.association.id,
+                expected_association_version=self.association.version, expected_mapping_version=mapping["version"])
+        self.assertEqual(blocked.exception.code, "PART_BASELINE_INCOMPLETE")
+        self.assertNotIn("PartBaselineProcessing", self.client.tables,
+            "the rejected incomplete baseline must not start creating normalized records")
+
     def test_grist_commit_response_loss_recovers_the_same_initial_baseline(self):
         rows = [source_row(10)]
         groups, mapping_result = self.save_rows(rows, "hash-recovery", request_key="map:recovery")

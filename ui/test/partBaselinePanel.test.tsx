@@ -88,6 +88,23 @@ it("blocks initial baseline submission and explains every missing confirmation",
   expect(apiMocks.establishPartBaseline).not.toHaveBeenCalled();
 });
 
+it("keeps a removed mapped line visible and blocks baseline completeness until its removal is reviewed", async () => {
+  const baseReview = review();
+  const pendingRemoval = {...baseReview, families:{...baseReview.families,
+    mcl:{...baseReview.families.mcl,pendingDeletedLineCount:1}}};
+  apiMocks.partBaselineReview.mockResolvedValue(pendingRemoval);
+  renderPanel();
+  await openAndReview();
+  const mcl = screen.getByText("5. Material Cut List Price").closest(".part-baseline-family")!;
+  expect(within(mcl).getByText(/1 previously mapped source line\(s\) are missing/)).toBeTruthy();
+  fireEvent.change(within(mcl).getByLabelText("Applicability"), {target:{value:"applicable"}});
+  expect((within(mcl).getByLabelText("All applicable rows for this Part are mapped and complete") as HTMLInputElement).disabled).toBe(true);
+  expect((within(mcl).getByLabelText("Applicability") as HTMLSelectElement).querySelector('option[value="not_applicable"]')?.hasAttribute("disabled")).toBe(true);
+  expect(screen.getByText(/previously mapped source line\(s\) were removed and need explicit review/i)).toBeTruthy();
+  expect((screen.getByRole("button", {name:"Establish Part baseline"}) as HTMLButtonElement).disabled).toBe(true);
+  expect(apiMocks.establishPartBaseline).not.toHaveBeenCalled();
+});
+
 it("blocks a second baseline when Grist reports partial publication but this browser has no retry identity", async () => {
   apiMocks.partBaselineReview.mockResolvedValue(review("recovery_required"));
   renderPanel();

@@ -1037,11 +1037,13 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
     association_version = payload.get("expectedAssociationVersion")
     decisions = payload.get("decisions", {})
     line_decisions = payload.get("lineDecisions", {})
+    deleted_line_reviews = payload.get("deletedLineReviews", {})
     group_reasons = payload.get("reasons", {})
     line_reasons = payload.get("lineReasons", {})
     if (type(version) is not int or type(association_version) is not int or not isinstance(decisions, dict)
-            or not isinstance(line_decisions, dict)
+            or not isinstance(line_decisions, dict) or not isinstance(deleted_line_reviews, dict)
             or any(not isinstance(key, str) or not isinstance(value, str) for mapping in (decisions, line_decisions) for key, value in mapping.items())
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in deleted_line_reviews.items())
             or not isinstance(group_reasons, dict)
             or not isinstance(line_reasons, dict)
             or any(not isinstance(key, str) or not isinstance(value, str) for mapping in (group_reasons, line_reasons) for key, value in mapping.items())):
@@ -1064,7 +1066,7 @@ def save_part_mappings(request: Request, payload: dict[str, Any] = Body(...), id
             expected_version=version, expected_association=str(payload.get("expectedAssociationKey") or ""),
             expected_association_version=association_version, actor=_request_actor(request),
             reason=str(payload.get("reason") or ""), group_reasons=group_reasons,
-            line_reasons=line_reasons,
+            line_reasons=line_reasons, deleted_line_reviews=deleted_line_reviews,
             request_key=idempotency_key or "", before_write=verify_current)
     except PartConflict as exc:
         raise _error(409, exc.code, str(exc))

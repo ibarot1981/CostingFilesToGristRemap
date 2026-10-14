@@ -140,6 +140,7 @@ class PartMappingTests(unittest.TestCase):
             association=self.association, groups=moved)["groups"][0]
         self.assertEqual([(row["row"], (row.get("part") or {}).get("id")) for row in moved_detail["rows"]],
             [(30, "2"), (31, "1"), (32, None)])
+        self.assertEqual(moved_detail["deletedLines"], [], "moved semantic matches are not deletions")
         changed = self.manufacturing_groups("Tool Shop Items", [
             (30, {"product_part_name": "Shaft", "item_name": "Rear", "material_to_cut": "MS", "qty": 2}),
             (31, {"product_part_name": "Shaft", "item_name": "Front", "material_to_cut": "Aluminum", "qty": 1}),
@@ -151,6 +152,7 @@ class PartMappingTests(unittest.TestCase):
         self.assertIsNone(changed_detail["rows"][1]["part"])
         self.assertEqual(changed_detail["rows"][1]["previousAssignment"]["partId"], "1")
         self.assertIsNone(changed_detail["rows"][2]["part"])
+        self.assertEqual(changed_detail["deletedLines"], [], "a uniquely paired changed predecessor is not a deletion")
 
     def test_added_shared_anchor_line_cannot_supersede_unchanged_assignment(self):
         from copy import deepcopy
@@ -688,6 +690,7 @@ class PartMappingTests(unittest.TestCase):
         comparison = detail["groups"][0]["semanticComparison"]
         self.assertEqual(comparison["status"], "ambiguous_correspondence")
         self.assertTrue(all(item["type"] == "ambiguous" for item in comparison["differences"]))
+        self.assertEqual(detail["groups"][0]["deletedLines"], [], "ambiguous duplicates must not be mislabeled as deletions")
 
         added = self.manufacturing_groups("Tool Shop Items", [
             (20, {"product_part_name": "Bracket", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
@@ -697,6 +700,110 @@ class PartMappingTests(unittest.TestCase):
             association=self.association, groups=added)
         additions = addition_detail["groups"][0]["semanticComparison"]["differences"]
         self.assertEqual({item["type"] for item in additions}, {"added", "deleted"})
+        self.assertEqual(addition_detail["groups"][0]["deletedLines"], [], "ambiguous source additions do not prove a deletion")
+
+    def test_deleted_mapped_line_stays_outstanding_inside_a_surviving_group(self):
+        self.create(name="Front Part", part_key="front-part")
+        self.create(name="Rear Part", part_key="rear-part")
+        before = self.manufacturing_groups("Tool Shop Items", [
+            (10, {"product_part_name": "Shaft", "item_name": "Front", "material_to_cut": "Steel", "qty": 1}),
+            (11, {"product_part_name": "Shaft", "item_name": "Rear", "material_to_cut": "Steel", "qty": 1}),
+        ])
+        prior = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-delete-before",
+            association=self.association, groups=before)["groups"][0]["rows"]
+        self.save_lines(before, {prior[0]["lineKey"]: "1", prior[1]["lineKey"]: "2"},
+            source_hash="hash-delete-before", request_key="deleted-line-initial-map")
+
+        after = self.manufacturing_groups("Tool Shop Items", [
+            (10, {"product_part_name": "Shaft", "item_name": "Front", "material_to_cut": "Steel", "qty": 1}),
+        ])
+        current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-delete-after",
+            association=self.association, groups=after)
+        group = current["groups"][0]
+        self.assertEqual([(row["row"], row["reviewed"], (row.get("part") or {}).get("id"))
+            for row in group["rows"]], [(10, True, "1")])
+        self.assertFalse(group["reviewed"], "a deleted mapped sibling remains a group review obligation")
+        self.assertEqual(group["semanticComparison"]["status"], "deleted_lines_pending")
+        self.assertTrue(group["semanticComparison"]["requiresReview"])
+        self.assertEqual(group["semanticComparison"]["differences"][0]["type"], "deleted")
+        deleted = group["deletedLines"]
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual((deleted[0]["row"], deleted[0]["previousAssignment"]["partId"]), (11, "2"))
+        self.assertEqual(deleted[0]["semanticEvidence"]["fields"], before[0]["semanticEvidence"][11]["fields"])
+        self.assertEqual(current["unresolvedGroups"], 1)
+        self.assertEqual(current["unresolvedDeletedLines"], 1)
+
+        evidence = {"partRowsRequiringReview": [], "pendingPolicies": ["Reviewed Part assignments", "Other policy"]}
+        attach_mapping_evidence(evidence, current)
+        self.assertIn("Reviewed Part assignments", evidence["pendingPolicies"],
+            "the processing gate must not clear while a deleted mapped line is unresolved")
+
+        # Reconfirming the surviving line cannot consume or hide its deleted sibling.
+        self.save_lines(after, {group["rows"][0]["lineKey"]: "1"}, source_hash="hash-delete-after",
+            expected_version=current["version"], request_key="deleted-line-survivor-reconfirm")
+        reloaded = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-delete-after",
+            association=self.association, groups=after)
+        self.assertEqual(reloaded["unresolvedDeletedLines"], 1)
+        self.assertEqual(reloaded["groups"][0]["deletedLines"][0]["previousAssignment"]["partId"], "2")
+
+        deletion = reloaded["groups"][0]["deletedLines"][0]
+        resolved = save_mapping(self.store, file_id="file:pilot.ods", source_hash="hash-delete-after",
+            association=self.association, groups=after, decisions={}, line_decisions={},
+            deleted_line_reviews={deletion["reviewKey"]: "Verified removed from the current workbook"},
+            expected_hash="hash-delete-after", expected_version=reloaded["version"],
+            expected_association="association-1", expected_association_version=1,
+            actor="Irshad", request_key="deleted-line-acknowledgement")
+        self.assertEqual(resolved["savedRows"], 1)
+        self.assertEqual(resolved["deletedLineReviews"][deletion["reviewKey"]]["actionType"], "source_deletion_review")
+        self.assertEqual(self.store.tables["PartMappingReview"][-1]["fields"]["Reason"],
+            "Verified removed from the current workbook")
+        retry = save_mapping(self.store, file_id="file:pilot.ods", source_hash="hash-delete-after",
+            association=self.association, groups=after, decisions={}, line_decisions={},
+            deleted_line_reviews={deletion["reviewKey"]: "Verified removed from the current workbook"},
+            expected_hash="hash-delete-after", expected_version=reloaded["version"],
+            expected_association="association-1", expected_association_version=1,
+            actor="Irshad", request_key="deleted-line-acknowledgement")
+        self.assertTrue(retry["idempotent"])
+        self.assertEqual(len(self.store.tables["PartMappingReview"]), 4)
+        after_review = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-delete-after",
+            association=self.association, groups=after)
+        self.assertEqual(after_review["unresolvedDeletedLines"], 0)
+        self.assertEqual(after_review["unresolvedGroups"], 0)
+        self.assertEqual(after_review["groups"][0]["semanticComparison"]["status"], "deleted_lines_reviewed")
+        self.assertTrue(after_review["groups"][0]["reviewed"])
+        self.assertEqual(after_review["history"][-1]["ActionType"], "source_deletion_review")
+
+    def test_all_group_removal_exposes_each_prior_line_and_can_be_reviewed(self):
+        self.create(name="Front Part", part_key="front-part")
+        self.create(name="Rear Part", part_key="rear-part")
+        before = self.manufacturing_groups("Tool Shop Items", [
+            (10, {"product_part_name": "Shaft", "item_name": "Front", "material_to_cut": "Steel", "qty": 1}),
+            (11, {"product_part_name": "Shaft", "item_name": "Rear", "material_to_cut": "Steel", "qty": 1}),
+        ])
+        rows = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-remove-group-before",
+            association=self.association, groups=before)["groups"][0]["rows"]
+        self.save_lines(before, {rows[0]["lineKey"]: "1", rows[1]["lineKey"]: "2"},
+            source_hash="hash-remove-group-before", request_key="removed-group-initial-map")
+        current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-remove-group-after",
+            association=self.association, groups=[])
+        removed = current["removedGroups"][0]
+        self.assertFalse(removed["reviewed"])
+        self.assertEqual([(line["row"], line["previousAssignment"]["partId"]) for line in removed["deletedLines"]],
+            [(10, "1"), (11, "2")])
+        self.assertEqual(current["unresolvedGroups"], 1)
+        self.assertEqual(current["unresolvedDeletedLines"], 2)
+        decisions = {line["reviewKey"]: f"Verified row {line['row']} removal" for line in removed["deletedLines"]}
+        saved = save_mapping(self.store, file_id="file:pilot.ods", source_hash="hash-remove-group-after",
+            association=self.association, groups=[], decisions={}, line_decisions={}, deleted_line_reviews=decisions,
+            expected_hash="hash-remove-group-after", expected_version=current["version"],
+            expected_association="association-1", expected_association_version=1,
+            actor="Irshad", request_key="removed-group-review")
+        self.assertEqual(saved["savedRows"], 2)
+        reread = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="hash-remove-group-after",
+            association=self.association, groups=[])
+        self.assertEqual(reread["unresolvedDeletedLines"], 0)
+        self.assertEqual(reread["unresolvedGroups"], 0)
+        self.assertTrue(reread["removedGroups"][0]["reviewed"])
 
     def test_price_totals_formatting_and_document_metadata_do_not_change_semantics(self):
         first = self.manufacturing_groups("CNC Cut List", [
@@ -1099,6 +1206,112 @@ class PartMappingTests(unittest.TestCase):
                     self.assertEqual(len([row for row in client.tables["PartMappingReview"]
                         if row["fields"].get("FileKey") == f4_file_id]), 2)
 
+    def test_deleted_line_review_persists_and_recovers_after_fresh_grist_registry(self):
+        from copy import deepcopy
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from app.grist_parts import GristPartRegistry
+
+        class IsolatedDeletionGrist:
+            doc_id = "isolated-deleted-line-review"
+            def __init__(self):
+                self.tables = {"ProductPart": [
+                    {"id": 1, "fields": {"StablePartId": "stable-rear", "PartKey": "stable-rear",
+                        "DisplayName": "Rear Part", "PartNumber": "SM-P-000002", "EngineeringRevision": "A",
+                        "ScopeType": "product", "ScopeTargetLabel": "Safari 1000", "Description": "Rear Part",
+                        "Status": "canonical", "PublishStatus": "published"}},
+                ], "PartMappingReview": []}
+
+            def validate_safari_write_target(self):
+                return None
+
+            def fetch_table_records_with_ids(self, table):
+                return deepcopy(self.tables.get(table, []))
+
+            def create_table_records(self, table, records):
+                def assert_cell_value(value):
+                    if value is None or isinstance(value, (str, int, float, bool)):
+                        return
+                    if isinstance(value, list) and value and value[0] == "O" and len(value) == 2 and isinstance(value[1], dict):
+                        for nested in value[1].values():
+                            assert_cell_value(nested)
+                        return
+                    if isinstance(value, list) and value and value[0] == "L":
+                        for nested in value[1:]:
+                            assert_cell_value(nested)
+                        return
+                    raise AssertionError(f"Invalid Grist REST CellValue: {value!r}")
+
+                for record in records:
+                    for value in record["fields"].values():
+                        assert_cell_value(value)
+                rows = self.tables.setdefault(table, [])
+                next_id = len(rows) + 1
+                for item in records:
+                    rows.append({"id": next_id, "fields": deepcopy(item["fields"])})
+                    next_id += 1
+                return {"records": deepcopy(rows[-len(records):])}
+
+        with TemporaryDirectory() as temp:
+            client = IsolatedDeletionGrist()
+            journal = Path(temp) / "mapping-journal.sqlite3"
+            registry = GristPartRegistry(client, path=journal)
+            registry._verify_writer = lambda: None
+            registry.mapping_evidence_schema_available = lambda: True
+            store = PartRegistryMappingStore(GristPartStore(client), registry)
+            before = self.manufacturing_groups("Tool Shop Items", [
+                (11, {"product_part_name": "Shaft", "item_name": "Rear", "material_to_cut": "Steel", "qty": 1}),
+            ])
+            preview = mapping_detail(store, file_id="file:grist-deleted-line.ods", source_hash="before-removal",
+                association=self.association, groups=before)
+            prior_line = preview["groups"][0]["rows"][0]
+            save_mapping(store, file_id="file:grist-deleted-line.ods", source_hash="before-removal",
+                association=self.association, groups=before, line_decisions={prior_line["lineKey"]: "stable-rear"},
+                expected_hash="before-removal", expected_version=0, expected_association="association-1",
+                expected_association_version=1, actor="isolated operator", request_key="grist-deleted-line-map")
+
+            pending = mapping_detail(store, file_id="file:grist-deleted-line.ods", source_hash="after-removal",
+                association=self.association, groups=[])
+            deleted = pending["removedGroups"][0]["deletedLines"][0]
+            self.assertEqual(deleted["previousAssignment"]["partId"], "stable-rear")
+            self.assertEqual(deleted["provenance"]["actor"], "isolated operator")
+            result = save_mapping(store, file_id="file:grist-deleted-line.ods", source_hash="after-removal",
+                association=self.association, groups=[], decisions={}, line_decisions={},
+                deleted_line_reviews={deleted["reviewKey"]: "Verified row 11 was removed"},
+                expected_hash="after-removal", expected_version=pending["version"],
+                expected_association="association-1", expected_association_version=1,
+                actor="isolated reviewer", request_key="grist-deleted-line-review")
+            self.assertEqual(result["savedRows"], 1)
+            persisted = client.tables["PartMappingReview"][-1]["fields"]
+            self.assertEqual(persisted["ActionType"], "source_deletion_review")
+            self.assertEqual(persisted["Reason"], "Verified row 11 was removed")
+            evidence = json.loads(persisted["SemanticEvidence"])
+            self.assertTrue(evidence["sourceDeletionReview"])
+            self.assertEqual(evidence["deletionReviewKey"], deleted["reviewKey"])
+            self.assertEqual(evidence["priorReviewKey"], deleted["priorReviewKey"])
+            self.assertEqual(evidence["fingerprint"], deleted["semanticEvidence"]["fingerprint"])
+
+            recovered_registry = GristPartRegistry(client, path=journal)
+            recovered_registry._verify_writer = lambda: None
+            recovered_registry.mapping_evidence_schema_available = lambda: True
+            recovered_store = PartRegistryMappingStore(GristPartStore(client), recovered_registry)
+            recovered = mapping_detail(recovered_store, file_id="file:grist-deleted-line.ods", source_hash="after-removal",
+                association=self.association, groups=[])
+            self.assertEqual(recovered["unresolvedDeletedLines"], 0)
+            self.assertEqual(recovered["unresolvedGroups"], 0)
+            resolved = recovered["removedGroups"][0]["deletedLines"][0]
+            self.assertTrue(resolved["reviewed"])
+            self.assertEqual(resolved["previousAssignment"]["partId"], "stable-rear")
+            self.assertEqual(resolved["provenance"]["actor"], "isolated operator")
+            retry = save_mapping(recovered_store, file_id="file:grist-deleted-line.ods", source_hash="after-removal",
+                association=self.association, groups=[], decisions={}, line_decisions={},
+                deleted_line_reviews={deleted["reviewKey"]: "Verified row 11 was removed"},
+                expected_hash="after-removal", expected_version=pending["version"],
+                expected_association="association-1", expected_association_version=1,
+                actor="isolated reviewer", request_key="grist-deleted-line-review")
+            self.assertTrue(retry["idempotent"])
+            self.assertEqual(len(client.tables["PartMappingReview"]), 2)
+
     def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)
         with self.assertRaises(PartConflict) as error:
@@ -1138,6 +1351,36 @@ class PartMappingTests(unittest.TestCase):
         with mock.patch.object(web, "_part_context", return_value=(repository, "file:pilot.ods", self.association, "hash1", self.groups)), mock.patch.object(web, "_processing_context", return_value=(repository, "file:pilot.ods", self.association, "hash1")):
             web.save_part_mappings(request, payload, "http-key")
         self.assertEqual(self.store.tables["PartMappingReview"][0]["fields"]["Actor"], "Irshad")
+
+    def test_http_deleted_line_review_payload_appends_the_reasoned_audit_event(self):
+        from app import web
+        from app.repository import InMemorySafariRepository
+        repository = InMemorySafariRepository(); repository.part_store = self.store; self.create(name="Rear Part")
+        before = self.manufacturing_groups("Tool Shop Items", [
+            (11, {"product_part_name": "Shaft", "item_name": "Rear", "material_to_cut": "Steel", "qty": 1}),
+        ])
+        prior = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="http-deleted-before",
+            association=self.association, groups=before)["groups"][0]["rows"][0]
+        self.save_lines(before, {prior["lineKey"]: "1"}, source_hash="http-deleted-before",
+            request_key="http-deleted-line-map")
+        pending = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="http-deleted-after",
+            association=self.association, groups=[])
+        deletion = pending["removedGroups"][0]["deletedLines"][0]
+        request = Request({"type": "http", "headers": [(b"x-authentik-username", b"Irshad")]})
+        payload = {"path": "pilot.ods", "expectedHash": "http-deleted-after", "expectedVersion": pending["version"],
+            "expectedAssociationKey": "association-1", "expectedAssociationVersion": 1,
+            "decisions": {}, "lineDecisions": {},
+            "deletedLineReviews": {deletion["reviewKey"]: "Verified row 11 removal from the current workbook"}}
+        with mock.patch.object(web, "_part_context", return_value=(repository, "file:pilot.ods", self.association, "http-deleted-after", [])), \
+             mock.patch.object(web, "_processing_context", return_value=(repository, "file:pilot.ods", self.association, "http-deleted-after")), \
+             mock.patch("app.processing.processing_detail", return_value={"state": "associated"}):
+            result = web.save_part_mappings(request, payload, "http-deleted-line-review")
+        self.assertEqual(result["savedRows"], 1)
+        self.assertEqual(result["deletedLineReviews"][deletion["reviewKey"]]["actionType"], "source_deletion_review")
+        event = self.store.tables["PartMappingReview"][-1]["fields"]
+        self.assertEqual(event["ActionType"], "source_deletion_review")
+        self.assertEqual(event["Actor"], "Irshad")
+        self.assertEqual(event["Reason"], "Verified row 11 removal from the current workbook")
 
     def test_http_final_source_change_and_processed_file_block_new_writes(self):
         from app import web

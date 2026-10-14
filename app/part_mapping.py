@@ -594,6 +594,11 @@ def _history(store, file_id: str):
     return rows
 
 
+def _is_source_deletion_review(record: dict[str, Any]) -> bool:
+    evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+    return bool(record.get("ActionType") == "source_deletion_review" and evidence.get("sourceDeletionReview") is True)
+
+
 def _group_records_by_key(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -605,7 +610,11 @@ def _group_mapping_detail(store, *, file_id: str, source_hash: str, association,
     _ensure_group_semantic_evidence(groups)
     parts = list_parts(store, refresh=refresh_parts)
     history = _history(store, file_id)
-    rows_by_group = _group_records_by_key([row["fields"] for row in history if row["fields"].get("GroupKey")])
+    # A deletion acknowledgement is durable audit evidence, not a mapping for
+    # a source row. Keep it in history/versioning, but never let it replace a
+    # group's last complete manufacturing snapshot.
+    mapping_history = [row["fields"] for row in history if not _is_source_deletion_review(row["fields"])]
+    rows_by_group = _group_records_by_key([row for row in mapping_history if row.get("GroupKey")])
     latest_by_group = {}
     for key, rows in rows_by_group.items():
         latest_version = max((int(row.get("Version") or 0) for row in rows), default=0)
@@ -652,8 +661,8 @@ def _group_mapping_detail(store, *, file_id: str, source_hash: str, association,
         source_refs = {(row["sheet"], row["row"]) for row in group["rows"]}
         prior_rows = []
         if not latest:
-            prior_rows = [row["fields"] for row in history
-                if (str(row["fields"].get("SheetName") or ""), int(row["fields"].get("SourceRow") or 0)) in source_refs]
+            prior_rows = [row for row in mapping_history
+                if (str(row.get("SheetName") or ""), int(row.get("SourceRow") or 0)) in source_refs]
         prior_rows.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("OccurredAt") or ""), str(row.get("RequestKey") or "")))
         latest_by_source: dict[tuple[str, int], dict[str, Any]] = {}
         for prior in prior_rows:
@@ -788,11 +797,19 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
     detail = _group_mapping_detail(store, file_id=file_id, source_hash=source_hash,
         association=association, groups=groups, refresh_parts=refresh_parts)
     history = [row["fields"] for row in _history(store, file_id)]
+    deletion_review_events = [record for record in history if _is_source_deletion_review(record)]
+    mapping_history = [record for record in history if not _is_source_deletion_review(record)]
+    acknowledged_deletions = {}
+    for record in deletion_review_events:
+        evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+        key = str(evidence.get("deletionReviewKey") or "")
+        if key:
+            acknowledged_deletions[key] = record
     all_parts = list_parts(store, refresh=refresh_parts)
     parts_by_id = {part["id"]: part for part in all_parts}
     line_events: dict[str, dict[str, Any]] = {}
     legacy_events: dict[tuple[str, str, int], dict[str, Any]] = {}
-    for record in history:
+    for record in mapping_history:
         line_key = _stored_line_key(record)
         if line_key:
             current = line_events.get(line_key)
@@ -824,6 +841,10 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         if str(record.get("ReviewKey") or "") not in superseded_review_keys}
 
     current_lines: list[dict[str, Any]] = []
+    group_comparisons = {str(group.get("key") or ""): group.get("semanticComparison") or {}
+        for group in detail["groups"]}
+    removed_comparisons = {str(group.get("key") or ""): group.get("semanticComparison") or {}
+        for group in detail.get("removedGroups") or []}
     for group in detail["groups"]:
         group["mappingMode"] = "line"
         for source in group.get("rows") or []:
@@ -855,6 +876,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
 
     matched_record_keys: set[tuple[str, str]] = set()
     ambiguous_current: set[int] = set()
+    ambiguous_record_keys: set[tuple[str, str]] = set()
 
     def record_event_key(record: dict[str, Any]) -> tuple[str, str]:
         stored_key = _stored_line_key(record)
@@ -881,6 +903,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 selected_record = preferred[0][0]
             else:
                 ambiguous_current.add(id(item))
+                ambiguous_record_keys.update(record_event_key(record) for record, _ in preferred)
                 source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
                     "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
         if selected_record is None:
@@ -888,6 +911,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         event_key = record_event_key(selected_record)
         if event_key in matched_record_keys:
             ambiguous_current.add(id(item))
+            ambiguous_record_keys.add(event_key)
             continue
         matched_record_keys.add(event_key)
         source["lineKey"] = _stored_line_key(selected_record) or source["lineKey"]
@@ -947,6 +971,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         latest_part_ids = {_stored_part_id(record) for record in latest_candidates}
         if len(latest_part_ids) > 1:
             ambiguous_current.add(id(item))
+            ambiguous_record_keys.update(record_event_key(record) for record in latest_candidates)
             source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
                 "reason": "Legacy row history contains conflicting prior Part assignments."}
             continue
@@ -1012,6 +1037,10 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         unique_candidate = next(iter(candidates.items())) if len(candidates) == 1 else None
         if unique_candidate and len(candidate_users[unique_candidate[0]]) == 1:
             event_key, (record, previous) = unique_candidate
+            # A uniquely paired edit is not a deleted predecessor. Reserve it
+            # just like an unchanged match so the deletion inventory below
+            # cannot duplicate the line as a removal.
+            matched_record_keys.add(event_key)
             authoritative_review_key = str(record.get("ReviewKey") or "")
             source["authoritativeReviewKey"] = authoritative_review_key
             source["authoritativeReviewKeys"] = [authoritative_review_key] if authoritative_review_key else []
@@ -1028,12 +1057,190 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 "previous": previous, "current": evidence}
         elif candidates:
             ambiguous_current.add(id(item))
+            ambiguous_record_keys.update(candidates)
             source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
                 "reason": ("Several current source lines compete for the same previous source line."
                     if len(candidates) == 1 else "Several previous source lines have the same modification anchors.")}
         elif old_by_sheet_fp.get((str(group["sheet"]), str(evidence.get("fingerprint") or ""))):
             source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
                 "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
+
+    current_groups_by_key = {str(group.get("key") or ""): group for group in detail["groups"]}
+    removed_groups_by_key = {str(group.get("key") or ""): group for group in detail.get("removedGroups") or []}
+    current_or_removed = {**removed_groups_by_key, **current_groups_by_key}
+    for group in current_or_removed.values():
+        group["deletedLines"] = []
+    attached_deletions: dict[str, set[str]] = defaultdict(set)
+    deleted_signatures: set[tuple[str, str, str]] = set()
+    for group in [*detail["groups"], *(detail.get("removedGroups") or [])]:
+        comparison = group_comparisons.get(str(group.get("key") or "")) or removed_comparisons.get(str(group.get("key") or "")) or {}
+        for difference in comparison.get("differences") or []:
+            if difference.get("type") == "deleted" and isinstance(difference.get("previous"), dict):
+                deleted_signatures.add((str(group.get("key") or ""), str(group.get("sheet") or ""),
+                    str(difference["previous"].get("fingerprint") or "")))
+
+    active_records: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in [*line_events.values(), *legacy_events.values()]:
+        active_records[record_event_key(record)] = record
+    acknowledged_by_signature: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in deletion_review_events:
+        evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+        signature = (str(evidence.get("priorGroupKey") or record.get("GroupKey") or ""),
+            str(record.get("SheetName") or ""), str(evidence.get("fingerprint") or ""))
+        if evidence.get("deletionReviewKey") and signature[2]:
+            acknowledged_by_signature[signature].append(record)
+    for records in acknowledged_by_signature.values():
+        records.sort(key=lambda row: (int(row.get("Version") or 0), str(row.get("ReviewKey") or "")))
+
+    def deletion_context(group_key: str, sheet: str):
+        exact = current_or_removed.get(group_key)
+        if exact and str(exact.get("sheet") or "") == sheet:
+            return exact
+        return next((group for group in detail["groups"] if str(group.get("sheet") or "") == sheet
+            and group_key in {str(group.get("key") or ""), *(str(key) for key in group.get("legacyGroupKeys") or [])}), None)
+
+    def add_deleted_line(group: dict[str, Any], *, evidence: dict[str, Any], record: dict[str, Any] | None,
+                         review_key: str | None = None, comparison_type: str = "deleted",
+                         resolution: dict[str, Any] | None = None, fallback_assignment: dict[str, Any] | None = None):
+        group_key = str((evidence.get("priorGroupKey") if resolution else None) or
+            (record or {}).get("GroupKey") or group.get("key") or "")
+        sheet = str((record or {}).get("SheetName") or group.get("sheet") or "")
+        semantic_fingerprint = str(evidence.get("fingerprint") or "")
+        review_key = review_key or str((record or {}).get("ReviewKey") or "")
+        if not review_key:
+            review_key = "deleted-line:" + fingerprint([file_id, group_key, sheet, semantic_fingerprint])
+        if review_key in attached_deletions[group_key]:
+            return
+        ack = resolution or acknowledged_deletions.get(review_key)
+        prior_record = record
+        if ack:
+            ack_evidence = decode_grist_any_object(ack.get("SemanticEvidence")) or {}
+            prior_record = {**ack, "GroupKey": ack_evidence.get("priorGroupKey") or ack.get("GroupKey"),
+                "SheetName": ack.get("SheetName"), "SourceRow": ack_evidence.get("priorSourceRow") or ack.get("SourceRow"),
+                "ReviewKey": ack_evidence.get("priorReviewKey") or review_key}
+        part_id = _stored_part_id(prior_record or {})
+        part = parts_by_id.get(part_id)
+        if prior_record:
+            previous_assignment = {"partId": (part or {}).get("id") or (part_id or None),
+                "partNumber": (part or {}).get("partNumber") or prior_record.get("PartNumberUsed"),
+                "name": (part or {}).get("name") or prior_record.get("NameUsed"),
+                "assignedPartIds": [part_id] if part_id else [], "hasPriorAssignment": bool(part_id),
+                "requiresReview": not bool(ack), "reviewKey": review_key, "reviewKeys": [review_key],
+                "evidenceStatus": "verified" if _stored_line_evidence(prior_record, sheet) else "legacy_unverified",
+                "sourceChanged": prior_record.get("SourceHash") != source_hash,
+                "associationChanged": not context_matches(prior_record)}
+        else:
+            previous_assignment = dict(fallback_assignment or group.get("previousAssignment") or {})
+            if not previous_assignment.get("previousRowsAgree"):
+                previous_assignment.update({"partId": None, "partNumber": None, "name": None, "assignedPartIds": [],
+                    "hasPriorAssignment": False})
+            previous_assignment.update({"requiresReview": not bool(ack), "reviewKey": review_key,
+                "reviewKeys": [review_key], "evidenceStatus": previous_assignment.get("evidenceStatus") or "legacy_unverified"})
+        prior_review_key = str((prior_record or {}).get("ReviewKey") or review_key)
+        ack_evidence = decode_grist_any_object(ack.get("SemanticEvidence")) if ack else None
+        provenance_source = prior_record or {}
+        if ack and ack_evidence:
+            provenance_source = {**provenance_source,
+                "Version": ack_evidence.get("priorVersion", provenance_source.get("Version")),
+                "Actor": ack_evidence.get("priorActor", provenance_source.get("Actor")),
+                "Reason": ack_evidence.get("priorReason", provenance_source.get("Reason")),
+                "OccurredAt": ack_evidence.get("priorOccurredAt", provenance_source.get("OccurredAt"))}
+        line = {"reviewKey": review_key, "priorReviewKey": prior_review_key,
+            "lineKey": _stored_line_key(record or {}) or str(evidence.get("lineKey") or ""),
+            "groupKey": group_key, "sheet": sheet,
+            "description": str((record or {}).get("SourceDescription") or group.get("description") or ""),
+            "row": int((record or {}).get("SourceRow") or (ack_evidence or {}).get("priorSourceRow") or 0) or None,
+            "semanticEvidence": evidence, "previousAssignment": previous_assignment,
+            "semanticComparison": {"status": "deleted" if comparison_type == "deleted" else "unmatched_previous",
+                "previousFingerprint": semantic_fingerprint, "currentFingerprint": None,
+                "differences": [{"type": comparison_type, "previous": evidence, "current": None, "fieldDifferences": []}],
+                "requiresReview": not bool(ack)},
+            "provenance": {"reviewKey": prior_review_key, "version": provenance_source.get("Version"),
+                "actor": provenance_source.get("Actor"), "reason": provenance_source.get("Reason"),
+                "occurredAt": provenance_source.get("OccurredAt"), "sourceHash": provenance_source.get("SourceHash")},
+            "reviewed": bool(ack), "resolution": ({"reviewKey": ack.get("ReviewKey"), "version": ack.get("Version"),
+                "actor": ack.get("Actor"), "reason": ack.get("Reason"), "occurredAt": ack.get("OccurredAt")} if ack else None)}
+        group["deletedLines"].append(line)
+        attached_deletions[group_key].add(review_key)
+
+    # The group snapshot can prove a deletion even when the line has only
+    # legacy/group-level audit evidence. Prefer a matching line event to keep
+    # the canonical Part and actor/reason provenance line-specific.
+    consumed_deletion_events: set[tuple[str, str]] = set()
+    for group in [*detail["groups"], *(detail.get("removedGroups") or [])]:
+        group_key, sheet = str(group.get("key") or ""), str(group.get("sheet") or "")
+        comparison = group_comparisons.get(group_key) or removed_comparisons.get(group_key) or {}
+        for difference in comparison.get("differences") or []:
+            previous = difference.get("previous") if isinstance(difference.get("previous"), dict) else None
+            if difference.get("type") != "deleted" or not previous:
+                continue
+            signature = str(previous.get("fingerprint") or "")
+            if not signature or current_by_sheet_fp.get((sheet, signature)):
+                continue
+            allowed = {group_key, *(str(key) for key in group.get("legacyGroupKeys") or [])}
+            candidates = [(key, record) for key, record in active_records.items()
+                if key not in matched_record_keys and key not in ambiguous_record_keys and key not in consumed_deletion_events
+                and str(record.get("SheetName") or "") == sheet and str(record.get("GroupKey") or "") in allowed
+                and (_stored_line_evidence(record, sheet) or {}).get("fingerprint") == signature]
+            ack_candidates = [record for record in acknowledged_by_signature.get((group_key, sheet, signature), [])
+                if str((decode_grist_any_object(record.get("SemanticEvidence")) or {}).get("deletionReviewKey") or "")
+                not in attached_deletions[group_key]]
+            selected_record = candidates[0][1] if candidates else None
+            resolution = ack_candidates[0] if ack_candidates else None
+            if selected_record:
+                consumed_deletion_events.add(record_event_key(selected_record))
+            stable_key = (str((decode_grist_any_object(resolution.get("SemanticEvidence")) or {}).get("deletionReviewKey") or "")
+                if resolution else str((selected_record or {}).get("ReviewKey") or ""))
+            add_deleted_line(group, evidence=previous, record=selected_record,
+                review_key=stable_key or None, resolution=resolution,
+                fallback_assignment=group.get("previousAssignment"))
+
+    # A partial line save does not contain a complete group snapshot. Its
+    # unmatched authoritative line event still needs a visible, conservative
+    # review card. Changed or duplicate predecessors are excluded above.
+    for event_key, record in active_records.items():
+        if event_key in matched_record_keys or event_key in ambiguous_record_keys or event_key in consumed_deletion_events:
+            continue
+        sheet = str(record.get("SheetName") or "")
+        evidence = _stored_line_evidence(record, sheet)
+        if not evidence or not context_matches(record) or record.get("SourceHash") == source_hash:
+            continue
+        if current_by_sheet_fp.get((sheet, str(evidence.get("fingerprint") or ""))):
+            continue
+        group_key = str(record.get("GroupKey") or "")
+        target = deletion_context(group_key, sheet)
+        if not target:
+            continue
+        comp_type = "deleted" if (group_key, sheet, str(evidence.get("fingerprint") or "")) in deleted_signatures else "unmatched_previous"
+        resolution = acknowledged_deletions.get(str(record.get("ReviewKey") or ""))
+        add_deleted_line(target, evidence=evidence, record=record, comparison_type=comp_type, resolution=resolution)
+
+    # Keep resolved audit evidence visible on reload even if a later partial
+    # mapping save means the old full-group snapshot is no longer reconstructable.
+    for record in deletion_review_events:
+        evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+        review_key = str(evidence.get("deletionReviewKey") or "")
+        group_key = str(evidence.get("priorGroupKey") or record.get("GroupKey") or "")
+        sheet = str(record.get("SheetName") or "")
+        signature = str(evidence.get("fingerprint") or "")
+        if (not review_key or not signature or review_key in attached_deletions[group_key]
+                or current_by_sheet_fp.get((sheet, signature))):
+            continue
+        target = deletion_context(group_key, sheet)
+        if target:
+            add_deleted_line(target, evidence=evidence, record=None, review_key=review_key,
+                comparison_type="deleted", resolution=record)
+
+    pending_deleted_count = 0
+    for group in current_or_removed.values():
+        group["deletedLines"].sort(key=lambda item: (int(item.get("row") or 0), item["reviewKey"]))
+        pending = [item for item in group["deletedLines"] if not item.get("reviewed")]
+        pending_deleted_count += len(pending)
+        if group in detail.get("removedGroups", []):
+            group["reviewed"] = bool(group["deletedLines"]) and not pending
+            if group["deletedLines"] and not pending:
+                group["semanticComparison"] = {**(group.get("semanticComparison") or {}),
+                    "status": "deleted_lines_reviewed", "requiresReview": False}
 
     for group in detail["groups"]:
         rows = group.get("rows") or []
@@ -1043,11 +1250,17 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         group["assignmentSummary"] = {"partCount": len(part_ids), "mappedLineCount": mapped_count,
             "unassignedLineCount": max(0, len(rows) - mapped_count)}
         group["part"] = assigned[0] if rows and all(row.get("reviewed") and row.get("part") for row in rows) and len(part_ids) == 1 else None
-        group["reviewed"] = bool(rows) and all(row.get("reviewed") for row in rows)
+        group["reviewed"] = bool(rows) and all(row.get("reviewed") for row in rows) and not any(
+            not item.get("reviewed") for item in group.get("deletedLines") or [])
         group["explicitlyUnassigned"] = bool(rows) and all(row.get("explicitlyUnassigned") for row in rows)
         group["pendingLineKeys"] = [row["lineKey"] for row in rows if not row.get("reviewed")]
         statuses = {str(row.get("semanticComparison", {}).get("status") or "") for row in rows}
-        if rows and group["reviewed"] and statuses.issubset({"", "new", "unchanged"}):
+        base_comparison = group_comparisons.get(str(group.get("key") or "")) or group.get("semanticComparison") or {}
+        if any(not item.get("reviewed") for item in group.get("deletedLines") or []):
+            group["semanticComparison"] = {**base_comparison, "status": "deleted_lines_pending", "requiresReview": True}
+        elif group.get("deletedLines"):
+            group["semanticComparison"] = {**base_comparison, "status": "deleted_lines_reviewed", "requiresReview": False}
+        elif rows and group["reviewed"] and statuses.issubset({"", "new", "unchanged"}):
             group["semanticComparison"] = {**(group.get("semanticComparison") or {}),
                 "status": "unchanged", "differences": [], "requiresReview": False,
                 "groupingPolicyChanged": False}
@@ -1059,13 +1272,16 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         for part in assigned:
             if all(existing["id"] != part["id"] for existing in detail["parts"]):
                 detail["parts"].append(part)
-    detail["unresolvedGroups"] = sum(not group["reviewed"] for group in detail["groups"]) + len(detail.get("removedGroups") or [])
+    detail["unresolvedDeletedLines"] = pending_deleted_count
+    detail["unresolvedGroups"] = sum(not group["reviewed"] for group in detail["groups"]) + sum(
+        not group.get("reviewed") for group in detail.get("removedGroups") or [])
     detail["unresolvedLines"] = sum(1 for item in current_lines if not item["source"].get("reviewed"))
     return detail
 
 
 def save_mapping(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]],
                  decisions: dict[str, str] | None = None, line_decisions: dict[str, str] | None = None,
+                 deleted_line_reviews: dict[str, str] | None = None,
                  expected_hash: str, expected_version: int, expected_association: str,
                  expected_association_version: int, actor: str, reason: str = "",
                  group_reasons: dict[str, str] | None = None, line_reasons: dict[str, str] | None = None,
@@ -1073,14 +1289,16 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
     _ensure_group_semantic_evidence(groups)
     decisions = decisions or {}
     line_decisions = line_decisions or {}
+    deleted_line_reviews = deleted_line_reviews or {}
     group_reasons = group_reasons or {}
     line_reasons = line_reasons or {}
-    if not (decisions or line_decisions) or not request_key.strip() or not actor.strip():
-        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for at least one source line and provide a request identity")
-    if any(not isinstance(key, str) or not isinstance(value, str) for mapping in (decisions, line_decisions) for key, value in mapping.items()):
-        raise PartConflict("PART_REVIEW_INPUT_INVALID", "Line and group assignments must use text keys and Part identities")
+    if not (decisions or line_decisions or deleted_line_reviews) or not request_key.strip() or not actor.strip():
+        raise PartConflict("PART_REVIEW_INPUT_REQUIRED", "Select a Part for a source line or explicitly review a deleted line")
+    if any(not isinstance(key, str) or not isinstance(value, str) for mapping in (decisions, line_decisions, deleted_line_reviews) for key, value in mapping.items()):
+        raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping decisions and review reasons must use text keys and values")
     payload_hash = fingerprint([file_id, expected_hash, expected_version, expected_association,
         expected_association_version, sorted(decisions.items()), sorted(line_decisions.items()),
+        sorted((key, str(value or "").strip()) for key, value in deleted_line_reviews.items()),
         {key: str(value or "").strip() for key, value in sorted(group_reasons.items())},
         {key: str(value or "").strip() for key, value in sorted(line_reasons.items())}, reason.strip(), actor])
     with store.lock:
@@ -1095,6 +1313,9 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                 "assignments": {}, "lineAssignments": {_stored_line_key(row): {"partId": _stored_part_id(row) or None,
                     "actionType": row.get("ActionType") or "legacy_review", "requiresUserReason": row.get("ActionType") in {"replace_assignment", "clear_assignment"}}
                     for row in replay if _stored_line_key(row)},
+                "deletedLineReviews": {str((decode_grist_any_object(row.get("SemanticEvidence")) or {}).get("deletionReviewKey") or ""):
+                    {"actionType": row.get("ActionType"), "requiresUserReason": True}
+                    for row in replay if _is_source_deletion_review(row)},
                 "confirmedRows": replay, "sourceHash": source_hash, "associationKey": association.id if association else "",
                 "associationVersion": association.version if association else 0}
         detail = mapping_detail(store, file_id=file_id, source_hash=source_hash, association=association,
@@ -1135,6 +1356,18 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify lines included in this save")
         if set(group_reasons) - set(decisions) and set(group_reasons) - set(source_groups.values()):
             raise PartConflict("PART_REVIEW_INPUT_INVALID", "Mapping reasons must identify groups included in this save")
+
+        deleted_line_items = {str(line.get("reviewKey") or ""): line
+            for group in [*detail.get("groups", []), *(detail.get("removedGroups") or [])]
+            for line in group.get("deletedLines") or []}
+        for review_key, user_reason in deleted_line_reviews.items():
+            line = deleted_line_items.get(review_key)
+            if line is None:
+                raise PartConflict("PART_DELETED_LINE_UNKNOWN", "A deleted source line is no longer awaiting review; reload the mapping")
+            if line.get("reviewed"):
+                raise PartConflict("PART_DELETED_LINE_ALREADY_REVIEWED", "This deleted source line was already reviewed; reload the mapping")
+            if not str(user_reason or "").strip():
+                raise PartConflict("PART_DELETED_LINE_REASON_REQUIRED", "Confirming a removed source line requires an audited reason")
 
         parts = {part["id"]: part for part in list_parts(store, refresh=True)}
         for part_id in expanded.values():
@@ -1210,10 +1443,58 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                 "SemanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
                 "SemanticFingerprint": group["semanticFingerprint"], "SemanticEvidence": persisted_evidence,
                 "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
-                "RequestFingerprint": payload_hash, "RequestRowCount": len(expanded)}
+                "RequestFingerprint": payload_hash, "RequestRowCount": len(expanded) + len(deleted_line_reviews)}
             if not (row.get("ProductPart") is None and row.get("PartIdentity")):
                 row.pop("PartIdentity", None)
             rows.append(row)
+        deleted_review_actions: dict[str, dict[str, Any]] = {}
+        history_by_key = {str(row["fields"].get("ReviewKey") or ""): row["fields"] for row in all_rows}
+        groups_by_key = {str(group.get("key") or ""): group for group in detail.get("groups", [])}
+        for review_key, user_reason in sorted(deleted_line_reviews.items()):
+            deleted = deleted_line_items[review_key]
+            prior_record = history_by_key.get(str(deleted.get("priorReviewKey") or ""))
+            previous = deleted.get("previousAssignment") or {}
+            part_id = str(previous.get("partId") or "")
+            selected = parts.get(part_id)
+            prior_evidence = deleted.get("semanticEvidence") or {}
+            persisted_evidence = {**prior_evidence, "sourceDeletionReview": True,
+                "deletionReviewKey": review_key, "priorReviewKey": str(deleted.get("priorReviewKey") or review_key),
+                "priorGroupKey": str(deleted.get("groupKey") or ""), "priorSourceRow": deleted.get("row"),
+                "priorVersion": (prior_record or {}).get("Version"), "priorActor": (prior_record or {}).get("Actor"),
+                "priorReason": (prior_record or {}).get("Reason"), "priorOccurredAt": (prior_record or {}).get("OccurredAt"),
+                "reviewedAgainstSourceHash": source_hash, "reviewedAgainstAssociationKey": association.id,
+                "reviewedAgainstAssociationVersion": association.version}
+            supersedes = str((prior_record or {}).get("ReviewKey") or "")
+            if supersedes:
+                prior_links = prior_evidence.get("supersedesReviewKeys")
+                persisted_evidence["supersedesReviewKeys"] = sorted({
+                    *(str(key) for key in prior_links if isinstance(key, str) and key), supersedes}) if isinstance(prior_links, list) else [supersedes]
+            event = {"ReviewKey": "part-deletion-review:" + fingerprint([request_key, review_key]),
+                "FileKey": file_id, "SourceHash": source_hash, "AssociationKey": association.id,
+                "AssociationVersion": association.version, "GroupKey": str(deleted.get("groupKey") or ""),
+                "SheetName": str(deleted.get("sheet") or ""), "SourceRow": int(deleted.get("row") or 0),
+                "SourceDescription": str(deleted.get("description") or ""),
+                "ProductPart": (prior_record or {}).get("ProductPart") if prior_record else (
+                    int(selected["gristRecordId"]) if selected and selected.get("gristRecordId") is not None else None),
+                "StablePartId": (prior_record or {}).get("StablePartId") if prior_record else (
+                    part_id if selected and selected.get("stableIdentity") and selected.get("gristRecordId") is not None else ""),
+                "PartRevision": (prior_record or {}).get("PartRevision") if prior_record else (
+                    _grist_ref(selected.get("partRevisionRecordId")) if selected and selected.get("gristRecordId") is not None else None),
+                "PartMetadataVersion": (prior_record or {}).get("PartMetadataVersion") if prior_record else (
+                    _grist_ref(selected.get("partMetadataRecordId")) if selected and selected.get("gristRecordId") is not None else None),
+                "PartNumberUsed": str((prior_record or {}).get("PartNumberUsed") or previous.get("partNumber") or ""),
+                "NameUsed": str((prior_record or {}).get("NameUsed") or previous.get("name") or ""),
+                "Version": version, "Actor": actor, "Reason": str(user_reason or "").strip(),
+                "ActionType": "source_deletion_review", "MappingPolicyVersion": MAPPING_POLICY_VERSION,
+                "SemanticPolicyVersion": MAPPING_SEMANTIC_POLICY_VERSION,
+                "SemanticFingerprint": (groups_by_key.get(str(deleted.get("groupKey") or "")) or {}).get("semanticFingerprint")
+                    or (prior_record or {}).get("SemanticFingerprint") or "",
+                "SemanticEvidence": persisted_evidence, "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": payload_hash, "RequestRowCount": len(expanded) + len(deleted_line_reviews)}
+            if not (event.get("ProductPart") is None and event.get("PartIdentity")):
+                event.pop("PartIdentity", None)
+            rows.append(event)
+            deleted_review_actions[review_key] = {"actionType": "source_deletion_review", "requiresUserReason": True}
         if before_write:
             before_write()
         store.append(MAPPING_TABLE, rows)
@@ -1223,7 +1504,8 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
             raise PartConflict("PART_WRITE_UNCONFIRMED", "Grist did not confirm every source-line mapping record after Save")
         assignments = {key: actions[0] for key, actions in grouped_actions.items() if len(actions) == 1}
         return {"idempotent": False, "version": version, "savedRows": len(rows), "assignments": assignments,
-            "lineAssignments": line_actions, "confirmedRows": confirmed_rows, "sourceHash": source_hash,
+            "lineAssignments": line_actions, "deletedLineReviews": deleted_review_actions,
+            "confirmedRows": confirmed_rows, "sourceHash": source_hash,
             "associationKey": association.id if association else "",
             "associationVersion": association.version if association else 0}
 
@@ -1250,5 +1532,5 @@ def attach_mapping_evidence(evidence: dict[str, Any], detail: dict[str, Any]):
     evidence["partRowsRequiringReview"] = [row for row in rows if (row["sheet"], row["row"]) not in reviewed]
     evidence["partMapping"] = {"version": detail["version"], "schemaAvailable": detail["schemaAvailable"],
         "reviewedRows": len(rows) - len(evidence["partRowsRequiringReview"]), "unresolvedGroups": detail["unresolvedGroups"]}
-    if detail["schemaAvailable"] and not evidence["partRowsRequiringReview"]:
+    if detail["schemaAvailable"] and not evidence["partRowsRequiringReview"] and not detail.get("unresolvedDeletedLines"):
         evidence["pendingPolicies"] = [policy for policy in evidence["pendingPolicies"] if policy != "Reviewed Part assignments"]
