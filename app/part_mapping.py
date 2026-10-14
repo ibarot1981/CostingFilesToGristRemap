@@ -787,6 +787,12 @@ def _current_line_key(file_id: str, source_hash: str, group: dict[str, Any], sou
         group.get("key"), source.get("sheet"), source.get("row"), line_evidence.get("fingerprint")])
 
 
+def _legacy_deletion_review_key(file_id: str, group_key: str, sheet: str, record: dict[str, Any]) -> str:
+    """Bind a legacy removal decision to one prior audit row without inventing semantics."""
+    return "legacy-deleted-line:" + fingerprint([file_id, group_key, sheet,
+        int(record.get("SourceRow") or 0), str(record.get("ReviewKey") or "")])
+
+
 def mapping_detail(store, *, file_id: str, source_hash: str, association, groups: list[dict[str, Any]], refresh_parts: bool = False):
     """Return group display data with independently resolved source-line assignments.
 
@@ -1099,6 +1105,30 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         return next((group for group in detail["groups"] if str(group.get("sheet") or "") == sheet
             and group_key in {str(group.get("key") or ""), *(str(key) for key in group.get("legacyGroupKeys") or [])}), None)
 
+    def matching_legacy_ack(record: dict[str, Any], group_key: str, sheet: str, review_key: str):
+        ack = acknowledged_deletions.get(review_key)
+        if not ack:
+            return None
+        evidence = decode_grist_any_object(ack.get("SemanticEvidence")) or {}
+        prior_review_key = str(record.get("ReviewKey") or "")
+        row = int(record.get("SourceRow") or 0)
+        if not (evidence.get("sourceDeletionReview") is True
+                and evidence.get("legacySemanticEvidenceUnavailable") is True
+                and evidence.get("deletionReviewKey") == review_key
+                and evidence.get("priorReviewKey") == prior_review_key
+                and str(evidence.get("priorGroupKey") or "") == group_key
+                and int(evidence.get("priorSourceRow") or 0) == row
+                and str(ack.get("GroupKey") or "") == group_key
+                and str(ack.get("SheetName") or "") == sheet
+                and int(ack.get("SourceRow") or 0) == row
+                and str(evidence.get("reviewedAgainstSourceHash") or "") == source_hash
+                and str(evidence.get("reviewedAgainstAssociationKey") or "") == str(getattr(association, "id", "") or "")
+                and int(evidence.get("reviewedAgainstAssociationVersion") or 0) == int(getattr(association, "version", 0) or 0)
+                and str(ack.get("SourceHash") or "") == source_hash
+                and context_matches(ack)):
+            return None
+        return ack
+
     def add_deleted_line(group: dict[str, Any], *, evidence: dict[str, Any], record: dict[str, Any] | None,
                          review_key: str | None = None, comparison_type: str = "deleted",
                          resolution: dict[str, Any] | None = None, fallback_assignment: dict[str, Any] | None = None):
@@ -1111,7 +1141,9 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             review_key = "deleted-line:" + fingerprint([file_id, group_key, sheet, semantic_fingerprint])
         if review_key in attached_deletions[group_key]:
             return
-        ack = resolution or acknowledged_deletions.get(review_key)
+        legacy_unverified = comparison_type == "legacy_evidence_missing"
+        ack = resolution or (matching_legacy_ack(record, group_key, sheet, review_key)
+            if legacy_unverified and record else acknowledged_deletions.get(review_key))
         prior_record = record
         if ack:
             ack_evidence = decode_grist_any_object(ack.get("SemanticEvidence")) or {}
@@ -1150,10 +1182,15 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             "groupKey": group_key, "sheet": sheet,
             "description": str((record or {}).get("SourceDescription") or group.get("description") or ""),
             "row": int((record or {}).get("SourceRow") or (ack_evidence or {}).get("priorSourceRow") or 0) or None,
-            "semanticEvidence": evidence, "previousAssignment": previous_assignment,
-            "semanticComparison": {"status": "deleted" if comparison_type == "deleted" else "unmatched_previous",
+            "semanticEvidence": {} if legacy_unverified else evidence,
+            "evidenceStatus": "legacy_unverified" if legacy_unverified else "verified",
+            "previousAssignment": previous_assignment,
+            "semanticComparison": {"status": "legacy_evidence_missing" if legacy_unverified else
+                    "deleted" if comparison_type == "deleted" else "unmatched_previous",
                 "previousFingerprint": semantic_fingerprint, "currentFingerprint": None,
-                "differences": [{"type": comparison_type, "previous": evidence, "current": None, "fieldDifferences": []}],
+                "differences": [] if legacy_unverified else
+                    [{"type": comparison_type, "previous": evidence, "current": None, "fieldDifferences": []}],
+                "evidenceUnavailable": legacy_unverified,
                 "requiresReview": not bool(ack)},
             "provenance": {"reviewKey": prior_review_key, "version": provenance_source.get("Version"),
                 "actor": provenance_source.get("Actor"), "reason": provenance_source.get("Reason"),
@@ -1163,10 +1200,36 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         group["deletedLines"].append(line)
         attached_deletions[group_key].add(review_key)
 
+    consumed_deletion_events: set[tuple[str, str]] = set()
+    # Pre-v14 mapping rows have a known source coordinate and audit trail but
+    # no normalized manufacturing evidence. Surface a reasoned removal review
+    # for each previously assigned row of a wholly removed group. The stable
+    # key includes the prior ReviewKey and source coordinate so an old review
+    # cannot silently cover a different row or a later workbook version.
+    for group in detail.get("removedGroups") or []:
+        comparison = group.get("semanticComparison") or {}
+        if comparison.get("status") != "legacy_evidence_missing":
+            continue
+        group_key, sheet = str(group.get("key") or ""), str(group.get("sheet") or "")
+        candidates = [record for record in active_records.values()
+            if str(record.get("GroupKey") or "") == group_key
+            and str(record.get("SheetName") or "") == sheet
+            and context_matches(record)
+            and _stored_part_id(record)
+            and not record.get("SemanticEvidence")
+            and not record.get("SemanticFingerprint")
+            and not record.get("SemanticPolicyVersion")
+            and _stored_line_evidence(record, sheet) is None]
+        candidates.sort(key=lambda record: (int(record.get("SourceRow") or 0), str(record.get("ReviewKey") or "")))
+        for record in candidates:
+            review_key = _legacy_deletion_review_key(file_id, group_key, sheet, record)
+            add_deleted_line(group, evidence={}, record=record, review_key=review_key,
+                comparison_type="legacy_evidence_missing")
+            consumed_deletion_events.add(record_event_key(record))
+
     # The group snapshot can prove a deletion even when the line has only
     # legacy/group-level audit evidence. Prefer a matching line event to keep
     # the canonical Part and actor/reason provenance line-specific.
-    consumed_deletion_events: set[tuple[str, str]] = set()
     for group in [*detail["groups"], *(detail.get("removedGroups") or [])]:
         group_key, sheet = str(group.get("key") or ""), str(group.get("sheet") or "")
         comparison = group_comparisons.get(group_key) or removed_comparisons.get(group_key) or {}
@@ -1239,8 +1302,14 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         if group in detail.get("removedGroups", []):
             group["reviewed"] = bool(group["deletedLines"]) and not pending
             if group["deletedLines"] and not pending:
-                group["semanticComparison"] = {**(group.get("semanticComparison") or {}),
-                    "status": "deleted_lines_reviewed", "requiresReview": False}
+                comparison = group.get("semanticComparison") or {}
+                if comparison.get("status") == "legacy_evidence_missing":
+                    group["removalReviewStatus"] = "reviewed"
+                    group["semanticComparison"] = {**comparison, "requiresReview": False,
+                        "removalReviewStatus": "reviewed"}
+                else:
+                    group["semanticComparison"] = {**comparison,
+                        "status": "deleted_lines_reviewed", "requiresReview": False}
 
     for group in detail["groups"]:
         rows = group.get("rows") or []
@@ -1464,6 +1533,9 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
                 "priorReason": (prior_record or {}).get("Reason"), "priorOccurredAt": (prior_record or {}).get("OccurredAt"),
                 "reviewedAgainstSourceHash": source_hash, "reviewedAgainstAssociationKey": association.id,
                 "reviewedAgainstAssociationVersion": association.version}
+            if deleted.get("evidenceStatus") == "legacy_unverified":
+                persisted_evidence["legacySemanticEvidenceUnavailable"] = True
+                persisted_evidence["priorEvidenceStatus"] = "legacy_unverified"
             supersedes = str((prior_record or {}).get("ReviewKey") or "")
             if supersedes:
                 prior_links = prior_evidence.get("supersedesReviewKeys")

@@ -749,7 +749,7 @@ it("shows per-line deletion evidence and recovers an explicit review with the sa
   render(<PartMappingView path="pilot.ods"/>);
 
   expect(await screen.findByText(/1 previously mapped source line\(s\) are absent or unmatched/)).toBeTruthy();
-  expect(screen.getByText(/SM-P-000002 · S1KHF — Bracket/)).toBeTruthy();
+  expect(screen.getAllByText(/SM-P-000002 · S1KHF — Bracket/).length).toBeGreaterThan(0);
   expect(screen.getByText(/Initial line map/)).toBeTruthy();
   fireEvent.change(screen.getByRole("textbox", {name:/Reason for confirming removed source line/}),
     {target:{value:"Verified row 11 removed"}});
@@ -763,6 +763,40 @@ it("shows per-line deletion evidence and recovers an explicit review with the sa
   expect(mocks.savePartMappings.mock.calls[0][0].deletedLineReviews).toEqual({"prior-review-2":"Verified row 11 removed"});
   fireEvent.click(screen.getByText(/Assignment and removal review history/));
   expect(screen.getByText(/Source line removal review · Tool Shop Items row 11/)).toBeTruthy();
+});
+
+it("explains that a legacy removal review confirms absence only when manufacturing evidence is missing", async () => {
+  const legacyLine = {reviewKey:"legacy-deleted-line:key",priorReviewKey:"legacy-prior-review",groupKey:"tool-legacy",
+    sheet:"Tool Shop Items",description:"Legacy shaft",row:27,semanticEvidence:{},evidenceStatus:"legacy_unverified",
+    previousAssignment:{partId:bracket.id,partNumber:bracket.partNumber,name:bracket.name,requiresReview:true,
+      evidenceStatus:"legacy_unverified"},
+    semanticComparison:{status:"legacy_evidence_missing",differences:[],evidenceUnavailable:true,requiresReview:true},
+    provenance:{reviewKey:"legacy-prior-review",version:3,actor:"mapping operator",reason:"Original group mapping",sourceHash:"legacy-hash"},
+    reviewed:false};
+  const removedGroup = {key:"tool-legacy",sheet:"Tool Shop Items",description:"Legacy shaft",removed:true,reviewed:false,
+    previousAssignment:legacyLine.previousAssignment,semanticComparison:{status:"legacy_evidence_missing",differences:[],requiresReview:true},
+    deletedLines:[legacyLine]};
+  const pending = detail([], {sourceHash:"legacy-current-hash",associationKey:"assoc1",associationVersion:2,version:3,
+    parts:[bracket],removedGroups:[removedGroup],unresolvedGroups:1,unresolvedDeletedLines:1});
+  const resolvedLine = {...legacyLine,reviewed:true,resolution:{actor:"mapping reviewer",reason:"Checked the saved source location",version:4}};
+  const resolved = detail([], {sourceHash:"legacy-current-hash",associationKey:"assoc1",associationVersion:2,version:4,
+    parts:[bracket],removedGroups:[{...removedGroup,reviewed:true,deletedLines:[resolvedLine]}],
+    unresolvedGroups:0,unresolvedDeletedLines:0});
+  mocks.partMappings.mockResolvedValueOnce(pending).mockResolvedValueOnce(resolved);
+  mocks.savePartMappings.mockResolvedValueOnce({savedRows:1,version:4,sourceHash:"legacy-current-hash",
+    associationKey:"assoc1",associationVersion:2,confirmedRows:[]});
+  render(<PartMappingView path="pilot.ods"/>);
+
+  expect(await screen.findByText(/legacy record preserves this source coordinate, prior Part, and audit history, but not the manufacturing values needed to verify line identity/i)).toBeTruthy();
+  expect(screen.getAllByText(/SM-P-000002 · S1KHF — Bracket/).length).toBeGreaterThan(0);
+  fireEvent.change(screen.getByRole("textbox", {name:/Reason for confirming removed source line/}),
+    {target:{value:"Checked the saved source location"}});
+  fireEvent.click(screen.getByRole("button", {name:"Confirm source line removed"}));
+  expect(await screen.findByText(/This review records only that the legacy mapping at this source coordinate was checked and is absent/i)).toBeTruthy();
+  expect(mocks.savePartMappings).toHaveBeenCalledWith(expect.objectContaining({
+    expectedHash:"legacy-current-hash",expectedVersion:3,
+    deletedLineReviews:{"legacy-deleted-line:key":"Checked the saved source location"},
+  }),"request-key");
 });
 
 it("does not show or select stale search results while a newer query is loading", async () => {

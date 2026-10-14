@@ -7,6 +7,7 @@ import "../src/styles.css";
 
 const STORAGE = "isolated-grist-part-line-records";
 const REMOVED_SOURCE_LINE_STORAGE = "isolated-removed-source-line";
+const REMOVED_LEGACY_GROUP_STORAGE = "isolated-removed-legacy-group";
 const workbookPath = "isolated-line-assignments.ods";
 type FixturePart = {id:string; partNumber:string; name:string; description:string; variant:string; selectable:boolean; duplicateName:boolean;
   engineeringRevision:string; legacy:boolean; status:string; scope:string; scopeTargetId:string; scopeTarget:string; shortcode:string;
@@ -26,6 +27,7 @@ let mappingReads = 0;
 let changedLineEvidence = false;
 const persistedRemovedSourceLine = Number(sessionStorage.getItem(REMOVED_SOURCE_LINE_STORAGE));
 let removedSourceLine:number|null = Number.isInteger(persistedRemovedSourceLine) && persistedRemovedSourceLine > 0 ? persistedRemovedSourceLine : null;
+let removedLegacyGroup = sessionStorage.getItem(REMOVED_LEGACY_GROUP_STORAGE) === "true";
 let loseNextDeletionResponse = false;
 let pendingCreate: (() => void) | null = null;
 let notify: (() => void) | null = null;
@@ -59,6 +61,24 @@ function deletedLineFor(groupKey:string) {
     provenance:{reviewKey:prior.ReviewKey,version:prior.Version,actor:prior.Actor,reason:prior.Reason,occurredAt:prior.OccurredAt,sourceHash:prior.SourceHash},
     reviewed:Boolean(resolution),resolution:resolution ? {actor:resolution.Actor,reason:resolution.Reason,version:resolution.Version} : null}];
 }
+function legacyDeletedLinesFor(groupKey:string) {
+  const prior = server.history.slice().reverse().find(row => row.GroupKey === groupKey
+    && row.ActionType !== "source_deletion_review" && row.StablePartId && !row.SemanticEvidence);
+  if (!prior) return [];
+  const reviewKey = `legacy-deleted-line:${prior.ReviewKey}`;
+  const resolution = server.history.find(row => row.ActionType === "source_deletion_review"
+    && row.SemanticEvidence?.deletionReviewKey === reviewKey
+    && row.SemanticEvidence?.reviewedAgainstSourceHash === "isolated-source-hash");
+  return [{reviewKey,priorReviewKey:prior.ReviewKey,groupKey,sheet:prior.SheetName,description:prior.SourceDescription,
+    row:prior.SourceRow,semanticEvidence:{},evidenceStatus:"legacy_unverified",
+    previousAssignment:{partId:prior.StablePartId,partNumber:prior.PartNumberUsed,name:prior.NameUsed,
+      requiresReview:!resolution,evidenceStatus:"legacy_unverified"},
+    semanticComparison:{status:"legacy_evidence_missing",previousFingerprint:null,currentFingerprint:null,
+      differences:[],evidenceUnavailable:true,requiresReview:!resolution},
+    provenance:{reviewKey:prior.ReviewKey,version:prior.Version,actor:prior.Actor,reason:prior.Reason,
+      occurredAt:prior.OccurredAt,sourceHash:prior.SourceHash},reviewed:Boolean(resolution),
+    resolution:resolution ? {actor:resolution.Actor,reason:resolution.Reason,version:resolution.Version} : null}];
+}
 function group(key:string,sheet:string,description:string,rows:any[],deletedLines:any[] = []) {
   const assigned = rows.map(row => ({row,saved:server.lineAssignments[row.lineKey]}));
   const mapped = assigned.filter(item => item.saved?.partId);
@@ -78,19 +98,29 @@ function group(key:string,sheet:string,description:string,rows:any[],deletedLine
 function mappingDetail() {
   mappingReads += 1;
   notify?.();
-  const mclRows = [10,11,12,13].filter(row => row !== removedSourceLine)
+  const mclRows = [10,11,12,13].filter(row => row !== removedSourceLine && !removedLegacyGroup)
     .map(row => sourceRow("mcl-chassis","5. Material Cut List Price",row,`Plate ${row-9}`,["2","1","4","3"][row-10]));
   const toolRows = [21,22].map((row,index) => sourceRow("tool-jig","Tool Shop Items",row,`Jig ${index+1}`,["1","2"][index]));
-  const groups = [group("mcl-chassis","5. Material Cut List Price","Chassis",mclRows,deletedLineFor("mcl-chassis")),
+  const groups = [...(!removedLegacyGroup ? [group("mcl-chassis","5. Material Cut List Price","Chassis",mclRows,deletedLineFor("mcl-chassis"))] : []),
     group("tool-jig","Tool Shop Items","Inspection jig",toolRows)];
+  const legacyDeletedLines = removedLegacyGroup ? legacyDeletedLinesFor("mcl-chassis") : [];
+  const removedGroups = removedLegacyGroup ? [{key:"mcl-chassis",sheet:"5. Material Cut List Price",description:"Chassis",removed:true,
+    reviewed:legacyDeletedLines.length > 0 && legacyDeletedLines.every(line => line.reviewed),
+    previousAssignment:{partId:legacyDeletedLines[0]?.previousAssignment.partId || null,
+      partNumber:legacyDeletedLines[0]?.previousAssignment.partNumber || null,name:legacyDeletedLines[0]?.previousAssignment.name || null,
+      evidenceStatus:"legacy_unverified"},
+    semanticComparison:{status:"legacy_evidence_missing",differences:[],requiresReview:legacyDeletedLines.some(line => !line.reviewed)},
+    deletedLines:legacyDeletedLines}] : [];
   return {sourceHash:"isolated-source-hash",associationKey:"fixture-association",associationVersion:1,version:server.version,schemaAvailable:true,
     legacyHistoryAvailable:true,mappingPolicyVersion:"part-source-labels-v2",semanticPolicyVersion:"part-mapping-semantic-v1",
     sourceSheets:{"5. Material Cut List Price":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A8",ambiguousLabelHeaders:[],headerRow:8},
       "Tool Shop Items":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A7",ambiguousLabelHeaders:[],headerRow:7}},
-    parts:server.parts,groups,unresolvedGroups:groups.filter(item => !item.reviewed).length,
+    parts:server.parts,groups,unresolvedGroups:groups.filter(item => !item.reviewed).length
+      + removedGroups.filter(item => !item.reviewed).length,
     unresolvedLines:groups.reduce((sum,item) => sum + item.rows.filter((row:any) => !row.reviewed).length,0),
-    unresolvedDeletedLines:groups.reduce((sum,item) => sum + item.deletedLines.filter((line:any) => !line.reviewed).length,0),
-    history:server.history,removedGroups:[]};
+    unresolvedDeletedLines:[...groups.flatMap(item => item.deletedLines),...removedGroups.flatMap(item => item.deletedLines)]
+      .filter(line => !line.reviewed).length,
+    history:server.history,removedGroups};
 }
 const scopes = {scopes:[
   {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
@@ -137,7 +167,9 @@ fixtureApi.savePartMappings = async (payload:any,requestKey:string) => {
   }
   const deletionEvents:any[] = [];
   for (const [reviewKey,reason] of Object.entries(payload.deletedLineReviews || {})) {
-    const prior = server.history.find(row => row.ReviewKey === reviewKey && row.ActionType !== "source_deletion_review");
+    const legacyReview = reviewKey.startsWith("legacy-deleted-line:");
+    const priorReviewKey = legacyReview ? reviewKey.slice("legacy-deleted-line:".length) : reviewKey;
+    const prior = server.history.find(row => row.ReviewKey === priorReviewKey && row.ActionType !== "source_deletion_review");
     const existing = server.history.find(row => row.ActionType === "source_deletion_review" && row.SemanticEvidence?.deletionReviewKey === reviewKey);
     if (!prior || !prior.StablePartId || !String(reason || "").trim()) throw new Error("The deleted-line review is incomplete or no longer available.");
     if (existing) throw new Error("This source-line removal was already reviewed; reload the mapping detail.");
@@ -149,8 +181,11 @@ fixtureApi.savePartMappings = async (payload:any,requestKey:string) => {
       RequestRowCount:Object.keys(lineAssignments).length+Object.keys(payload.deletedLineReviews || {}).length,
       SemanticEvidence:{sourceDeletionReview:true,deletionReviewKey:reviewKey,priorReviewKey:prior.ReviewKey,
         priorGroupKey:"mcl-chassis",priorSourceRow:prior.SourceRow,priorVersion:prior.Version,priorActor:prior.Actor,
-        priorReason:prior.Reason,priorOccurredAt:prior.OccurredAt,fingerprint:prior.SemanticEvidence?.fingerprint,
-        lineKey:prior.LineKey}});
+        priorReason:prior.Reason,priorOccurredAt:prior.OccurredAt,...(legacyReview ? {
+          legacySemanticEvidenceUnavailable:true,priorEvidenceStatus:"legacy_unverified",
+          reviewedAgainstSourceHash:"isolated-source-hash",reviewedAgainstAssociationKey:"fixture-association",
+          reviewedAgainstAssociationVersion:1,
+        } : {fingerprint:prior.SemanticEvidence?.fingerprint,lineKey:prior.LineKey})}});
   }
   server.version += 1; server.writes += 1;
   server.lineAssignments = {...server.lineAssignments,...lineAssignments};
@@ -158,7 +193,7 @@ fixtureApi.savePartMappings = async (payload:any,requestKey:string) => {
     const rowNumber = Number(key.split(":line:")[1]);
     const part = server.parts.find(item => item.id === record.partId);
     server.history.push({ReviewKey:`isolated-review-${server.history.length+1}`,
-    Version:server.version,StablePartId:record.partId,SourceRow:Number(key.split(":line:")[1]),SheetName:key.startsWith("mcl-") ? "5. Material Cut List Price" : "Tool Shop Items",
+    Version:server.version,StablePartId:record.partId,GroupKey:key.split(":line:")[0],SourceRow:Number(key.split(":line:")[1]),SheetName:key.startsWith("mcl-") ? "5. Material Cut List Price" : "Tool Shop Items",
     SourceDescription:key.startsWith("mcl-") ? `Plate ${rowNumber-9}` : `Jig ${rowNumber-20}`,
     PartNumberUsed:part?.partNumber,NameUsed:part?.name,SemanticEvidence:{lineKey:key,fingerprint:lineFingerprint(key,rowNumber)},
     ActionType:record.actionType,RequestKey:requestKey,RequestRowCount:Object.keys(lineAssignments).length+deletionEvents.length,
@@ -187,7 +222,7 @@ fixtureApi.createManagedPart = async (payload:any) => new Promise(resolve => {
   };
 });
 
-declare global { interface Window { __completeFixtureCreate:()=>void; __changeLineEvidenceAndReload:()=>void; __removeMappedSourceLineAndReload:()=>void; __loseNextDeletionResponse:()=>void; __syncFixture:()=>void; __lastCreatedPart?:FixturePart } }
+declare global { interface Window { __completeFixtureCreate:()=>void; __changeLineEvidenceAndReload:()=>void; __removeMappedSourceLineAndReload:()=>void; __removeLegacyMappedGroupAndReload:()=>void; __loseNextDeletionResponse:()=>void; __syncFixture:()=>void; __lastCreatedPart?:FixturePart } }
 
 function Harness() {
   const [page,setPage] = useState<"mapping"|"parts">("mapping");
@@ -205,10 +240,22 @@ function Harness() {
     sessionStorage.setItem(REMOVED_SOURCE_LINE_STORAGE,String(removedSourceLine));
     Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.trim() === "Reload review")?.click();
   };
+  window.__removeLegacyMappedGroupAndReload = () => {
+    const prior = server.history.slice().reverse().find(row => row.GroupKey === "mcl-chassis"
+      && row.SourceRow === 10 && row.ActionType !== "source_deletion_review" && row.StablePartId);
+    if (prior) {
+      for (const column of ["SemanticEvidence", "SemanticFingerprint", "SemanticPolicyVersion", "LineKey"]) delete prior[column];
+      removedLegacyGroup = true;
+      sessionStorage.setItem(REMOVED_LEGACY_GROUP_STORAGE,"true");
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.trim() === "Reload review")?.click();
+    }
+  };
   window.__loseNextDeletionResponse = () => { loseNextDeletionResponse=true; };
   window.__syncFixture = () => setFixtureVersion(value => value + 1);
   const evidence = useMemo(() => JSON.stringify({page,gristVersion:server.version,gristWrites:server.writes,mappingReads,
     savedLines:Object.entries(server.lineAssignments).map(([key,value]) => ({lineKey:key,partId:value.partId,reviewed:value.reviewed})),
+    removedLegacyGroup,legacySemanticEvidenceUnavailable:server.history.filter(row => row.GroupKey === "mcl-chassis"
+      && row.ActionType !== "source_deletion_review" && !row.SemanticEvidence).length,
     deletedLineReviews:server.history.filter(row => row.ActionType === "source_deletion_review").length,
     quantityEdits:0,serverHistoryRows:server.history.length,fixtureVersion}),[page,fixtureVersion]);
   return <div className="app-shell">
@@ -218,8 +265,9 @@ function Harness() {
         <button type="button" onClick={() => { if (pendingCreate) window.__completeFixtureCreate(); }}>Complete isolated Part creation</button>
         <button type="button" onClick={() => window.__changeLineEvidenceAndReload()}>Change row 13 evidence and reload review</button>
         <button type="button" onClick={() => window.__removeMappedSourceLineAndReload()}>Remove mapped row 10 from isolated workbook</button>
+        <button type="button" onClick={() => window.__removeLegacyMappedGroupAndReload()}>Remove legacy mapped group after dropping semantic evidence</button>
         <button type="button" onClick={() => window.__loseNextDeletionResponse()}>Lose next deleted-line response after commit</button>
-        <button type="button" onClick={() => { sessionStorage.removeItem(STORAGE); sessionStorage.removeItem(REMOVED_SOURCE_LINE_STORAGE); server={version:0,writes:0,lineAssignments:{},history:[],parts:[chassis,bracket]}; changedLineEvidence=false; removedSourceLine=null; loseNextDeletionResponse=false; location.reload(); }}>Reset isolated records</button>
+        <button type="button" onClick={() => { sessionStorage.removeItem(STORAGE); sessionStorage.removeItem(REMOVED_SOURCE_LINE_STORAGE); sessionStorage.removeItem(REMOVED_LEGACY_GROUP_STORAGE); server={version:0,writes:0,lineAssignments:{},history:[],parts:[chassis,bracket]}; changedLineEvidence=false; removedSourceLine=null; removedLegacyGroup=false; loseNextDeletionResponse=false; location.reload(); }}>Reset isolated records</button>
       </div>
       <pre id="fixture-evidence" aria-label="Isolated persistence evidence" style={{whiteSpace:"pre-wrap",fontSize:11,margin:"8px 0 0"}}>{evidence}</pre>
     </header>

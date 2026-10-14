@@ -521,6 +521,36 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertNotIn("PartBaselineProcessing", self.client.tables,
             "the rejected incomplete baseline must not start creating normalized records")
 
+    def test_removed_legacy_group_without_semantic_snapshot_still_blocks_baseline_processing(self):
+        legacy_group = PartSourceGroups([self.family_group("mcl", 46, description="Legacy plate")],
+            all_source_diagnostics())
+        self.save_group_set(legacy_group, "legacy-baseline-before")
+        legacy_record = next(row["fields"] for row in self.client.tables["PartMappingReview"]
+            if row["fields"].get("FileKey") == "pilot.ods")
+        for column in ("SemanticEvidence", "SemanticFingerprint", "SemanticPolicyVersion"):
+            legacy_record.pop(column, None)
+
+        current_groups = PartSourceGroups([], all_source_diagnostics())
+        mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="legacy-baseline-after",
+            association=self.association, groups=current_groups)
+        self.assertEqual(mapping["unresolvedDeletedLines"], 1)
+        family = _family_review_rows(mapping, self.part["id"])["mcl"]
+        self.assertEqual(family["pendingDeletedLineCount"], 1)
+        _, errors = _family_confirmations(mapping, self.part["id"], self.family_choices_for({"mcl"}), strict=True)
+        self.assertTrue(any("previously mapped source line(s) were removed" in error for error in errors))
+
+        with self.assertRaises(PartIdentityError) as blocked:
+            self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
+                workbook_path="C:/isolated/pilot.ods", source_hash="legacy-baseline-after", association=self.association,
+                groups=current_groups, mapping_store=self.mapping_store,
+                source_families=self.family_choices_for({"mcl"}), actor="baseline reviewer",
+                reason="Review the legacy removal before baseline", request_key="baseline-legacy-removal-gate",
+                expected_hash="legacy-baseline-after", expected_association=self.association.id,
+                expected_association_version=self.association.version, expected_mapping_version=mapping["version"])
+        self.assertEqual(blocked.exception.code, "PART_BASELINE_INCOMPLETE")
+        self.assertNotIn("PartBaselineProcessing", self.client.tables,
+            "the incomplete legacy removal must not start normalized baseline writes")
+
     def test_grist_commit_response_loss_recovers_the_same_initial_baseline(self):
         rows = [source_row(10)]
         groups, mapping_result = self.save_rows(rows, "hash-recovery", request_key="map:recovery")

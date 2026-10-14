@@ -805,6 +805,103 @@ class PartMappingTests(unittest.TestCase):
         self.assertEqual(reread["unresolvedGroups"], 0)
         self.assertTrue(reread["removedGroups"][0]["reviewed"])
 
+    def test_legacy_removed_groups_need_scoped_reasoned_review_without_semantic_evidence(self):
+        from app.part_mapping import decode_grist_any_object
+
+        self.create(name="Legacy shared Part")
+        groups = [
+            *self.manufacturing_groups("5. Material Cut List Price", [
+                (10, {"product_part_name": "Bracket", "material_to_cut": "MS", "qty": 1}),
+            ]),
+            *self.manufacturing_groups("Tool Shop Items", [
+                (20, {"product_part_name": "Tool", "item_name": "Cutter", "material_to_cut": "HSS", "qty": 1}),
+            ]),
+            *self.manufacturing_groups("CNC Cut List", [
+                (30, {"part_category": "Frame", "product_part_name": "Side plate", "material_to_cut": "MS",
+                    "length": "120", "width": "25", "thickness": "3", "qty": 1}),
+            ]),
+        ]
+        initial = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-before",
+            association=self.association, groups=groups)
+        choices = {row["lineKey"]: "1" for group in initial["groups"] for row in group["rows"]}
+        self.save_lines(groups, choices, source_hash="legacy-before", request_key="legacy-group-initial-map")
+
+        # Model records written before semantic evidence columns existed.
+        for row in self.store.tables["PartMappingReview"]:
+            fields = row["fields"]
+            for name in ("SemanticEvidence", "SemanticFingerprint", "SemanticPolicyVersion"):
+                fields.pop(name, None)
+
+        current = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=[])
+        self.assertEqual({group["sheet"] for group in current["removedGroups"]}, {
+            "5. Material Cut List Price", "Tool Shop Items", "CNC Cut List"})
+        self.assertEqual(current["unresolvedDeletedLines"], 3)
+        for group in current["removedGroups"]:
+            line = group["deletedLines"][0]
+            self.assertEqual(line["previousAssignment"]["partId"], "1")
+            self.assertEqual(line["previousAssignment"]["evidenceStatus"], "legacy_unverified")
+            self.assertEqual(line["semanticComparison"]["status"], "legacy_evidence_missing")
+            self.assertTrue(line["semanticComparison"]["evidenceUnavailable"])
+            self.assertEqual(line["semanticEvidence"], {})
+            self.assertEqual(line["semanticComparison"]["differences"], [])
+            self.assertEqual(line["provenance"]["actor"], "Irshad")
+            self.assertEqual(line["provenance"]["reason"], "Initial Part assignment")
+        evidence = {"partRowsRequiringReview": [], "pendingPolicies": ["Reviewed Part assignments"]}
+        attach_mapping_evidence(evidence, current)
+        self.assertIn("Reviewed Part assignments", evidence["pendingPolicies"])
+
+        # A save for another current group cannot consume the old pending rows.
+        unrelated = self.manufacturing_groups("5. Material Cut List Price", [
+            (40, {"product_part_name": "Current guard", "material_to_cut": "MS", "qty": 2}),
+        ])
+        partial = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=unrelated)
+        self.assertEqual(partial["unresolvedDeletedLines"], 3)
+        partial_line = partial["groups"][0]["rows"][0]
+        self.save_lines(unrelated, {partial_line["lineKey"]: "1"}, source_hash="legacy-after",
+            expected_version=partial["version"], request_key="legacy-unrelated-current-save")
+        after_partial = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=unrelated)
+        self.assertEqual(after_partial["unresolvedDeletedLines"], 3)
+        reviews = {line["reviewKey"]: f"Checked legacy row {line['row']} is absent"
+            for group in after_partial["removedGroups"] for line in group["deletedLines"]}
+        saved = save_mapping(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=unrelated, decisions={}, line_decisions={},
+            deleted_line_reviews=reviews, expected_hash="legacy-after", expected_version=after_partial["version"],
+            expected_association="association-1", expected_association_version=1,
+            actor="Irshad", request_key="legacy-removal-review")
+        self.assertEqual(saved["savedRows"], 3)
+        audit_rows = self.store.tables["PartMappingReview"][-3:]
+        for row in audit_rows:
+            fields = row["fields"]
+            self.assertEqual(fields["ActionType"], "source_deletion_review")
+            self.assertTrue(fields["Reason"].startswith("Checked legacy row "))
+            stored = decode_grist_any_object(fields["SemanticEvidence"])
+            self.assertTrue(stored["legacySemanticEvidenceUnavailable"])
+            self.assertEqual(stored["priorEvidenceStatus"], "legacy_unverified")
+            self.assertNotIn("fingerprint", stored)
+            self.assertEqual(fields["SemanticFingerprint"], "")
+
+        retry = save_mapping(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=unrelated, decisions={}, line_decisions={},
+            deleted_line_reviews=reviews, expected_hash="legacy-after", expected_version=after_partial["version"],
+            expected_association="association-1", expected_association_version=1,
+            actor="Irshad", request_key="legacy-removal-review")
+        self.assertTrue(retry["idempotent"])
+        resolved = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-after",
+            association=self.association, groups=unrelated)
+        self.assertEqual(resolved["unresolvedDeletedLines"], 0)
+        self.assertEqual(resolved["unresolvedGroups"], 0)
+        self.assertTrue(all(group["reviewed"] for group in resolved["removedGroups"]))
+        self.assertTrue(all(line["reviewed"] for group in resolved["removedGroups"] for line in group["deletedLines"]))
+
+        # The same historical key cannot carry the decision to a different workbook revision.
+        changed = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="legacy-later",
+            association=self.association, groups=unrelated)
+        self.assertEqual(changed["unresolvedDeletedLines"], 3)
+        self.assertTrue(all(not line["reviewed"] for group in changed["removedGroups"] for line in group["deletedLines"]))
+
     def test_price_totals_formatting_and_document_metadata_do_not_change_semantics(self):
         first = self.manufacturing_groups("CNC Cut List", [
             (10, {"part_category": "Frame", "product_part_name": "Frame side", "material_to_cut": "MS",
@@ -1311,6 +1408,78 @@ class PartMappingTests(unittest.TestCase):
                 actor="isolated reviewer", request_key="grist-deleted-line-review")
             self.assertTrue(retry["idempotent"])
             self.assertEqual(len(client.tables["PartMappingReview"]), 2)
+
+            # Missing pre-v14 semantic columns remain absent through the
+            # isolated Grist fixture. Review evidence is written separately,
+            # survives a fresh registry, and cannot mask another workbook hash.
+            legacy_file_id = "file:grist-legacy-removed-group.ods"
+            legacy_group = self.manufacturing_groups("CNC Cut List", [
+                (27, {"part_category": "Frame", "product_part_name": "Side plate", "material_to_cut": "MS",
+                    "length": "120", "width": "25", "thickness": "3", "qty": 1}),
+            ])
+            legacy_preview = mapping_detail(store, file_id=legacy_file_id, source_hash="legacy-before-removal",
+                association=self.association, groups=legacy_group)
+            legacy_line = legacy_preview["groups"][0]["rows"][0]
+            save_mapping(store, file_id=legacy_file_id, source_hash="legacy-before-removal",
+                association=self.association, groups=legacy_group,
+                line_decisions={legacy_line["lineKey"]: "stable-rear"},
+                expected_hash="legacy-before-removal", expected_version=0,
+                expected_association="association-1", expected_association_version=1,
+                actor="legacy mapping operator", request_key="grist-legacy-prior-map")
+            legacy_fields = next(row["fields"] for row in client.tables["PartMappingReview"]
+                if row["fields"].get("FileKey") == legacy_file_id)
+            for column in ("SemanticEvidence", "SemanticFingerprint", "SemanticPolicyVersion"):
+                legacy_fields.pop(column, None)
+
+            legacy_pending = mapping_detail(store, file_id=legacy_file_id, source_hash="legacy-after-removal",
+                association=self.association, groups=[])
+            legacy_deleted = legacy_pending["removedGroups"][0]["deletedLines"][0]
+            self.assertEqual(legacy_deleted["semanticEvidence"], {})
+            self.assertEqual(legacy_deleted["previousAssignment"]["partId"], "stable-rear")
+            self.assertEqual(legacy_deleted["provenance"]["actor"], "legacy mapping operator")
+            self.assertEqual(legacy_deleted["semanticComparison"]["status"], "legacy_evidence_missing")
+            legacy_reason = "Checked CNC row 27 is absent"
+            legacy_request = "grist-legacy-removal-review"
+            legacy_saved = save_mapping(store, file_id=legacy_file_id, source_hash="legacy-after-removal",
+                association=self.association, groups=[], decisions={}, line_decisions={},
+                deleted_line_reviews={legacy_deleted["reviewKey"]: legacy_reason},
+                expected_hash="legacy-after-removal", expected_version=legacy_pending["version"],
+                expected_association="association-1", expected_association_version=1,
+                actor="isolated legacy reviewer", request_key=legacy_request)
+            self.assertEqual(legacy_saved["savedRows"], 1)
+            legacy_audit = client.tables["PartMappingReview"][-1]["fields"]
+            self.assertEqual(legacy_audit["Reason"], legacy_reason)
+            self.assertEqual(legacy_audit["SemanticFingerprint"], "")
+            legacy_audit_evidence = json.loads(legacy_audit["SemanticEvidence"])
+            self.assertTrue(legacy_audit_evidence["legacySemanticEvidenceUnavailable"])
+            self.assertEqual(legacy_audit_evidence["priorReviewKey"], legacy_deleted["priorReviewKey"])
+            self.assertEqual(legacy_audit_evidence["priorGroupKey"], legacy_deleted["groupKey"])
+            self.assertEqual(legacy_audit_evidence["priorSourceRow"], 27)
+            self.assertNotIn("fingerprint", legacy_audit_evidence)
+
+            legacy_recovered_registry = GristPartRegistry(client, path=Path(temp) / "legacy-fresh-registry.sqlite3")
+            legacy_recovered_registry._verify_writer = lambda: None
+            legacy_recovered_registry.mapping_evidence_schema_available = lambda: True
+            legacy_recovered_store = PartRegistryMappingStore(GristPartStore(client), legacy_recovered_registry)
+            legacy_recovered = mapping_detail(legacy_recovered_store, file_id=legacy_file_id,
+                source_hash="legacy-after-removal", association=self.association, groups=[])
+            self.assertEqual(legacy_recovered["unresolvedDeletedLines"], 0)
+            self.assertEqual(legacy_recovered["unresolvedGroups"], 0)
+            legacy_resolved = legacy_recovered["removedGroups"][0]["deletedLines"][0]
+            self.assertTrue(legacy_resolved["reviewed"])
+            self.assertEqual(legacy_resolved["previousAssignment"]["partId"], "stable-rear")
+            self.assertEqual(legacy_resolved["resolution"]["reason"], legacy_reason)
+            legacy_retry = save_mapping(legacy_recovered_store, file_id=legacy_file_id,
+                source_hash="legacy-after-removal", association=self.association, groups=[], decisions={},
+                line_decisions={}, deleted_line_reviews={legacy_deleted["reviewKey"]: legacy_reason},
+                expected_hash="legacy-after-removal", expected_version=legacy_pending["version"],
+                expected_association="association-1", expected_association_version=1,
+                actor="isolated legacy reviewer", request_key=legacy_request)
+            self.assertTrue(legacy_retry["idempotent"])
+            changed_hash = mapping_detail(legacy_recovered_store, file_id=legacy_file_id,
+                source_hash="legacy-later-workbook", association=self.association, groups=[])
+            self.assertEqual(changed_hash["unresolvedDeletedLines"], 1)
+            self.assertFalse(changed_hash["removedGroups"][0]["deletedLines"][0]["reviewed"])
 
     def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)
