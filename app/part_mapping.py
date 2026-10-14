@@ -855,6 +855,11 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
 
     matched_record_keys: set[tuple[str, str]] = set()
     ambiguous_current: set[int] = set()
+
+    def record_event_key(record: dict[str, Any]) -> tuple[str, str]:
+        stored_key = _stored_line_key(record)
+        return ("line", stored_key) if stored_key else ("legacy", str(record.get("ReviewKey") or ""))
+
     for item in current_lines:
         group, source, evidence = item["group"], item["source"], item["evidence"]
         sheet_fp = (str(group["sheet"]), str(evidence.get("fingerprint") or ""))
@@ -880,8 +885,7 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                     "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
         if selected_record is None:
             continue
-        event_key = ("line", _stored_line_key(selected_record)) if _stored_line_key(selected_record) else (
-            "legacy", str(selected_record.get("ReviewKey") or ""))
+        event_key = record_event_key(selected_record)
         if event_key in matched_record_keys:
             ambiguous_current.add(id(item))
             continue
@@ -962,17 +966,25 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             source["explicitlyUnassigned"] = True
             source["semanticComparison"] = {"status": "legacy_evidence_missing", "requiresReview": True}
 
-    # Pair a changed line with prior evidence only as a proposal. It never
-    # inherits the previous Part without an explicit user save.
+    # Pair changed lines with prior evidence only as proposals. First reserve
+    # every event already matched to an unchanged current line. Then accept a
+    # predecessor edge only when it is unique from both the current-line and
+    # prior-event sides; otherwise a shared modification anchor is not enough
+    # to claim authoritative lineage.
+    changed_candidates: dict[int, dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]]] = {}
+    candidate_users: dict[tuple[str, str], set[int]] = defaultdict(set)
     for item in current_lines:
         if item["source"].get("reviewed") or item["source"].get("previousAssignment") or id(item) in ambiguous_current:
             continue
         group, source, evidence = item["group"], item["source"], item["evidence"]
         current_fields = _line_field_map(evidence)
-        candidates = []
+        candidates: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
         for records in (line_events.values(), legacy_events.values()):
             for record in records:
                 if str(record.get("SheetName") or "") != str(group["sheet"]):
+                    continue
+                event_key = record_event_key(record)
+                if event_key in matched_record_keys:
                     continue
                 previous_evidence = _stored_line_evidence(record, str(group["sheet"]))
                 if not previous_evidence or previous_evidence.get("fingerprint") == evidence.get("fingerprint"):
@@ -982,11 +994,19 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
                 shared = next((name for name in anchors if previous_fields.get(name, {}).get("state") == "value"
                     and current_fields.get(name, {}).get("state") == "value"), None)
                 if shared and previous_fields[shared].get("value") == current_fields[shared].get("value"):
-                    candidates.append((record, previous_evidence))
-        unique = {(_stored_line_key(record) or str(record.get("ReviewKey") or "")): (record, old)
-            for record, old in candidates}
-        if len(unique) == 1:
-            record, previous = next(iter(unique.values()))
+                    candidates[event_key] = (record, previous_evidence)
+        changed_candidates[id(item)] = candidates
+        for event_key in candidates:
+            candidate_users[event_key].add(id(item))
+
+    for item in current_lines:
+        candidates = changed_candidates.get(id(item))
+        if candidates is None:
+            continue
+        group, source, evidence = item["group"], item["source"], item["evidence"]
+        unique_candidate = next(iter(candidates.items())) if len(candidates) == 1 else None
+        if unique_candidate and len(candidate_users[unique_candidate[0]]) == 1:
+            event_key, (record, previous) = unique_candidate
             authoritative_review_key = str(record.get("ReviewKey") or "")
             source["authoritativeReviewKey"] = authoritative_review_key
             source["authoritativeReviewKeys"] = [authoritative_review_key] if authoritative_review_key else []
@@ -1004,7 +1024,8 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
         elif candidates:
             ambiguous_current.add(id(item))
             source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
-                "reason": "Several previous source lines have the same modification anchors."}
+                "reason": ("Several current source lines compete for the same previous source line."
+                    if len(candidates) == 1 else "Several previous source lines have the same modification anchors.")}
         elif old_by_sheet_fp.get((str(group["sheet"]), str(evidence.get("fingerprint") or ""))):
             source["semanticComparison"] = {"status": "ambiguous_correspondence", "requiresReview": True,
                 "reason": "Duplicate source lines prevent an unambiguous moved-line match."}
