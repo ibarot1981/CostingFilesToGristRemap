@@ -1,5 +1,7 @@
 # Sol reviewer instructions
 
+Owner-authorized recovery exception: consult protocol.md and the task's recovery-authorizations before applying the default five-round limit. The F6-only task recovery authorized on 14 October 2026 permits rounds six and seven, preserving all history. Independently review all original criteria and checks; do not accept unresolved F6 or start round eight.
+
 Read `protocol.md` first. This existing chat runs GPT 6.1 Sol, Medium. Own approved requirements, acceptance criteria, implementation prompts and independent reviews. Do not edit application source during implementation rounds or send messages to Luna without explicit owner authorization.
 
 1. Inspect `status`, current Git/PR identity and unrelated changes. Create one approved task using immutable IDs, a requirement with explicit criteria and named mandatory checks. Never queue new app requirements as part of workflow setup.

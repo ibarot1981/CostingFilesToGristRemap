@@ -8,6 +8,10 @@ Sol records owner-approved requirements, explicit acceptance criteria and requir
 
 One task may be active at a time, including blocked or interrupted creation. Five implementation rounds maximum; a failed fifth round becomes blocked and needs owner intervention. The helper never starts round six. Owner intervention must explicitly settle the task; do not reset counters or delete history to bypass the limit.
 
+Explicit owner recovery exception (authorized 14 October 2026): the owner may authorize one bounded two-round extension after a reviewed fifth-round limit blocker. Use `authorize-recovery` with the exact blocked task/round/state, unique request ID, explicit owner note, existing criterion IDs and recorded-defect-only prompt. It atomically preserves all artifacts, records `recovery-authorizations/001.json`, raises that task's limit to seven, and publishes prompt 006 for round six. Other tasks retain the default five-round limit. No repeat extension or eighth round is supported. Approval, commit, verification and production restrictions remain unchanged. This is never automatic recovery.
+
+For `pr3-part-mapping-line-assignments-20261013`, the owner authorized this exception for F6 only; requirements c1-c7 and all seven checks remain acceptance gates. Recovery corrections may fix only F6 and regressions caused by that fix. Read the recorded authorization and current prompt before claiming.
+
 Use `scripts/agent_workflow.py` with the repository virtual-environment Python. It uses only the standard library. `.agent-workflow/tasks/` and the transition lock are ignored by Git. These instructions, helper and tests are reusable tracked files.
 
 ## Task layout

@@ -195,6 +195,36 @@ class WorkflowTests(unittest.TestCase):
             self.flow.apply('request-round','task-1',1,'reviewing','correction',token=token,
                 report=self.review(),prompt='Invent new scope',criterion_ids=['new'])
 
+    def test_owner_recovery_preserves_history_and_stops_at_seven(self):
+        self.test_five_round_limit_preserves_history()
+        before = dict(self.flow.status('task-1')['artifacts'])
+        args = dict(owner_note='Human explicitly authorizes two rounds for the recorded defect only',
+            additional_rounds=2, prompt='Fix c1 recorded defect only', criterion_ids=['c1'])
+        for bad in ({'owner_note': ''}, {'additional_rounds': 3}, {'criterion_ids': ['new']}):
+            with self.assertRaises(w.WorkflowError):
+                self.flow.apply('authorize-recovery', 'task-1', 5, 'blocked', 'bad-recovery', **{**args, **bad})
+        with patch.object(self.flow, 'commit', side_effect=OSError('interrupted publication')):
+            with self.assertRaises(OSError):
+                self.flow.apply('authorize-recovery', 'task-1', 5, 'blocked', 'recovery', **args)
+        self.assertEqual(self.flow.status('task-1')['state'], 'blocked')
+        result = self.flow.apply('authorize-recovery', 'task-1', 5, 'blocked', 'recovery', **args)
+        self.assertEqual((result['round'], result['state']), (6, 'awaiting_implementation'))
+        self.assertTrue(self.flow.apply('authorize-recovery', 'task-1', 5, 'blocked', 'recovery', **args)['idempotent'])
+        state = self.flow.status('task-1')
+        self.assertEqual(state['max_rounds'], 7)
+        self.assertTrue(all(state['artifacts'][key] == value for key, value in before.items()))
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('authorize-recovery', 'task-1', 6, 'awaiting_implementation', 'duplicate-recovery', **args)
+        for number in (6, 7):
+            self.publish(self.claim(number=number), number)
+            token = self.claim('review', number)
+            self.flow.apply('request-round', 'task-1', number, 'reviewing', f'correction-{number}',
+                token=token, report=self.review(number), prompt='Fix c1 only', criterion_ids=['c1'])
+        self.assertEqual(self.flow.status('task-1')['state'], 'blocked')
+        self.assertFalse((self.flow.path('task-1')/'prompts/008.md').exists())
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('authorize-recovery', 'task-1', 7, 'blocked', 'second-extension', **args)
+
     def test_block_resume_and_stale_claim_no_reclaim(self):
         token=self.claim()
         self.assertTrue(self.flow.status('task-1',stale_seconds=0)['stale_claim'])

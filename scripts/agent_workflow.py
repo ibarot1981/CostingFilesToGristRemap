@@ -322,7 +322,7 @@ class Workflow:
                     'pr_url': state['pr_url'], 'meaning': 'Verified acceptance only; merge/deployment/production writes are not authorized.'}))
                 state.update(state='complete', claim=None)
             elif number >= state['max_rounds']:
-                self.block(state, 'Maximum five implementation rounds reached; owner intervention required.', 'awaiting_implementation')
+                self.block(state, f'Maximum {state["max_rounds"]} implementation rounds reached; owner intervention required.', 'awaiting_implementation')
             else:
                 self.artifact(state, f'prompts/{number + 1:03}.md', p['prompt'].encode())
                 state.update(state='awaiting_implementation', round=number + 1, claim=None)
@@ -334,6 +334,26 @@ class Workflow:
             elif not p.get('owner_note'):
                 raise WorkflowError('Blocking an unclaimed task requires an explicit owner note.')
             self.block(state, p['reason'], 'awaiting_review' if current in {'reviewing', 'awaiting_review'} else 'awaiting_implementation')
+        elif action == 'authorize-recovery':
+            if (current != 'blocked' or state.get('claim') or number != state['max_rounds']
+                    or state.get('resume_state') != 'awaiting_implementation'
+                    or f'review-reports/{number:03}.json' not in state['artifacts']):
+                raise WorkflowError('Recovery requires a reviewed round-limit blocker without an active claim.')
+            if state['max_rounds'] != 5 or p.get('additional_rounds') != 2:
+                raise WorkflowError('Only one explicit two-round recovery extension is supported.')
+            if not p.get('owner_note', '').strip() or not p.get('prompt', '').strip():
+                raise WorkflowError('Recovery requires explicit human authorization and a bounded correction prompt.')
+            scope = p.get('criterion_ids', [])
+            if not scope or not set(scope).issubset({c['id'] for c in state['criteria']}):
+                raise WorkflowError('Recovery must reference existing approved criteria only.')
+            authorization = {'task_id': state['task_id'], 'round': number,
+                'previous_max_rounds': state['max_rounds'], 'max_rounds': number + 2,
+                'owner_note': p['owner_note'], 'criterion_ids': scope,
+                'meaning': 'Bounded owner-authorized recovery; prior history and verification gates remain unchanged.'}
+            self.artifact(state, 'recovery-authorizations/001.json', encoded(authorization))
+            self.artifact(state, f'prompts/{number + 1:03}.md', p['prompt'].encode())
+            state.update(max_rounds=number + 2, round=number + 1,
+                state='awaiting_implementation', claim=None, recovery_scope=scope)
         elif action == 'resume':
             if current != 'blocked' or not p.get('owner_note'):
                 raise WorkflowError('Resume requires blocked state and explicit human authorization note.')
@@ -362,7 +382,7 @@ def main():
     status = commands.add_parser('status')
     status.add_argument('--task-id')
     status.add_argument('--stale-seconds', type=int, default=3600)
-    for action in ('create', 'claim-implementation', 'claim-review', 'checkpoint', 'publish-implementation', 'request-round', 'accept', 'block', 'resume'):
+    for action in ('create', 'claim-implementation', 'claim-review', 'checkpoint', 'publish-implementation', 'request-round', 'accept', 'block', 'resume', 'authorize-recovery'):
         p = commands.add_parser(action)
         p.add_argument('--task-id', required=True)
         p.add_argument('--round', type=int, required=True)
@@ -389,7 +409,11 @@ def main():
             if action == 'request-round':
                 p.add_argument('--prompt', type=Path, required=True)
                 p.add_argument('--criterion-id', action='append', required=True)
-            if action in ('block', 'resume'):
+            if action == 'authorize-recovery':
+                p.add_argument('--prompt', type=Path, required=True)
+                p.add_argument('--criterion-id', action='append', required=True)
+                p.add_argument('--additional-rounds', type=int, required=True)
+            if action in ('block', 'resume', 'authorize-recovery'):
                 p.add_argument('--owner-note', default='')
             if action == 'block':
                 p.add_argument('--reason', required=True)
