@@ -332,6 +332,136 @@ class PartMappingTests(unittest.TestCase):
                 self.assertEqual(saved["ActionType"], {"replace": "replace_assignment", "clear": "clear_assignment",
                     "confirm": "context_reconfirmation"}[operation])
 
+    def test_legacy_semantic_proposals_reserve_their_predecessors(self):
+        from copy import deepcopy
+
+        examples = [
+            ("5. Material Cut List Price", {"product_part_name": "Bar", "material_to_cut": "MS",
+                "dimension_to_cut_mm": "12", "qty": 1}),
+            ("Tool Shop Items", {"product_part_name": "Shaft", "item_name": "Pin",
+                "material_to_cut": "Steel", "qty": 1}),
+            ("CNC Cut List", {"part_category": "Bracket", "product_part_name": "Plate",
+                "material_to_cut": "MS", "length": "12", "width": "8", "thickness": "3", "qty": 1}),
+        ]
+        for index, (sheet, original_fields) in enumerate(examples):
+            for added_reason in (False, True):
+                with self.subTest(sheet=sheet, added_reason=added_reason):
+                    self.store = MemoryPartStore()
+                    self.create(name="Part A", part_key=f"f4-a-{index}-{added_reason}")
+                    self.create(name="Part B", part_key=f"f4-b-{index}-{added_reason}")
+                    original = self.manufacturing_groups(sheet, [(10, original_fields)])
+                    original_row = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-1",
+                        association=self.association, groups=original)["groups"][0]["rows"][0]
+                    self.save_lines(original, {original_row["lineKey"]: "1"}, source_hash="f4-hash-1",
+                        request_key="f4-legacy-original")
+                    legacy_evidence = self.store.tables["PartMappingReview"][0]["fields"]["SemanticEvidence"]
+                    self.assertEqual(legacy_evidence["linePolicyVersion"], "part-mapping-line-v1")
+                    legacy_evidence.pop("lineKey")
+                    legacy_evidence.pop("linePolicyVersion")
+                    legacy_event = deepcopy(self.store.tables["PartMappingReview"][0])
+
+                    changed_fields = {**original_fields, "qty": 2}
+                    added_fields = {**original_fields, "qty": 3}
+                    expanded = self.manufacturing_groups(sheet, [(10, changed_fields), (11, added_fields)])
+                    preview = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-2",
+                        association=self.association, groups=expanded)["groups"][0]
+                    changed_line, added_line = preview["rows"]
+                    self.assertEqual(changed_line["previousAssignment"]["partId"], "1")
+                    self.assertEqual(changed_line["semanticComparison"]["status"], "legacy_evidence_missing")
+                    self.assertIsNone(added_line["previousAssignment"],
+                        "a legacy proposal for row 10 must reserve its event before row 11's changed-line pass")
+                    added_key = added_line["lineKey"]
+                    reason = {added_key: "Reviewed added line"} if added_reason else {}
+                    result = self.save_lines(expanded, {added_key: "2"}, source_hash="f4-hash-2",
+                        expected_version=1, request_key=f"f4-add-{index}-{added_reason}", line_reasons=reason)
+                    self.assertEqual(result["lineAssignments"][added_key]["actionType"], "initial_assignment")
+                    added_event = self.store.tables["PartMappingReview"][-1]["fields"]
+                    self.assertNotIn("supersedesReviewKeys", added_event["SemanticEvidence"])
+                    self.assertEqual(self.store.tables["PartMappingReview"][0], legacy_event,
+                        "the prior event is immutable when another line is added")
+
+                    recovered = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-2",
+                        association=self.association, groups=expanded)["groups"][0]
+                    self.assertEqual(recovered["rows"][0]["previousAssignment"]["partId"], "1",
+                        "an untouched changed legacy line keeps its truthful prior-Part proposal")
+                    self.assertEqual(recovered["rows"][1]["part"]["id"], "2")
+                    self.assertEqual(recovered["rows"][1]["previousAssignment"], None)
+                    retry = self.save_lines(expanded, {added_key: "2"}, source_hash="f4-hash-2",
+                        expected_version=1, request_key=f"f4-add-{index}-{added_reason}", line_reasons=reason)
+                    self.assertTrue(retry["idempotent"])
+                    self.assertEqual(len(self.store.tables["PartMappingReview"]), 2)
+
+    def test_legacy_semantic_proposal_keeps_new_line_predecessors_and_old_line_resolution_independent(self):
+        from copy import deepcopy
+
+        for operation in ("reconfirm", "replace", "clear"):
+            with self.subTest(operation=operation):
+                self.store = MemoryPartStore()
+                self.create(name="Part A", part_key="f4-resolution-a")
+                self.create(name="Part B", part_key="f4-resolution-b")
+                original = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 1}),
+                ])
+                original_row = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-1",
+                    association=self.association, groups=original)["groups"][0]["rows"][0]
+                self.save_lines(original, {original_row["lineKey"]: "1"}, source_hash="f4-hash-1",
+                    request_key="f4-resolution-original")
+                old_evidence = self.store.tables["PartMappingReview"][0]["fields"]["SemanticEvidence"]
+                old_evidence.pop("lineKey")
+                old_evidence.pop("linePolicyVersion")
+                original_event = deepcopy(self.store.tables["PartMappingReview"][0])
+
+                expanded = self.manufacturing_groups("Tool Shop Items", [
+                    (10, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 2}),
+                    (11, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 3}),
+                    (12, {"product_part_name": "Shaft", "item_name": "Pin", "material_to_cut": "Steel", "qty": 4}),
+                ])
+                preview = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-2",
+                    association=self.association, groups=expanded)["groups"][0]
+                old_line, added_line, other_added_line = preview["rows"]
+                self.assertEqual(old_line["previousAssignment"]["partId"], "1")
+                self.assertIsNone(added_line["previousAssignment"])
+                self.assertIsNone(other_added_line["previousAssignment"])
+
+                self.save_lines(expanded, {added_line["lineKey"]: "2"}, source_hash="f4-hash-2",
+                    expected_version=1, request_key="f4-resolution-added")
+                added_event = self.store.tables["PartMappingReview"][-1]["fields"]
+                self.assertEqual(added_event["ActionType"], "initial_assignment")
+                self.assertNotIn("supersedesReviewKeys", added_event["SemanticEvidence"])
+                self.assertEqual(self.store.tables["PartMappingReview"][0], original_event)
+
+                new_old_line = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-2",
+                    association=self.association, groups=expanded)["groups"][0]["rows"][0]
+                line_key = new_old_line["lineKey"]
+                selection = {"reconfirm": "1", "replace": "2", "clear": ""}[operation]
+                if operation != "reconfirm":
+                    with self.assertRaises(PartConflict) as missing_reason:
+                        self.save_lines(expanded, {line_key: selection}, source_hash="f4-hash-2",
+                            expected_version=2, request_key=f"f4-{operation}-missing-reason")
+                    self.assertEqual(missing_reason.exception.code, "PART_REVIEW_REASON_REQUIRED")
+                reasons = {line_key: "Reviewed predecessor resolution"} if operation != "reconfirm" else {}
+                saved = self.save_lines(expanded, {line_key: selection}, source_hash="f4-hash-2",
+                    expected_version=2, request_key=f"f4-{operation}", line_reasons=reasons)
+                expected_action = {"reconfirm": "context_reconfirmation", "replace": "replace_assignment",
+                    "clear": "clear_assignment"}[operation]
+                self.assertEqual(saved["lineAssignments"][line_key]["actionType"], expected_action)
+                resolution_event = self.store.tables["PartMappingReview"][-1]["fields"]
+                self.assertEqual(resolution_event["SemanticEvidence"]["supersedesReviewKeys"],
+                    [original_event["fields"]["ReviewKey"]])
+                self.assertEqual(self.store.tables["PartMappingReview"][0], original_event)
+                self.assertEqual(self.store.tables["PartMappingReview"][1]["fields"], added_event)
+
+                recovered = mapping_detail(self.store, file_id="file:pilot.ods", source_hash="f4-hash-2",
+                    association=self.association, groups=expanded)["groups"][0]
+                self.assertEqual(recovered["rows"][0]["reviewed"], True)
+                if operation == "clear":
+                    self.assertIsNone(recovered["rows"][0]["part"])
+                    self.assertTrue(recovered["rows"][0]["explicitlyUnassigned"])
+                else:
+                    self.assertEqual(recovered["rows"][0]["part"]["id"], selection)
+                self.assertEqual(recovered["rows"][1]["part"]["id"], "2")
+                self.assertFalse(recovered["rows"][2]["reviewed"])
+
     def test_group_identity_is_sheet_and_mapping_label_with_source_details(self):
         groups = source_groups({
             "5. Material Cut List Price": [{"status": "active", "source_row": 10,
@@ -890,6 +1020,84 @@ class PartMappingTests(unittest.TestCase):
             self.assertTrue(f3_retry["idempotent"])
             self.assertEqual(len([row for row in client.tables["PartMappingReview"]
                 if row["fields"].get("FileKey") == f3_file_id]), 2)
+
+            # A semantic whole-group record without the newer line identity
+            # still belongs to the current row that receives its legacy
+            # proposal. Added lines must not borrow it or supersede it.
+            f4_examples = [
+                ("5. Material Cut List Price", {"product_part_name": "Bar", "material_to_cut": "MS",
+                    "dimension_to_cut_mm": "12", "qty": 1}),
+                ("Tool Shop Items", {"product_part_name": "Shaft", "item_name": "Pin",
+                    "material_to_cut": "Steel", "qty": 1}),
+                ("CNC Cut List", {"part_category": "Bracket", "product_part_name": "Plate",
+                    "material_to_cut": "MS", "length": "12", "width": "8", "thickness": "3", "qty": 1}),
+            ]
+            for f4_index, (sheet, original_fields) in enumerate(f4_examples):
+                for added_reason in (False, True):
+                    f4_file_id = f"file:f4-grist-{f4_index}-{int(added_reason)}.ods"
+                    f4_registry = GristPartRegistry(client, path=Path(temp) / f"journal-f4-{f4_index}-{int(added_reason)}.sqlite3")
+                    f4_registry._verify_writer = lambda: None
+                    f4_registry.mapping_evidence_schema_available = lambda: True
+                    f4_store = PartRegistryMappingStore(GristPartStore(client), f4_registry)
+                    original = self.manufacturing_groups(sheet, [(10, original_fields)])
+                    original_row = mapping_detail(f4_store, file_id=f4_file_id, source_hash="f4-grist-hash-1",
+                        association=self.association, groups=original)["groups"][0]["rows"][0]
+                    save_mapping(f4_store, file_id=f4_file_id, source_hash="f4-grist-hash-1",
+                        association=self.association, groups=original,
+                        line_decisions={original_row["lineKey"]: "stable-bracket"},
+                        expected_hash="f4-grist-hash-1", expected_version=0,
+                        expected_association="association-1", expected_association_version=1,
+                        actor="Irshad", request_key=f"grist-f4-original-{f4_index}-{int(added_reason)}")
+                    legacy_row = next(row["fields"] for row in client.tables["PartMappingReview"]
+                        if row["fields"].get("FileKey") == f4_file_id)
+                    legacy_evidence = json.loads(legacy_row["SemanticEvidence"])
+                    legacy_evidence.pop("lineKey")
+                    legacy_evidence.pop("linePolicyVersion")
+                    legacy_row["SemanticEvidence"] = json.dumps(legacy_evidence, sort_keys=True, separators=(",", ":"))
+                    immutable_legacy_row = deepcopy(legacy_row)
+
+                    expanded = self.manufacturing_groups(sheet, [
+                        (10, {**original_fields, "qty": 2}),
+                        (11, {**original_fields, "qty": 3}),
+                    ])
+                    preview = mapping_detail(f4_store, file_id=f4_file_id, source_hash="f4-grist-hash-2",
+                        association=self.association, groups=expanded)["groups"][0]
+                    self.assertEqual(preview["rows"][0]["previousAssignment"]["partId"], "stable-bracket")
+                    self.assertIsNone(preview["rows"][1]["previousAssignment"])
+                    added_key = preview["rows"][1]["lineKey"]
+                    reasons = {added_key: "Reviewed added manufacturing line"} if added_reason else {}
+                    request_key = f"grist-f4-added-{f4_index}-{int(added_reason)}"
+                    saved = save_mapping(f4_store, file_id=f4_file_id, source_hash="f4-grist-hash-2",
+                        association=self.association, groups=expanded, line_decisions={added_key: "stable-mount"},
+                        expected_hash="f4-grist-hash-2", expected_version=1,
+                        expected_association="association-1", expected_association_version=1,
+                        actor="Irshad", line_reasons=reasons, request_key=request_key)
+                    self.assertEqual(saved["lineAssignments"][added_key]["actionType"], "initial_assignment")
+                    f4_events = [row["fields"] for row in client.tables["PartMappingReview"]
+                        if row["fields"].get("FileKey") == f4_file_id]
+                    self.assertEqual(f4_events[0], immutable_legacy_row,
+                        "the prior isolated Grist-compatible record remains immutable")
+                    self.assertEqual(f4_events[1]["ActionType"], "initial_assignment")
+                    added_evidence = json.loads(f4_events[1]["SemanticEvidence"])
+                    self.assertNotIn("supersedesReviewKeys", added_evidence)
+
+                    recovered_registry = GristPartRegistry(client,
+                        path=Path(temp) / f"recovered-f4-{f4_index}-{int(added_reason)}.sqlite3")
+                    recovered_registry._verify_writer = lambda: None
+                    recovered_registry.mapping_evidence_schema_available = lambda: True
+                    recovered_store = PartRegistryMappingStore(GristPartStore(client), recovered_registry)
+                    recovered = mapping_detail(recovered_store, file_id=f4_file_id, source_hash="f4-grist-hash-2",
+                        association=self.association, groups=expanded)["groups"][0]
+                    self.assertEqual(recovered["rows"][0]["previousAssignment"]["partId"], "stable-bracket")
+                    self.assertEqual(recovered["rows"][1]["part"]["id"], "stable-mount")
+                    replay = save_mapping(recovered_store, file_id=f4_file_id, source_hash="f4-grist-hash-2",
+                        association=self.association, groups=expanded, line_decisions={added_key: "stable-mount"},
+                        expected_hash="f4-grist-hash-2", expected_version=1,
+                        expected_association="association-1", expected_association_version=1,
+                        actor="Irshad", line_reasons=reasons, request_key=request_key)
+                    self.assertTrue(replay["idempotent"])
+                    self.assertEqual(len([row for row in client.tables["PartMappingReview"]
+                        if row["fields"].get("FileKey") == f4_file_id]), 2)
 
     def test_legacy_grist_part_store_is_read_only(self):
         client = FakeGristClient(); self.store = GristPartStore(client)

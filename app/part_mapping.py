@@ -939,6 +939,11 @@ def mapping_detail(store, *, file_id: str, source_hash: str, association, groups
             continue
         latest_version = max(int(record.get("Version") or 0) for record in candidates)
         latest_candidates = [record for record in candidates if int(record.get("Version") or 0) == latest_version]
+        # A row-scoped legacy proposal still owns its predecessor event. It
+        # may not have a line key, but allowing the later changed-line pass to
+        # reuse it would let a newly added row supersede the known prior Part
+        # for this current row.
+        matched_record_keys.update(record_event_key(record) for record in latest_candidates)
         latest_part_ids = {_stored_part_id(record) for record in latest_candidates}
         if len(latest_part_ids) > 1:
             ambiguous_current.add(id(item))
