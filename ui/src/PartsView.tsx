@@ -45,6 +45,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   });
   const [fullDetails, setFullDetails] = useState(Boolean(window.location.hash.match(/^#parts\//)));
   const [details, setDetails] = useState<any>(null);
+  const [requestedDetailSection, setRequestedDetailSection] = useState<{ partId: string; sectionId: string } | null>(null);
   const [scope, setScope] = useState<Scope>("global");
   const [targetId, setTargetId] = useState("global");
   const [description, setDescription] = useState("");
@@ -63,6 +64,8 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const previewGeneration = useRef(0);
   const detailsGeneration = useRef(0);
   const hasLoadedRegister = useRef(false);
+  const creationFormGeneration = useRef(0);
+  const [creationFormInstance, setCreationFormInstance] = useState(0);
 
   async function refresh(search = query, background = hasLoadedRegister.current) {
     if (!hasLoadedRegister.current) setLoading(true);
@@ -83,6 +86,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   useEffect(() => { if (selectedId) sessionStorage.setItem("parts:selected", selectedId); else sessionStorage.removeItem("parts:selected"); }, [selectedId]);
   useEffect(() => {
     if (!mappingReturn?.partId) return;
+    setRequestedDetailSection(null);
     setSelectedId(mappingReturn.partId);
     setMode("selected");
     setFullDetails(true);
@@ -123,8 +127,22 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }, [selectedId, mode]);
 
   useEffect(() => {
+    if (!requestedDetailSection) return;
+    if (requestedDetailSection.partId !== selectedId || mode !== "selected") {
+      setRequestedDetailSection(null);
+      return;
+    }
+    if (!fullDetails || !details) return;
+    const section = document.getElementById(requestedDetailSection.sectionId);
+    if (!section) return;
+    openPartDetailSection(requestedDetailSection.sectionId);
+    setRequestedDetailSection(null);
+  }, [requestedDetailSection, selectedId, mode, fullDetails, details]);
+
+  useEffect(() => {
     const onPopState = () => {
       const route = window.location.hash.match(/^#parts\/(.+)$/);
+      setRequestedDetailSection(null);
       setSelectedId(route ? decodeURIComponent(route[1]) : sessionStorage.getItem("parts:selected"));
       setFullDetails(Boolean(route));
     };
@@ -161,6 +179,9 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }
 
   function startCreate(kind: "part" | "assembly" = "part") {
+    creationFormGeneration.current += 1;
+    setCreationFormInstance(creationFormGeneration.current);
+    setRequestedDetailSection(null);
     setError(""); setNotice(""); setSelectedId(null); setDetails(null); setMode("create"); setFullDetails(false);
     setCreationKind(kind); setNavigationPath([]);
     setDescription(""); setVariant(""); setReason(""); setScope("global"); setTargetId("global"); setNamePreview(null);
@@ -169,6 +190,8 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }
 
   function selectPart(part: Part) {
+    if (mode === "create") creationFormGeneration.current += 1;
+    setRequestedDetailSection(null);
     setSelectedId(part.id); setMode("selected"); setFullDetails(false); setNavigationPath([]); setError(""); setNotice(""); setRetireReason(""); setRetireAttempt(null);
     if (window.location.hash.startsWith("#parts/")) history.pushState(null, "", "#parts");
   }
@@ -180,11 +203,13 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }
 
   function backToSummary() {
+    setRequestedDetailSection(null);
     history.pushState(null, "", "#parts");
     setFullDetails(false);
   }
 
   function openNestedPart(part: Part) {
+    setRequestedDetailSection(null);
     if (selected && selected.id !== part.id) setNavigationPath(path => [...path, selected]);
     setRegister(old => ({ ...old, items: [part, ...old.items.filter(item => item.id !== part.id)] }));
     history.pushState(null, "", `#parts/${encodeURIComponent(part.id)}`);
@@ -192,6 +217,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }
 
   function backToParent() {
+    setRequestedDetailSection(null);
     const parent = navigationPath[navigationPath.length - 1];
     if (!parent) { backToSummary(); return; }
     setNavigationPath(path => path.slice(0, -1));
@@ -200,13 +226,15 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }
 
   function openManufacturingBaseline() {
+    if (!selectedId) return;
+    setRequestedDetailSection({ partId: selectedId, sectionId: "manufacturing-baseline" });
     openFullDetails();
-    window.setTimeout(() => openPartDetailSection("manufacturing-baseline"), 0);
   }
 
   function openComposition() {
+    if (!selectedId) return;
+    setRequestedDetailSection({ partId: selectedId, sectionId: "components" });
     openFullDetails();
-    window.setTimeout(() => openPartDetailSection("components"), 0);
   }
 
   async function openCollision(collision: Preview["collision"][number]) {
@@ -300,13 +328,17 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
       <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed Parts and assemblies, manufacturing evidence, and nested composition.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "view" ? mappingReturn.partId : selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
       {error && <div className="parts-error" role="alert">{error}{(metadataAttempt || retireAttempt) && <small>Retry uses the original request key and payload.</small>}</div>}
       {notice && <p className="parts-notice" role="status"><Check size={14}/>{notice}</p>}
-      {mode === "create" ? <PartCreationForm kind={creationKind} onCreated={created => {
+      {mode === "create" ? <PartCreationForm key={`${creationKind}:${creationFormInstance}`} kind={creationKind} onCreated={created => {
         const part = created as unknown as Part;
-        setSelectedId(part.id); setMode("selected"); setFullDetails(false); setError("");
-        setNavigationPath([]); setNotice(`Created ${part.identityKind === "assembly" ? "Assembly" : "Part"} ${part.partNumber} · ${part.name} · Rev A.`); setQuery("");
+        const originatingFormIsCurrent = creationFormGeneration.current === creationFormInstance;
+        if (originatingFormIsCurrent) {
+          setSelectedId(part.id); setMode("selected"); setFullDetails(false); setError("");
+          setNavigationPath([]); setQuery("");
+        }
+        setNotice(`${originatingFormIsCurrent ? "Created" : "Created from the earlier request"} ${part.identityKind === "assembly" ? "Assembly" : "Part"} ${part.partNumber} · ${part.name} · Rev A.`);
         setRegister(old => ({ ...old, items: [part, ...old.items.filter(item => item.id !== part.id)] }));
         void refresh("", true);
-      }} onUseExisting={part => selectPart(part as unknown as Part)} onCancel={() => { setMode("selected"); setError(""); }} cancelLabel="Back to Parts"/> : mode === "edit" ? editForm : selected ? <>
+      }} onUseExisting={part => { if (creationFormGeneration.current === creationFormInstance) selectPart(part as unknown as Part); }} onCancel={() => { setMode("selected"); setError(""); }} cancelLabel="Back to Parts"/> : mode === "edit" ? editForm : selected ? <>
         {fullDetails && <button className="parts-back-link" onClick={navigationPath.length ? backToParent : backToSummary}><ArrowLeft size={15}/>{navigationPath.length ? `Back to ${navigationPath[navigationPath.length - 1].name}` : "Back to Parts"}</button>}
         <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : selected.identityKind === "assembly" ? `Assembly · ${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}` : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>{selected.legacy ? "Engineering revision unverified" : "Engineering revision · A"}</span></div></div>
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>

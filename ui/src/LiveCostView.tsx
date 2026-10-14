@@ -152,7 +152,8 @@ export function LiveCostView({ products }: { products: Product[] }) {
   };
 
   const [secondSnapshot, setSecondSnapshot] = useState("");
-  const selectedPartOptions = useMemo(() => new Map(catalog.map((item: any) => [item.id, item])), [catalog]);
+  const configurationParts = useMemo(() => catalog.filter((item: any) => item.identityKind !== "assembly"), [catalog]);
+  const selectedPartOptions = useMemo(() => new Map(configurationParts.map((item: any) => [item.id, item])), [configurationParts]);
 
   return <main className="live-cost-view">
     <div className="live-cost-header"><div><div className="eyebrow">Disposable calculation · explicit history</div><h1>Live Cost &amp; Snapshots</h1>
@@ -170,10 +171,10 @@ export function LiveCostView({ products }: { products: Product[] }) {
     {codeId && <>
       <section className="live-panel">
         <div className="live-section-title"><div><h2>Explicit Part configuration</h2><p>{configuration?.status === "configured" ? `Current revision ${configuration.configuration.version} · ${configuration.configuration.currency}` : "No configuration saved"}</p></div><span>Changes create a new Grist configuration revision</span></div>
-        {!catalog.length && <p className="live-muted">No canonical Parts found. Create or map a Part from the Parts screen first.</p>}
+        {!configurationParts.length && <p className="live-muted">No canonical Parts found. Create or map a Part from the Parts screen first.</p>}
         {selections.map(row => <div className="live-selection" key={row.selectionIdentity}>
           <label className="live-selection-part">Canonical Part<select value={row.partId} onChange={event => { const selected = selectedPartOptions.get(event.target.value) as any; updateSelection(row.selectionIdentity, { partId: event.target.value, partName: selected?.name || row.partName }); }}>
-            <option value="">Choose canonical Part</option>{row.partId && !selectedPartOptions.has(row.partId) && <option value={row.partId}>{row.partName || row.partId}</option>}{catalog.map((part: any) => <option key={part.id} value={part.id}>{part.partNumber} · {part.name} · Rev {part.engineeringRevision}</option>)}
+            <option value="">Choose canonical Part</option>{row.partId && !selectedPartOptions.has(row.partId) && <option value={row.partId}>{row.partName || row.partId}</option>}{configurationParts.map((part: any) => <option key={part.id} value={part.id}>{part.partNumber} · {part.name} · Rev {part.engineeringRevision}</option>)}
           </select></label>
           <label>Quantity<input type="number" min="0.000001" step="any" value={row.quantity} onChange={event => updateSelection(row.selectionIdentity, { quantity: event.target.value })}/></label>
           <label>Unit<input value={row.uom} onChange={event => updateSelection(row.selectionIdentity, { uom: event.target.value })}/></label>

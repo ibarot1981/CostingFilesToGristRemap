@@ -73,7 +73,10 @@ export const api = {
   addPartUnitConversion: (id: string, specId: number, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-specifications/${specId}/unit-conversions`, payload, { "Idempotency-Key": key }),
   addPartCurrencyConversion: (id: string, specId: number, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-specifications/${specId}/currency-conversions`, payload, { "Idempotency-Key": key }),
   partPurchaseRate: (id: string, asOf = "") => get<any>(`/api/parts/${encodeURIComponent(id)}/purchase-rate${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ""}`),
-  partsForConfiguration: (search = "") => get<any>(`/api/parts?${new URLSearchParams({ search, include_retired: "false" })}`),
+  partsForConfiguration: async (search = "") => {
+    const result = await get<any>(`/api/parts?${new URLSearchParams({ search, include_retired: "false" })}`);
+    return { ...result, items: (result.items || []).filter((item: any) => item.identityKind !== "assembly") };
+  },
   costingConfiguration: (codeId: string) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/costing-configuration`),
   saveCostingConfiguration: (codeId: string, payload: unknown, key: string) => send<any>(`/api/model-codes/${encodeURIComponent(codeId)}/costing-configuration`, payload, { "Idempotency-Key": key }, "PUT"),
   liveCost: (codeId: string) => get<any>(`/api/model-codes/${encodeURIComponent(codeId)}/live-cost`),

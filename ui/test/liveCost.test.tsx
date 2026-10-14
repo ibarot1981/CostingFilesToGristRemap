@@ -12,6 +12,7 @@ vi.mock("../src/api", () => ({ api: mocks }));
 
 const products = [{ id: "p", name: "Product" }] as Product[];
 const part = { id: "part-1", partNumber: "SM-P-000001", name: "S1K — Bearing", engineeringRevision: "A" };
+const assembly = { id: "assembly-1", partNumber: "SM-A-000001", name: "S1K — Bearing Assembly", engineeringRevision: "A", identityKind: "assembly" };
 const live = { status: "complete", generation: "live-generation-1", inputFingerprint: "input-fingerprint-1", currency: "INR", costBasis: "current configured cost",
   totalCost: 100, knownSubtotal: 100, lineCount: 1, availableLineCount: 1, configuration: { id: 10, revisionId: 11, revisionKey: "configuration:1", version: 1 },
   parts: [{ occurrencePath: "selection:slot-a", partNumber: part.partNumber, name: part.name, engineeringRevision: "A" }],
@@ -105,4 +106,19 @@ it("creates an explicit configuration revision before a current cost becomes sav
   expect(mocks.saveCostingConfiguration.mock.calls[0][0]).toBe("c");
   expect(mocks.saveCostingConfiguration.mock.calls[0][1].selections).toHaveLength(1);
   expect(mocks.saveCostingConfiguration.mock.calls[0][1].selections[0]).toMatchObject({ partId: part.id, quantity: 1, uom: "each" });
+});
+
+it("does not offer assembly rows returned with the Live Cost catalog", async () => {
+  mocks.partsForConfiguration.mockResolvedValue({ items: [part, assembly] });
+  mocks.costingConfiguration.mockResolvedValueOnce({ status: "missing", configuration: null });
+  mocks.liveCost.mockResolvedValueOnce({ status: "incomplete", generation: "missing", inputFingerprint: "empty", totalCost: null,
+    knownSubtotal: 0, parts: [], lines: [], rateEvidence: [], warnings: [] });
+  render(<LiveCostView products={products}/>);
+  await selectCode();
+  await screen.findByText("No configuration saved");
+  fireEvent.click(screen.getByRole("button", { name: "Add Part occurrence" }));
+  const partSelectors = await screen.findAllByRole("combobox", { name: "Canonical Part" });
+  expect(partSelectors.length).toBeGreaterThan(0);
+  expect(await screen.findByRole("option", { name: /SM-P-000001/ })).toBeTruthy();
+  expect(screen.queryByRole("option", { name: /SM-A-000001/ })).toBeNull();
 });

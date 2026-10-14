@@ -26,6 +26,26 @@ const scopeTargets = (modelShortcode: string | null) => ({scopes:[
   {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD"}]},
 ]});
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
+  return {promise, resolve, reject};
+}
+
+async function fillAndSaveCreation(kind: "part" | "assembly", description: string, reason: string) {
+  const label = kind === "assembly" ? "Assembly" : "Part";
+  fireEvent.click(screen.getAllByRole("button", {name:`New ${label}`})[0]);
+  const form = await screen.findByRole("region", {name:`Create a canonical ${label}`});
+  const descriptionInput = within(form).getByLabelText(`What is the ${label} called?`) as HTMLInputElement;
+  await waitFor(() => expect(descriptionInput.disabled).toBe(false));
+  fireEvent.change(descriptionInput, {target:{value:description}});
+  fireEvent.change(within(form).getByLabelText(`Why is this ${label} needed?`), {target:{value:reason}});
+  const save = within(form).getByRole("button", {name:`Save ${label}`}) as HTMLButtonElement;
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.click(save);
+}
+
 beforeEach(() => {
   sessionStorage.clear(); window.history.replaceState(null,"", "#parts");
   Object.values(mocks).forEach(mock => mock.mockReset());
@@ -388,6 +408,140 @@ it("creates an explicit SM-A Assembly without exposing intended Model Code assig
     reason:"Create the first assembly identity",
   });
   expect(mocks.createManagedPart).not.toHaveBeenCalled();
+});
+
+it("keeps an unresolved Part request in Part recovery while a new Assembly uses its own request", async () => {
+  const firstPartResponse = deferred<any>();
+  const reservedRequests = new Map<string, any>();
+  mocks.createManagedPart.mockReset()
+    .mockImplementationOnce(() => firstPartResponse.promise)
+    .mockImplementation((payload: any, key: string) => {
+      expect(reservedRequests.get(key)).toEqual(payload);
+      return Promise.resolve({part:{...part,id:"part-recovered-after-switch",partNumber:"SM-P-000002",name:payload.expectedName}});
+    });
+  vi.stubGlobal("crypto", {randomUUID:vi.fn().mockReturnValueOnce("part-create-key").mockReturnValueOnce("assembly-create-key")});
+  render(<PartsView/>);
+
+  await fillAndSaveCreation("part", "Switchable Part", "Keep the Part request recoverable");
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  const originalPartRequest = mocks.createManagedPart.mock.calls[0];
+  expect(reservedRequests.has(originalPartRequest[1])).toBe(false);
+  expect(JSON.parse(sessionStorage.getItem("parts:create-attempt") || "{}")).toEqual({
+    key:originalPartRequest[1], payload:originalPartRequest[0], origin:null,
+  });
+
+  await fillAndSaveCreation("assembly", "Independent Assembly", "Use a distinct Assembly request");
+  await waitFor(() => expect(mocks.createAssembly).toHaveBeenCalledTimes(1));
+  expect(mocks.createAssembly.mock.calls[0][0]).toMatchObject({identityKind:"assembly",description:"Independent Assembly"});
+  expect(mocks.createAssembly.mock.calls[0][1]).toBe("assembly-create-key");
+  expect(mocks.createAssembly.mock.calls[0][0]).not.toEqual(originalPartRequest[0]);
+
+  reservedRequests.set(originalPartRequest[1], originalPartRequest[0]);
+  firstPartResponse.reject(new Error("The response was lost after the Part request was reserved."));
+  await firstPartResponse.promise.catch(() => undefined);
+  fireEvent.click(screen.getAllByRole("button", {name:"New Part"})[0]);
+  const restoredDescription = await screen.findByLabelText("What is the Part called?") as HTMLInputElement;
+  expect(restoredDescription.value).toBe("Switchable Part");
+  const retry = screen.getByRole("button", {name:"Retry same creation request"});
+  expect((retry as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(retry);
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(2));
+  expect(mocks.createManagedPart.mock.calls[1]).toEqual(originalPartRequest);
+  expect(mocks.createAssembly.mock.calls[0][1]).not.toBe(originalPartRequest[1]);
+});
+
+it("keeps an unresolved Assembly request recoverable after switching to and reloading a Part form", async () => {
+  const firstAssemblyResponse = deferred<any>();
+  const reservedRequests = new Map<string, any>();
+  mocks.createAssembly.mockReset()
+    .mockImplementationOnce(() => firstAssemblyResponse.promise)
+    .mockImplementation((payload: any, key: string) => {
+      expect(reservedRequests.get(key)).toEqual(payload);
+      return Promise.resolve({part:{...part,id:"assembly-recovered-after-switch",identityKind:"assembly",partNumber:"SM-A-000002",name:payload.expectedName}});
+    });
+  vi.stubGlobal("crypto", {randomUUID:vi.fn().mockReturnValueOnce("assembly-create-key").mockReturnValueOnce("part-create-key")});
+  render(<PartsView/>);
+
+  await fillAndSaveCreation("assembly", "Switchable Assembly", "Keep the Assembly request recoverable");
+  await waitFor(() => expect(mocks.createAssembly).toHaveBeenCalledTimes(1));
+  const originalAssemblyRequest = mocks.createAssembly.mock.calls[0];
+  expect(reservedRequests.has(originalAssemblyRequest[1])).toBe(false);
+  expect(JSON.parse(sessionStorage.getItem("assemblies:create-attempt") || "{}")).toEqual({
+    key:originalAssemblyRequest[1], payload:originalAssemblyRequest[0], origin:null,
+  });
+
+  await fillAndSaveCreation("part", "Independent Part", "Use a distinct Part request");
+  await waitFor(() => expect(mocks.createManagedPart).toHaveBeenCalledTimes(1));
+  expect(mocks.createManagedPart.mock.calls[0][0]).not.toHaveProperty("identityKind", "assembly");
+  expect(mocks.createManagedPart.mock.calls[0][0]).toMatchObject({description:"Independent Part"});
+  expect(mocks.createManagedPart.mock.calls[0][1]).toBe("part-create-key");
+  expect(mocks.createManagedPart.mock.calls[0][0]).not.toEqual(originalAssemblyRequest[0]);
+
+  reservedRequests.set(originalAssemblyRequest[1], originalAssemblyRequest[0]);
+  firstAssemblyResponse.reject(new Error("The response was lost after the Assembly request was reserved."));
+  await firstAssemblyResponse.promise.catch(() => undefined);
+  cleanup();
+  render(<PartsView/>);
+  const restoredDescription = await screen.findByLabelText("What is the Assembly called?") as HTMLInputElement;
+  expect(restoredDescription.value).toBe("Switchable Assembly");
+  const retry = screen.getByRole("button", {name:"Retry same creation request"});
+  expect((retry as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(retry);
+  await waitFor(() => expect(mocks.createAssembly).toHaveBeenCalledTimes(2));
+  expect(mocks.createAssembly.mock.calls[1]).toEqual(originalAssemblyRequest);
+  expect(mocks.createManagedPart.mock.calls[0][1]).not.toBe(originalAssemblyRequest[1]);
+});
+
+it("opens Manufacturing baseline only after delayed Part details render", async () => {
+  const pendingDetails = deferred<any>();
+  mocks.partDetails.mockReturnValueOnce(pendingDetails.promise);
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline/}));
+  expect(document.getElementById("manufacturing-baseline")).toBeNull();
+
+  pendingDetails.resolve(details);
+  await waitFor(() => expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement)?.open).toBe(true));
+});
+
+it("opens composition only after delayed Assembly details render", async () => {
+  const assembly = {...part, id:"assembly-delayed", identityKind:"assembly" as const, partNumber:"SM-A-000001", name:"S1K — Delayed Assembly", scope:"global", scopeTargetId:"global", scopeTarget:"Safari Manufacturing"};
+  const pendingDetails = deferred<any>();
+  mocks.parts.mockResolvedValue({items:[assembly,part],legacyItems:[],storage:"Grist Safari Manufacturing"});
+  mocks.partDetails.mockReturnValueOnce(pendingDetails.promise);
+  render(<PartsView/>);
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-A-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Open composition/}));
+  expect(document.getElementById("components")).toBeNull();
+
+  pendingDetails.resolve({...details, part:{...assembly,compositionStatus:"draft"}, components:{status:"available",items:[]}});
+  await waitFor(() => expect((document.getElementById("components") as HTMLDetailsElement)?.open).toBe(true));
+});
+
+it("cancels a delayed section shortcut when navigation moves to another Part", async () => {
+  const otherPart = {...part, id:"other-part", partNumber:"SM-P-000002", name:"S1K — Other Part"};
+  const firstDetails = deferred<any>();
+  const secondDetails = deferred<any>();
+  mocks.parts.mockResolvedValue({items:[part,otherPart],legacyItems:[],storage:"Grist Safari Manufacturing"});
+  mocks.partDetails.mockImplementation((id: string) => id === part.id ? firstDetails.promise : secondDetails.promise);
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline/}));
+  fireEvent.click(screen.getByRole("treeitem", {name:/SM-P-000002/}));
+
+  firstDetails.resolve(details);
+  secondDetails.resolve({...details, part:{...otherPart,compositionStatus:"draft"}});
+  fireEvent.click(await screen.findByRole("button", {name:/Open full Part details/}));
+  await waitFor(() => expect(document.getElementById("manufacturing-baseline")).not.toBeNull());
+  expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement).open).toBe(false);
 });
 
 it("shows accepted baseline provenance from the Part and preserves blank versus missing source fields", async () => {
