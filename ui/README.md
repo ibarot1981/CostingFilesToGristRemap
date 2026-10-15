@@ -30,6 +30,13 @@ npm install
 npm run dev
 ```
 
+On Windows, `start-safari-manufacturing.bat` is the normal combined launcher.
+It uses the browser address `http://127.0.0.1:4320/` and API port `4321`.
+Repeated launches reuse services whose health responses identify this project;
+an occupied or mismatched port produces an actionable error and no process is
+stopped. Vite uses strict port binding, so it never reports success on a
+fallback UI port.
+
 Use Node.js `^20.0.0`, `^22.0.0`, or `>=24.0.0` for frontend install, test,
 and build commands (Vitest 4.1.11's supported engine range). The system Node
 18.8.0 is incompatible; verification used the bundled Node.js 24.19.0 runtime.
@@ -111,3 +118,11 @@ Part Mapping shows exact source-description groups and individual blank rows, ca
 The Parts tab searches permanent Part numbers, current names and aliases. It generates names from maintained scope shortcodes, description and optional design variant, then allocates an `SM-P` number on Save. All managed Parts remain Rev A. Name/scope changes preserve identity and record metadata history; changing the physical design requires a new Part. Process-line, drawing and per-code usage detail shows explicit partial/unavailable states until those records are connected to stable Part identity.
 
 New Part identities and mapping reviews use the backend's local SQLite registry. Configure `SAFARI_PART_DATABASE_PATH` only to another local disk path; all app processes must share the same file on one host. The default database is ignored by Git. Back it up with `python scripts/backup_part_registry.py` from the repository root. Legacy Grist Part and mapping records remain read-only; this slice does not apply a Grist migration.
+
+Part details include a read-only **Mapped workbook lines** view for the latest
+saved MCL, Tool Shop, and CNC assignment decisions. It shows workbook path,
+sheet, row, available source details, and save provenance. Changed or
+unavailable workbook evidence is labelled for review or as historical; it is
+not counted as current ownership. This view is independent of the accepted
+manufacturing baseline and pinned engineering process lines. Assembly mapping,
+purchased/store support, and baseline approval remain separate workflows.

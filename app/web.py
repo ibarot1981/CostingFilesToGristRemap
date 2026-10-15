@@ -350,6 +350,218 @@ def _part_scope_warnings(repository: SafariRepository, association, part: dict[s
     return [{"id": code_id, "code": repository.codes[code_id].code} for code_id in out_of_scope]
 
 
+def _part_mapped_lines(repository: SafariRepository, part_id: str) -> dict[str, Any]:
+    """Project current read-only workbook assignments for one managed Part.
+
+    Current ownership always comes from ``mapping_detail`` against the current
+    workbook and association. If that evidence cannot be read, the saved event
+    is retained as historical provenance and is never promoted to a current
+    assignment.
+    """
+    from app.part_mapping import (MAPPING_TABLE, MAPPING_LABEL_FIELD,
+        _is_source_deletion_review, _stored_line_key, _stored_part_id, decode_grist_any_object,
+        mapping_detail)
+
+    family_by_sheet = {
+        "5. Material Cut List Price": "MCL",
+        "Tool Shop Items": "Tool Shop",
+        "CNC Cut List": "CNC",
+    }
+    field_labels = {
+        "product_part_name": "Machine Piece Description", "part_category": "Part Category",
+        "material_to_cut": "Material to Cut", "dimension_to_cut_mm": "Dimension to Cut (mm)",
+        "dimension_to_cut_inches": "Dimension to Cut (inches)", "qty": "Quantity",
+        "optional_item_group_1": "Optional Item Group 1", "in_use": "In Use",
+        "item_name": "Item Name", "weight_per_meter_kg": "Weight per Meter (kg)",
+        "total_weight_kg": "Total Weight (kg)", "toolshop_part_name": "Tool Shop Part Name",
+        "toolshop_remarks": "Tool Shop Items Remarks", "job_remarks": "Job Remarks",
+        "length": "Length", "width": "Width", "thickness": "Thickness", "part_weight_kg": "Part Weight (kg)",
+    }
+    try:
+        store = _part_mapping_store(repository)
+        rows = store.records(MAPPING_TABLE)
+    except Exception as exc:
+        return {"status": "unavailable", "items": [], "historical": [],
+            "message": f"Saved mapped workbook evidence could not be read: {exc}"}
+    if not rows and getattr(store, "legacy_history_available", True) is False:
+        return {"status": "unavailable", "items": [], "historical": [],
+            "message": "Saved mapped workbook evidence is unavailable because the mapping history table could not be read."}
+
+    history_by_file: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        fields = row.get("fields") if isinstance(row, dict) else None
+        if not isinstance(fields, dict):
+            continue
+        file_id = str(fields.get("FileKey") or "")
+        if file_id:
+            history_by_file.setdefault(file_id, []).append(fields)
+    candidate_ids = sorted(file_id for file_id, records in history_by_file.items()
+        if any(_stored_part_id(record) == part_id for record in records))
+    if not candidate_ids:
+        return {"status": "empty", "items": [], "historical": [],
+            "message": "No saved workbook line assignments are linked to this Part."}
+
+    files_by_id = {}
+    try:
+        files_by_id = {str(item["file"].get("id") or ""): item["file"]
+            for item in repository.list_mapped_files() if item.get("file")}
+    except Exception:
+        # A missing catalog projection must not hide mapping provenance.
+        pass
+
+    current_items: list[dict[str, Any]] = []
+    historical_items: list[dict[str, Any]] = []
+    unavailable_count = 0
+
+    def provenance_record(records: list[dict[str, Any]], review_keys: list[str]) -> dict[str, Any] | None:
+        matching = [record for record in records if str(record.get("ReviewKey") or "") in set(review_keys)]
+        if not matching:
+            return None
+        return max(matching, key=lambda item: (int(item.get("Version") or 0), str(item.get("ReviewKey") or "")))
+
+    def provenance_for(records: list[dict[str, Any]], review_keys: list[str]) -> dict[str, Any]:
+        record = provenance_record(records, review_keys)
+        if not record:
+            return {}
+        return {"reviewKey": record.get("ReviewKey"), "version": record.get("Version"),
+            "actor": record.get("Actor"), "reason": record.get("Reason"), "occurredAt": record.get("OccurredAt"),
+            "sourceHash": record.get("SourceHash"), "associationKey": record.get("AssociationKey"),
+            "associationVersion": record.get("AssociationVersion"), "sourceDescription": record.get("SourceDescription"),
+            "sourceRow": record.get("SourceRow"), "sourceSheet": record.get("SheetName")}
+
+    def line_payload(file_id: str, path: str, sheet: str, row_number: Any, description: str,
+                     description_status: str, fields: dict[str, Any], available_fields: list[str],
+                     source_headers: dict[str, Any], semantic_evidence: dict[str, Any] | None,
+                     provenance: dict[str, Any], *, assignment_status: str, source_status: str,
+                     comparison: dict[str, Any] | None = None) -> dict[str, Any]:
+        available = set(available_fields)
+        detail_fields = []
+        semantic = semantic_evidence.get("fields", []) if isinstance(semantic_evidence, dict) else []
+        for item in semantic:
+            key = str(item.get("field") or "")
+            if not key or key.endswith("_uom"):
+                continue
+            state = str(item.get("state") or "")
+            source_state = str(item.get("sourceState") or "")
+            value = item.get("display")
+            if state == "unavailable":
+                display_state = "missing"
+                value = None
+            elif state == "blank" or source_state == "blank":
+                display_state = "blank"
+                value = None
+            else:
+                display_state = "available"
+            source_header = str(source_headers.get(key) or "")
+            detail_fields.append({"field": key, "label": field_labels.get(key) or source_header or key.replace("_", " ").title(),
+                "sourceHeader": source_header or None, "status": display_state, "value": value})
+        workbook_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else "Unknown workbook"
+        return {"key": f"{file_id}:{sheet}:{row_number}:{provenance.get('reviewKey') or ''}",
+            "family": family_by_sheet.get(sheet, "Workbook"), "description": description,
+            "descriptionStatus": description_status, "workbookName": workbook_name, "workbookPath": path,
+            "sheet": sheet, "row": row_number, "sourceStatus": source_status,
+            "assignmentStatus": assignment_status, "details": detail_fields,
+            "provenance": provenance, "semanticComparison": comparison or {}}
+
+    for file_id in candidate_ids:
+        records = history_by_file[file_id]
+        file_record = files_by_id.get(file_id) or {}
+        path = str(file_record.get("relative_path") or file_id.removeprefix("file:"))
+        source_unavailable = True
+        try:
+            current_repository, actual_file_id, association, source_hash, groups = _part_context(path)
+            if actual_file_id != file_id:
+                raise ValueError("Workbook identity no longer matches the saved mapping key")
+            source_unavailable = False
+            resolved = mapping_detail(store, file_id=file_id, source_hash=source_hash,
+                association=association, groups=groups)
+            for group in resolved.get("groups") or []:
+                sheet = str(group.get("sheet") or "")
+                label_field = MAPPING_LABEL_FIELD.get(sheet, "")
+                for source in group.get("rows") or []:
+                    part = source.get("part") or {}
+                    previous = source.get("previousAssignment") or {}
+                    fields = source.get("fields") or {}
+                    available_fields = source.get("availableFields") or list(fields)
+                    source_headers = source.get("sourceHeaders") or {}
+                    candidates = (label_field, "product_part_name", "item_name", "toolshop_part_name", "part_category")
+                    description_field = next((key for key in candidates if fields.get(key) is not None and str(fields.get(key)).strip()), None)
+                    description = str(fields.get(description_field) or "") if description_field else ""
+                    description_status = "available" if description_field else (
+                        "blank" if label_field in set(available_fields) else "missing")
+                    if part.get("id") == part_id:
+                        keys = source.get("authoritativeReviewKeys") or ([source.get("authoritativeReviewKey")] if source.get("authoritativeReviewKey") else [])
+                        current_items.append(line_payload(file_id, path, sheet, source.get("row"), description,
+                            description_status, fields, available_fields, source_headers, source.get("semanticEvidence"),
+                            provenance_for(records, [str(key) for key in keys if key]), assignment_status="current",
+                            source_status="readable", comparison=source.get("semanticComparison")))
+                    elif previous.get("partId") == part_id:
+                        keys = previous.get("reviewKeys") or ([previous.get("reviewKey")] if previous.get("reviewKey") else [])
+                        saved_record = provenance_record(records, [str(key) for key in keys if key])
+                        saved_evidence = decode_grist_any_object(saved_record.get("SemanticEvidence")) if saved_record else None
+                        saved_description = str((saved_record or {}).get("SourceDescription") or description)
+                        historical_items.append(line_payload(file_id, path, sheet, source.get("row"), saved_description,
+                            "available" if saved_description else description_status, fields, available_fields, source_headers,
+                            saved_evidence or source.get("semanticEvidence"),
+                            provenance_for(records, [str(key) for key in keys if key]), assignment_status="review_required",
+                            source_status="readable_changed", comparison=source.get("semanticComparison")))
+            for group in [*(resolved.get("groups") or []), *(resolved.get("removedGroups") or [])]:
+                sheet = str(group.get("sheet") or "")
+                for deleted in group.get("deletedLines") or []:
+                    previous = deleted.get("previousAssignment") or {}
+                    if previous.get("partId") != part_id:
+                        continue
+                    keys = previous.get("reviewKeys") or [previous.get("reviewKey") or deleted.get("priorReviewKey")]
+                    semantic = deleted.get("semanticEvidence") or {}
+                    desc = str(deleted.get("description") or group.get("description") or "")
+                    historical_items.append(line_payload(file_id, path, sheet, deleted.get("row"), desc,
+                        "available" if desc else "unknown", {}, [], {}, semantic,
+                        provenance_for(records, [str(key) for key in keys if key]), assignment_status="removed_from_source",
+                        source_status="readable_removed", comparison=deleted.get("semanticComparison")))
+        except Exception as exc:
+            unavailable_count += 1
+            failure_status = "source_unavailable" if source_unavailable else "mapping_unavailable"
+            # With no current workbook/association evidence, retain only the
+            # latest non-superseded event per explicit line or legacy row. It is
+            # visibly historical and cannot claim current ownership.
+            superseded = set()
+            for record in records:
+                evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+                linked = evidence.get("supersedesReviewKeys")
+                if isinstance(linked, list):
+                    superseded.update(str(key) for key in linked if isinstance(key, str) and key)
+            latest: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for record in records:
+                if _is_source_deletion_review(record) or str(record.get("ReviewKey") or "") in superseded:
+                    continue
+                line_key = _stored_line_key(record)
+                key = ("line", line_key) if line_key else ("legacy", str(record.get("GroupKey") or ""),
+                    str(record.get("SheetName") or ""), int(record.get("SourceRow") or 0))
+                current = latest.get(key)
+                if current is None or int(record.get("Version") or 0) > int(current.get("Version") or 0):
+                    latest[key] = record
+            for record in latest.values():
+                if _stored_part_id(record) != part_id:
+                    continue
+                sheet = str(record.get("SheetName") or "")
+                evidence = decode_grist_any_object(record.get("SemanticEvidence")) or {}
+                historical_items.append(line_payload(file_id, path, sheet, record.get("SourceRow"),
+                    str(record.get("SourceDescription") or ""), "unknown", {}, [], {}, evidence,
+                    provenance_for(records, [str(record.get("ReviewKey") or "")]),
+                    assignment_status="unverifiable", source_status="unavailable" if source_unavailable else "mapping_unavailable",
+                    comparison={"status": failure_status, "message": str(exc),
+                        "savedSemanticEvidence": evidence}))
+
+    current_items.sort(key=lambda item: (item["workbookPath"].casefold(), item["sheet"], int(item["row"] or 0)))
+    historical_items.sort(key=lambda item: (item["workbookPath"].casefold(), item["sheet"], int(item["row"] or 0),
+        str(item.get("provenance", {}).get("version") or "")))
+    status = "partial" if unavailable_count else "available" if current_items or historical_items else "empty"
+    message = (f"Current source or mapping evidence is unavailable for {unavailable_count} saved source file(s); retained assignments are historical and unverified."
+        if unavailable_count else "Mapped workbook lines are read-only source evidence; they do not establish a manufacturing baseline.")
+    return {"status": status, "items": current_items, "historical": historical_items, "message": message,
+        "readOnly": True, "baselineIndependent": True, "unavailableSourceCount": unavailable_count}
+
+
 def _scope_target(repository: SafariRepository, scope: str, target_id: str) -> dict[str, str]:
     if scope not in {"global", "product", "product_model", "model_code"}:
         raise _error(422, "PART_SCOPE_INVALID", "Choose Global, Product, Product Model or Model Code sharing scope.", {"retryDisposition": "safe_to_edit"})
@@ -737,10 +949,10 @@ def part_details(part_id: str) -> dict[str, Any]:
         else:
             history = {}
         part.setdefault("mappingHistory", [])
-        mapped_sources = [{"name": f"{item['SheetName']} · row {item['SourceRow']}", "sheet": item["SheetName"],
-            "row": item["SourceRow"], "description": item["SourceDescription"], "sourceHash": item["SourceHash"],
-            "associationVersion": item["AssociationVersion"], "mappingVersion": item["Version"],
-            "actor": item.get("Actor"), "reason": item.get("Reason"), "occurredAt": item.get("OccurredAt")} for item in part["mappingHistory"]]
+        mapped_lines = _part_mapped_lines(repository, part_id) if part.get("identityKind", "part") == "part" else {
+            "status": "deferred", "items": [], "historical": [],
+            "message": "Workbook assignment to assemblies is deferred.", "readOnly": True,
+            "baselineIndependent": True}
         if registry.__class__.__name__ == "GristPartRegistry":
             features = _part_features()
             process_lines = features.process_lines(part_id)
@@ -757,12 +969,12 @@ def part_details(part_id: str) -> dict[str, Any]:
                     raise
                 manufacturing_baseline = {"status": "schema_required", "message": str(exc), "baseline": None, "families": [], "requirements": []}
         else:
-            process_lines = {"status": "partial" if mapped_sources else "unavailable", "items": mapped_sources,
-                "message": "Process line requirements are not pinned to stable Parts in this local preview."}
+            process_lines = {"status": "unavailable", "items": [],
+                "message": "Pinned engineering process lines require Safari Grist; saved workbook assignments are shown separately under Mapped workbook lines."}
             components, drawings, purchases = [], [], {"specifications": [], "purchaseHistoryAvailable": False, "message": "Purchase capture requires Safari Grist."}
             intended_sharing = {"status": "unavailable", "version": 0, "items": [], "history": []}
             used_in = {"status": "unavailable", "coverage": "none", "items": [], "message": "Current configuration usage requires Safari Grist."}
-        return {"part": part, "mappingHistory": part["mappingHistory"],
+        return {"part": part, "mappingHistory": part["mappingHistory"], "mappedLines": mapped_lines,
                 "manufacturingBaseline": manufacturing_baseline if registry.__class__.__name__ == "GristPartRegistry" else {"status": "unavailable", "baseline": None, "families": [], "requirements": []},
                 "processLines": process_lines,
                 "components": {"status": "available", "items": components, "message": "No component Parts are linked." if not components else None},
@@ -776,7 +988,8 @@ def part_details(part_id: str) -> dict[str, Any]:
         row = next((item for item in rows if str(item.get("id")) == record_id), None)
         if row:
             legacy = _legacy_part_payloads(repository, [row])
-        return {"part": legacy[0], "processLines": {"status": "unavailable", "items": [], "message": "Legacy line references are retained in Grist and have not been migrated."},
+        return {"part": legacy[0], "mappedLines": {"status": "unavailable", "items": [], "historical": [], "message": "Legacy workbook assignments have not been reconciled."},
+                    "processLines": {"status": "unavailable", "items": [], "message": "Legacy line references are retained in Grist and have not been migrated."},
                     "drawings": {"status": "unavailable", "items": [], "message": "Legacy drawing references have not been reconciled."},
                     "usedIn": {"status": "unavailable", "items": [], "message": "Legacy configurations have not been reconciled."}}
     raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")

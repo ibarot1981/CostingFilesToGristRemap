@@ -92,6 +92,46 @@ it("collapses and expands scope targets, then opens the selected Part details", 
   expect(sessionStorage.getItem("parts:expanded")).toContain("target:product_model:model-1");
 });
 
+it("shows saved MCL, Tool Shop and CNC mappings separately from baseline and pinned process lines", async () => {
+  mocks.partDetails.mockResolvedValue({...details,
+    manufacturingBaseline:{status:"not_established",message:"Manufacturing requirements are not yet established."},
+    processLines:{status:"available",items:[]},
+    mappedLines:{status:"partial",readOnly:true,baselineIndependent:true,
+      message:"Current source or mapping evidence is unavailable for one saved source file; retained assignments are historical and unverified.",
+      items:[
+        {key:"mcl",family:"MCL",description:"Plate blank",descriptionStatus:"available",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"5. Material Cut List Price",row:7,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"qty",label:"Quantity",status:"available",value:"2"},{field:"dimension_to_cut_mm",label:"Dimension",status:"blank",value:null}],provenance:{version:3,actor:"owner",reason:"Inline Part mapping",occurredAt:"2026-10-15T07:00:00Z"}},
+        {key:"tool",family:"Tool Shop",description:"Weld fixture",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"Tool Shop Items",row:12,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"toolshop_remarks",label:"Remarks",status:"blank",value:null}]},
+        {key:"cnc",family:"CNC",description:"Frame",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"CNC Cut List",row:4,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"thickness",label:"Thickness",status:"missing",value:null}]},
+      ],
+      historical:[{key:"unavailable",family:"MCL",description:"Saved flange",workbookName:"missing.ods",workbookPath:"old/missing.ods",sheet:"5. Material Cut List Price",row:9,sourceStatus:"unavailable",assignmentStatus:"unverifiable",details:[],provenance:{version:1,actor:"owner",reason:"Initial assignment"},semanticComparison:{status:"source_unavailable",message:"File no longer exists."}}]},
+  });
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(screen.getByRole("button", {name:"Mapped workbook lines"}));
+
+  expect(await screen.findByText("MCL · Plate blank")).toBeTruthy();
+  expect(screen.getByText("Tool Shop · Weld fixture")).toBeTruthy();
+  expect(screen.getByText("CNC · Frame")).toBeTruthy();
+  expect(screen.getByText(/Dimension: \(blank in source\)/)).toBeTruthy();
+  expect(screen.getByText(/Thickness: Column not in source/)).toBeTruthy();
+  expect(screen.getByText("Saved v3 · owner · Inline Part mapping · 2026-10-15T07:00:00Z")).toBeTruthy();
+  expect(screen.getByText("Historical or changed source evidence")).toBeTruthy();
+  expect(screen.getByText("Unverifiable history")).toBeTruthy();
+  expect(screen.getByText("File no longer exists.")).toBeTruthy();
+  expect(screen.getByText(/remain visible when no manufacturing baseline exists/)).toBeTruthy();
+  expect(mocks.addPartComponent).not.toHaveBeenCalled();
+  expect(mocks.recordPartPurchase).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getAllByRole("button", {name:"Manufacturing baseline"}).at(-1)!);
+  expect(screen.getByText("Manufacturing requirements are not yet established.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Process lines"}));
+  expect(screen.getByText("No process requirements are pinned to this Part. MCL, Toolshop and CNC are all optional.")).toBeTruthy();
+});
+
 it("filters one Model's code list and keeps intended codes separate from its naming anchor", async () => {
   render(<PartsView/>);
   fireEvent.click(screen.getAllByRole("button", {name:/New Part/})[0]);
