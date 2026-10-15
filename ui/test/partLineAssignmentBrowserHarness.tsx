@@ -9,6 +9,7 @@ const STORAGE = "isolated-grist-part-line-records";
 const REMOVED_SOURCE_LINE_STORAGE = "isolated-removed-source-line";
 const REMOVED_LEGACY_GROUP_STORAGE = "isolated-removed-legacy-group";
 const workbookPath = "isolated-line-assignments.ods";
+const sourceColumnCase = new URLSearchParams(window.location.search).get("source-columns") === "alias" ? "alias" : "distinct";
 type FixturePart = {id:string; partNumber:string; name:string; description:string; variant:string; selectable:boolean; duplicateName:boolean;
   engineeringRevision:string; legacy:boolean; status:string; scope:string; scopeTargetId:string; scopeTarget:string; shortcode:string;
   aliases:string[]; outOfScopeCodes:any[]};
@@ -36,14 +37,20 @@ function lineKey(groupKey:string,row:number) { return `${groupKey}:line:${row}`;
 function lineFingerprint(key:string,row:number) { return `semantic-${key}${changedLineEvidence && row === 13 ? "-changed" : ""}`; }
 function sourceRow(groupKey:string,sheet:string,row:number,description:string,quantity:string) {
   const key = lineKey(groupKey,row);
+  const isToolShop = sheet === "Tool Shop Items";
+  const itemNameColumn = isToolShop && sourceColumnCase === "alias" ? "C" : "B";
+  const itemName = isToolShop && sourceColumnCase === "alias" ? "MS Plate" : description;
   return {sheet,row,lineKey:key,semanticEvidence:{fingerprint:lineFingerprint(key,row)},
     fields:{product_part_name:description,part_category:description,material_to_cut:"MS Plate",dimension_to_cut_mm:"3 x 25",qty:quantity,
-      optional_item_group_1:"HF",in_use:"Yes",item_name:description,toolshop_remarks:"Isolated browser line"},
+      optional_item_group_1:"HF",in_use:"Yes",item_name:itemName,toolshop_remarks:"Isolated browser line"},
     sourceHeaders:{product_part_name:"Plate Part to Cut",part_category:"Part Category",material_to_cut:"Material to Cut",
-      dimension_to_cut_mm:"Dimension to Cut (mm)",qty:"Quantity",item_name:"Item Name / Material",toolshop_remarks:"Remarks"},
-    sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:"C8",dimension_to_cut_mm:"D8",qty:"E8",item_name:"A7",toolshop_remarks:"F7"},
-    sourceCells:{qty:{cell:`E${row}`},material_to_cut:{cell:`C${row}`}},headerRow:sheet === "Tool Shop Items" ? 7 : 8,
-    availableFields:["product_part_name","part_category","material_to_cut","dimension_to_cut_mm","qty","item_name","toolshop_remarks"]};
+      dimension_to_cut_mm:"Dimension to Cut (mm)",qty:"Quantity",item_name:"Item Name / Material",toolshop_remarks:"Remarks",
+      ...(isToolShop ? {material_to_cut:"Material Used",item_name:"Material Used",in_use:"In Use"} : {in_use:"In Use"})},
+    sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:isToolShop ? "C7" : "C8",dimension_to_cut_mm:isToolShop ? "D7" : "D8",
+      qty:isToolShop ? "E7" : "E8",item_name:isToolShop ? `${itemNameColumn}7` : "A7",toolshop_remarks:"F7",in_use:isToolShop ? "G7" : "F8"},
+    sourceCells:{qty:{cell:`E${row}`},material_to_cut:{cell:`C${row}`},item_name:{cell:`${itemNameColumn}${row}`},in_use:{cell:`${isToolShop ? "G" : "F"}${row}`}},
+    headerRow:sheet === "Tool Shop Items" ? 7 : 8,
+    availableFields:["product_part_name","part_category","material_to_cut","dimension_to_cut_mm","qty","item_name","in_use","toolshop_remarks"]};
 }
 function deletedLineFor(groupKey:string) {
   if (removedSourceLine === null) return [];
@@ -261,6 +268,7 @@ function Harness() {
   return <div className="app-shell">
     <header className="topbar" style={{position:"relative",zIndex:10000,display:"block",minHeight:"auto",padding:"10px 16px"}}>
       <strong>Isolated Grist fixture · Part line assignment browser verification</strong>
+      <p>Mock data only · Tool Shop source columns: {sourceColumnCase === "alias" ? "aliased to one physical column" : "distinct columns with matching header text"}. No production writes.</p>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
         <button type="button" onClick={() => { if (pendingCreate) window.__completeFixtureCreate(); }}>Complete isolated Part creation</button>
         <button type="button" onClick={() => window.__changeLineEvidenceAndReload()}>Change row 13 evidence and reload review</button>

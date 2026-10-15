@@ -66,6 +66,29 @@ function lineEvidenceContext(rows: SourceRow[]) {
   return JSON.stringify(rows.map(row => ({lineKey:String(row.lineKey), fingerprint:String(row.semanticEvidence!.fingerprint)}))
     .sort((left, right) => left.lineKey.localeCompare(right.lineKey)));
 }
+function sourceColumnFromCell(cell?: string) {
+  const match = /^\$?([A-Z]{1,3})\$?\d+$/i.exec(String(cell || "").trim());
+  return match?.[1].toUpperCase() || null;
+}
+function samePhysicalSourceColumn(rows: SourceRow[], leftKey: string, rightKey: string) {
+  let physicalColumn: string | null = null;
+  let hasProvenance = false;
+  for (const row of rows) {
+    const evidencePairs = [
+      [row.sourceHeaderCells?.[leftKey], row.sourceHeaderCells?.[rightKey]],
+      [row.sourceCells?.[leftKey]?.cell, row.sourceCells?.[rightKey]?.cell],
+    ];
+    for (const [leftCell, rightCell] of evidencePairs) {
+      const leftColumn = sourceColumnFromCell(leftCell);
+      const rightColumn = sourceColumnFromCell(rightCell);
+      if (!leftColumn || !rightColumn) continue;
+      if (leftColumn !== rightColumn || (physicalColumn && physicalColumn !== leftColumn)) return false;
+      physicalColumn = leftColumn;
+      hasProvenance = true;
+    }
+  }
+  return hasProvenance;
+}
 function sheetFamilyClass(sheet: string) {
   return sheet === "5. Material Cut List Price" ? "part-sheet-family-mcl"
     : sheet === "Tool Shop Items" ? "part-sheet-family-toolshop"
@@ -1175,13 +1198,15 @@ function PartSearchCombobox({ group, selected, disabled, path, open, onOpen, onC
 function SourceDetails({ group, expanded, onToggle, selectionMode, selectedLineKeys, onToggleLine, effectivePart, onViewPart }: { group: Group; expanded: boolean; onToggle: () => void; selectionMode: boolean; selectedLineKeys: string[]; onToggleLine: (row: SourceRow) => void; effectivePart: (row: SourceRow) => Part | null; onViewPart: (row: SourceRow) => void }) {
   const columns = sourceFields[group.sheet] || [];
   const compactKeys: Record<string, string[]> = {
-    "5. Material Cut List Price": columns.slice(0, 5).map(column => column.key),
+    "5. Material Cut List Price": columns.slice(0, 4).map(column => column.key),
     "Tool Shop Items": ["item_name", "material_to_cut", "dimension_to_cut_mm", "qty", "toolshop_remarks"],
     "CNC Cut List": columns.slice(0, 5).map(column => column.key),
   };
-  const withoutLegacyRemarksDuplicate = columns.filter(column => !(group.sheet === "Tool Shop Items" && column.key === "toolshop_part_name"
-    && group.rows.some(row => row.sourceHeaders?.toolshop_part_name === "Remarks")));
-  const visibleColumns = (expanded ? withoutLegacyRemarksDuplicate : withoutLegacyRemarksDuplicate.filter(column => (compactKeys[group.sheet] || []).includes(column.key)));
+  const withoutDuplicatePhysicalColumns = columns.filter(column => !(group.sheet === "Tool Shop Items"
+    && ((column.key === "item_name" && samePhysicalSourceColumn(group.rows, "item_name", "material_to_cut"))
+      || (column.key === "toolshop_part_name" && samePhysicalSourceColumn(group.rows, "toolshop_part_name", "toolshop_remarks")))));
+  const withoutInUse = withoutDuplicatePhysicalColumns.filter(column => column.key !== "in_use");
+  const visibleColumns = expanded ? withoutInUse : withoutInUse.filter(column => (compactKeys[group.sheet] || []).includes(column.key));
   return <section className={`part-source-details ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
     <div className="part-source-details-heading"><strong>Source evidence</strong><button type="button" className="button quiet" aria-expanded={expanded} onClick={onToggle}>{expanded ? "Show key fields" : "Expand source details"}</button></div>
     {!columns.length ? <p>Source-specific fields are not configured for this sheet.</p> : <div className="part-detail-scroll"><table><thead><tr>{selectionMode && <th>Assign line</th>}{visibleColumns.map(column => {

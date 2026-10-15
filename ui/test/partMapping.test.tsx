@@ -176,6 +176,87 @@ it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-fa
   expect(screen.getByText("Plate flange source")).toBeTruthy();
 });
 
+it("deduplicates Tool Shop columns only with physical provenance and hides In Use in every source table mode", async () => {
+  const toolAlias = group("tool-alias", "Tool Shop Items", "Aliased tool", 18, {rows:[
+    {sheet:"Tool Shop Items",row:18,fields:{item_name:"MS Plate",material_to_cut:"MS Plate",dimension_to_cut_mm:"80",qty:"1",in_use:"Yes",
+      toolshop_remarks:"Deburr",toolshop_part_name:"Deburr"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",dimension_to_cut_mm:"Dimension (mm)",qty:"Quantity",in_use:"In Use",
+        toolshop_remarks:"Remarks",toolshop_part_name:"Remarks"},
+      sourceHeaderCells:{item_name:"$C$7",material_to_cut:"C8",dimension_to_cut_mm:"D7",qty:"E7",in_use:"F7",toolshop_remarks:"G7",toolshop_part_name:"G8"},
+      sourceCells:{item_name:{cell:"C18"},material_to_cut:{cell:"C18"},in_use:{cell:"F18"},toolshop_remarks:{cell:"G18"},toolshop_part_name:{cell:"G18"}},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use","toolshop_remarks","toolshop_part_name"]},
+  ]});
+  const toolDistinct = group("tool-distinct", "Tool Shop Items", "Distinct columns", 19, {rows:[
+    {sheet:"Tool Shop Items",row:19,fields:{item_name:"Bearing",material_to_cut:"MS Plate",dimension_to_cut_mm:"50",qty:"2",in_use:"Yes",
+      toolshop_remarks:"Deburr",toolshop_part_name:"Legacy note"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",dimension_to_cut_mm:"Dimension (mm)",qty:"Quantity",in_use:"In Use",
+        toolshop_remarks:"Remarks",toolshop_part_name:"Remarks"},
+      sourceHeaderCells:{item_name:"B7",material_to_cut:"C7",dimension_to_cut_mm:"D7",qty:"E7",in_use:"F7",toolshop_remarks:"G7",toolshop_part_name:"H7"},
+      sourceCells:{item_name:{cell:"B19"},material_to_cut:{cell:"C19"},in_use:{cell:"F19"},toolshop_remarks:{cell:"G19"},toolshop_part_name:{cell:"H19"}},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use","toolshop_remarks","toolshop_part_name"]},
+  ]});
+  const toolIncomplete = group("tool-incomplete", "Tool Shop Items", "Incomplete provenance", 20, {rows:[
+    {sheet:"Tool Shop Items",row:20,fields:{item_name:"Cable tray",material_to_cut:"MS Plate",dimension_to_cut_mm:"50",qty:"2",in_use:"Yes"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",in_use:"In Use"},sourceHeaderCells:{},sourceCells:{},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use"]},
+  ]});
+  const cncGroup = group("cnc-frame", "CNC Cut List", "Frame", 42);
+  const mclGroup = group("mcl-frame", "5. Material Cut List Price", "MS frame", 11);
+  mocks.partMappings.mockResolvedValue(detail([mclGroup,toolAlias,toolDistinct,toolIncomplete,cncGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 5 of 5 source groups");
+  for (const label of ["MS frame", "Aliased tool", "Distinct columns", "Incomplete provenance", "Frame"]) await expandGroup(label);
+
+  const cardFor = (label: string) => screen.getByText(label).closest(".part-source-group") as HTMLElement;
+  const tableFor = (label: string) => cardFor(label).querySelector(".part-source-details table") as HTMLTableElement;
+  const aliasTable = tableFor("Aliased tool");
+  const distinctTable = tableFor("Distinct columns");
+  const incompleteTable = tableFor("Incomplete provenance");
+  expect(within(aliasTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(1);
+  expect(within(distinctTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(incompleteTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(aliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  expect(within(distinctTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  expect(within(incompleteTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  for (const label of ["MS frame", "Frame"]) {
+    expect(within(tableFor(label)).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  }
+  expect(within(aliasTable).getByText("MS Plate")).toBeTruthy();
+  expect(within(distinctTable).getByText("Bearing")).toBeTruthy();
+  expect(within(distinctTable).getByText("MS Plate")).toBeTruthy();
+  expect(within(incompleteTable).getByText("Cable tray")).toBeTruthy();
+  expect(within(incompleteTable).getByText("MS Plate")).toBeTruthy();
+  for (const table of [aliasTable, distinctTable, incompleteTable, tableFor("MS frame"), tableFor("Frame")]) {
+    expect(within(table).getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  }
+
+  for (const label of ["MS frame", "Frame"]) {
+    fireEvent.click(within(cardFor(label)).getByRole("button", {name:"Expand source details"}));
+    expect(within(tableFor(label)).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  }
+
+  const aliasCard = cardFor("Aliased tool");
+  fireEvent.click(within(aliasCard).getByRole("button", {name:"Expand source details"}));
+  const expandedAliasTable = tableFor("Aliased tool");
+  expect(within(expandedAliasTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(1);
+  expect(within(expandedAliasTable).getAllByRole("columnheader", {name:"Remarks"})).toHaveLength(1);
+  expect(within(expandedAliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  const distinctCard = cardFor("Distinct columns");
+  fireEvent.click(within(distinctCard).getByRole("button", {name:"Expand source details"}));
+  const expandedDistinctTable = tableFor("Distinct columns");
+  expect(within(expandedDistinctTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(expandedDistinctTable).getAllByRole("columnheader", {name:"Remarks"})).toHaveLength(2);
+  expect(within(expandedDistinctTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+
+  fireEvent.click(within(aliasCard).getByRole("button", {name:"Split assignments"}));
+  const lineCheckbox = within(aliasCard).getByRole("checkbox", {name:"Select Tool Shop Items row 18 for Part assignment"}) as HTMLInputElement;
+  expect(lineCheckbox.checked).toBe(false);
+  fireEvent.click(lineCheckbox);
+  expect(lineCheckbox.checked).toBe(true);
+  expect(within(expandedAliasTable).getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  expect(within(expandedAliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+});
+
 it("saves only one group, retries the identical request, and reloads saved state", async () => {
   mocks.savePartMappings.mockRejectedValueOnce(new Error("response lost"));
   render(<PartMappingView path="pilot.ods"/>);

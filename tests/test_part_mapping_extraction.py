@@ -90,6 +90,51 @@ class PartMappingExtractionTests(unittest.TestCase):
         self.assertEqual(diagnostics["CNC Cut List"]["labelHeader"], "Part Category")
         self.assertEqual(diagnostics["CNC Cut List"]["labelHeaderCell"], "B8")
 
+    def test_in_use_filter_and_semantic_source_evidence_are_preserved_for_all_part_sheets(self):
+        flags = ["Yes", "No", None, "Maybe"]
+        source_rows = {
+            "5. Material Cut List Price": {row: [f"MCL part {row}", "MS Plate", "3 x 25", "1", "HF", flag]
+                for row, flag in zip(range(9, 13), flags)},
+            "Tool Shop Items": {row: [f"Tool part {row}", f"Item {row}", "Steel", "20", "1", flag]
+                for row, flag in zip(range(10, 14), flags)},
+            "CNC Cut List": {row: [f"Plate {row}", f"CNC part {row}", "MS", "120", "30", "3", "1", flag]
+                for row, flag in zip(range(9, 13), flags)},
+        }
+        document = OdsDocument(Path("in-use-status.ods"), {
+            "5. Material Cut List Price": sheet("5. Material Cut List Price", 8,
+                ["Machine Piece Description", "Material to Cut", "Dimension to Cut (mm)", "Quantity Nos", "Optional Item Group 1", "In Use"],
+                source_rows["5. Material Cut List Price"]),
+            "Tool Shop Items": sheet("Tool Shop Items", 9,
+                ["Machine Piece Description", "Item Name", "Material Used", "Dimension in mm", "Qty", "In Use"],
+                source_rows["Tool Shop Items"]),
+            "CNC Cut List": sheet("CNC Cut List", 8,
+                ["Plate Part to Cut", "Part Category", "Material used", "Length", "Width", "Thickness", "Qty Of Part Used", "In Use"],
+                source_rows["CNC Cut List"]),
+        })
+
+        lines = _configured_process_lines(document)
+        groups = source_groups(lines)
+        expected_statuses = ["active", "historical", "active", "unexpected"]
+        for name, first_row in (("5. Material Cut List Price", 9), ("Tool Shop Items", 10), ("CNC Cut List", 9)):
+            with self.subTest(sheet=name):
+                extracted = lines[name]
+                self.assertEqual([row["status"] for row in extracted], expected_statuses)
+                for row, expected_flag in zip(extracted, flags):
+                    self.assertEqual(row["fields"]["in_use"], expected_flag)
+                    self.assertEqual(row["source_headers"]["in_use"], "In Use")
+                    self.assertIn("in_use", row["available_fields"])
+                    self.assertEqual(row["source_cells"]["in_use"]["cell"], f"F{row['source_row']}" if name != "CNC Cut List" else f"H{row['source_row']}")
+
+                retained = [row for group in groups if group["sheet"] == name for row in group["rows"]]
+                self.assertEqual(sorted(row["row"] for row in retained), [first_row, first_row + 2])
+                semantic_by_row = {row["row"]: group["semanticEvidence"][row["row"]]
+                    for group in groups if group["sheet"] == name for row in group["rows"]}
+                for source_row, source_state, display in ((first_row, "value", "Yes"), (first_row + 2, "blank", None)):
+                    evidence = next(field for field in semantic_by_row[source_row]["fields"] if field["field"] == "in_use")
+                    self.assertEqual(evidence["sourceState"], source_state)
+                    self.assertEqual(evidence["value"], "active")
+                    self.assertEqual(evidence["display"], display)
+
     def test_cnc_missing_category_does_not_substitute_plate_identity_and_ambiguous_headers_are_reported(self):
         document = OdsDocument(Path("pilot.ods"), {
             "5. Material Cut List Price": sheet("5. Material Cut List Price", 8,
