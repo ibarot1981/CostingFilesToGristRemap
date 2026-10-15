@@ -551,7 +551,7 @@ it("shows accepted baseline provenance from the Part and preserves blank versus 
       baseline:{WorkbookName:"S1KHF.ods",WorkbookPath:"pilot/S1KHF.ods",SourceHash:"workbook-hash"},
       families:[{FamilyKey:"MCL",Family:"MCL",ApplicabilityStatus:"applicable",SourceEvidenceStatus:"complete",RequirementCount:1,CompletenessConfirmed:true}],
       requirements:[
-        {key:"mcl",family:"mcl",sheet:"5. Material Cut List Price",row:12,lineKey:"mcl:line",physical:{item_name:"Plate 1",quantity:2,quantity_uom:"Nos",material:"MS plate",dimension:"3 x 25",weight_kg:0.105}},
+        {key:"mcl",family:"mcl",sheet:"5. Material Cut List Price",row:2,lineKey:"part-baseline-line:opaque-hash",physical:{item_name:null,quantity:"2",quantity_uom:"nos",material:"ms plate",dimension:"3 x 25",weight_kg:null},rawFields:{product_part_name:"Browser QA Plate",material_to_cut:"MS Plate",dimension_to_cut_mm:"3 x 25",qty:"2",in_use:"Yes",remarks:"Synthetic fixture"},cellEvidence:{sourceHeaders:{product_part_name:"Machine Piece Description"}}},
         {key:"toolshop",family:"toolshop",sheet:"Tool Shop Items",row:18,lineKey:"toolshop:line",physical:{item_name:"Weld fixture",quantity:1,quantity_uom:"Nos"},lineDetail:{toolShopItemsRemarks:{sourceStatus:"blank",value:null}}},
         {key:"cnc",family:"cnc",sheet:"CNC Cut List",row:27,lineKey:"cnc:line",physical:{plate_part:"Frame",quantity:1,quantity_uom:"Nos",length:25,width:3,thickness:2},lineDetail:{platePartToCut:{sourceStatus:"missing",value:null}}},
       ]},
@@ -565,7 +565,11 @@ it("shows accepted baseline provenance from the Part and preserves blank versus 
   fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
   fireEvent.click(await screen.findByRole("button", {name:/Manufacturing baseline/}));
   await screen.findByText("S1KHF.ods · pilot/S1KHF.ods");
-  expect(screen.getByText(/5\. Material Cut List Price · row 12 · quantity 2 Nos · material MS plate/)).toBeTruthy();
+  expect(screen.getByText("MCL · Machine Piece Description: Browser QA Plate")).toBeTruthy();
+  expect(screen.getByText("Tool Shop · Weld fixture")).toBeTruthy();
+  expect(screen.getByText("CNC · Frame")).toBeTruthy();
+  expect(screen.queryByText(/part-baseline-line:/)).toBeNull();
+  expect(screen.getByText(/5\. Material Cut List Price · row 2 · quantity 2 nos · material ms plate/)).toBeTruthy();
   expect(screen.getByText("Tool Shop Items Remarks: (blank in source)")).toBeTruthy();
   expect(screen.getByText("Plate Part to Cut: Column not in source")).toBeTruthy();
   expect(mocks.addPartComponent).not.toHaveBeenCalled();

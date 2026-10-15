@@ -29,6 +29,26 @@ function openPartDetailSection(id: string) {
   section?.scrollIntoView?.({ behavior: "smooth", block: "start" });
 }
 
+function manufacturingBaselineRequirementTitle(item: any): string {
+  const family = String(item.family || "").toLowerCase();
+  const familyLabel = ({ mcl: "MCL", toolshop: "Tool Shop", cnc: "CNC" } as Record<string, string>)[family] || "Manufacturing";
+  const sourceHeaders = item.cellEvidence?.sourceHeaders || {};
+  const candidates: Array<{ value: unknown; sourceKey: string }> = [
+    { value: item.physical?.item_name, sourceKey: "item_name" },
+    { value: item.physical?.plate_part, sourceKey: "product_part_name" },
+    { value: item.physical?.toolshop_detail, sourceKey: "toolshop_detail" },
+    { value: item.rawFields?.product_part_name, sourceKey: "product_part_name" },
+    { value: item.rawFields?.item_name, sourceKey: "item_name" },
+    { value: item.rawFields?.toolshop_part_name, sourceKey: "toolshop_part_name" },
+    { value: item.rawFields?.part_category, sourceKey: "part_category" },
+  ];
+  const description = candidates.find(candidate => typeof candidate.value === "string" && candidate.value.trim());
+  if (!description) return `${familyLabel} · Description unavailable`;
+  const text = (description.value as string).trim();
+  const sourceLabel = String(sourceHeaders[description.sourceKey] || "").trim();
+  return `${familyLabel} · ${sourceLabel ? `${sourceLabel}: ` : ""}${text}`;
+}
+
 export function PartsView({ active = true, mappingReturn = null, onReturnToMapping }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
@@ -354,7 +374,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
                 <p><strong>Workbook hash:</strong> <code>{details.manufacturingBaseline.sourceHash || details.manufacturingBaseline.baseline.SourceHash}</code></p>
                 <h4>Applicable source requirements</h4>
                 {details.manufacturingBaseline.families?.length ? <ul>{details.manufacturingBaseline.families.map((family: any) => <li key={family.FamilyKey}><strong>{family.Family}</strong> · {family.ApplicabilityStatus?.replaceAll("_", " ")} · {family.SourceEvidenceStatus?.replaceAll("_", " ")} · {family.RequirementCount || 0} requirements · complete {family.CompletenessConfirmed ? "yes" : "no"}</li>)}</ul> : <p>No family applicability records are available.</p>}
-                {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{item.family} · {item.physical?.item_name || item.physical?.plate_part || item.physical?.toolshop_detail || item.lineKey}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small>
+                {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{manufacturingBaselineRequirementTitle(item)}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small>
                   {item.family === "toolshop" && <small>Tool Shop Items Remarks: {item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.toolShopItemsRemarks?.value}</small>}
                   {item.family === "cnc" && <small>Plate Part to Cut: {item.lineDetail?.platePartToCut?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.platePartToCut?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.platePartToCut?.value}</small>}
                 </div><span>{item.revisionKey || "accepted"}</span></article>)}</div> : <p>This Rev A baseline contains no workbook-derived line requirements. Existing child or purchase requirements remain separate.</p>}
