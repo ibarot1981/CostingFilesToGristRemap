@@ -48,17 +48,21 @@ def api_matches_project(port: int, project_root: str | Path) -> bool:
     try:
         status, body = _read_url(f"http://{HOST}:{port}/api/health")
         health = json.loads(body.decode("utf-8"))
-        reported_root = health.get("costingRoot")
+        # costingRoot identifies workbook data. Only projectRoot proves which
+        # checkout is serving this API; older health responses fail closed.
+        reported_root = health.get("projectRoot")
         return (status == 200 and health.get("status") == "ok" and isinstance(reported_root, str)
             and bool(reported_root.strip()) and normalize_root(reported_root) == normalize_root(project_root))
     except (OSError, ValueError, URLError, json.JSONDecodeError):
         return False
 
 
-def ui_matches_project(port: int) -> bool:
+def ui_matches_project(port: int, project_root: str | Path) -> bool:
+    """Require both the expected UI and its proxy to the matching project API."""
     try:
         status, body = _read_url(f"http://{HOST}:{port}/")
-        return status == 200 and UI_TITLE.encode("ascii") in body
+        return (status == 200 and UI_TITLE.encode("ascii") in body
+            and api_matches_project(port, project_root))
     except (OSError, URLError):
         return False
 
@@ -67,13 +71,13 @@ def startup_plan(*, api_busy: bool, api_matches: bool, ui_busy: bool, ui_matches
     """Plan safe starts/reuse; fail before launching anything on foreign ports."""
     if api_busy and not api_matches:
         raise LauncherError(
-            f"Port {API_PORT} is occupied by a service that does not identify this project API. "
-            f"Inspect it and free the port yourself; no process was stopped."
+            f"Port {API_PORT} is occupied by an API without a matching projectRoot identity. "
+            f"Inspect it and, if it is an older instance, restart this checkout's API yourself; no process was stopped."
         )
     if ui_busy and not ui_matches:
         raise LauncherError(
-            f"Port {UI_PORT} is occupied by a service that does not identify the Safari Manufacturing UI. "
-            f"Inspect it and free the port yourself; no process was stopped."
+            f"Port {UI_PORT} does not serve this project's UI and matching API proxy. "
+            f"Inspect it and restart this checkout's UI yourself; no process was stopped."
         )
     return {"api": "reuse" if api_busy else "start", "ui": "reuse" if ui_busy else "start"}
 
@@ -110,16 +114,15 @@ def launch(project_root: str | Path, *, start_api=_start_api, start_ui=_start_ui
     api_busy = port_is_listening(API_PORT)
     ui_busy = port_is_listening(UI_PORT)
     plan = startup_plan(api_busy=api_busy, api_matches=api_matches_project(API_PORT, root) if api_busy else False,
-        ui_busy=ui_busy, ui_matches=ui_matches_project(UI_PORT) if ui_busy else False)
+        ui_busy=ui_busy, ui_matches=ui_matches_project(UI_PORT, root) if ui_busy else False)
 
     if plan["api"] == "start":
         start_api(root)
         wait_until(lambda: api_matches_project(API_PORT, root), f"Project API at http://{HOST}:{API_PORT}")
     if plan["ui"] == "start":
         start_ui(root)
-    wait_until(lambda: ui_matches_project(UI_PORT), f"Project UI at http://{HOST}:{UI_PORT}")
-    wait_until(lambda: api_matches_project(UI_PORT, root),
-        f"UI proxy to this project's API at http://{HOST}:{API_PORT}")
+    wait_until(lambda: ui_matches_project(UI_PORT, root),
+        f"Project UI and proxy to its API at http://{HOST}:{UI_PORT}")
     return plan
 
 

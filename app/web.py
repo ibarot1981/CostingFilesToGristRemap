@@ -52,7 +52,7 @@ async def _part_identity_error_handler(request: Request, exc: PartIdentityError)
 def health(request: Request) -> dict[str, Any]:
     repository = _get_repository()
     grist_writes_enabled = repository.adapter_name == "grist-safari"
-    return {"status": "ok", "mode": "local" if repository.adapter_name == "in-memory" else "grist", "adapter": repository.adapter_name, "user": _request_user(request), "catalogAvailable": _catalog_path().exists(), "costingRoot": str(_costing_root()), "writeEnabled": grist_writes_enabled}
+    return {"status": "ok", "mode": "local" if repository.adapter_name == "in-memory" else "grist", "adapter": repository.adapter_name, "user": _request_user(request), "catalogAvailable": _catalog_path().exists(), "projectRoot": str(PROJECT_ROOT), "costingRoot": str(_costing_root()), "writeEnabled": grist_writes_enabled}
 
 
 @app.get("/api/catalog/summary")
