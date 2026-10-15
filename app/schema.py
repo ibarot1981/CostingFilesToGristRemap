@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-13.v14"
+SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-14.v15"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -156,6 +156,14 @@ FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 # columns; this implementation round never applies the plan to production Grist.
 FOUNDATION_TABLES += (
     _table("PartMappingReview", {"SemanticPolicyVersion": "Text", "SemanticFingerprint": "Text", "SemanticEvidence": "Any"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# v15 classifies managed identities so assemblies can share PartRevision and
+# PartComponentRevision while retaining an independent permanent number series.
+FOUNDATION_TABLES += (
+    _table("ProductPart", {"IdentityKind": "Text"}),
+    _table("PartRegistryRequest", {"IdentityKind": "Text"}),
 )
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 

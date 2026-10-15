@@ -9,6 +9,7 @@ const STORAGE = "isolated-grist-part-line-records";
 const REMOVED_SOURCE_LINE_STORAGE = "isolated-removed-source-line";
 const REMOVED_LEGACY_GROUP_STORAGE = "isolated-removed-legacy-group";
 const workbookPath = "isolated-line-assignments.ods";
+const sourceColumnCase = new URLSearchParams(window.location.search).get("source-columns") === "alias" ? "alias" : "distinct";
 type FixturePart = {id:string; partNumber:string; name:string; description:string; variant:string; selectable:boolean; duplicateName:boolean;
   engineeringRevision:string; legacy:boolean; status:string; scope:string; scopeTargetId:string; scopeTarget:string; shortcode:string;
   aliases:string[]; outOfScopeCodes:any[]};
@@ -36,14 +37,27 @@ function lineKey(groupKey:string,row:number) { return `${groupKey}:line:${row}`;
 function lineFingerprint(key:string,row:number) { return `semantic-${key}${changedLineEvidence && row === 13 ? "-changed" : ""}`; }
 function sourceRow(groupKey:string,sheet:string,row:number,description:string,quantity:string) {
   const key = lineKey(groupKey,row);
+  const isToolShop = sheet === "Tool Shop Items";
+  const isCnc = sheet === "CNC Cut List";
+  const itemNameColumn = isToolShop && sourceColumnCase === "alias" ? "C" : "B";
+  const itemName = isToolShop && sourceColumnCase === "alias" ? "MS Plate" : description;
   return {sheet,row,lineKey:key,semanticEvidence:{fingerprint:lineFingerprint(key,row)},
     fields:{product_part_name:description,part_category:description,material_to_cut:"MS Plate",dimension_to_cut_mm:"3 x 25",qty:quantity,
-      optional_item_group_1:"HF",in_use:"Yes",item_name:description,toolshop_remarks:"Isolated browser line"},
+      optional_item_group_1:"HF",in_use:"Yes",item_name:itemName,toolshop_remarks:"Isolated browser line",
+      ...(isCnc ? {length:"120",width:"60",thickness:"3",part_weight_kg:"12",total_weight_kg:"24"} : {})},
     sourceHeaders:{product_part_name:"Plate Part to Cut",part_category:"Part Category",material_to_cut:"Material to Cut",
-      dimension_to_cut_mm:"Dimension to Cut (mm)",qty:"Quantity",item_name:"Item Name / Material",toolshop_remarks:"Remarks"},
-    sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:"C8",dimension_to_cut_mm:"D8",qty:"E8",item_name:"A7",toolshop_remarks:"F7"},
-    sourceCells:{qty:{cell:`E${row}`},material_to_cut:{cell:`C${row}`}},headerRow:sheet === "Tool Shop Items" ? 7 : 8,
-    availableFields:["product_part_name","part_category","material_to_cut","dimension_to_cut_mm","qty","item_name","toolshop_remarks"]};
+      dimension_to_cut_mm:"Dimension to Cut (mm)",qty:"Quantity",item_name:"Item Name / Material",toolshop_remarks:"Remarks",
+      ...(isToolShop ? {material_to_cut:"Material Used",item_name:"Material Used",in_use:"In Use"} : {in_use:"In Use"}),
+      ...(isCnc ? {material_to_cut:"Material used",length:"Length",width:"Width",thickness:"Thickness",qty:"Qty Of Part Used",
+        part_weight_kg:"Per Part Weight (Kg)",total_weight_kg:"Total Weight (Kgs)",optional_item_group_1:"Item Group 1"} : {})},
+    sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:isToolShop ? "C7" : "C8",dimension_to_cut_mm:isToolShop ? "D7" : "D8",
+      qty:isToolShop ? "E7" : isCnc ? "G8" : "E8",item_name:isToolShop ? `${itemNameColumn}7` : "A7",toolshop_remarks:"F7",in_use:isToolShop ? "G7" : isCnc ? "K8" : "F8",
+      ...(isCnc ? {length:"D8",width:"E8",thickness:"F8",part_weight_kg:"H8",total_weight_kg:"I8",optional_item_group_1:"J8"} : {})},
+    sourceCells:{qty:{cell:`${isCnc ? "G" : "E"}${row}`},material_to_cut:{cell:`C${row}`},item_name:{cell:`${itemNameColumn}${row}`},in_use:{cell:`${isCnc ? "K" : isToolShop ? "G" : "F"}${row}`},
+      ...(isCnc ? {length:{cell:`D${row}`},width:{cell:`E${row}`},thickness:{cell:`F${row}`},part_weight_kg:{cell:`H${row}`},total_weight_kg:{cell:`I${row}`},optional_item_group_1:{cell:`J${row}`}} : {})},
+    headerRow:sheet === "Tool Shop Items" ? 7 : 8,
+    availableFields:["product_part_name","part_category","material_to_cut","dimension_to_cut_mm","qty","item_name","in_use","toolshop_remarks",
+      ...(isCnc ? ["length","width","thickness","part_weight_kg","total_weight_kg","optional_item_group_1"] : [])]};
 }
 function deletedLineFor(groupKey:string) {
   if (removedSourceLine === null) return [];
@@ -101,8 +115,9 @@ function mappingDetail() {
   const mclRows = [10,11,12,13].filter(row => row !== removedSourceLine && !removedLegacyGroup)
     .map(row => sourceRow("mcl-chassis","5. Material Cut List Price",row,`Plate ${row-9}`,["2","1","4","3"][row-10]));
   const toolRows = [21,22].map((row,index) => sourceRow("tool-jig","Tool Shop Items",row,`Jig ${index+1}`,["1","2"][index]));
+  const cncRows = [41,42].map((row,index) => sourceRow("cnc-frame","CNC Cut List",row,`CNC plate ${index+1}`,["2","1"][index]));
   const groups = [...(!removedLegacyGroup ? [group("mcl-chassis","5. Material Cut List Price","Chassis",mclRows,deletedLineFor("mcl-chassis"))] : []),
-    group("tool-jig","Tool Shop Items","Inspection jig",toolRows)];
+    group("tool-jig","Tool Shop Items","Inspection jig",toolRows),group("cnc-frame","CNC Cut List","Frame",cncRows)];
   const legacyDeletedLines = removedLegacyGroup ? legacyDeletedLinesFor("mcl-chassis") : [];
   const removedGroups = removedLegacyGroup ? [{key:"mcl-chassis",sheet:"5. Material Cut List Price",description:"Chassis",removed:true,
     reviewed:legacyDeletedLines.length > 0 && legacyDeletedLines.every(line => line.reviewed),
@@ -114,7 +129,8 @@ function mappingDetail() {
   return {sourceHash:"isolated-source-hash",associationKey:"fixture-association",associationVersion:1,version:server.version,schemaAvailable:true,
     legacyHistoryAvailable:true,mappingPolicyVersion:"part-source-labels-v2",semanticPolicyVersion:"part-mapping-semantic-v1",
     sourceSheets:{"5. Material Cut List Price":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A8",ambiguousLabelHeaders:[],headerRow:8},
-      "Tool Shop Items":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A7",ambiguousLabelHeaders:[],headerRow:7}},
+      "Tool Shop Items":{present:true,status:"ok",labelField:"product_part_name",labelHeader:"Machine Piece Description",labelHeaderCell:"A7",ambiguousLabelHeaders:[],headerRow:7},
+      "CNC Cut List":{present:true,status:"ok",labelField:"part_category",labelHeader:"Part Category",labelHeaderCell:"B8",ambiguousLabelHeaders:[],headerRow:8}},
     parts:server.parts,groups,unresolvedGroups:groups.filter(item => !item.reviewed).length
       + removedGroups.filter(item => !item.reviewed).length,
     unresolvedLines:groups.reduce((sum,item) => sum + item.rows.filter((row:any) => !row.reviewed).length,0),
@@ -261,6 +277,7 @@ function Harness() {
   return <div className="app-shell">
     <header className="topbar" style={{position:"relative",zIndex:10000,display:"block",minHeight:"auto",padding:"10px 16px"}}>
       <strong>Isolated Grist fixture · Part line assignment browser verification</strong>
+      <p>Mock data only · Tool Shop source columns: {sourceColumnCase === "alias" ? "aliased to one physical column" : "distinct columns with matching header text"}. No production writes.</p>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
         <button type="button" onClick={() => { if (pendingCreate) window.__completeFixtureCreate(); }}>Complete isolated Part creation</button>
         <button type="button" onClick={() => window.__changeLineEvidenceAndReload()}>Change row 13 evidence and reload review</button>

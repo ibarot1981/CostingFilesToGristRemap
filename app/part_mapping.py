@@ -496,7 +496,8 @@ def list_parts(store, *, refresh: bool = False) -> list[dict[str, Any]]:
         duplicate = any(len(set(names.get(name_key(label), []))) > 1 for label in labels if name_key(label))
         result.append({"id": identity_id, "gristRecordId": record_id, "key": fields.get("PartKey"),
             "name": name, "status": fields.get("Status"), "aliases": aliases_by_part.get(identity_id, []),
-            "selectable": bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"} and fields.get("PublishStatus", "published") == "published",
+            "identityKind": str(fields.get("IdentityKind") or "part"),
+            "selectable": str(fields.get("IdentityKind") or "part") == "part" and bool(fields.get("PartKey")) and fields.get("Status") in {"canonical", "active", "reviewed"} and fields.get("PublishStatus", "published") == "published",
             "duplicateName": duplicate, "partNumber": fields.get("PartNumber"),
             "description": str(fields.get("Description") or fields.get("PartDescription") or ""),
             "variant": str(fields.get("DesignVariant") or fields.get("Variant") or ""),
@@ -558,7 +559,7 @@ def search_parts(store, *, query: str = "", offset: int = 0, limit: int = 50) ->
     wanted = name_key(query)
     matches = []
     for part in list_parts(store):
-        if not part.get("selectable") or part.get("duplicateName"):
+        if part.get("identityKind", "part") != "part" or not part.get("selectable") or part.get("duplicateName"):
             continue
         searchable = name_key(" ".join(str(value or "") for value in (
             part.get("id"), part.get("partNumber"), part.get("name"), part.get("description"),
@@ -1442,6 +1443,8 @@ def save_mapping(store, *, file_id: str, source_hash: str, association, groups: 
         for part_id in expanded.values():
             if part_id:
                 part = parts.get(part_id)
+                if part and part.get("identityKind", "part") == "assembly":
+                    raise PartConflict("PART_ASSIGNMENT_DEFERRED", "Assembly assignment to source workbooks is deferred; choose a canonical SM-P Part.")
                 if not part or not part["selectable"] or part["duplicateName"]:
                     raise PartConflict("PART_SELECTION_INVALID", "Select a canonical Part with an unambiguous name")
         version = detail["version"] + 1

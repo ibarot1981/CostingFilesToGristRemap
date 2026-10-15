@@ -7,11 +7,11 @@ import "./parts.css";
 type Scope = "global" | "product" | "product_model" | "model_code";
 type Target = { id: string; label: string; parentId?: string; shortcode?: string | null };
 type ScopeOption = { id: Scope; label: string; target?: Target; targets?: Target[] };
-type Part = { id: string; partNumber: string | null; name: string; description: string; variant: string; scope: string; scopeTargetId: string | null; scopeTarget: string; shortcode?: string; engineeringRevision: string | null; status: string; metadataVersion: number | null; manufacturingBaselineStatus?: string; aliases: string[]; legacy: boolean; createdAt?: string; actor?: string; reason?: string; legacyRevisionValues?: string[]; partKey?: string; ambiguousName?: boolean; metadataHistory?: any[]; lifecycleHistory?: any[] };
+type Part = { id: string; partNumber: string | null; name: string; description: string; variant: string; scope: string; scopeTargetId: string | null; scopeTarget: string; shortcode?: string; engineeringRevision: string | null; identityKind?: "part" | "assembly"; status: string; metadataVersion: number | null; manufacturingBaselineStatus?: string; aliases: string[]; legacy: boolean; createdAt?: string; actor?: string; reason?: string; legacyRevisionValues?: string[]; partKey?: string; ambiguousName?: boolean; metadataHistory?: any[]; lifecycleHistory?: any[] };
 type Preview = { name: string; available: boolean; collision: { source: string; id: string; number: string | null; status: string }[]; before?: any; after?: any; affectedSourceAssignments?: any[]; usageFingerprint?: string };
 type Attempt = { key: string; payload: Record<string, unknown> };
 type Register = { items: Part[]; legacyItems: Part[] };
-type TreeEntry = { id: string; parentId?: string; label: string; depth: number; kind: "group" | "target" | "part"; part?: Part; count?: number; expanded?: boolean; hasChildren?: boolean };
+type TreeEntry = { id: string; parentId?: string; label: string; depth: number; kind: "group" | "target" | "part" | "assembly"; part?: Part; count?: number; expanded?: boolean; hasChildren?: boolean };
 
 const scopeLabels: Record<Scope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 const emptyRegister: Register = { items: [], legacyItems: [] };
@@ -29,6 +29,26 @@ function openPartDetailSection(id: string) {
   section?.scrollIntoView?.({ behavior: "smooth", block: "start" });
 }
 
+function manufacturingBaselineRequirementTitle(item: any): string {
+  const family = String(item.family || "").toLowerCase();
+  const familyLabel = ({ mcl: "MCL", toolshop: "Tool Shop", cnc: "CNC" } as Record<string, string>)[family] || "Manufacturing";
+  const sourceHeaders = item.cellEvidence?.sourceHeaders || {};
+  const candidates: Array<{ value: unknown; sourceKey: string }> = [
+    { value: item.physical?.item_name, sourceKey: "item_name" },
+    { value: item.physical?.plate_part, sourceKey: "product_part_name" },
+    { value: item.physical?.toolshop_detail, sourceKey: "toolshop_detail" },
+    { value: item.rawFields?.product_part_name, sourceKey: "product_part_name" },
+    { value: item.rawFields?.item_name, sourceKey: "item_name" },
+    { value: item.rawFields?.toolshop_part_name, sourceKey: "toolshop_part_name" },
+    { value: item.rawFields?.part_category, sourceKey: "part_category" },
+  ];
+  const description = candidates.find(candidate => typeof candidate.value === "string" && candidate.value.trim());
+  if (!description) return `${familyLabel} · Description unavailable`;
+  const text = (description.value as string).trim();
+  const sourceLabel = String(sourceHeaders[description.sourceKey] || "").trim();
+  return `${familyLabel} · ${sourceLabel ? `${sourceLabel}: ` : ""}${text}`;
+}
+
 export function PartsView({ active = true, mappingReturn = null, onReturnToMapping }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
@@ -36,13 +56,16 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(sessionStorage.getItem("parts:expanded") || "{}"); } catch { return {}; }
   });
-  const [mode, setMode] = useState<"selected" | "create" | "edit">(() => sessionStorage.getItem("parts:create-attempt") ? "create" : "selected");
+  const [mode, setMode] = useState<"selected" | "create" | "edit">(() => sessionStorage.getItem("assemblies:create-attempt") || sessionStorage.getItem("parts:create-attempt") ? "create" : "selected");
+  const [creationKind, setCreationKind] = useState<"part" | "assembly">(() => sessionStorage.getItem("assemblies:create-attempt") ? "assembly" : "part");
+  const [navigationPath, setNavigationPath] = useState<Part[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(() => {
     const route = window.location.hash.match(/^#parts\/(.+)$/);
     return route ? decodeURIComponent(route[1]) : sessionStorage.getItem("parts:selected");
   });
   const [fullDetails, setFullDetails] = useState(Boolean(window.location.hash.match(/^#parts\//)));
   const [details, setDetails] = useState<any>(null);
+  const [requestedDetailSection, setRequestedDetailSection] = useState<{ partId: string; sectionId: string } | null>(null);
   const [scope, setScope] = useState<Scope>("global");
   const [targetId, setTargetId] = useState("global");
   const [description, setDescription] = useState("");
@@ -61,6 +84,8 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const previewGeneration = useRef(0);
   const detailsGeneration = useRef(0);
   const hasLoadedRegister = useRef(false);
+  const creationFormGeneration = useRef(0);
+  const [creationFormInstance, setCreationFormInstance] = useState(0);
 
   async function refresh(search = query, background = hasLoadedRegister.current) {
     if (!hasLoadedRegister.current) setLoading(true);
@@ -81,6 +106,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   useEffect(() => { if (selectedId) sessionStorage.setItem("parts:selected", selectedId); else sessionStorage.removeItem("parts:selected"); }, [selectedId]);
   useEffect(() => {
     if (!mappingReturn?.partId) return;
+    setRequestedDetailSection(null);
     setSelectedId(mappingReturn.partId);
     setMode("selected");
     setFullDetails(true);
@@ -121,8 +147,22 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   }, [selectedId, mode]);
 
   useEffect(() => {
+    if (!requestedDetailSection) return;
+    if (requestedDetailSection.partId !== selectedId || mode !== "selected") {
+      setRequestedDetailSection(null);
+      return;
+    }
+    if (!fullDetails || !details) return;
+    const section = document.getElementById(requestedDetailSection.sectionId);
+    if (!section) return;
+    openPartDetailSection(requestedDetailSection.sectionId);
+    setRequestedDetailSection(null);
+  }, [requestedDetailSection, selectedId, mode, fullDetails, details]);
+
+  useEffect(() => {
     const onPopState = () => {
       const route = window.location.hash.match(/^#parts\/(.+)$/);
+      setRequestedDetailSection(null);
       setSelectedId(route ? decodeURIComponent(route[1]) : sessionStorage.getItem("parts:selected"));
       setFullDetails(Boolean(route));
     };
@@ -158,15 +198,21 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     await refresh();
   }
 
-  function startCreate() {
+  function startCreate(kind: "part" | "assembly" = "part") {
+    creationFormGeneration.current += 1;
+    setCreationFormInstance(creationFormGeneration.current);
+    setRequestedDetailSection(null);
     setError(""); setNotice(""); setSelectedId(null); setDetails(null); setMode("create"); setFullDetails(false);
+    setCreationKind(kind); setNavigationPath([]);
     setDescription(""); setVariant(""); setReason(""); setScope("global"); setTargetId("global"); setNamePreview(null);
     setMetadataAttempt(null); setRetireAttempt(null); setRetireReason("");
     if (window.location.hash.startsWith("#parts/")) history.pushState(null, "", "#parts");
   }
 
   function selectPart(part: Part) {
-    setSelectedId(part.id); setMode("selected"); setFullDetails(false); setError(""); setNotice(""); setRetireReason(""); setRetireAttempt(null);
+    if (mode === "create") creationFormGeneration.current += 1;
+    setRequestedDetailSection(null);
+    setSelectedId(part.id); setMode("selected"); setFullDetails(false); setNavigationPath([]); setError(""); setNotice(""); setRetireReason(""); setRetireAttempt(null);
     if (window.location.hash.startsWith("#parts/")) history.pushState(null, "", "#parts");
   }
 
@@ -176,14 +222,46 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     setFullDetails(true);
   }
 
+  function openMappedWorkbookLines() {
+    if (!selectedId) return;
+    setRequestedDetailSection({ partId: selectedId, sectionId: "mapped-workbook-lines" });
+    history.pushState(null, "", `#parts/${encodeURIComponent(selectedId)}`);
+    setFullDetails(true);
+  }
+
   function backToSummary() {
+    setRequestedDetailSection(null);
     history.pushState(null, "", "#parts");
     setFullDetails(false);
   }
 
   function openNestedPart(part: Part) {
+    setRequestedDetailSection(null);
+    if (selected && selected.id !== part.id) setNavigationPath(path => [...path, selected]);
+    setRegister(old => ({ ...old, items: [part, ...old.items.filter(item => item.id !== part.id)] }));
     history.pushState(null, "", `#parts/${encodeURIComponent(part.id)}`);
     setSelectedId(part.id); setMode("selected"); setFullDetails(true); setError(""); setNotice("");
+  }
+
+  function backToParent() {
+    setRequestedDetailSection(null);
+    const parent = navigationPath[navigationPath.length - 1];
+    if (!parent) { backToSummary(); return; }
+    setNavigationPath(path => path.slice(0, -1));
+    history.pushState(null, "", `#parts/${encodeURIComponent(parent.id)}`);
+    setSelectedId(parent.id); setMode("selected"); setFullDetails(true); setError(""); setNotice("");
+  }
+
+  function openManufacturingBaseline() {
+    if (!selectedId) return;
+    setRequestedDetailSection({ partId: selectedId, sectionId: "manufacturing-baseline" });
+    openFullDetails();
+  }
+
+  function openComposition() {
+    if (!selectedId) return;
+    setRequestedDetailSection({ partId: selectedId, sectionId: "components" });
+    openFullDetails();
   }
 
   async function openCollision(collision: Preview["collision"][number]) {
@@ -254,68 +332,73 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   </section>;
   return <main className="parts-page">
     <aside className="parts-explorer">
-      <div className="panel-heading"><div><span>Parts explorer</span><small>Stable identity and history</small></div><Tags size={17}/></div>
+      <div className="panel-heading"><div><span>Parts explorer</span><small>Parts and nested assemblies</small></div><Tags size={17}/></div>
       <label className="tree-search"><Search size={14}/><input name="parts-register-search" autoComplete="off" spellCheck={false} autoCapitalize="none" aria-label="Search Parts by number, name or alias" value={query} onChange={event => { setQuery(event.target.value); void refresh(event.target.value); }} placeholder="Search number, name or alias"/></label>
-      <button className="parts-new-button" onClick={startCreate}><Plus size={15}/> New Part</button>
+      <div className="parts-new-actions"><button className="parts-new-button" onClick={() => startCreate("part")}><Plus size={15}/> New Part</button><button className="parts-new-button assembly" onClick={() => startCreate("assembly")}><PackagePlus size={15}/> New Assembly</button></div>
       {loading && <div className="parts-loading"><LoaderCircle className="spin" size={16}/>Loading Parts…</div>}
       {registerRefreshing && !loading && <div className="parts-register-refresh" role="status"><LoaderCircle className="spin" size={14}/>Refreshing Part register from Grist; existing entries are the last confirmed read.</div>}
-      <div className="parts-list-scroll" role="tree" aria-label="Parts by sharing scope and target">
+      <div className="parts-list-scroll" role="tree" aria-label="Parts and assemblies by sharing scope and target">
         {tree.map((entry, index) => <button key={entry.id} type="button" role="treeitem" aria-level={entry.depth + 1}
           aria-expanded={entry.hasChildren ? Boolean(entry.expanded) : undefined} aria-selected={entry.part ? selectedId === entry.part.id && mode === "selected" : undefined}
           data-parts-tree-index={index} className={`parts-tree-row ${entry.kind} ${entry.part && selectedId === entry.part.id && mode === "selected" ? "selected" : ""}`}
           style={{ "--tree-depth": entry.depth } as CSSProperties} onKeyDown={event => treeKeyDown(event, index, entry)}
           onClick={() => entry.part ? selectPart(entry.part) : toggleTree(entry)}>
           {entry.hasChildren ? (entry.expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>) : <span className="parts-tree-spacer"/>}
-          {entry.part ? <span className="parts-tree-part"><span className="parts-row-number">{entry.part.partNumber || "Legacy · unallocated"}</span><strong>{entry.part.name}</strong><small>{entry.part.legacy ? "Legacy · revision unverified" : `Rev A · ${entry.part.status}`}</small></span>
+          {entry.part ? <span className="parts-tree-part"><span className="parts-row-number">{entry.part.partNumber || "Legacy · unallocated"}</span><strong>{entry.part.name}</strong><small>{entry.part.legacy ? "Legacy · revision unverified" : entry.part.identityKind === "assembly" ? `Assembly · Rev A · ${entry.part.status}` : `Part · Rev A · ${entry.part.status}`}</small></span>
             : <><strong>{entry.label}</strong><small>{entry.count ?? 0}</small></>}
         </button>)}
-        {!loading && !allParts.length && <div className="empty"><strong>No Parts found</strong><span>Try another search or create a Part.</span></div>}
+        {!loading && !allParts.length && <div className="empty"><strong>No Parts or assemblies found</strong><span>Try another search or create a managed identity.</span></div>}
       </div>
       <div className="panel-footer"><Archive size={15}/><div><strong>Permanent identity</strong><span>Retired numbers remain reserved</span></div></div>
     </aside>
     <section className="parts-work-panel">
-      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed identity, generated names, metadata history and Rev A.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "view" ? mappingReturn.partId : selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
+      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed Parts and assemblies, manufacturing evidence, and nested composition.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "view" ? mappingReturn.partId : selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
       {error && <div className="parts-error" role="alert">{error}{(metadataAttempt || retireAttempt) && <small>Retry uses the original request key and payload.</small>}</div>}
       {notice && <p className="parts-notice" role="status"><Check size={14}/>{notice}</p>}
-      {mode === "create" ? <PartCreationForm onCreated={created => {
+      {mode === "create" ? <PartCreationForm key={`${creationKind}:${creationFormInstance}`} kind={creationKind} onCreated={created => {
         const part = created as unknown as Part;
-        setSelectedId(part.id); setMode("selected"); setFullDetails(false); setError("");
-        setNotice(`Created ${part.partNumber} · ${part.name} · Rev A.`); setQuery("");
+        const originatingFormIsCurrent = creationFormGeneration.current === creationFormInstance;
+        if (originatingFormIsCurrent) {
+          setSelectedId(part.id); setMode("selected"); setFullDetails(false); setError("");
+          setNavigationPath([]); setQuery("");
+        }
+        setNotice(`${originatingFormIsCurrent ? "Created" : "Created from the earlier request"} ${part.identityKind === "assembly" ? "Assembly" : "Part"} ${part.partNumber} · ${part.name} · Rev A.`);
         setRegister(old => ({ ...old, items: [part, ...old.items.filter(item => item.id !== part.id)] }));
         void refresh("", true);
-      }} onUseExisting={part => selectPart(part as unknown as Part)} onCancel={() => { setMode("selected"); setError(""); }} cancelLabel="Back to Parts"/> : mode === "edit" ? editForm : selected ? <>
-        {fullDetails && <button className="parts-back-link" onClick={backToSummary}><ArrowLeft size={15}/> Back to Parts</button>}
-        <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>{selected.legacy ? "Engineering revision unverified" : "Engineering revision · A"}</span></div></div>
+      }} onUseExisting={part => { if (creationFormGeneration.current === creationFormInstance) selectPart(part as unknown as Part); }} onCancel={() => { setMode("selected"); setError(""); }} cancelLabel="Back to Parts"/> : mode === "edit" ? editForm : selected ? <>
+        {fullDetails && <button className="parts-back-link" onClick={navigationPath.length ? backToParent : backToSummary}><ArrowLeft size={15}/>{navigationPath.length ? `Back to ${navigationPath[navigationPath.length - 1].name}` : "Back to Parts"}</button>}
+        <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : selected.identityKind === "assembly" ? `Assembly · ${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}` : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>{selected.legacy ? "Engineering revision unverified" : "Engineering revision · A"}</span></div></div>
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>
-          <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full Part details</button><button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
-          {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div><div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
+          <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full {selected.identityKind === "assembly" ? "Assembly" : "Part"} details</button>{selected.identityKind === "assembly" ? <button className="button" onClick={openComposition}><PackagePlus size={14}/> Open composition</button> : <><button className="button" onClick={openManufacturingBaseline}><Wrench size={14}/> Manufacturing baseline</button><button className="button" onClick={openMappedWorkbookLines}><FileText size={14}/> Mapped workbook lines</button></>}<button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
+          {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
           {fullDetails && details ? <>
-            <div className="parts-detail-tabs" aria-label="Part detail sections">{["Overview", "Manufacturing baseline", "Intended sharing", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"].map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" aria-controls={id} onClick={() => openPartDetailSection(id)}>{label}</button>; })}</div>
-            <PartDetailSection id="overview" title="Overview" initiallyOpen><dl><div><dt>Part number</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div><div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div><div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></PartDetailSection>
-            <PartDetailSection id="manufacturing-baseline" title="Manufacturing baseline">
+            <div className="parts-detail-tabs" aria-label={`${selected.identityKind === "assembly" ? "Assembly" : "Part"} detail sections`}>{(selected.identityKind === "assembly" ? ["Overview", "Components", "Drawings", "Used in configurations", "History"] : ["Overview", "Manufacturing baseline", "Intended sharing", "Mapped workbook lines", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"]).map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" aria-controls={id} onClick={() => openPartDetailSection(id)}>{label}</button>; })}</div>
+            <PartDetailSection id="overview" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></PartDetailSection>
+            {selected.identityKind === "assembly" ? <PartDetailSection id="manufacturing-baseline" title="Manufacturing baseline"><p>Assembly requirements are represented by its pinned child composition. Workbook mapping, baseline roll-up, and purchased/store composition are deferred.</p></PartDetailSection> : <PartDetailSection id="manufacturing-baseline" title="Accepted Manufacturing baseline">
               {details.manufacturingBaseline?.baseline ? <>
                 <p><strong>Status:</strong> {String(details.manufacturingBaseline.status || "established").replaceAll("_", " ")} · Rev {details.manufacturingBaseline.revisionLabel || "A"} · {details.manufacturingBaseline.revisionLifecycle || "draft"}</p>
                 <p><strong>Originating workbook:</strong> {details.manufacturingBaseline.baseline.WorkbookName} · {details.manufacturingBaseline.baseline.WorkbookPath}</p>
                 <p><strong>Workbook hash:</strong> <code>{details.manufacturingBaseline.sourceHash || details.manufacturingBaseline.baseline.SourceHash}</code></p>
                 <h4>Applicable source requirements</h4>
                 {details.manufacturingBaseline.families?.length ? <ul>{details.manufacturingBaseline.families.map((family: any) => <li key={family.FamilyKey}><strong>{family.Family}</strong> · {family.ApplicabilityStatus?.replaceAll("_", " ")} · {family.SourceEvidenceStatus?.replaceAll("_", " ")} · {family.RequirementCount || 0} requirements · complete {family.CompletenessConfirmed ? "yes" : "no"}</li>)}</ul> : <p>No family applicability records are available.</p>}
-                {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{item.family} · {item.physical?.item_name || item.physical?.plate_part || item.physical?.toolshop_detail || item.lineKey}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small>
+                {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{manufacturingBaselineRequirementTitle(item)}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small>
                   {item.family === "toolshop" && <small>Tool Shop Items Remarks: {item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.toolShopItemsRemarks?.value}</small>}
                   {item.family === "cnc" && <small>Plate Part to Cut: {item.lineDetail?.platePartToCut?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.platePartToCut?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.platePartToCut?.value}</small>}
                 </div><span>{item.revisionKey || "accepted"}</span></article>)}</div> : <p>This Rev A baseline contains no workbook-derived line requirements. Existing child or purchase requirements remain separate.</p>}
                 <p className="parts-help">Baseline publication does not finalize Rev A. Review the definition, then use the Engineering baseline control in History to finalize it. Future physical changes require the approved Change Request flow.</p>
               </> : <p>{details.manufacturingBaseline?.message || "Manufacturing requirements are not yet established. Establish the initial baseline from a complete, explicitly mapped workbook in Part Mapping."}</p>}
-            </PartDetailSection>
+            </PartDetailSection>}
             <IntendedSharingSection part={details.part} state={details.intendedSharing} scopes={scopes} onSaved={reloadSelectedDetails}/>
-            <ProcessLineSection partId={selected.id} state={details.processLines} onSaved={reloadSelectedDetails}/>
+            {selected.identityKind !== "assembly" && <MappedWorkbookLinesSection state={details.mappedLines}/>}
+            {selected.identityKind !== "assembly" && <ProcessLineSection partId={selected.id} state={details.processLines} onSaved={reloadSelectedDetails}/>}
             <ComponentSection partId={selected.id} currentPart={selected} parts={allParts} state={details.components} partState={details.part} onOpen={openNestedPart} onSaved={reloadSelectedDetails}/>
-            <PurchaseDetailSection partId={selected.id} state={details.purchases} onSaved={reloadSelectedDetails}/>
+            {selected.identityKind !== "assembly" && <PurchaseDetailSection partId={selected.id} state={details.purchases} onSaved={reloadSelectedDetails}/>}
             <DrawingSection partId={selected.id} state={details.drawings} onSaved={reloadSelectedDetails}/>
             <UsedInConfigurationsSection state={details.usedIn} intended={details.intendedSharing?.items || []}/>
             <PartDetailSection id="history" title={<><History size={15}/> History</>}><h4>Engineering baseline</h4><p>Rev A · {details.part.compositionStatus || "draft"}. Finalized definitions are physically locked; later engineering revisions require the approved CR process.</p>{details.part.compositionStatus === "draft" && <FinalizeBaseline partId={selected.id} onSaved={reloadSelectedDetails}/>}<h4>Name and scope metadata</h4>{selected.metadataHistory?.map((item: any) => <article className="parts-history-item" key={`${item.part_id}:${item.version}`}><strong>Metadata v{item.version} · {item.display_name}</strong><span>{scopeLabels[item.scope_type as Scope] || item.scope_type} · {item.target_label} · {item.shortcode} · {item.occurred_at}</span><p>{item.description}{item.variant ? ` · ${item.variant}` : ""} · {item.actor} · {item.reason}</p></article>)}{selected.aliases.length > 0 && <p>Previous names searchable as aliases: {selected.aliases.join(" · ")}</p>}<h4>Lifecycle</h4>{details.part.lifecycleHistory?.length ? details.part.lifecycleHistory.map((item: any) => <article className="parts-history-item" key={item.event_id}><strong>{item.event_type} · {item.status}</strong><span>{item.occurred_at}</span><p>{item.actor} · {item.reason}</p></article>) : <p>No lifecycle changes recorded.</p>}<h4>Source and mapping audit</h4>{details.mappingHistory?.length ? details.mappingHistory.map((item: any, index: number) => <article className="parts-history-item" key={`${item.RequestKey}:${index}`}><strong>{item.SheetName} · row {item.SourceRow} · source mapping v{item.Version}</strong><span>{item.SourceHash} · association v{item.AssociationVersion} · {item.OccurredAt}</span><p>{item.Actor} · {item.Reason}</p></article>) : <p>No source mapping history is linked to this stable Part identity yet.</p>}{selected.status === "active" && <div className="parts-retire"><label>Reason for retirement<input value={retireReason} onChange={event => setRetireReason(event.target.value)} disabled={busy}/></label><button className="button" disabled={busy || !retireReason.trim()} onClick={() => void retire()}>{retireAttempt ? "Retry retirement" : "Retire Part"}</button></div>}</PartDetailSection>
           </> : <div className="parts-details-placeholder"><strong>Part summary</strong><span>Open full details for process lines, drawings, explicit code use and history.</span></div>}
         </>}
-      </> : mode === "selected" ? <div className="parts-welcome"><Tags size={25}/><h2>Select a Part</h2><p>Search by number, current name or previous alias, or start a new Part.</p><button className="button primary" onClick={startCreate}><Plus size={14}/> New Part</button></div> : null}
+      </> : mode === "selected" ? <div className="parts-welcome"><Tags size={25}/><h2>Select a Part or assembly</h2><p>Search by permanent number, current name or previous alias, or create a managed identity.</p><div className="parts-welcome-actions"><button className="button primary" onClick={() => startCreate("part")}><Plus size={14}/> New Part</button><button className="button" onClick={() => startCreate("assembly")}><PackagePlus size={14}/> New Assembly</button></div></div> : null}
     </section>
   </main>;
 }
@@ -333,7 +416,7 @@ function buildPartsTree(scopes: ScopeOption[], parts: Part[], expandedState: Rec
   };
   const appendParts = (items: Part[], parentId: string, depth: number) => {
     [...items].sort((a, b) => (a.partNumber || a.name).localeCompare(b.partNumber || b.name)).forEach(part =>
-      output.push({ id: `part:${part.id}`, parentId, label: part.name, depth, kind: "part", part }));
+      output.push({ id: `part:${part.id}`, parentId, label: part.name, depth, kind: part.identityKind === "assembly" ? "assembly" : "part", part }));
   };
   const appendScopeRoot = (scope: Scope | "legacy", label: string, count: number, hasChildren: boolean, children: (rootId: string) => void) => {
     const rootId = `scope:${scope}`;
@@ -440,23 +523,78 @@ function FinalizeBaseline({ partId, onSaved }: { partId: string; onSaved: () => 
 function ComponentSection({ partId, currentPart, parts, state, partState, onOpen, onSaved }: { partId: string; currentPart: Part; parts: Part[]; state: any; partState: any; onOpen: (part: Part) => void; onSaved: () => Promise<void> }) {
   const [open, setOpen] = useState(false);
   const [childPartId, setChildPartId] = useState("");
+  const [childCatalog, setChildCatalog] = useState<Part[]>(parts);
   const [quantity, setQuantity] = useState("1");
   const [uom, setUom] = useState("each");
   const [sourcingRoute, setSourcingRoute] = useState("auto");
   const [reason, setReason] = useState("");
   const [attempt, setAttempt] = useState<Attempt | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [error, setError] = useState("");
+  const isAssembly = currentPart.identityKind === "assembly";
+  const childOptions = childCatalog.filter(part => !part.legacy && part.id !== currentPart.id && part.status !== "retired"
+    && (isAssembly || part.identityKind !== "assembly"));
+  async function openChild(item: any) {
+    if (!item.childPartId || ["unavailable_revision", "unavailable_child"].includes(item.relationshipStatus)) return;
+    let child = parts.find(part => part.id === item.childPartId) || childCatalog.find(part => part.id === item.childPartId);
+    if (!child) {
+      try { child = (await api.partDetails(item.childPartId)).part as Part; }
+      catch (cause) { setError(`This child identity could not be loaded: ${String(cause)}`); return; }
+    }
+    if (child) onOpen(child);
+  }
+  async function toggleEditor() {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    setError("");
+    if (!nextOpen) return;
+    setLoadingCatalog(true);
+    try { const register = await api.parts(""); setChildCatalog(register.items || []); }
+    catch (cause) { setError(`Managed child choices are unavailable: ${String(cause)}`); }
+    finally { setLoadingCatalog(false); }
+  }
   async function save() {
-    const next = attempt || { key: crypto.randomUUID(), payload: { childPartId, quantity: Number(quantity), uom, reason, sourcingRoute } };
+    const next = attempt || { key: crypto.randomUUID(), payload: { childPartId, quantity: Number(quantity), uom, reason, sourcingRoute: isAssembly ? "auto" : sourcingRoute } };
     setAttempt(next); setBusy(true); setError("");
     try { await api.addPartComponent(partId, next.payload, next.key); setAttempt(null); setOpen(false); setReason(""); await onSaved(); }
     catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
   }
-  return <PartDetailSection id="components" title={<><PackagePlus size={15}/> Components</>}>
-    {state?.items?.length ? <div className="parts-linked-items">{state.items.map((item: any) => <article key={item.componentKey}><button className="parts-child-link" onClick={() => { const child = parts.find(part => part.id === item.childPartId); if (child) onOpen(child); }}><strong>{item.childPartNumber} · {item.childName}</strong></button><span>{item.quantity} {item.uom} · Rev {item.childRevisionLabel || "A"} · {item.sourcingRoute === "make" ? "Manufacture" : item.sourcingRoute === "buy" ? "Purchase" : "Configured route"}</span></article>)}</div> : <p>No child Parts are linked. Assemblies and purchased children are optional.</p>}
-    {partState?.compositionStatus === "draft" && <><button className="button" onClick={() => setOpen(value => !value)}>{open ? "Close component form" : "Add child Part"}</button>{open && <div className="parts-capture-grid"><label>Child Part<select value={childPartId} disabled={busy || Boolean(attempt)} onChange={event => setChildPartId(event.target.value)}><option value="">Choose a canonical Part</option>{parts.filter(part => !part.legacy && part.id !== currentPart.id && part.status !== "retired").map(part => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label><label>Quantity per parent<input type="number" min="0.000001" step="any" value={quantity} disabled={busy || Boolean(attempt)} onChange={event => setQuantity(event.target.value)}/></label><label>Unit basis<input value={uom} disabled={busy || Boolean(attempt)} onChange={event => setUom(event.target.value)}/></label><label>Sourcing route<select value={sourcingRoute} disabled={busy || Boolean(attempt)} onChange={event => setSourcingRoute(event.target.value)}><option value="auto">Use configured Part route</option><option value="make">Manufacture this occurrence</option><option value="buy">Purchase this occurrence</option></select></label><label>Reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || (!childPartId && !attempt) || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry same component" : "Save child Part"}</button>{error && <p className="parts-error">{error}</p>}</div>}</>}
+  return <PartDetailSection id="components" title={<><PackagePlus size={15}/> {isAssembly ? "Assembly composition" : "Components"}</>}>
+    {state?.items?.length ? <div className="parts-linked-items">{state.items.map((item: any) => {
+      const childAssembly = item.childIdentityKind === "assembly";
+      const relationAvailable = !["unavailable_revision", "unavailable_child"].includes(item.relationshipStatus) && Boolean(item.childPartId);
+      return <article key={item.componentKey || item.id}><div>{relationAvailable ? <button className="parts-child-link" onClick={() => void openChild(item)}><strong>{item.childPartNumber || "Number unavailable"} · {item.childName || "Name unavailable"}</strong></button> : <strong>{item.childPartNumber || "Unavailable child relationship"} · {item.childName || "Review required"}</strong>}<small>{childAssembly ? "Subassembly" : "Component Part"} · pinned Rev {item.childRevisionLabel || "unknown"} · {item.quantity ?? "quantity unavailable"} {item.uom || "unit unavailable"}</small>{!relationAvailable && <small className="parts-unavailable">{item.relationshipMessage || "This legacy relationship is incomplete and needs review."}</small>}{!isAssembly && <small>{item.sourcingRoute === "make" ? "Manufacture" : item.sourcingRoute === "buy" ? "Purchase" : "Configured route"}</small>}</div></article>;
+    })}</div> : state?.status === "unavailable" || state?.status === "partial" ? <p className="parts-unavailable">{state.message || "Composition could not be read completely."}</p> : <p>{isAssembly ? "This assembly is empty. Add Parts or subassemblies to begin its draft composition." : "No child Parts are linked. Existing Part compositions remain optional."}</p>}
+    {partState?.compositionStatus === "draft" && <><button className="button" onClick={() => void toggleEditor()}>{open ? "Close component form" : isAssembly ? "Add Part or subassembly" : "Add child Part"}</button>{open && <div className="parts-capture-grid"><label>{isAssembly ? "Child Part or assembly" : "Child Part"}<select value={childPartId} disabled={busy || loadingCatalog || Boolean(attempt)} onChange={event => setChildPartId(event.target.value)}><option value="">{loadingCatalog ? "Loading managed identities…" : "Choose an existing managed identity"}</option>{childOptions.map(part => <option key={part.id} value={part.id}>{part.identityKind === "assembly" ? "Assembly · " : "Part · "}{part.partNumber} · {part.name} · Rev {part.engineeringRevision || "A"}</option>)}</select></label><label>Quantity per parent<input type="number" min="0.000001" step="any" value={quantity} disabled={busy || Boolean(attempt)} onChange={event => setQuantity(event.target.value)}/></label><label>Unit of measure<input value={uom} disabled={busy || Boolean(attempt)} onChange={event => setUom(event.target.value)}/></label>{!isAssembly && <label>Sourcing route<select value={sourcingRoute} disabled={busy || Boolean(attempt)} onChange={event => setSourcingRoute(event.target.value)}><option value="auto">Use configured Part route</option><option value="make">Manufacture this occurrence</option><option value="buy">Purchase this occurrence</option></select></label>}<label>Reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || loadingCatalog || (!childPartId && !attempt) || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry same component" : isAssembly ? "Save child identity" : "Save child Part"}</button>{error && <p className="parts-error">{error}</p>}</div>}</>}
+  </PartDetailSection>;
+}
+
+function MappedWorkbookLinesSection({ state }: { state: any }) {
+  const items = state?.items || [];
+  const historical = state?.historical || [];
+  const fieldValue = (field: any) => field.status === "missing" ? "Column not in source" :
+    field.status === "blank" ? "(blank in source)" : field.value;
+  const lineCard = (item: any, historicalItem = false) => <article key={item.key}>
+    <div><strong>{item.family} · {item.description || "Description unavailable"}</strong>
+      <small>{item.workbookPath && item.workbookPath !== item.workbookName ? `${item.workbookName} · ${item.workbookPath}` : item.workbookPath || item.workbookName}</small>
+      <small>{item.sheet} · row {item.row ?? "unavailable"}{item.sourceStatus === "unavailable" ? " · workbook unavailable" : item.sourceStatus === "mapping_unavailable" ? " · mapping evidence unavailable" : ""}</small>
+      {item.details?.length > 0 && <small>{item.details.map((field: any) => `${field.label}: ${fieldValue(field)}`).join(" · ")}</small>}
+      {item.provenance && <small>Saved v{item.provenance.version ?? "unknown"} · {item.provenance.actor || "actor unavailable"} · {item.provenance.reason || "reason unavailable"} · {item.provenance.occurredAt || "date unavailable"}</small>}
+      {historicalItem && item.sourceStatus === "readable_changed" && <small className="parts-unavailable">Saved assignment is historical until the changed source or association is reviewed.</small>}
+      {historicalItem && item.sourceStatus === "readable_removed" && <small className="parts-unavailable">This saved assignment is historical; the source row is no longer in the workbook.</small>}
+      {historicalItem && item.semanticComparison?.message && <small className="parts-unavailable">{item.semanticComparison.message}</small>}
+    </div>
+    <span>{historicalItem ? item.assignmentStatus === "removed_from_source" ? "Removed from source" : item.assignmentStatus === "unverifiable" ? "Unverifiable history" : "Review required" : "Saved mapping"}</span>
+  </article>;
+  return <PartDetailSection id="mapped-workbook-lines" title={<><FileText size={15}/> Mapped workbook lines</>}>
+    <p>Read-only assignments from the latest saved mapping decisions. These assignments remain visible when no manufacturing baseline exists and stay separate from pinned process lines; viewing them does not create or finalize a baseline.</p>
+    {state?.message && <p className={state.status === "partial" || state.status === "unavailable" ? "parts-unavailable" : "parts-help"}>{state.message}</p>}
+    {items.length > 0 && <div className="parts-linked-items">{items.map((item: any) => lineCard(item))}</div>}
+    {historical.length > 0 && <><h4>Historical or changed source evidence</h4><div className="parts-linked-items">{historical.map((item: any) => lineCard(item, true))}</div></>}
+    {!items.length && !historical.length && state?.status === "empty" && <p>No saved workbook lines are assigned to this Part. Mapped workbook lines do not require a manufacturing baseline.</p>}
+    {state?.status === "deferred" && <p>Assembly assignment remains deferred.</p>}
   </PartDetailSection>;
 }
 

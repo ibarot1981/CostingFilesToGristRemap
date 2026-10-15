@@ -221,6 +221,8 @@ class GristLiveCostService:
                 raise PartIdentityError("COST_CONFIGURATION_INPUT_INVALID", "Every unique occurrence needs a saved canonical Part, positive quantity, unit, and auto/make/buy route.")
             seen.add(identity)
             part = parts_by_stable[stable_id]
+            if str(_fields(part).get("IdentityKind") or "part").casefold() == "assembly":
+                raise PartIdentityError("COST_CONFIGURATION_ASSEMBLY_DEFERRED", "Assembly assignment to Model Codes is deferred; choose a managed SM-P Part.")
             if str(_fields(part).get("Status") or "active").casefold() != "active":
                 raise PartIdentityError("COST_CONFIGURATION_PART_INACTIVE", "Retired Parts cannot be added to a current Model Code configuration.")
             selections.append({"selectionIdentity": identity, "partRecordId": int(part["id"]), "partId": stable_id,

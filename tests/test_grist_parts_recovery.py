@@ -100,6 +100,134 @@ class GristPartRecoveryTests(unittest.TestCase):
             description=description, variant=variant, expected_name=f"S1K — {description}" + (f" — {variant}" if variant else ""),
             actor="test operator", reason="isolated recovery test", request_key=request_key, revision_assertion="A")
 
+    def create_assembly(self, registry, *, request_key, description, variant=""):
+        expected_name = f"S1K — {description}" + (f" — {variant}" if variant else "")
+        client_payload = {"scope": "product", "targetId": "17", "description": description, "variant": variant,
+            "expectedName": expected_name, "reason": "isolated assembly test", "identityKind": "assembly"}
+        # The memory Grist fixture supplies the v15 columns through this focused
+        # seam; a separate test asserts production writes fail closed without them.
+        registry._ensure_assembly_schema = lambda: None
+        return registry.create_assembly(scope_type="product", target_id="17", target_label="Safari 1000",
+            description=description, variant=variant, expected_name=expected_name, actor="test operator",
+            reason="isolated assembly test", request_key=request_key, revision_assertion="A",
+            request_payload=client_payload)
+
+    def test_part_and_assembly_number_series_are_independent_and_request_keys_are_typed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            part_one = self.create(registry, request_key="series-part-one", description="Frame", variant="")
+            assembly_one = self.create_assembly(registry, request_key="series-assembly-one", description="Drive Group")
+            part_two = self.create(registry, request_key="series-part-two", description="Bracket", variant="")
+            assembly_two = self.create_assembly(registry, request_key="series-assembly-two", description="Actuator Group")
+
+            self.assertEqual([part_one["part"]["partNumber"], part_two["part"]["partNumber"]], ["SM-P-000001", "SM-P-000002"])
+            self.assertEqual([assembly_one["part"]["partNumber"], assembly_two["part"]["partNumber"]], ["SM-A-000001", "SM-A-000002"])
+            self.assertEqual(assembly_one["part"]["identityKind"], "assembly")
+            self.assertEqual(client.tables["ProductPart"][-1]["fields"]["IdentityKind"], "assembly")
+            self.assertEqual(client.tables["PartRegistryRequest"][-1]["fields"]["IdentityKind"], "assembly")
+
+            part_key = self.create(registry, request_key="cross-kind-key", description="Cross-kind", variant="")["part"]
+            with self.assertRaises(PartIdentityError) as assembly_conflict:
+                self.create_assembly(registry, request_key="cross-kind-key", description="Cross-kind")
+            self.assertEqual(assembly_conflict.exception.code, "PART_REQUEST_CONFLICT")
+            assembly_key = self.create_assembly(registry, request_key="reverse-cross-kind-key", description="Reverse Cross-kind")["part"]
+            with self.assertRaises(PartIdentityError) as part_conflict:
+                self.create(registry, request_key="reverse-cross-kind-key", description="Reverse Cross-kind", variant="")
+            self.assertEqual(part_conflict.exception.code, "PART_REQUEST_CONFLICT")
+            self.assertNotEqual(part_key["partNumber"], assembly_key["partNumber"])
+
+    def test_assembly_create_retry_restart_and_grist_request_journal_recovery_keep_reserved_number(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "parts.sqlite3"
+            client = MemoryGrist()
+            registry = self.make_registry(client, path)
+            client.lose_after_create_table = "PartMetadataVersion"
+            with self.assertRaises(TimeoutError):
+                self.create_assembly(registry, request_key="assembly-recover", description="Recovery Group")
+
+            restarted = self.make_registry(client, path)
+            recovered = self.create_assembly(restarted, request_key="assembly-recover", description="Recovery Group")["part"]
+            self.assertEqual((recovered["partNumber"], recovered["identityKind"], recovered["engineeringRevision"]),
+                ("SM-A-000001", "assembly", "A"))
+            self.assertEqual(len([row for row in client.tables["ProductPart"] if row["fields"].get("IdentityKind") == "assembly"]), 1)
+            self.assertEqual(len([row for row in client.tables["PartMetadataVersion"] if row["fields"].get("ProductPart") == recovered["gristRecordId"]]), 1)
+
+            # Lose only the local request row while retaining its coordinator and
+            # sequence settings, then restore from the durable Grist envelope.
+            with restarted._database() as db:
+                db.execute("DELETE FROM part_registry_reservations WHERE request_key=?", ("assembly-recover",))
+            new_process = self.make_registry(client, path)
+            original_payload = {"scope": "product", "targetId": "17", "description": "Recovery Group", "variant": "",
+                "expectedName": "S1K — Recovery Group", "reason": "isolated assembly test", "identityKind": "assembly"}
+            saved = new_process.prepare_create_recovery("assembly-recover", original_payload, identity_kind="assembly")
+            restored = new_process._local_create_reservation("assembly-recover")
+            self.assertEqual((restored["part_number"], saved["identityKind"]), ("SM-A-000001", "assembly"))
+            repeated = self.create_assembly(new_process, request_key="assembly-recover", description="Recovery Group")
+            self.assertTrue(repeated["idempotent"])
+            following = self.create_assembly(new_process, request_key="assembly-next", description="Next Group")["part"]
+            self.assertEqual(following["partNumber"], "SM-A-000002")
+
+    def test_nested_assemblies_share_parts_reject_cycles_and_obey_revision_locks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            features = GristPartFeatures(registry)
+            root = self.create_assembly(registry, request_key="assembly-root", description="Root Group")["part"]
+            nested = self.create_assembly(registry, request_key="assembly-nested", description="Nested Group")["part"]
+            leaf = self.create(registry, request_key="assembly-leaf", description="Leaf Part", variant="")["part"]
+
+            args = dict(parent_part_id=root["id"], child_part_id=nested["id"], quantity=2, uom="each",
+                actor="reviewer", reason="Nested assembly", request_key="root-nested")
+            first = features.add_component(**args)
+            retry = features.add_component(**args)
+            self.assertEqual(first["id"], retry["id"])
+            self.assertTrue(retry["component"].get("RequestFingerprint"))
+            self.assertEqual(first["components"][0]["childIdentityKind"], "assembly")
+            self.assertEqual(first["components"][0]["quantity"], 2)
+            self.assertEqual(first["components"][0]["childRevisionLabel"], "A")
+            features.add_component(parent_part_id=nested["id"], child_part_id=leaf["id"], quantity=3.5, uom="set",
+                actor="reviewer", reason="Leaf requirement", request_key="nested-leaf")
+
+            invalid_values = (0, -1, float("nan"), float("inf"))
+            for index, value in enumerate(invalid_values):
+                with self.subTest(quantity=value), self.assertRaises(PartIdentityError) as invalid:
+                    features.add_component(parent_part_id=root["id"], child_part_id=leaf["id"], quantity=value, uom="each",
+                        actor="reviewer", reason="Invalid quantity", request_key=f"invalid-{index}")
+                self.assertEqual(invalid.exception.code, "PART_COMPONENT_INPUT_INVALID")
+            for parent, child in ((root, root), (nested, root)):
+                with self.subTest(parent=parent["partNumber"], child=child["partNumber"]), self.assertRaises(PartIdentityError) as cycle:
+                    features.add_component(parent_part_id=parent["id"], child_part_id=child["id"], quantity=1, uom="each",
+                        actor="reviewer", reason="Cycle check", request_key=f"cycle-{parent['partNumber']}")
+                self.assertEqual(cycle.exception.code, "PART_COMPONENT_CYCLE")
+
+            with self.assertRaises(PartIdentityError) as draft_child:
+                features.finalize_revision(part_id=root["id"], actor="reviewer", reason="premature", request_key="finish-root-early")
+            self.assertEqual(draft_child.exception.code, "PART_CHILD_REVISION_DRAFT")
+            features.finalize_revision(part_id=leaf["id"], actor="reviewer", reason="leaf locked", request_key="finish-leaf")
+            features.finalize_revision(part_id=nested["id"], actor="reviewer", reason="nested locked", request_key="finish-nested")
+            features.finalize_revision(part_id=root["id"], actor="reviewer", reason="root locked", request_key="finish-root")
+            self.assertEqual(len(client.tables["PartComponentRevision"]), 2)
+            self.assertEqual(len(features.components(root["id"])), 1)
+            with self.assertRaises(PartIdentityError) as locked:
+                features.add_component(parent_part_id=root["id"], child_part_id=leaf["id"], quantity=1, uom="each",
+                    actor="reviewer", reason="must stay locked", request_key="locked-add")
+            self.assertEqual(locked.exception.code, "PART_REVISION_LOCKED")
+
+    def test_assembly_schema_guard_requires_both_additive_v15_columns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            registry = self.make_registry(MemoryGrist(), Path(temp) / "parts.sqlite3")
+            with mock.patch("app.grist_parts.GristAdminClientShim") as shim_type:
+                shim_type.return_value.list_columns.side_effect = lambda table: (
+                    [{"id": "IdentityKind"}] if table == "ProductPart" else [{"id": "RequestKey"}]
+                )
+                with self.assertRaises(PartIdentityError) as missing:
+                    registry._ensure_assembly_schema()
+            self.assertEqual(missing.exception.code, "PART_ASSEMBLY_SCHEMA_REQUIRED")
+            with mock.patch("app.grist_parts.GristAdminClientShim") as shim_type:
+                shim_type.return_value.list_columns.return_value = [{"id": "IdentityKind"}]
+                registry._ensure_assembly_schema()
+
     def seed_model_codes(self, client):
         client.tables["Product"] = [{"id": 17, "fields": {"Name": "Safari 1000", "Active": True}}]
         client.tables["ProductModel"] = [{"id": 201, "fields": {"Product": 17, "ModelNumber": "S1KHF", "Name": "Safari 1000 HF", "Active": True}}]

@@ -66,6 +66,29 @@ function lineEvidenceContext(rows: SourceRow[]) {
   return JSON.stringify(rows.map(row => ({lineKey:String(row.lineKey), fingerprint:String(row.semanticEvidence!.fingerprint)}))
     .sort((left, right) => left.lineKey.localeCompare(right.lineKey)));
 }
+function sourceColumnFromCell(cell?: string) {
+  const match = /^\$?([A-Z]{1,3})\$?\d+$/i.exec(String(cell || "").trim());
+  return match?.[1].toUpperCase() || null;
+}
+function samePhysicalSourceColumn(rows: SourceRow[], leftKey: string, rightKey: string) {
+  let physicalColumn: string | null = null;
+  let hasProvenance = false;
+  for (const row of rows) {
+    const evidencePairs = [
+      [row.sourceHeaderCells?.[leftKey], row.sourceHeaderCells?.[rightKey]],
+      [row.sourceCells?.[leftKey]?.cell, row.sourceCells?.[rightKey]?.cell],
+    ];
+    for (const [leftCell, rightCell] of evidencePairs) {
+      const leftColumn = sourceColumnFromCell(leftCell);
+      const rightColumn = sourceColumnFromCell(rightCell);
+      if (!leftColumn || !rightColumn) continue;
+      if (leftColumn !== rightColumn || (physicalColumn && physicalColumn !== leftColumn)) return false;
+      physicalColumn = leftColumn;
+      hasProvenance = true;
+    }
+  }
+  return hasProvenance;
+}
 function sheetFamilyClass(sheet: string) {
   return sheet === "5. Material Cut List Price" ? "part-sheet-family-mcl"
     : sheet === "Tool Shop Items" ? "part-sheet-family-toolshop"
@@ -1175,27 +1198,31 @@ function PartSearchCombobox({ group, selected, disabled, path, open, onOpen, onC
 function SourceDetails({ group, expanded, onToggle, selectionMode, selectedLineKeys, onToggleLine, effectivePart, onViewPart }: { group: Group; expanded: boolean; onToggle: () => void; selectionMode: boolean; selectedLineKeys: string[]; onToggleLine: (row: SourceRow) => void; effectivePart: (row: SourceRow) => Part | null; onViewPart: (row: SourceRow) => void }) {
   const columns = sourceFields[group.sheet] || [];
   const compactKeys: Record<string, string[]> = {
-    "5. Material Cut List Price": columns.slice(0, 5).map(column => column.key),
+    "5. Material Cut List Price": columns.slice(0, 4).map(column => column.key),
     "Tool Shop Items": ["item_name", "material_to_cut", "dimension_to_cut_mm", "qty", "toolshop_remarks"],
     "CNC Cut List": columns.slice(0, 5).map(column => column.key),
   };
-  const withoutLegacyRemarksDuplicate = columns.filter(column => !(group.sheet === "Tool Shop Items" && column.key === "toolshop_part_name"
-    && group.rows.some(row => row.sourceHeaders?.toolshop_part_name === "Remarks")));
-  const visibleColumns = (expanded ? withoutLegacyRemarksDuplicate : withoutLegacyRemarksDuplicate.filter(column => (compactKeys[group.sheet] || []).includes(column.key)));
+  const withoutDuplicatePhysicalColumns = columns.filter(column => !(group.sheet === "Tool Shop Items"
+    && ((column.key === "item_name" && samePhysicalSourceColumn(group.rows, "item_name", "material_to_cut"))
+      || (column.key === "toolshop_part_name" && samePhysicalSourceColumn(group.rows, "toolshop_part_name", "toolshop_remarks")))));
+  const withoutInUse = withoutDuplicatePhysicalColumns.filter(column => column.key !== "in_use");
+  const withoutCncDimensions = withoutInUse.filter(column => !(group.sheet === "CNC Cut List"
+    && ["length", "width", "thickness"].includes(column.key)));
+  const visibleColumns = expanded ? withoutCncDimensions : withoutCncDimensions.filter(column => (compactKeys[group.sheet] || []).includes(column.key));
   return <section className={`part-source-details ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
     <div className="part-source-details-heading"><strong>Source evidence</strong><button type="button" className="button quiet" aria-expanded={expanded} onClick={onToggle}>{expanded ? "Show key fields" : "Expand source details"}</button></div>
     {!columns.length ? <p>Source-specific fields are not configured for this sheet.</p> : <div className="part-detail-scroll"><table><thead><tr>{selectionMode && <th>Assign line</th>}{visibleColumns.map(column => {
       const header = group.rows.map(row => row.sourceHeaders?.[column.key]).find(Boolean);
       const available = group.rows.some(row => row.availableFields?.includes(column.key));
       return <th key={column.key} title={header || (available ? column.label : "Column not found in source")}>{header || `${column.label}${available ? "" : " · not found"}`}</th>;
-    })}<th>Source row</th>{selectionMode && <th>Canonical Part</th>}</tr></thead><tbody>{group.rows.map(row => <tr key={`${row.sheet}:${row.row}`} className={selectionMode && selectedLineKeys.includes(String(row.lineKey || "")) ? "is-line-selected" : ""}>{selectionMode && <td className="part-line-select-cell"><input type="checkbox" aria-label={`Select ${group.sheet} row ${row.row} for Part assignment`} checked={selectedLineKeys.includes(String(row.lineKey || ""))} disabled={!row.lineKey} onChange={() => onToggleLine(row)}/></td>}{visibleColumns.map(column => {
+    })}<th>Source row</th><th>Canonical Part</th></tr></thead><tbody>{group.rows.map(row => <tr key={`${row.sheet}:${row.row}`} className={selectionMode && selectedLineKeys.includes(String(row.lineKey || "")) ? "is-line-selected" : ""}>{selectionMode && <td className="part-line-select-cell"><input type="checkbox" aria-label={`Select ${group.sheet} row ${row.row} for Part assignment`} checked={selectedLineKeys.includes(String(row.lineKey || ""))} disabled={!row.lineKey} onChange={() => onToggleLine(row)}/></td>}{visibleColumns.map(column => {
       const value = row.fields?.[column.key];
       const cell = row.sourceCells?.[column.key]?.cell;
       const available = row.availableFields?.includes(column.key);
       return <td className="part-source-value" key={column.key} title={cell ? `Source cell ${cell}${row.sourceHeaders?.[column.key] ? ` · ${row.sourceHeaders[column.key]}` : ""}` : undefined}>
         {value === null || value === undefined || String(value).trim() === "" ? <span className={available ? "part-source-blank" : "part-source-missing"}>{available ? "— blank in source" : "Not in sheet"}</span> : <>{String(value)}{cell && <small className="part-cell-ref">{cell}</small>}</>}
       </td>;
-    })}<td><strong className={`part-sheet-label ${sheetFamilyClass(row.sheet)}`}>{row.sheet}</strong><small>row {row.row}{row.headerRow ? ` · headers row ${row.headerRow}` : ""}</small></td>{selectionMode && <td className="part-line-assignment-cell">{effectivePart(row) ? <><strong>{formatPart(effectivePart(row))}</strong><button type="button" className="button quiet" disabled={!row.reviewed} onClick={() => onViewPart(row)}>View</button></> : row.previousAssignment?.name ? <span className="part-line-prior-proposal">Needs review · proposed {row.previousAssignment.partNumber ? `${row.previousAssignment.partNumber} · ` : ""}{row.previousAssignment.name}</span> : <span className="part-source-blank">Unassigned</span>}{effectivePart(row)?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: {effectivePart(row)!.outOfScopeCodes!.map(code => code.code).join(", ")}</small> : null}{row.lineKey && Object.prototype.hasOwnProperty.call(row, "reviewed") && !row.reviewed && <small>{row.semanticComparison?.status === "ambiguous_correspondence" ? "Ambiguous match · confirm this line" : row.explicitlyUnassigned ? "Explicitly cleared" : "Needs assignment"}</small>}</td>}</tr>)}</tbody></table></div>}
+    })}<td><strong className={`part-sheet-label ${sheetFamilyClass(row.sheet)}`}>{row.sheet}</strong><small>row {row.row}{row.headerRow ? ` · headers row ${row.headerRow}` : ""}</small></td><td className="part-line-assignment-cell">{effectivePart(row) ? <><strong>{formatPart(effectivePart(row))}</strong><button type="button" className="button quiet" disabled={!row.reviewed} onClick={() => onViewPart(row)}>View</button></> : row.previousAssignment?.name ? <span className="part-line-prior-proposal">Needs review · proposed {row.previousAssignment.partNumber ? `${row.previousAssignment.partNumber} · ` : ""}{row.previousAssignment.name}</span> : <span className="part-source-blank">Unassigned</span>}{effectivePart(row)?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: {effectivePart(row)!.outOfScopeCodes!.map(code => code.code).join(", ")}</small> : null}{row.lineKey && Object.prototype.hasOwnProperty.call(row, "reviewed") && !row.reviewed && <small>{row.semanticComparison?.status === "ambiguous_correspondence" ? "Ambiguous match · confirm this line" : row.explicitlyUnassigned ? "Explicitly cleared" : "Needs assignment"}</small>}</td></tr>)}</tbody></table></div>}
     {expanded && <p className="part-source-note">Values and units are copied from the saved workbook. Blank or unavailable values remain blank; source text is displayed as text. CR Log is source evidence only.</p>}
   </section>;
 }

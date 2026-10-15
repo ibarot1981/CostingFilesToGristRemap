@@ -117,6 +117,17 @@ it("uses a sheet-specific label and shows bounded source values with workbook pr
   expect(screen.getByText("row 42 · headers row 8")).toBeTruthy();
 });
 
+it("keeps Canonical Part visible before, during, and after line selection mode", async () => {
+  render(<PartMappingView path="pilot.ods"/>);
+  await expandGroup();
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Split assignments"}));
+  expect(screen.getByRole("checkbox", {name:"Select 5. Material Cut List Price row 10 for Part assignment"})).toBeTruthy();
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Done selecting"}));
+  expect(screen.getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+});
+
 it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-family treatments", async () => {
   const toolGroup = group("toolshop-jig", "Tool Shop Items", "Inspection jig", 18, {rows:[
     {sheet:"Tool Shop Items",row:18,fields:{item_name:"Jig",material_to_cut:"Steel",dimension_to_cut_mm:"80",qty:"1",toolshop_remarks:"Deburr\ninside",job_remarks:"Job only"},
@@ -163,6 +174,142 @@ it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-fa
   fireEvent.click(within(cncToggle.closest(".part-source-group")!).getByRole("button", {name:"Expand source details"}));
   expect(screen.getByRole("columnheader", {name:"Plate Part to Cut"})).toBeTruthy();
   expect(screen.getByText("Plate flange source")).toBeTruthy();
+});
+
+it("hides CNC dimensions from compact and expanded Part Mapping details without changing line assignment evidence", async () => {
+  const cncGroup = group("cnc-dimensions", "CNC Cut List", "Frame", 42, {rows:[
+    {sheet:"CNC Cut List",row:42,fields:{product_part_name:"Plate flange",part_category:"Frame",material_to_cut:"MS Plate",
+      length:"120",width:"60",thickness:"3",qty:"2",part_weight_kg:"12",total_weight_kg:"24",optional_item_group_1:"Laser"},
+      sourceHeaders:{product_part_name:"Plate Part to Cut",part_category:"Part Category",material_to_cut:"Material used",length:"Length",
+        width:"Width",thickness:"Thickness",qty:"Qty Of Part Used",part_weight_kg:"Per Part Weight (Kg)",
+        total_weight_kg:"Total Weight (Kgs)",optional_item_group_1:"Item Group 1",in_use:"In Use"},
+      sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:"C8",length:"D8",width:"E8",thickness:"F8",qty:"G8",
+        part_weight_kg:"H8",total_weight_kg:"I8",optional_item_group_1:"J8",in_use:"K8"},
+      sourceCells:{product_part_name:{cell:"A42"},part_category:{cell:"B42"},material_to_cut:{cell:"C42"},length:{cell:"D42"},width:{cell:"E42"},
+        thickness:{cell:"F42"},qty:{cell:"G42"},part_weight_kg:{cell:"H42"},total_weight_kg:{cell:"I42"},optional_item_group_1:{cell:"J42"},in_use:{cell:"K42"}},
+      headerRow:8,availableFields:["product_part_name","part_category","material_to_cut","length","width","thickness","qty",
+        "part_weight_kg","total_weight_kg","optional_item_group_1","in_use"]},
+  ]});
+  mocks.partMappings.mockResolvedValue(detail([cncGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 1 of 1 source groups");
+  await expandGroup("Frame");
+
+  const card = screen.getByText("Frame").closest(".part-source-group") as HTMLElement;
+  const table = () => card.querySelector(".part-source-details table") as HTMLTableElement;
+  const assertDimensionsHidden = (current: HTMLTableElement) => {
+    for (const name of ["Length", "Width", "Thickness"]) {
+      expect(within(current).queryByRole("columnheader", {name})).toBeNull();
+    }
+    for (const value of ["120", "60", "3"]) expect(within(current).queryByText(value)).toBeNull();
+    for (const cell of ["D42", "E42", "F42"]) expect(current.querySelector(`[title^="Source cell ${cell}"]`)).toBeNull();
+  };
+  const compactTable = table();
+  assertDimensionsHidden(compactTable);
+  for (const name of ["Plate Part to Cut", "Material used", "Source row", "Canonical Part"]) {
+    expect(within(compactTable).getByRole("columnheader", {name})).toBeTruthy();
+  }
+  expect(within(compactTable).getByText("Plate flange")).toBeTruthy();
+  expect(within(compactTable).getByText("A42")).toBeTruthy();
+
+  fireEvent.click(within(card).getByRole("button", {name:"Split assignments"}));
+  const lineCheckbox = within(card).getByRole("checkbox", {name:"Select CNC Cut List row 42 for Part assignment"}) as HTMLInputElement;
+  fireEvent.click(lineCheckbox);
+  expect(lineCheckbox.checked).toBe(true);
+  expect(within(card).getByRole("combobox", {name:"Canonical Part for 1 selected lines"})).toBeTruthy();
+  assertDimensionsHidden(table());
+
+  fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
+  const expandedTable = table();
+  assertDimensionsHidden(expandedTable);
+  for (const name of ["Qty Of Part Used", "Per Part Weight (Kg)", "Total Weight (Kgs)", "Item Group 1", "Source row", "Canonical Part"]) {
+    expect(within(expandedTable).getByRole("columnheader", {name})).toBeTruthy();
+  }
+  expect(within(expandedTable).getByText("12")).toBeTruthy();
+  expect(within(expandedTable).getByText("24")).toBeTruthy();
+  expect(cncGroup.rows[0].fields.length).toBe("120");
+  expect(cncGroup.rows[0].sourceCells.length.cell).toBe("D42");
+});
+
+it("deduplicates Tool Shop columns only with physical provenance and hides In Use in every source table mode", async () => {
+  const toolAlias = group("tool-alias", "Tool Shop Items", "Aliased tool", 18, {rows:[
+    {sheet:"Tool Shop Items",row:18,fields:{item_name:"MS Plate",material_to_cut:"MS Plate",dimension_to_cut_mm:"80",qty:"1",in_use:"Yes",
+      toolshop_remarks:"Deburr",toolshop_part_name:"Deburr"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",dimension_to_cut_mm:"Dimension (mm)",qty:"Quantity",in_use:"In Use",
+        toolshop_remarks:"Remarks",toolshop_part_name:"Remarks"},
+      sourceHeaderCells:{item_name:"$C$7",material_to_cut:"C8",dimension_to_cut_mm:"D7",qty:"E7",in_use:"F7",toolshop_remarks:"G7",toolshop_part_name:"G8"},
+      sourceCells:{item_name:{cell:"C18"},material_to_cut:{cell:"C18"},in_use:{cell:"F18"},toolshop_remarks:{cell:"G18"},toolshop_part_name:{cell:"G18"}},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use","toolshop_remarks","toolshop_part_name"]},
+  ]});
+  const toolDistinct = group("tool-distinct", "Tool Shop Items", "Distinct columns", 19, {rows:[
+    {sheet:"Tool Shop Items",row:19,fields:{item_name:"Bearing",material_to_cut:"MS Plate",dimension_to_cut_mm:"50",qty:"2",in_use:"Yes",
+      toolshop_remarks:"Deburr",toolshop_part_name:"Legacy note"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",dimension_to_cut_mm:"Dimension (mm)",qty:"Quantity",in_use:"In Use",
+        toolshop_remarks:"Remarks",toolshop_part_name:"Remarks"},
+      sourceHeaderCells:{item_name:"B7",material_to_cut:"C7",dimension_to_cut_mm:"D7",qty:"E7",in_use:"F7",toolshop_remarks:"G7",toolshop_part_name:"H7"},
+      sourceCells:{item_name:{cell:"B19"},material_to_cut:{cell:"C19"},in_use:{cell:"F19"},toolshop_remarks:{cell:"G19"},toolshop_part_name:{cell:"H19"}},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use","toolshop_remarks","toolshop_part_name"]},
+  ]});
+  const toolIncomplete = group("tool-incomplete", "Tool Shop Items", "Incomplete provenance", 20, {rows:[
+    {sheet:"Tool Shop Items",row:20,fields:{item_name:"Cable tray",material_to_cut:"MS Plate",dimension_to_cut_mm:"50",qty:"2",in_use:"Yes"},
+      sourceHeaders:{item_name:"Material Used",material_to_cut:"Material Used",in_use:"In Use"},sourceHeaderCells:{},sourceCells:{},headerRow:7,
+      availableFields:["item_name","material_to_cut","dimension_to_cut_mm","qty","in_use"]},
+  ]});
+  const cncGroup = group("cnc-frame", "CNC Cut List", "Frame", 42);
+  const mclGroup = group("mcl-frame", "5. Material Cut List Price", "MS frame", 11);
+  mocks.partMappings.mockResolvedValue(detail([mclGroup,toolAlias,toolDistinct,toolIncomplete,cncGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 5 of 5 source groups");
+  for (const label of ["MS frame", "Aliased tool", "Distinct columns", "Incomplete provenance", "Frame"]) await expandGroup(label);
+
+  const cardFor = (label: string) => screen.getByText(label).closest(".part-source-group") as HTMLElement;
+  const tableFor = (label: string) => cardFor(label).querySelector(".part-source-details table") as HTMLTableElement;
+  const aliasTable = tableFor("Aliased tool");
+  const distinctTable = tableFor("Distinct columns");
+  const incompleteTable = tableFor("Incomplete provenance");
+  expect(within(aliasTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(1);
+  expect(within(distinctTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(incompleteTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(aliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  expect(within(distinctTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  expect(within(incompleteTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  for (const label of ["MS frame", "Frame"]) {
+    expect(within(tableFor(label)).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  }
+  expect(within(aliasTable).getByText("MS Plate")).toBeTruthy();
+  expect(within(distinctTable).getByText("Bearing")).toBeTruthy();
+  expect(within(distinctTable).getByText("MS Plate")).toBeTruthy();
+  expect(within(incompleteTable).getByText("Cable tray")).toBeTruthy();
+  expect(within(incompleteTable).getByText("MS Plate")).toBeTruthy();
+  for (const table of [aliasTable, distinctTable, incompleteTable, tableFor("MS frame"), tableFor("Frame")]) {
+    expect(within(table).getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  }
+
+  for (const label of ["MS frame", "Frame"]) {
+    fireEvent.click(within(cardFor(label)).getByRole("button", {name:"Expand source details"}));
+    expect(within(tableFor(label)).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  }
+
+  const aliasCard = cardFor("Aliased tool");
+  fireEvent.click(within(aliasCard).getByRole("button", {name:"Expand source details"}));
+  const expandedAliasTable = tableFor("Aliased tool");
+  expect(within(expandedAliasTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(1);
+  expect(within(expandedAliasTable).getAllByRole("columnheader", {name:"Remarks"})).toHaveLength(1);
+  expect(within(expandedAliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+  const distinctCard = cardFor("Distinct columns");
+  fireEvent.click(within(distinctCard).getByRole("button", {name:"Expand source details"}));
+  const expandedDistinctTable = tableFor("Distinct columns");
+  expect(within(expandedDistinctTable).getAllByRole("columnheader", {name:"Material Used"})).toHaveLength(2);
+  expect(within(expandedDistinctTable).getAllByRole("columnheader", {name:"Remarks"})).toHaveLength(2);
+  expect(within(expandedDistinctTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
+
+  fireEvent.click(within(aliasCard).getByRole("button", {name:"Split assignments"}));
+  const lineCheckbox = within(aliasCard).getByRole("checkbox", {name:"Select Tool Shop Items row 18 for Part assignment"}) as HTMLInputElement;
+  expect(lineCheckbox.checked).toBe(false);
+  fireEvent.click(lineCheckbox);
+  expect(lineCheckbox.checked).toBe(true);
+  expect(within(expandedAliasTable).getByRole("columnheader", {name:"Canonical Part"})).toBeTruthy();
+  expect(within(expandedAliasTable).queryByRole("columnheader", {name:"In Use"})).toBeNull();
 });
 
 it("saves only one group, retries the identical request, and reloads saved state", async () => {
