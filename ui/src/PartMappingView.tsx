@@ -1206,7 +1206,9 @@ function SourceDetails({ group, expanded, onToggle, selectionMode, selectedLineK
     && ((column.key === "item_name" && samePhysicalSourceColumn(group.rows, "item_name", "material_to_cut"))
       || (column.key === "toolshop_part_name" && samePhysicalSourceColumn(group.rows, "toolshop_part_name", "toolshop_remarks")))));
   const withoutInUse = withoutDuplicatePhysicalColumns.filter(column => column.key !== "in_use");
-  const visibleColumns = expanded ? withoutInUse : withoutInUse.filter(column => (compactKeys[group.sheet] || []).includes(column.key));
+  const withoutCncDimensions = withoutInUse.filter(column => !(group.sheet === "CNC Cut List"
+    && ["length", "width", "thickness"].includes(column.key)));
+  const visibleColumns = expanded ? withoutCncDimensions : withoutCncDimensions.filter(column => (compactKeys[group.sheet] || []).includes(column.key));
   return <section className={`part-source-details ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
     <div className="part-source-details-heading"><strong>Source evidence</strong><button type="button" className="button quiet" aria-expanded={expanded} onClick={onToggle}>{expanded ? "Show key fields" : "Expand source details"}</button></div>
     {!columns.length ? <p>Source-specific fields are not configured for this sheet.</p> : <div className="part-detail-scroll"><table><thead><tr>{selectionMode && <th>Assign line</th>}{visibleColumns.map(column => {

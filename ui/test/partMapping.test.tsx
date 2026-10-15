@@ -176,6 +176,61 @@ it("shows Tool Shop Remarks and CNC plate text per line with accessible sheet-fa
   expect(screen.getByText("Plate flange source")).toBeTruthy();
 });
 
+it("hides CNC dimensions from compact and expanded Part Mapping details without changing line assignment evidence", async () => {
+  const cncGroup = group("cnc-dimensions", "CNC Cut List", "Frame", 42, {rows:[
+    {sheet:"CNC Cut List",row:42,fields:{product_part_name:"Plate flange",part_category:"Frame",material_to_cut:"MS Plate",
+      length:"120",width:"60",thickness:"3",qty:"2",part_weight_kg:"12",total_weight_kg:"24",optional_item_group_1:"Laser"},
+      sourceHeaders:{product_part_name:"Plate Part to Cut",part_category:"Part Category",material_to_cut:"Material used",length:"Length",
+        width:"Width",thickness:"Thickness",qty:"Qty Of Part Used",part_weight_kg:"Per Part Weight (Kg)",
+        total_weight_kg:"Total Weight (Kgs)",optional_item_group_1:"Item Group 1",in_use:"In Use"},
+      sourceHeaderCells:{product_part_name:"A8",part_category:"B8",material_to_cut:"C8",length:"D8",width:"E8",thickness:"F8",qty:"G8",
+        part_weight_kg:"H8",total_weight_kg:"I8",optional_item_group_1:"J8",in_use:"K8"},
+      sourceCells:{product_part_name:{cell:"A42"},part_category:{cell:"B42"},material_to_cut:{cell:"C42"},length:{cell:"D42"},width:{cell:"E42"},
+        thickness:{cell:"F42"},qty:{cell:"G42"},part_weight_kg:{cell:"H42"},total_weight_kg:{cell:"I42"},optional_item_group_1:{cell:"J42"},in_use:{cell:"K42"}},
+      headerRow:8,availableFields:["product_part_name","part_category","material_to_cut","length","width","thickness","qty",
+        "part_weight_kg","total_weight_kg","optional_item_group_1","in_use"]},
+  ]});
+  mocks.partMappings.mockResolvedValue(detail([cncGroup]));
+  render(<PartMappingView path="pilot.ods"/>);
+  await screen.findByText("Showing 1 of 1 source groups");
+  await expandGroup("Frame");
+
+  const card = screen.getByText("Frame").closest(".part-source-group") as HTMLElement;
+  const table = () => card.querySelector(".part-source-details table") as HTMLTableElement;
+  const assertDimensionsHidden = (current: HTMLTableElement) => {
+    for (const name of ["Length", "Width", "Thickness"]) {
+      expect(within(current).queryByRole("columnheader", {name})).toBeNull();
+    }
+    for (const value of ["120", "60", "3"]) expect(within(current).queryByText(value)).toBeNull();
+    for (const cell of ["D42", "E42", "F42"]) expect(current.querySelector(`[title^="Source cell ${cell}"]`)).toBeNull();
+  };
+  const compactTable = table();
+  assertDimensionsHidden(compactTable);
+  for (const name of ["Plate Part to Cut", "Material used", "Source row", "Canonical Part"]) {
+    expect(within(compactTable).getByRole("columnheader", {name})).toBeTruthy();
+  }
+  expect(within(compactTable).getByText("Plate flange")).toBeTruthy();
+  expect(within(compactTable).getByText("A42")).toBeTruthy();
+
+  fireEvent.click(within(card).getByRole("button", {name:"Split assignments"}));
+  const lineCheckbox = within(card).getByRole("checkbox", {name:"Select CNC Cut List row 42 for Part assignment"}) as HTMLInputElement;
+  fireEvent.click(lineCheckbox);
+  expect(lineCheckbox.checked).toBe(true);
+  expect(within(card).getByRole("combobox", {name:"Canonical Part for 1 selected lines"})).toBeTruthy();
+  assertDimensionsHidden(table());
+
+  fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
+  const expandedTable = table();
+  assertDimensionsHidden(expandedTable);
+  for (const name of ["Qty Of Part Used", "Per Part Weight (Kg)", "Total Weight (Kgs)", "Item Group 1", "Source row", "Canonical Part"]) {
+    expect(within(expandedTable).getByRole("columnheader", {name})).toBeTruthy();
+  }
+  expect(within(expandedTable).getByText("12")).toBeTruthy();
+  expect(within(expandedTable).getByText("24")).toBeTruthy();
+  expect(cncGroup.rows[0].fields.length).toBe("120");
+  expect(cncGroup.rows[0].sourceCells.length.cell).toBe("D42");
+});
+
 it("deduplicates Tool Shop columns only with physical provenance and hides In Use in every source table mode", async () => {
   const toolAlias = group("tool-alias", "Tool Shop Items", "Aliased tool", 18, {rows:[
     {sheet:"Tool Shop Items",row:18,fields:{item_name:"MS Plate",material_to_cut:"MS Plate",dimension_to_cut_mm:"80",qty:"1",in_use:"Yes",
