@@ -116,8 +116,11 @@ beforeEach(() => {
   apiMocks.parts.mockImplementation(async () => ({items: [newPart], legacyItems: []}));
   apiMocks.partNamePreview.mockResolvedValue({name: newPart.name, available: true, collision: []});
   apiMocks.createManagedPart.mockResolvedValue({part: newPart, idempotent: false});
-  apiMocks.partDetails.mockResolvedValue({part: newPart, manufacturingBaseline: {status: "not_established"}, intendedSharing: {items: []},
-    processLines: {items: []}, components: {items: []}, purchases: {items: []}, drawings: {items: []}, usedIn: {items: []}});
+  apiMocks.partDetails.mockImplementation(async (id: string) => {
+    const selectedPart = [...existingParts, newPart].find(item => item.id === id) || newPart;
+    return {part: selectedPart, manufacturingBaseline: {status: "not_established"}, intendedSharing: {items: []},
+      processLines: {items: []}, components: {items: []}, purchases: {items: []}, drawings: {items: []}, usedIn: {items: []}};
+  });
 });
 
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});

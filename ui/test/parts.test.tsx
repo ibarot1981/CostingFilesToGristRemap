@@ -686,8 +686,13 @@ it("requires an explicit workbook when several associated sources are available 
   mocks.mappedFiles.mockResolvedValue({items:[
     {file:{relative_path:"pilot-a.ods",name:"pilot-a.ods"},association:{product_name:"Safari",model_name:"Model A"}},
     {file:{relative_path:"pilot-b.ods",name:"pilot-b.ods"},association:{product_name:"Safari",model_name:"Model B"}},
+    {file:{relative_path:"unrelated.ods",name:"unrelated.ods"},association:{product_name:"Safari",model_name:"Other Model"}},
     {file:{relative_path:"missing.ods",name:"missing.ods"},association:{product_name:"Safari",model_name:"Missing Model"},issues:["missing_file"]},
   ]});
+  mocks.partDetails.mockResolvedValue({...details, mappedLines:{status:"available",historical:[],items:[
+    {workbookPath:"pilot-a.ods",assignmentStatus:"current",sourceStatus:"readable"},
+    {workbookPath:"pilot-b.ods",assignmentStatus:"current",sourceStatus:"readable"},
+  ]}});
   const review = vi.fn();
   render(<PartsView onReviewBaseline={review}/>);
   await screen.findByRole("treeitem", {name:/Product Model/});
@@ -700,8 +705,50 @@ it("requires an explicit workbook when several associated sources are available 
   await waitFor(() => expect((source as HTMLSelectElement).options).toHaveLength(3));
   expect((source as HTMLSelectElement).value).toBe("");
   expect(Array.from((source as HTMLSelectElement).options).some(option => option.value === "missing.ods")).toBe(false);
+  expect(Array.from((source as HTMLSelectElement).options).some(option => option.value === "unrelated.ods")).toBe(false);
   expect((screen.getByRole("button", {name:"Review this Part in the selected workbook"}) as HTMLButtonElement).disabled).toBe(true);
   fireEvent.change(source,{target:{value:"pilot-b.ods"}});
   fireEvent.click(screen.getByRole("button", {name:"Review this Part in the selected workbook"}));
   expect(review).toHaveBeenCalledWith("part-uuid",expect.objectContaining({id:"part-uuid",name:part.name}),"pilot-b.ods");
+});
+
+it("explains when the selected Part has no current mapped workbook source", async () => {
+  mocks.mappedFiles.mockResolvedValue({items:[
+    {file:{relative_path:"unrelated.ods",name:"unrelated.ods"},association:{product_name:"Safari",model_name:"Model B"}},
+  ]});
+  mocks.partDetails.mockResolvedValue({...details, mappedLines:{status:"empty",items:[],historical:[],message:"No saved workbook line assignments are linked to this Part."}});
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+
+  const source = await screen.findByRole("combobox", {name:"Source workbook for Part baseline review"});
+  expect((source as HTMLSelectElement).disabled).toBe(true);
+  expect(screen.getByText(/No current saved workbook line assignments are linked to this Part/)).toBeTruthy();
+  expect(mocks.mappedFiles).not.toHaveBeenCalled();
+});
+
+it("reloads selected Part details on return to Parts while keeping the current detail section open", async () => {
+  const baseline = {status:"not_established",baseline:null,requirements:[],families:[],message:"No baseline yet."};
+  mocks.partDetails.mockResolvedValueOnce({...details, manufacturingBaseline:baseline})
+    .mockResolvedValue({...details, manufacturingBaseline:{...baseline,status:"established",baseline:{WorkbookName:"pilot.ods",WorkbookPath:"pilot.ods",SourceHash:"fresh"},requirements:[{key:"fresh-requirement"}]}});
+  const view = render(<PartsView active/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+  await waitFor(() => expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement).open).toBe(true));
+  await screen.findByText("No baseline yet.");
+
+  view.rerender(<PartsView active={false}/>);
+  view.rerender(<PartsView active/>);
+  await waitFor(() => expect(mocks.partDetails).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("established")).toBeTruthy();
+  expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement).open).toBe(true);
+  expect(screen.getByRole("heading", {name:part.name})).toBeTruthy();
 });
