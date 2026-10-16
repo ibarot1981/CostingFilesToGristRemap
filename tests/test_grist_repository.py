@@ -62,6 +62,64 @@ class FakeGristClient:
 
 
 class GristRepositoryTests(unittest.TestCase):
+    def test_model_code_description_and_creation_round_trip_without_changing_identity_or_associations(self) -> None:
+        import app.web as web
+
+        client = FakeGristClient()
+        client.tables["CostingFile"] = [{"id": 90, "fields": {
+            "RelativePath": "model.ods", "NormalizedPath": "model.ods", "Name": "model.ods",
+            "Extension": ".ods", "SizeBytes": 10, "FileHash": "workbook-sha", "MappingStatus": "mapped",
+        }}]
+        client.tables["FileModelAssociation"] = [{"id": 91, "fields": {
+            "CostingFile": 90, "Product": 1, "ProductModel": 2, "Actor": "owner", "Reason": "Existing association",
+            "CreatedAt": 1789812000.0, "Active": True, "Version": 1,
+        }}]
+        client.tables["FileCodeAssociation"] = [{"id": 92, "fields": {
+            "Association": 91, "CostingFile": 90, "ProductModelCode": 3, "Actor": "owner",
+            "CreatedAt": 1789812000.0, "Active": True,
+        }}]
+        original_model_links = json.dumps(client.tables["FileModelAssociation"], sort_keys=True)
+        original_code_links = json.dumps(client.tables["FileCodeAssociation"], sort_keys=True)
+        repository = GristSafariRepository(client=client)
+
+        with mock.patch.object(web, "_repository", repository):
+            updated = web.update_model_code_description("3", {"description": "Hydraulic actuator", "expectedDescription": ""})
+            created = web.create_model_code("2", {"code": "ACTUATOR-2", "description": "Secondary actuator"})
+
+        self.assertEqual(updated["id"], "3")
+        self.assertEqual(updated["model_id"], "2")
+        self.assertEqual(updated["code"], "CODE-A")
+        self.assertEqual(updated["description"], "Hydraulic actuator")
+        self.assertEqual(created["code"], "ACTUATOR-2")
+        self.assertEqual(created["description"], "Secondary actuator")
+        self.assertEqual(created["model_id"], "2")
+        self.assertEqual(client.tables["ProductModelCode"][0]["fields"]["Code"], "CODE-A")
+        self.assertEqual(client.tables["ProductModelCode"][0]["fields"]["Description"], "Hydraulic actuator")
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(client.created[0][0], "ProductModelCode")
+        self.assertEqual(client.updated, [("ProductModelCode", {"id": 3, "fields": {"Description": "Hydraulic actuator"}})])
+        self.assertEqual(json.dumps(client.tables["FileModelAssociation"], sort_keys=True), original_model_links)
+        self.assertEqual(json.dumps(client.tables["FileCodeAssociation"], sort_keys=True), original_code_links)
+
+        reloaded = GristSafariRepository(client=client)
+        saved_original = reloaded.codes["3"]
+        saved_new = reloaded.codes[created["id"]]
+        self.assertEqual((saved_original.code, saved_original.description, saved_original.model_id),
+            ("CODE-A", "Hydraulic actuator", "2"))
+        self.assertEqual((saved_new.code, saved_new.description, saved_new.model_id),
+            ("ACTUATOR-2", "Secondary actuator", "2"))
+        self.assertEqual(reloaded.current_code_owner("3").id, "fca:92")
+        self.assertEqual({item.id for item in reloaded.list_codes("2")}, {"3", "4", created["id"]})
+
+        write_count = (len(client.created), len(client.updated))
+        with self.assertRaisesRegex(GovernanceConflict, "already exists"):
+            reloaded.create_model_code("2", " code-a ", "Duplicate normalized identity")
+        with self.assertRaisesRegex(GovernanceConflict, "description is required"):
+            reloaded.create_model_code("2", "ACTUATOR-3", "   ")
+        with self.assertRaisesRegex(GovernanceConflict, "changed after it was loaded"):
+            reloaded.update_model_code_description("3", "Stale overwrite", expected_description="Old value")
+        self.assertEqual((len(client.created), len(client.updated)), write_count)
+
     def test_costing_acceptance_persists_gated_snapshot_change_audit_and_reloads(self) -> None:
         client = FakeGristClient()
         repository = GristSafariRepository(client=client)

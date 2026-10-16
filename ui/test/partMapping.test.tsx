@@ -206,6 +206,8 @@ it("hides CNC dimensions from compact and expanded Part Mapping details without 
   };
   const compactTable = table();
   assertDimensionsHidden(compactTable);
+  expect(card.querySelector(".part-source-details")?.classList.contains("cnc")).toBe(true);
+  expect(compactTable.querySelector('th[data-source-field="product_part_name"]')).toBeTruthy();
   for (const name of ["Plate Part to Cut", "Material used", "Source row", "Canonical Part"]) {
     expect(within(compactTable).getByRole("columnheader", {name})).toBeTruthy();
   }
@@ -222,6 +224,8 @@ it("hides CNC dimensions from compact and expanded Part Mapping details without 
   fireEvent.click(within(card).getByRole("button", {name:"Expand source details"}));
   const expandedTable = table();
   assertDimensionsHidden(expandedTable);
+  expect(expandedTable.querySelector('th[data-source-field="qty"]')).toBeTruthy();
+  expect(expandedTable.querySelector('td[data-source-field="qty"]')).toBeTruthy();
   for (const name of ["Qty Of Part Used", "Per Part Weight (Kg)", "Total Weight (Kgs)", "Item Group 1", "Source row", "Canonical Part"]) {
     expect(within(expandedTable).getByRole("columnheader", {name})).toBeTruthy();
   }
@@ -229,6 +233,18 @@ it("hides CNC dimensions from compact and expanded Part Mapping details without 
   expect(within(expandedTable).getByText("24")).toBeTruthy();
   expect(cncGroup.rows[0].fields.length).toBe("120");
   expect(cncGroup.rows[0].sourceCells.length.cell).toBe("D42");
+});
+
+it("opens the dedicated baseline workspace from the toolbar with the first mapped Part selected", async () => {
+  const saved = group("saved-frame", "CNC Cut List", "Frame", 42, {reviewed:true,part:chassis});
+  mocks.partMappings.mockResolvedValue(detail([saved],{parts:[chassis]}));
+  const openReview = vi.fn();
+  render(<PartMappingView path="pilot.ods" onReviewBaselines={openReview}/>);
+  await screen.findByText("Showing 1 of 1 source groups");
+  const button = await screen.findByRole("button",{name:"Review manufacturing baselines"});
+  expect((button as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(button);
+  expect(openReview).toHaveBeenCalledWith("pilot.ods","part-1");
 });
 
 it("deduplicates Tool Shop columns only with physical provenance and hides In Use in every source table mode", async () => {

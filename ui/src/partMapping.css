@@ -19,7 +19,8 @@
 .part-mapping-summary>div:last-child { border-right: 0; }
 .part-mapping-summary strong { color: #34435a; font-size: 16px; }
 .part-mapping-summary span { color: #788395; font-size: 9px; }
-.part-mapping-toolbar { max-width: 1480px; margin: 10px auto 5px; display: grid; grid-template-columns: minmax(220px,1fr) minmax(190px,.55fr) minmax(190px,.55fr) auto; align-items: end; gap: 10px; }
+.part-mapping-toolbar { max-width: 1480px; margin: 10px auto 5px; display: grid; grid-template-columns: minmax(220px,1fr) minmax(190px,.55fr) minmax(190px,.55fr) auto auto; align-items: end; gap: 10px; }
+.part-baseline-launcher { min-height: 34px; white-space: nowrap; }
 .part-group-expansion-actions { display: flex; justify-content: flex-end; gap: 5px; }
 .part-group-expansion-actions .button { padding: 7px 9px; font-size: 9px; white-space: nowrap; }
 .part-mapping-toolbar label,.part-sticky-save label,.part-combobox-label { display: grid; gap: 4px; color: #637086; font-size: 10px; font-weight: 600; }
@@ -71,6 +72,14 @@
 .part-source-details td { min-width: 75px; padding: 5px 7px; color: #48566b; border-bottom: 1px solid #eceef1; font-size: 10px; overflow-wrap: anywhere; vertical-align: top; }
 .part-source-details td.part-source-value { white-space: pre-wrap; overflow-wrap: anywhere; }
 .part-source-details td:last-child,.part-source-details th:last-child { width: 140px; }
+.part-source-details.cnc th[data-source-field="product_part_name"],.part-source-details.cnc td[data-source-field="product_part_name"] { width: 25%; min-width: 190px; }
+.part-source-details.cnc th[data-source-field="part_category"],.part-source-details.cnc td[data-source-field="part_category"] { width: 10%; min-width: 100px; }
+.part-source-details.cnc th[data-source-field="material_to_cut"],.part-source-details.cnc td[data-source-field="material_to_cut"] { width: 15%; min-width: 130px; }
+.part-source-details.cnc th[data-source-field="qty"],.part-source-details.cnc td[data-source-field="qty"] { width: 7%; min-width: 74px; }
+.part-source-details.cnc th[data-source-field="part_weight_kg"],.part-source-details.cnc td[data-source-field="part_weight_kg"] { width: 8%; min-width: 86px; }
+.part-source-details.cnc th[data-source-field="total_weight_kg"],.part-source-details.cnc td[data-source-field="total_weight_kg"] { width: 9%; min-width: 90px; }
+.part-source-details.cnc th[data-source-field="optional_item_group_1"],.part-source-details.cnc td[data-source-field="optional_item_group_1"] { width: 10%; min-width: 100px; }
+.part-source-details.cnc th[data-source-field="qty"],.part-source-details.cnc th[data-source-field="part_weight_kg"],.part-source-details.cnc th[data-source-field="total_weight_kg"] { overflow-wrap: normal; word-break: normal; }
 .part-source-details tbody tr:last-child td { border-bottom: 0; }
 .part-source-details td small,.part-cell-ref { display: block; margin-top: 2px; color: #8a94a2; font-size: 8px; }
 .part-source-blank,.part-source-missing { color: #969daa; font-style: italic; }
@@ -146,6 +155,8 @@
   .part-group-heading-copy>strong { display: block; margin: 6px 0 0; overflow-wrap: anywhere; }
   .part-detail-scroll { overflow-x: auto; }
   .part-source-details table { min-width: 590px; table-layout: auto; }
+  .part-source-details.cnc .part-detail-scroll { overflow-x: auto; }
+  .part-source-details.cnc table { min-width: 1040px; table-layout: fixed; }
   .part-sticky-save { grid-template-columns: 1fr auto; gap: 7px; padding: 8px; }
   .part-sticky-save>small { grid-column: 1 / -1; }
   .part-sticky-save .button { grid-column: 2; grid-row: 1; white-space: normal; }
@@ -204,7 +215,7 @@
 .part-error-banner span { overflow-wrap: anywhere; }
 .part-notice.compact { flex: none; max-width: none; margin: 2px 0 5px; padding: 5px 8px; font-size: 10px; }
 .part-loading-status { flex: none; margin: 3px 0 6px; color: #758092; font-size: 10px; }
-.part-mapping-toolbar { flex: none; max-width: none; margin: 2px 0 5px; grid-template-columns: minmax(200px,1.2fr) minmax(150px,.65fr) minmax(160px,.65fr) auto; gap: 7px; }
+.part-mapping-toolbar { flex: none; max-width: none; margin: 2px 0 5px; grid-template-columns: minmax(200px,1.2fr) minmax(150px,.65fr) minmax(160px,.65fr) auto auto; gap: 7px; }
 .part-mapping-toolbar label { min-width: 0; }
 .part-mapping-toolbar input,.part-mapping-toolbar select { font-size: 11px; }
 .part-group-expansion-actions .button { font-size: 9px; }
@@ -274,7 +285,7 @@
   .part-heading-compact .workbench-actions { width: 100%; justify-content: flex-start; }
   .part-heading-compact p { max-width: 92vw; }
   .part-mapping-toolbar { grid-template-columns: 1fr 1fr; }
-  .part-mapping-toolbar .part-search-label,.part-group-expansion-actions { grid-column: 1/-1; }
+  .part-mapping-toolbar .part-search-label,.part-baseline-launcher,.part-group-expansion-actions { grid-column: 1/-1; }
   .part-group-header-controls { grid-template-columns: 1fr; }
   .part-group-actions { display: flex; justify-content: flex-start; }
   .part-group-actions .button { min-height: 36px; padding: 7px 9px; font-size: 10px; }
@@ -287,7 +298,7 @@
 }
 @media(max-width:430px) {
   .part-mapping-toolbar { grid-template-columns: 1fr; }
-  .part-mapping-toolbar .part-search-label,.part-group-expansion-actions { grid-column: auto; }
+  .part-mapping-toolbar .part-search-label,.part-baseline-launcher,.part-group-expansion-actions { grid-column: auto; }
   .part-group-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
   .part-group-actions .button { justify-content: center; white-space: normal; }
   .part-sticky-save { grid-template-columns: 1fr; }

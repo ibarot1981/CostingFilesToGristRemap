@@ -8,6 +8,7 @@ import { NormalizedView } from "./NormalizedView";
 import { ModelCodeExplorer } from "./ModelCodeExplorer";
 import { LiveCostView } from "./LiveCostView";
 import { PartMappingView } from "./PartMappingView";
+import { PartBaselineWorkspace } from "./PartBaselineWorkspace";
 import { PartsView } from "./PartsView";
 import { ProcessingPanel } from "./ProcessingPanel";
 import "./normalized.css";
@@ -17,14 +18,16 @@ import type { AssociationValidation, CatalogSummary, ExplorerItem, MappedFile, M
 
 type TreeMap = Record<string, ExplorerItem[]>;
 type ExplorerSearch = { tree: TreeMap; total: number; itemCount: number; source?: "filesystem" | "cached-report" };
-type PartMappingReturn = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string };
+type PartMappingReturn = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string; lineKeys?: string[]; selectedLineEvidenceFingerprint?: string };
+type BaselineReviewRoute = { path: string; initialPartId: string; initialPart?: import("./PartMappingView").Part | null; returnView: "parts" | "mapping" };
 const emptyValidation: AssociationValidation = { valid: false, errors: [], warnings: [] };
 
 export function App() {
-  const [view, setView] = useState<"explorer" | "preview" | "costing" | "mapped" | "reconciliation" | "normalized" | "models" | "parts" | "mapping" | "live-cost">(window.location.hash.startsWith("#parts") ? "parts" : "explorer");
+  const [view, setView] = useState<"explorer" | "preview" | "costing" | "mapped" | "reconciliation" | "normalized" | "models" | "parts" | "mapping" | "baseline-review" | "live-cost">(window.location.hash.startsWith("#parts") ? "parts" : "explorer");
   const [partsVisited, setPartsVisited] = useState(window.location.hash.startsWith("#parts"));
   const [mappingVisited, setMappingVisited] = useState(false);
   const [partMappingReturn, setPartMappingReturn] = useState<PartMappingReturn | null>(null);
+  const [baselineReviewRoute, setBaselineReviewRoute] = useState<BaselineReviewRoute | null>(null);
   const [summary, setSummary] = useState<CatalogSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [models, setModels] = useState<ProductModel[]>([]);
@@ -235,16 +238,22 @@ export function App() {
     {error && <div className="error-banner"><AlertTriangle size={16}/><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}><X size={15}/></button></div>}
     {notice && <div className="notice-banner"><Check size={16}/>{notice}</div>}
     {view === "mapped" ? <MappedView rows={mapped} onSelect={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
-    : view === "models" ? <ModelCodeExplorer products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
+    : view === "models" ? <ModelCodeExplorer products={products} writeEnabled={adapter === "grist-safari"} onCatalogChanged={changed => {
+      if (!modelId || changed.model_id !== modelId) return;
+      void api.codes(modelId).then(next => setCodes(next.active)).catch(cause => setError(message(cause)));
+    }} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
     : view === "live-cost" ? <LiveCostView products={products}/>
+    : view === "baseline-review" && baselineReviewRoute ? <PartBaselineWorkspace path={baselineReviewRoute.path} initialPartId={baselineReviewRoute.initialPartId} initialPart={baselineReviewRoute.initialPart || null} returnLabel={baselineReviewRoute.returnView === "mapping" ? "Return to Part Mapping" : "Return to Parts"}
+        onBack={() => { const destination = baselineReviewRoute.returnView; setBaselineReviewRoute(null); setView(destination); }}
+        onUseDifferentPart={request => { const context = request.context as Partial<PartMappingReturn>; setPartMappingReturn({ path: baselineReviewRoute.path, groupKey: request.groupKey, partId: request.part.id, mode: "select", ...context }); setMappingVisited(true); setBaselineReviewRoute(null); setView("mapping"); }}/>
     : view === "preview" ? <main className="workbook-preview-tab"><PreviewPanel selectedFile={selectedFile} preview={preview} previewing={previewing} refreshing={refreshingPreview} refreshExternalLinks={() => void refreshExternalLinks()} chooseSheet={(sheet) => void chooseSheet(sheet)} summary={null}/></main>
     : view === "parts" || view === "mapping" ? null
     : view === "normalized" ? <NormalizedView selectedPath={selectedFile?.relative_path || ""} onReconcile={() => setView("costing")}/>
     : view === "costing" ? <CostingReviewView selectedPath={selectedFile?.relative_path || ""} selectedName={selectedFile?.name || ""}/>
     : view === "reconciliation" ? <ReconciliationView products={products} onOpenFile={(path) => { setView("explorer"); void chooseFile({ id: path, name: path.split("/").pop() || path, type: "file", relative_path: path, extension: ".ods" }); }}/>
     : <main className="workspace"><Explorer tree={explorerTree} expanded={explorerExpanded} visibleRoot={visibleRoot} filter={filter} setFilter={setFilter} statusFilter={statusFilter} setStatusFilter={setStatusFilter} typeFilter={typeFilter} setTypeFilter={setTypeFilter} classificationFilter={classificationFilter} setClassificationFilter={setClassificationFilter} matchesExplorer={visibleExplorerItem} toggleFolder={(path) => void toggleFolder(path)} chooseFile={(item) => void chooseFile(item)} selectedPath={selectedPath} summary={summary} searchPending={searchPending} searchTotal={searchResults?.total ?? null} searchItemCount={searchResults?.itemCount ?? 0} searchSource={searchResults?.source}/><AssociationPanel selectedFile={selectedFile} savedAssociation={savedAssociation} associationLoading={associationLoading} previewing={previewing || associationLoading || !savedAssociation} products={products} models={models} codes={codes} productId={productId} modelId={modelId} selectedCodes={selectedCodes} reason={reason} supersede={supersede} validation={validation} requestKeyReady={Boolean(requestKey)} busy={busy} setReason={(value) => { invalidateAssociation(); setReason(value); }} setSupersede={(value) => { invalidateAssociation(); setSupersede(value); }} loadModels={(id) => void loadModels(id)} loadCodes={(id) => void loadCodes(id)} toggleCode={(id) => { invalidateAssociation(); setSelectedCodes((old) => old.includes(id) ? old.filter((item) => item !== id) : [...old, id]); }} validate={() => void validate()} save={() => void save()}/><PreviewPanel selectedFile={selectedFile} preview={preview} previewing={previewing} refreshing={refreshingPreview} refreshExternalLinks={() => void refreshExternalLinks()} chooseSheet={(sheet) => void chooseSheet(sheet)} summary={summary}/></main>}
-    {partsVisited && <div ref={partsViewWrapper} className="app-cached-view" hidden={view !== "parts"} aria-hidden={view !== "parts"}><PartsView active={view === "parts"} mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setMappingVisited(true); setView("mapping"); }}/></div>}
-    {mappingVisited && <div ref={mappingViewWrapper} className="app-cached-view" hidden={view !== "mapping"} aria-hidden={view !== "mapping"}><PartMappingView active={view === "mapping"} path={selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onOpenParts={(groupKey, partId, mode = "select", context = {}) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId, mode, ...context }); setPartsVisited(true); setView("parts"); }}/></div>}
+    {partsVisited && <div ref={partsViewWrapper} className="app-cached-view" hidden={view !== "parts"} aria-hidden={view !== "parts"}><PartsView active={view === "parts"} mappingReturn={partMappingReturn} onReturnToMapping={(partId) => { setPartMappingReturn(old => old ? { ...old, partId: partId || old.partId } : null); setMappingVisited(true); setView("mapping"); }} onReviewBaseline={(partId, part, path) => { setBaselineReviewRoute({ path, initialPartId: partId, initialPart: part, returnView: "parts" }); setView("baseline-review"); }}/></div>}
+    {mappingVisited && <div ref={mappingViewWrapper} className="app-cached-view" hidden={view !== "mapping"} aria-hidden={view !== "mapping"}><PartMappingView active={view === "mapping"} path={(view === "mapping" && partMappingReturn?.path) || selectedFile?.relative_path || ""} returnSelection={partMappingReturn} onReturnSelectionConsumed={() => setPartMappingReturn(null)} onReviewBaselines={(path, initialPartId) => { setBaselineReviewRoute({ path, initialPartId, returnView: "mapping" }); setView("baseline-review"); }} onOpenParts={(groupKey, partId, mode = "select", context = {}) => { const path = selectedFile?.relative_path || ""; setPartMappingReturn({ path, groupKey, partId, mode, ...context }); setPartsVisited(true); setView("parts"); }}/></div>}
   </div>;
 }
 

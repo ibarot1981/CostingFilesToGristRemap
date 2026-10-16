@@ -151,7 +151,7 @@ it("retains an uncertain baseline publication identity and blocks competing acti
   const saved = JSON.parse(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1") || "null");
   expect(saved).toMatchObject({operation:"establish",partId:"part-1",key:"request-1"});
   expect(screen.getByRole("button", {name:"Retry baseline publication"}).hasAttribute("disabled")).toBe(false);
-  expect(screen.queryByRole("button", {name:"Compare incoming workbook"})).toBeNull();
+  expect((screen.getByRole("button", {name:"Compare incoming workbook"}) as HTMLButtonElement).disabled).toBe(true);
   first.unmount();
 
   renderPanel();
@@ -163,6 +163,15 @@ it("retains an uncertain baseline publication identity and blocks competing acti
   expect(apiMocks.establishPartBaseline).toHaveBeenCalledTimes(2);
   expect(apiMocks.establishPartBaseline.mock.calls[1]).toEqual(apiMocks.establishPartBaseline.mock.calls[0]);
   expect(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1")).toBeNull();
+});
+
+it("keeps establishment visible but disabled after a baseline is accepted, with a clear next action", async () => {
+  apiMocks.partBaselineReview.mockResolvedValue(review("established"));
+  renderPanel();
+  await openAndReview();
+  expect((screen.getByRole("button", {name:"Establish Part baseline"}) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText(/A Rev A baseline already exists/)).toBeTruthy();
+  expect((screen.getByRole("button", {name:"Compare incoming workbook"}) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it("keeps an uncertain comparison's exact request through reload and retries it", async () => {

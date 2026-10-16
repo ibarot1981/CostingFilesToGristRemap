@@ -163,7 +163,7 @@ export function LiveCostView({ products }: { products: Product[] }) {
     <div className="live-code-selectors">
       <label>Product<select value={productId} onChange={event => { setProductId(event.target.value); setModelId(""); setCodeId(""); }}><option value="">Select Product</option>{products.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
       <label>Product Model<select value={modelId} disabled={!productId} onChange={event => { setModelId(event.target.value); setCodeId(""); }}><option value="">Select Model</option>{models.map(item => <option value={item.id} key={item.id}>{item.model_number} {item.name}</option>)}</select></label>
-      <label>Model Code<select value={codeId} disabled={!modelId} onChange={event => setCodeId(event.target.value)}><option value="">Select Code</option>{codes.map(item => <option value={item.id} key={item.id}>{item.code} {item.description}</option>)}</select></label>
+      <label>Model Code<select value={codeId} disabled={!modelId} onChange={event => setCodeId(event.target.value)}><option value="">Select Code</option>{codes.map(item => <option value={item.id} key={item.id}>{item.code} · {item.description || "No description"}</option>)}</select></label>
       <button className="button" disabled={!codeId || busy} onClick={() => void refreshCode()}>Refresh Live Cost</button>
     </div>
     {error && <div role="alert" className="live-error">{error}</div>}{notice && <div role="status" className="live-notice">{notice}</div>}
