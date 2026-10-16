@@ -212,6 +212,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   const acceptedMappingRef = useRef({ path, detail, loading, createOrigin });
   acceptedMappingRef.current = { path, detail, loading, createOrigin };
   const generation = useRef(0);
+  const detailPath = useRef("");
   const inFlight = useRef(false);
   const tableScroll = useRef<HTMLDivElement>(null);
   const contextPanel = useRef<HTMLElement>(null);
@@ -374,7 +375,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         onReturnSelectionConsumed?.();
       }
       if (revision !== generation.current) return;
-      setDecisions(nextDecisions); setDraftParts(nextParts); setLineDecisions(nextLineDecisions); setLineDraftParts(nextLineParts); setDetail(result);
+      setDecisions(nextDecisions); setDraftParts(nextParts); setLineDecisions(nextLineDecisions); setLineDraftParts(nextLineParts); detailPath.current = path; setDetail(result);
     } catch (cause) { if (revision === generation.current) { setDetail(null); setError(String(cause)); } }
     finally { if (revision === generation.current) setLoading(false); }
   }
@@ -385,6 +386,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     const revision = ++generation.current;
     const returningToSamePath = loadedPath.current === path && Boolean(detail);
     if (!returningToSamePath) {
+      detailPath.current = "";
       setDetail(null); setDecisions({}); setDraftParts({}); setLineDecisions({}); setLineDraftParts({}); setSelectedLineKeys([]); setSplitModes({}); setLineReasons({}); setDeletedLineReasons({}); setStaleDrafts([]); setReason("");
       setGroupReasons({}); setExpandedGroups({}); setExpanded({}); setNotice(""); setError(""); setBusy(false);
       setMappingAttempt(null); setConfirmBatch(false); inFlight.current = false;
@@ -394,7 +396,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }, [path, active]);
 
   useEffect(() => {
-    if (!detail || !path) return;
+    if (!detail || !path || detailPath.current !== path) return;
     const saved: Draft = { path, sourceHash: detail.sourceHash, version: detail.version, associationKey: detail.associationKey,
       associationVersion: detail.associationVersion, decisions, draftParts, lineDecisions, lineDraftParts, selectedLineKeys, splitModes, lineReasons,
       groupReasons, expandedGroups, expandedSourceDetails: expanded, reason, query, sheetFilter, reviewFilter,
