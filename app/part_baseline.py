@@ -780,23 +780,23 @@ class PartBaselineService:
             current = current_by_id.get(part_id)
             expected_snapshot = str(item.get("snapshotKey") or "")
             if not current or not expected_snapshot:
-                results.append({"partId": part_id, "status": "blocked", "message": "This Part was not present in the reviewed workbook preview."})
+                results.append({"partId": part_id, "status": "blocked", "message": "This Part was not present in the reviewed workbook preview.", "retryable": False})
                 continue
             request_key = f"workbook-baseline:{_digest([file_id, batch_request_key, part_id])}"
             same_request = self._workbook_request_exists(part_id, request_key)
             if current["snapshotKey"] != expected_snapshot and not same_request:
                 results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
-                    "status": "blocked", "message": "This Part's revision, baseline or saved source-line evidence changed after preview."})
+                    "status": "blocked", "message": "This Part's revision, baseline or saved source-line evidence changed after preview.", "retryable": False})
                 continue
             if current["status"] != "ready" and not same_request:
                 results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
                     "status": "blocked", "message": "This Part is no longer ready for initial baseline establishment.",
-                    "blockers": current.get("blockers") or [current["status"].replace("_", " ")]})
+                    "blockers": current.get("blockers") or [current["status"].replace("_", " ")], "retryable": False})
                 continue
             append_existing = bool(item.get("appendExisting"))
             if current.get("existingContent", {}).get("requiresAppendConfirmation") and not append_existing and not same_request:
                 results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
-                    "status": "blocked", "message": "Review the existing Rev A content and explicitly confirm appending before continuing."})
+                    "status": "blocked", "message": "Review the existing Rev A content and explicitly confirm appending before continuing.", "retryable": False})
                 continue
             try:
                 result = self.establish(part_id=part_id, file_id=file_id, workbook_name=workbook_name,
@@ -814,11 +814,28 @@ class PartBaselineService:
                 is_stale = code in {"PART_BASELINE_STALE", "PART_BASELINE_EXISTS"}
                 if code == "PART_BASELINE_STALE":
                     stale_mid_batch = True
-                retryable_codes = {"PART_BASELINE_WRITE_UNCONFIRMED", "PART_BASELINE_RECOVERY_REQUIRED",
-                    "TimeoutError", "ConnectionError", "OSError"}
+                # Keep the saved batch identity whenever the outcome may be
+                # uncertain. This includes the real Grist adapter's GristError
+                # and unexpected failures after the durable request reservation.
+                # Only explicit validation/consent rejections with no matching
+                # request reservation are safe to discard and edit.
+                safe_to_discard_codes = {
+                    "PART_BASELINE_INPUT_REQUIRED", "PART_BASELINE_STALE", "PART_BASELINE_EXISTS",
+                    "PART_BASELINE_RECOVERY_BLOCKED", "PART_REVISION_LOCKED", "PART_BASELINE_INCOMPLETE",
+                    "PART_BASELINE_REQUIREMENTS_INCOMPLETE", "PART_BASELINE_JOIN_CONFIRMATION_REQUIRED",
+                }
+                try:
+                    request_reserved = (same_request or not self._table_available("PartRegistryRequest")
+                        or self._workbook_request_exists(part_id, request_key))
+                except Exception:
+                    # If Grist is unavailable, the server cannot prove the
+                    # request was not reserved, so preserve the original key.
+                    request_reserved = True
+                safe_to_discard = (isinstance(exc, PartIdentityError)
+                    and code in safe_to_discard_codes and not request_reserved)
                 results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
                     "status": "blocked" if is_stale else "failed", "message": str(exc),
-                    "code": code or type(exc).__name__, "retryable": (code or type(exc).__name__) in retryable_codes})
+                    "code": code or type(exc).__name__, "retryable": not safe_to_discard})
             if stale_mid_batch:
                 break
         if stale_mid_batch:
@@ -827,7 +844,22 @@ class PartBaselineService:
                 if part_id not in processed:
                     current = current_by_id.get(part_id, {})
                     results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
-                        "status": "blocked", "message": "The workbook or saved mappings changed during confirmation. Refresh before continuing."})
+                        "status": "blocked", "message": "The workbook or saved mappings changed during confirmation. Refresh before continuing.", "retryable": False})
+        submitted_ids = set(requested_by_id)
+        for part in preview["parts"]:
+            part_id = part["id"]
+            if part_id in submitted_ids:
+                continue
+            if part["status"] == "already_established":
+                results.append({"partId": part_id, "partNumber": part.get("partNumber"), "name": part.get("name"),
+                    "status": "already_established", "message": "An existing baseline was retained and not overwritten.", "retryable": False})
+            elif part["status"] != "ready":
+                blockers = list(part.get("blockers") or [])
+                message = "This Part remains blocked and was not included in workbook confirmation."
+                if blockers:
+                    message = f"{message} {' '.join(str(item) for item in blockers)}"
+                results.append({"partId": part_id, "partNumber": part.get("partNumber"), "name": part.get("name"),
+                    "status": "blocked", "message": message, "blockers": blockers, "retryable": False})
         failed = any(item["status"] == "failed" for item in results)
         blocked = any(item["status"] == "blocked" for item in results)
         successful = all(item["status"] in {"established", "already_established"} for item in results)

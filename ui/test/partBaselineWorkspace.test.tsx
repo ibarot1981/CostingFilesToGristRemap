@@ -70,7 +70,37 @@ it("shows a workbook preview, requires existing-content consent, and confirms ev
   expect(onReviewPendingRow).toHaveBeenCalledWith(expect.objectContaining({row:17,lineKey:"mcl-line-17"}),expect.objectContaining({sourceHash:"source-hash",mappingVersion:4}));
 });
 
-it("keeps the same bulk idempotency key after a lost response and prevents duplicate submit", async () => {
+it("reports blocked and retained Parts truthfully when no source rows are pending", async () => {
+  const mixed = preview();
+  mixed.parts = [
+    mixed.parts[0],
+    {...mixed.parts[1],id:"part-retained",partNumber:"SM-P-000004",name:"Retained baseline",status:"already_established"},
+    {...mixed.parts[2],id:"part-blocked",partNumber:"SM-P-000005",name:"Blocked guard",status:"blocked"},
+  ];
+  mixed.pendingRows = [];
+  mixed.counts = {mappedParts:3,readyParts:1,alreadyEstablishedParts:1,blockedParts:1,pendingRows:0};
+  mixed.workbookComplete = false;
+  mocks.partBaselineWorkbookPreview.mockResolvedValueOnce(mixed);
+  mocks.confirmWorkbookPartBaselines.mockResolvedValueOnce({status:"partial",totalSuccess:false,results:[
+    {partId:"part-1",status:"established"},
+    {partId:"part-retained",status:"already_established",message:"An existing baseline was retained and not overwritten."},
+    {partId:"part-blocked",status:"blocked",message:"The finalized Part remains blocked."},
+  ],pendingRows:[],workbookComplete:false});
+  render(<PartBaselineWorkspace path="pilot.ods" initialPartId="part-1" returnLabel="Return to Part Mapping" onBack={() => {}} onUseDifferentPart={() => {}} onReviewPendingRow={() => {}}/>);
+  await screen.findByRole("heading",{name:"Confirm manufacturing baselines"});
+  expect(screen.getAllByText("1",{selector:".baseline-bulk-counts strong"})).toHaveLength(3);
+  const previewCounts = screen.getByLabelText("Workbook baseline preview counts").textContent || "";
+  expect(previewCounts).toMatch(/1already established/);
+  expect(previewCounts).toMatch(/1blocked/);
+  fireEvent.click(screen.getByRole("button",{name:"Confirm 1 ready baseline"}));
+  await screen.findByText("1 Part baseline(s) established; 1 already established (retained); 1 blocked; 0 failed; 0 source row(s) remain for review.");
+  expect(screen.getByText("Workbook baseline confirmation needs review")).toBeTruthy();
+  expect(screen.queryByText("Workbook baseline confirmation complete")).toBeNull();
+  expect(screen.getByText(/An existing baseline was retained and not overwritten/)).toBeTruthy();
+  expect(screen.getByText(/The finalized Part remains blocked/)).toBeTruthy();
+});
+
+it("keeps the same bulk idempotency key after an uncertain response and workspace re-entry", async () => {
   let resolveRequest: ((value: unknown) => void) | undefined;
   mocks.confirmWorkbookPartBaselines.mockImplementationOnce(() => new Promise(resolve => {resolveRequest = resolve;}));
   render(<PartBaselineWorkspace path="pilot.ods" initialPartId="part-1" returnLabel="Return to Part Mapping" onBack={() => {}} onUseDifferentPart={() => {}} onReviewPendingRow={() => {}}/>);
@@ -81,11 +111,18 @@ it("keeps the same bulk idempotency key after a lost response and prevents dupli
   fireEvent.click(confirm);
   expect(mocks.confirmWorkbookPartBaselines).toHaveBeenCalledTimes(1);
   const firstCall = mocks.confirmWorkbookPartBaselines.mock.calls[0];
-  resolveRequest?.({status:"partial",totalSuccess:false,results:[{partId:"part-1",status:"established"},{partId:"part-2",status:"failed",retryable:true}],pendingRows:preview().pendingRows,workbookComplete:false});
+  resolveRequest?.({status:"partial",totalSuccess:false,results:[{partId:"part-1",status:"established"},{partId:"part-2",status:"failed",code:"GristError",retryable:true}],pendingRows:preview().pendingRows,workbookComplete:false});
   await screen.findByRole("button",{name:"Retry same confirmation"});
+  const savedAttempt = JSON.parse(localStorage.getItem("workbook-baseline-confirm-attempt:pilot.ods") || "null");
+  expect(savedAttempt).toMatchObject({key:firstCall[1],payload:firstCall[0]});
+  cleanup();
+  render(<PartBaselineWorkspace path="pilot.ods" initialPartId="part-1" returnLabel="Return to Part Mapping" onBack={() => {}} onUseDifferentPart={() => {}} onReviewPendingRow={() => {}}/>);
+  await screen.findByRole("button",{name:"Retry same confirmation"});
+  expect(JSON.parse(localStorage.getItem("workbook-baseline-confirm-attempt:pilot.ods") || "null")).toEqual(savedAttempt);
   fireEvent.click(screen.getByRole("button",{name:"Retry same confirmation"}));
   await waitFor(() => expect(mocks.confirmWorkbookPartBaselines).toHaveBeenCalledTimes(2));
   expect(mocks.confirmWorkbookPartBaselines.mock.calls[1]).toEqual(firstCall);
+  await waitFor(() => expect(localStorage.getItem("workbook-baseline-confirm-attempt:pilot.ods")).toBeNull());
 });
 
 it("drops a stale bulk attempt and refreshes evidence before allowing another confirmation", async () => {

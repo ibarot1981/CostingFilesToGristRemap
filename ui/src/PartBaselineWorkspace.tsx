@@ -161,8 +161,13 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
     try {
       const result = await api.confirmWorkbookPartBaselines(attempt.payload, attempt.key) as BulkResult;
       setBulkResult(result);
-      const hasRetryableFailure = result.results.some(item => item.status === "failed" && item.retryable !== false);
-      if (!hasRetryableFailure) {
+      const outcomes = Array.isArray(result.results) ? result.results : [];
+      const hasUncertainOutcome = outcomes.length === 0 || outcomes.some(item => {
+        if (["established", "already_established"].includes(item.status)) return false;
+        if (["failed", "blocked"].includes(item.status)) return item.retryable !== false;
+        return true;
+      });
+      if (!hasUncertainOutcome) {
         localStorage.removeItem(bulkAttemptKey(path));
         setBulkAttempt(null);
       }
@@ -249,7 +254,7 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
         {bulkError && <p className="baseline-bulk-error" role="alert">{bulkError}</p>}
         {bulkResult && <div className={`baseline-bulk-results ${bulkResult.totalSuccess ? "is-success" : "is-partial"}`} role="status" aria-live="polite">
           <strong>{bulkResult.totalSuccess ? "Workbook baseline confirmation complete" : "Workbook baseline confirmation needs review"}</strong>
-          <span>{bulkResult.results.filter(item => item.status === "established").length} Part baseline(s) established; {bulkResult.results.filter(item => item.status === "blocked").length} blocked; {bulkResult.results.filter(item => item.status === "failed").length} failed; {bulkResult.pendingRows?.length || 0} source row(s) remain for review.</span>
+          <span>{bulkResult.results.filter(item => item.status === "established").length} Part baseline(s) established; {bulkResult.results.filter(item => item.status === "already_established").length} already established (retained); {bulkResult.results.filter(item => item.status === "blocked").length} blocked; {bulkResult.results.filter(item => item.status === "failed").length} failed; {bulkResult.pendingRows?.length || 0} source row(s) remain for review.</span>
           <ul>{bulkResult.results.map((item,index) => <li key={`${item.partId}:${index}`}><strong>{item.partNumber || item.name || item.partId}</strong> · {baselineLabel(item.status)}{item.message ? ` · ${item.message}` : ""}</li>)}</ul>
           {!bulkResult.workbookComplete && <small>The mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed.</small>}
         </div>}

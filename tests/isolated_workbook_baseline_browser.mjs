@@ -9,19 +9,37 @@ try {
   const blockedPage=await browser.newPage({viewport:{width:1280,height:900}});
   await blockedPage.route("**/api/parts/manufacturing-baselines/workbook-preview**",async route=>{
     const response=await route.fetch(); const payload=await response.json();
-    const part=payload.parts.find(item=>item.status==="ready"); assert.ok(part,"fixture includes ready Part");
-    part.status="blocked"; part.blockers=["This Part's saved source assignment needs review."];
-    payload.counts.readyParts-=1; payload.counts.blockedParts+=1; payload.canConfirm=true;
+    const readyParts=payload.parts.filter(item=>item.status==="ready"); assert.ok(readyParts.length>=3,"fixture includes ready Parts for mixed-outcome confirmation");
+    const blocked=readyParts[0], retained=readyParts[1];
+    blocked.status="blocked"; blocked.blockers=["This Part's saved source assignment needs review."];
+    retained.status="already_established";
+    payload.pendingRows=[]; payload.counts={mappedParts:payload.parts.length,readyParts:1,alreadyEstablishedParts:1,blockedParts:1,pendingRows:0};
+    payload.workbookComplete=false; payload.canConfirm=true;
     await route.fulfill({status:response.status(),contentType:"application/json",body:JSON.stringify(payload)});
+  });
+  await blockedPage.route("**/api/parts/manufacturing-baselines/workbook-confirm",async route=>{
+    const body=JSON.parse(route.request().postData()||"{}"); assert.equal(body.parts.length,1,"only the ready Part is submitted");
+    const response={status:"partial",totalSuccess:false,results:[
+      {partId:body.parts[0].partId,partNumber:"SM-P-000001",status:"established"},
+      {partId:"browser-retained",partNumber:"SM-P-000002",status:"already_established",retryable:false,message:"An existing baseline was retained and not overwritten."},
+      {partId:"browser-blocked",partNumber:"SM-P-000003",status:"blocked",retryable:false,message:"This Part remains blocked and was not included in workbook confirmation."},
+    ],pendingRows:[],workbookComplete:false};
+    await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify(response)});
   });
   await blockedPage.goto(base,{waitUntil:"networkidle"});
   await blockedPage.locator(".tree-row").filter({hasText:"Browser-QA-Incoming.ods"}).click();
   await blockedPage.getByRole("button",{name:"Part Mapping",exact:true}).click();
   await blockedPage.getByRole("button",{name:"Confirm manufacturing baselines",exact:true}).click();
   await blockedPage.locator(".baseline-bulk-blocked").waitFor();
-  const blockedButton=blockedPage.getByRole("button",{name:"Confirm 2 ready baselines",exact:true});
+  const blockedButton=blockedPage.getByRole("button",{name:"Confirm 1 ready baseline",exact:true});
   evidence.blockedPreview={cardText:await blockedPage.locator(".baseline-bulk-blocked").innerText(),readyConfirmationEnabled:await blockedButton.isEnabled(),counts:await blockedPage.locator('[aria-label="Workbook baseline preview counts"]').innerText()};
   assert.match(evidence.blockedPreview.cardText,/needs review/); assert.equal(evidence.blockedPreview.readyConfirmationEnabled,true);
+  assert.match(evidence.blockedPreview.counts,/1\s+already established/); assert.match(evidence.blockedPreview.counts,/1\s+blocked/);
+  await blockedButton.click(); await blockedPage.locator(".baseline-bulk-results").waitFor();
+  evidence.blockedPreview.resultText=await blockedPage.locator(".baseline-bulk-results").innerText();
+  assert.match(evidence.blockedPreview.resultText,/confirmation needs review/);
+  assert.match(evidence.blockedPreview.resultText,/1 Part baseline\(s\) established; 1 already established \(retained\); 1 blocked; 0 failed; 0 source row\(s\) remain for review\./);
+  assert.match(evidence.blockedPreview.resultText,/not overwritten/);
   await blockedPage.close();
 
   const stalePage=await browser.newPage({viewport:{width:1280,height:900}}); let staleWrites=0;
@@ -70,13 +88,25 @@ try {
   await page.getByText(/The confirmation response was not received/).waitFor();
   assert.equal(await page.getByRole("button",{name:"Retry same confirmation",exact:true}).isEnabled(),true);
   const firstKey=evidence.bulkRequests[0].key, firstBody=evidence.bulkRequests[0].body;
+  const storedBeforeReload=await page.evaluate(()=>JSON.parse(localStorage.getItem("workbook-baseline-confirm-attempt:Browser-QA-Incoming.ods")||"null"));
+  assert.equal(storedBeforeReload.key,firstKey); assert.equal(JSON.stringify(storedBeforeReload.payload),JSON.stringify(JSON.parse(firstBody)));
+  await page.reload({waitUntil:"networkidle"});
+  await page.setViewportSize({width:1440,height:1000});
+  await page.locator(".tree-row").filter({hasText:"Browser-QA-Incoming.ods"}).click();
+  await page.getByRole("button",{name:"Part Mapping",exact:true}).click();
+  await page.locator("#part-mapping-context").getByRole("button",{name:"Hide supporting information",exact:true}).click();
+  await page.getByRole("button",{name:"Confirm manufacturing baselines",exact:true}).click();
+  await page.getByRole("button",{name:"Retry same confirmation",exact:true}).waitFor();
+  const storedAfterReload=await page.evaluate(()=>JSON.parse(localStorage.getItem("workbook-baseline-confirm-attempt:Browser-QA-Incoming.ods")||"null"));
+  assert.deepEqual(storedAfterReload,storedBeforeReload);
+  evidence.bulkReentry={key:storedAfterReload.key,body:storedAfterReload.payload,retainedAfterReload:true};
   await page.setViewportSize({width:1440,height:1000});
   await page.getByRole("button",{name:"Retry same confirmation",exact:true}).click();
   await page.locator(".baseline-bulk-results").waitFor();
   await page.waitForFunction(()=>document.querySelector('[aria-label="Workbook baseline preview counts"] span:first-child strong')?.innerText==="0");
   assert.equal(evidence.bulkRequests.length,2); assert.equal(evidence.bulkRequests[1].key,firstKey); assert.equal(evidence.bulkRequests[1].body,firstBody);
   const submitted=JSON.parse(firstBody); assert.equal(submitted.parts.length,3); assert.ok(!("sourceFamilies" in submitted.parts[0]));
-  evidence.bulk={requestCount:evidence.bulkRequests.length,key:firstKey,payload:submitted,firstAttemptHttp:evidence.bulkRequests[0].status,firstAttemptResults:evidence.bulkRequests[0].result.results.map(item=>({partId:item.partId,status:item.status})),secondAttemptResults:evidence.bulkRequests[1].result.results.map(item=>({partId:item.partId,status:item.status,idempotent:item.idempotent})),resultText:await page.locator(".baseline-bulk-results").innerText(),refreshedCounts:await counts.innerText()};
+  evidence.bulk={requestCount:evidence.bulkRequests.length,key:firstKey,payload:submitted,firstAttemptHttp:evidence.bulkRequests[0].status,firstAttemptResults:evidence.bulkRequests[0].result.results.map(item=>({partId:item.partId,status:item.status})),secondAttemptResults:evidence.bulkRequests[1].result.results.map(item=>({partId:item.partId,status:item.status,idempotent:item.idempotent})),resultText:await page.locator(".baseline-bulk-results").innerText(),refreshedCounts:await counts.innerText(),reentry:evidence.bulkReentry};
   assert.match(evidence.bulk.resultText,/3 Part baseline\(s\) established/);
   evidence.afterConfirm=await page.evaluate(async()=>await (await fetch("/api/qa/workbook-baseline-state")).json());
   assert.equal(evidence.afterConfirm.baselineCount,4); assert.equal(evidence.afterConfirm.revisionLineCount,4); assert.equal(evidence.afterConfirm.baselineRequestKeys.length,4); assert.equal(evidence.afterConfirm.mappingRecordCount,5);

@@ -276,10 +276,72 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             requested_parts=[{"partId": ready["id"], "snapshotKey": ready["snapshotKey"], "appendExisting": False}],
             actor="baseline reviewer", reason="Confirm ready workbook Parts", batch_request_key="second-workbook-confirmation")
         self.assertEqual(result["status"], "completed")
-        self.assertEqual([item["partId"] for item in result["results"]], [other["id"]])
+        self.assertEqual({item["partId"] for item in result["results"]}, {self.part["id"], other["id"]})
+        self.assertEqual({item["partId"]: item["status"] for item in result["results"]}, {
+            self.part["id"]: "already_established", other["id"]: "established"})
         established_after = self.service.baseline_detail(self.part["id"])
         self.assertEqual(established_after["baseline"]["id"], established_before["baseline"]["id"])
         self.assertEqual(established_after["requirements"], established_before["requirements"])
+
+    def test_workbook_confirmation_reports_ready_blocked_and_retained_parts_without_pending_rows(self):
+        other, groups, _ = self.workbook_multi_part_fixture(pending=False)
+        blocked = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
+            description="Finalized guard", variant="Standard", expected_name="S1K — Finalized guard — Standard",
+            actor="test operator", reason="isolated blocked workbook Part", request_key="create-workbook-blocked-part",
+            revision_assertion="A")["part"]
+        extra_group = self.family_group("mcl", 50, description="Finalized guard row")
+        groups = PartSourceGroups([*groups, extra_group], all_source_diagnostics())
+        before_extra_mapping = mapping_detail(self.mapping_store, file_id="pilot.ods", source_hash="bulk-baseline-source",
+            association=self.association, groups=groups)
+        extra_line = next(row for group in before_extra_mapping["groups"] if group["key"] == extra_group["key"]
+            for row in group["rows"])
+        save_mapping(self.mapping_store, file_id="pilot.ods", source_hash="bulk-baseline-source",
+            association=self.association, groups=groups, line_decisions={extra_line["lineKey"]: blocked["id"]},
+            expected_hash="bulk-baseline-source", expected_version=before_extra_mapping["version"],
+            expected_association=self.association.id, expected_association_version=self.association.version,
+            actor="mapping reviewer", request_key="map-finalized-guard-row")
+        initial = self.service.preview_workbook(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            source_hash="bulk-baseline-source", association=self.association, groups=groups,
+            mapping_store=self.mapping_store)
+        self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
+            workbook_path="C:/isolated/pilot.ods", source_hash="bulk-baseline-source", association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=None, actor="baseline reviewer",
+            reason="Preserve the earlier Rev A baseline", request_key="initial-ready-workbook-baseline",
+            expected_hash="bulk-baseline-source", expected_association=self.association.id,
+            expected_association_version=self.association.version,
+            expected_mapping_version=initial["source"]["mappingVersion"], workbook_initial=True)
+        established_before = self.service.baseline_detail(self.part["id"])
+        _, blocked_revision = self.service._part_and_revision(blocked["id"])
+        self.client.update_table_records("PartRevision", [{"id": int(blocked_revision["id"]),
+            "fields": {"Status": "finalized", "BaselineStatus": "finalized"}}])
+
+        preview = self.service.preview_workbook(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            source_hash="bulk-baseline-source", association=self.association, groups=groups,
+            mapping_store=self.mapping_store)
+        self.assertEqual(preview["pendingRows"], [])
+        self.assertEqual({part["id"]: part["status"] for part in preview["parts"]}, {
+            self.part["id"]: "already_established", other["id"]: "ready", blocked["id"]: "blocked"})
+        requested_parts = [{"partId": part["id"], "snapshotKey": part["snapshotKey"], "appendExisting": False}
+            for part in preview["parts"] if part["status"] == "ready"]
+        result = self.service.confirm_workbook(file_id="pilot.ods", workbook_name="pilot.ods",
+            workbook_path="C:/isolated/pilot.ods", source_hash="bulk-baseline-source", association=self.association,
+            groups=groups, mapping_store=self.mapping_store, expected_context_key=preview["contextKey"],
+            requested_parts=requested_parts, actor="baseline reviewer", reason="Confirm ready workbook Parts",
+            batch_request_key="ready-blocked-retained-workbook-confirmation")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertFalse(result["totalSuccess"])
+        self.assertFalse(result["workbookComplete"])
+        self.assertEqual(result["counts"], {"mappedParts": 3, "readyParts": 1,
+            "alreadyEstablishedParts": 1, "blockedParts": 1, "pendingRows": 0})
+        self.assertEqual({item["partId"]: item["status"] for item in result["results"]}, {
+            self.part["id"]: "already_established", other["id"]: "established", blocked["id"]: "blocked"})
+        self.assertIn("not overwritten", next(item["message"] for item in result["results"]
+            if item["partId"] == self.part["id"]))
+        established_after = self.service.baseline_detail(self.part["id"])
+        self.assertEqual(established_after["baseline"]["id"], established_before["baseline"]["id"])
+        self.assertEqual(established_after["requirements"], established_before["requirements"])
+        self.assertIsNone(self.service.baseline_detail(blocked["id"])["baseline"])
 
     def test_workbook_api_preview_and_confirm_persist_multiple_parts_and_reload(self):
         from app import web
@@ -330,6 +392,63 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             self.assertEqual(detail["sourceHash"], "bulk-baseline-source")
             self.assertEqual(len(detail["requirements"]), 2)
             self.assertEqual(detail["baseline"]["Actor"], "baseline reviewer")
+
+    def test_workbook_api_retries_grist_error_after_durable_family_write_with_original_batch(self):
+        from app import web
+        from app.exceptions import GristError
+        from starlette.requests import Request
+
+        other, groups, _ = self.workbook_multi_part_fixture(pending=False)
+        workbook = Path(self.temp.name) / "pilot.ods"
+        workbook.write_bytes(b"isolated durable GristError fixture")
+        repository = SimpleNamespace(processing_store=object())
+        context = (repository, "pilot.ods", self.association, "bulk-baseline-source", groups)
+        with patch.object(web, "_part_registry", return_value=self.registry), \
+             patch.object(web, "_part_context", return_value=context), \
+             patch.object(web, "_part_mapping_store", return_value=self.mapping_store), \
+             patch.object(web, "_part_baseline_service", return_value=self.service), \
+             patch.object(web, "_resolve_preview_workbook", return_value=workbook), \
+             patch.object(web, "_request_actor", return_value="baseline reviewer"), \
+             patch("app.processing.processing_detail", return_value={"state": "associated"}):
+            preview = web.preview_workbook_manufacturing_baselines("pilot.ods")
+            request_parts = [{"partId": part["id"], "snapshotKey": part["snapshotKey"], "appendExisting": False}
+                for part in preview["parts"] if part["status"] == "ready"]
+            payload = {"path": "pilot.ods", "expectedContextKey": preview["contextKey"],
+                "previewKey": preview["previewKey"], "parts": request_parts,
+                "reason": "Recover the original isolated workbook confirmation"}
+            request = Request({"type": "http", "method": "POST", "headers": []})
+            original_create = self.client.create_table_records
+            injected = {"value": False}
+
+            def commit_family_then_raise_grist_error(table, records):
+                response = original_create(table, records)
+                if table == "PartBaselineFamily" and not injected["value"]:
+                    injected["value"] = True
+                    raise GristError("Grist API request failed after the family rows were committed")
+                return response
+
+            with patch.object(self.client, "create_table_records", side_effect=commit_family_then_raise_grist_error):
+                first = web.confirm_workbook_manufacturing_baselines(request, payload,
+                    idempotency_key="isolated-grist-error-workbook-confirmation")
+            self.assertTrue(injected["value"], "the simulated adapter failure follows a durable PartBaselineFamily write")
+            self.assertEqual(first["status"], "partial")
+            self.assertFalse(first["totalSuccess"])
+            failed = next(item for item in first["results"] if item["status"] == "failed")
+            self.assertEqual(failed["code"], "GristError")
+            self.assertTrue(failed["retryable"])
+            self.assertEqual(len(self.client.tables["PartBaselineFamily"]), 6)
+            counts_after_uncertain_response = {table: len(self.client.tables.get(table, [])) for table in (
+                "PartBaselineProcessing", "PartBaselineFamily", "PartRevisionLine", "SourceLineObservation")}
+
+            recovered = web.confirm_workbook_manufacturing_baselines(request, payload,
+                idempotency_key="isolated-grist-error-workbook-confirmation")
+
+        self.assertEqual(recovered["status"], "completed")
+        self.assertTrue(recovered["totalSuccess"])
+        self.assertEqual({item["partId"] for item in recovered["results"] if item["status"] == "established"},
+            {self.part["id"], other["id"]})
+        self.assertEqual({table: len(self.client.tables.get(table, [])) for table in counts_after_uncertain_response},
+            {"PartBaselineProcessing": 2, "PartBaselineFamily": 6, "PartRevisionLine": 4, "SourceLineObservation": 4})
 
     def test_workbook_preview_blocks_only_parts_with_stale_assignment_and_blocks_missing_sheet(self):
         other = self.registry.create_part(scope_type="product", target_id="17", target_label="Safari 1000",
