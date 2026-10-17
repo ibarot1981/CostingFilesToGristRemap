@@ -6,6 +6,7 @@ const apiMocks = vi.hoisted(() => ({
   summary: vi.fn(), products: vi.fn(), tree: vi.fn(), associations: vi.fn(),
   fileAssociation: vi.fn(), inspect: vi.fn(), preview: vi.fn(), processingState: vi.fn(),
   partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(), partBaselineReview: vi.fn(),
+  partBaselineWorkbookPreview: vi.fn(), confirmWorkbookPartBaselines: vi.fn(),
   partScopeTargets: vi.fn(), parts: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), partDetails: vi.fn(), mappedFiles: vi.fn(),
   comparePartBaseline: vi.fn(), partManufacturingComparison: vi.fn(), decidePartManufacturingComparison: vi.fn(),
 }));
@@ -113,6 +114,11 @@ beforeEach(() => {
       lineAssignments, confirmedRows: []};
   });
   apiMocks.partBaselineReview.mockResolvedValue({});
+  apiMocks.partBaselineWorkbookPreview.mockResolvedValue({source:{fileId:"file:pilot.ods",workbookPath:"pilot.ods",sourceHash:"workbook-hash",
+    associationKey:"association-key",associationVersion:3,mappingVersion:0,mappingPolicyVersion:"part-source-labels-v2",sourceSheets:{}},
+    contextKey:"baseline-context",previewKey:"baseline-preview",parts:[],pendingRows:[],
+    counts:{mappedParts:0,readyParts:0,alreadyEstablishedParts:0,blockedParts:0,pendingRows:0},canConfirm:false,workbookComplete:true});
+  apiMocks.confirmWorkbookPartBaselines.mockResolvedValue({status:"completed",totalSuccess:true,results:[],pendingRows:[],workbookComplete:true});
   apiMocks.mappedFiles.mockResolvedValue({items: []});
   apiMocks.comparePartBaseline.mockResolvedValue({});
   apiMocks.partManufacturingComparison.mockResolvedValue({});
@@ -416,3 +422,43 @@ it("keeps cross-workbook replacement drafts on B after return selection is consu
   expect(aGroup2.querySelector<HTMLInputElement>("input[role=combobox]")?.value).toContain("SM-P-000002");
   expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
 }, 30000);
+
+it("returns a workbook pending-row link to the selected mapping row and preserves other unsaved drafts", async () => {
+  const mapped = mappedGroup(1);
+  persistedDetail = makeDetail([mapped, makeGroup(2), makeGroup(3)], {parts:[existingParts[0]]});
+  apiMocks.partBaselineReview.mockResolvedValue({baselineStatus:"not_established",
+    source:{fileId:"file:pilot.ods",workbookPath:"pilot.ods",sourceHash:"workbook-hash",associationKey:"association-key",
+      associationVersion:3,mappingVersion:0,mappingPolicyVersion:"part-source-labels-v2"},families:{},
+    existingContent:{processRequirements:0,components:0,purchaseSpecifications:0,requiresAppendConfirmation:false}});
+  apiMocks.partBaselineWorkbookPreview.mockResolvedValue({source:{fileId:"file:pilot.ods",workbookPath:"pilot.ods",sourceHash:"workbook-hash",
+    associationKey:"association-key",associationVersion:3,mappingVersion:0,mappingPolicyVersion:"part-source-labels-v2",sourceSheets:{}},
+    contextKey:"baseline-context",previewKey:"baseline-preview",parts:[{id:existingParts[0].id,partNumber:existingParts[0].partNumber,
+      name:existingParts[0].name,snapshotKey:"baseline-snapshot",status:"ready",blockers:[],mappedLineCount:1,requirementCount:1,
+      requirementsByFamily:{mcl:{mappedLines:1,pendingLines:0,requirements:1,applicabilityStatus:"applicable",completenessConfirmed:true}},
+      existingContent:{processRequirements:0,components:0,purchaseSpecifications:0,requiresAppendConfirmation:false}}],
+    pendingRows:[{groupKey:"mapping-2",sheet:"5. Material Cut List Price",family:"mcl",row:12,description:"Item 2",
+      lineKey:"mapping-2:line:12",lineFingerprint:"semantic-mapping-2",evidenceFingerprint:"evidence-mapping-2",
+      status:"needs_review",reason:"Choose a Part for this source row.",affectedPartIds:[]}],
+    counts:{mappedParts:1,readyParts:1,alreadyEstablishedParts:0,blockedParts:0,pendingRows:1},canConfirm:true,workbookComplete:false});
+
+  render(<App/>);
+  fireEvent.click(await screen.findByRole("button", {name:/pilot\.ods/}));
+  await screen.findByText("No saved association");
+  fireEvent.click(screen.getByRole("button", {name:"Part Mapping"}));
+  await screen.findByText("Showing 3 of 3 source groups");
+  await chooseExistingPart(3, 0);
+  await waitFor(() => expectPendingChanges(1));
+  fireEvent.click(screen.getByRole("button", {name:"Confirm manufacturing baselines"}));
+
+  await screen.findByRole("heading", {name:"Confirm manufacturing baselines"});
+  expect(screen.getByText(/Pending ODS rows · 1/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Review in Part Mapping"}));
+  await screen.findByRole("heading", {name:"Part Mapping"});
+  await screen.findByText("Review 5. Material Cut List Price row 12 and save any Part assignment explicitly. No assignment was added from the baseline preview.");
+  expect(screen.getByText("pilot.ods", {selector:".part-workbook"})).toBeTruthy();
+  expect((screen.getByRole("combobox", {name:"Part assignment for Item 2"}) as HTMLInputElement).value).toBe("No Part selected");
+  expect((screen.getByRole("combobox", {name:"Part assignment for Item 3"}) as HTMLInputElement).value).toContain("SM-P-000001");
+  expectPendingChanges(1);
+  expect(apiMocks.partBaselineWorkbookPreview).toHaveBeenCalledWith("pilot.ods");
+  expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
+}, 20000);

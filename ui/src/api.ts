@@ -91,6 +91,8 @@ export const api = {
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
   partBaselineReview: (id: string, path: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/review?path=${encodeURIComponent(path)}`),
+  partBaselineWorkbookPreview: (path: string) => get<any>(`/api/parts/manufacturing-baselines/workbook-preview?path=${encodeURIComponent(path)}`),
+  confirmWorkbookPartBaselines: (payload: unknown, key: string) => send<any>("/api/parts/manufacturing-baselines/workbook-confirm", payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   establishPartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/establish`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   comparePartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/compare`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   partManufacturingComparison: (key: string) => get<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}`),

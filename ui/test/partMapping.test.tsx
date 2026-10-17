@@ -241,7 +241,7 @@ it("opens the dedicated baseline workspace from the toolbar with the first mappe
   const openReview = vi.fn();
   render(<PartMappingView path="pilot.ods" onReviewBaselines={openReview}/>);
   await screen.findByText("Showing 1 of 1 source groups");
-  const button = await screen.findByRole("button",{name:"Review manufacturing baselines"});
+  const button = await screen.findByRole("button",{name:"Confirm manufacturing baselines"});
   expect((button as HTMLButtonElement).disabled).toBe(false);
   fireEvent.click(button);
   expect(openReview).toHaveBeenCalledWith("pilot.ods","part-1");
@@ -780,6 +780,31 @@ it("rejects a Part returned from Parts when that source group changed", async ()
   expect(await screen.findByText("The source group changed while Parts was open. Review the refreshed group before assigning a Part.")).toBeTruthy();
   await expandGroup("Shaft");
   expect((screen.getByRole("combobox", {name:"Part assignment for Shaft"}) as HTMLInputElement).value).toBe("No Part selected");
+});
+
+it("opens a returned pending workbook row for review without drafting an assignment", async () => {
+  const consumed = vi.fn();
+  const scrollIntoView = vi.fn();
+  const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {configurable:true, value:scrollIntoView});
+  try {
+  render(<PartMappingView path="pilot.ods" returnSelection={{path:"pilot.ods",groupKey:"mcl-shaft",partId:null,mode:"review",
+    sourceHash:"hash1",associationKey:"assoc1",associationVersion:2,evidenceFingerprint:"evidence-mcl-shaft",
+    lineKeys:["mcl-shaft:line:10"],selectedLineEvidenceFingerprint:JSON.stringify([
+      {lineKey:"mcl-shaft:line:10",fingerprint:"semantic-mcl-shaft-10"},
+    ])}} onReturnSelectionConsumed={consumed}/>);
+
+  await screen.findByText("Review 5. Material Cut List Price row 10 and save any Part assignment explicitly. No assignment was added from the baseline preview.");
+  const assignment = await screen.findByRole("combobox", {name:"Part assignment for Shaft"});
+  expect((assignment as HTMLInputElement).value).toBe("No Part selected");
+  expect(screen.getByRole("button", {name:/source evidence · Shaft/i}).getAttribute("aria-expanded")).toBe("true");
+  expect(mocks.savePartMappings).not.toHaveBeenCalled();
+  await waitFor(() => expect(consumed).toHaveBeenCalledOnce());
+  await waitFor(() => expect(scrollIntoView).toHaveBeenCalledOnce());
+  } finally {
+    if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {configurable:true, value:originalScrollIntoView});
+    else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  }
 });
 
 it("holds stale selections until the refreshed source is explicitly reviewed", async () => {

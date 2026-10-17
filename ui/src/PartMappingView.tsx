@@ -20,7 +20,7 @@ type Detail = { sourceHash: string; associationKey: string; associationVersion: 
 type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[]; lineKeys?: string[]; deletedLineReviewKeys?: string[] };
 type StaleDraft = { groupKey: string; sheet: string; description: string; rowCount: number; decision: string; hasGroupDecision?: boolean; part: Part | null; sourceHash: string; evidenceFingerprint: string; reason?: string; lineDecisions?: Record<string, string>; lineParts?: Record<string, Part>; lineEvidence?: Record<string, string>; lineReasons?: Record<string, string> };
 type Draft = { path: string; sourceHash: string; version: number; associationKey: string; associationVersion: number; decisions: Record<string, string>; draftParts: Record<string, Part>; lineDecisions?: Record<string, string>; lineDraftParts?: Record<string, Part>; selectedLineKeys?: string[]; splitModes?: Record<string, boolean>; lineReasons?: Record<string, string>; deletedLineReasons?: Record<string, string>; groupReasons?: Record<string, string>; expandedGroups?: Record<string, boolean>; expandedSourceDetails?: Record<string, boolean>; draftGroups?: {groupKey: string; sheet: string; description: string; rowCount: number; evidenceFingerprint: string; lineKeys?: string[]; lineEvidence?: Record<string, string>}[]; staleDrafts: StaleDraft[]; reason: string; query: string; sheetFilter: string; reviewFilter: string; scrollTop: number; mappingAttempt: Attempt | null };
-type ReturnSelection = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string; lineKeys?: string[]; selectedLineEvidenceFingerprint?: string };
+type ReturnSelection = { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" | "review"; sourceHash?: string; associationKey?: string; associationVersion?: number; evidenceFingerprint?: string; lineKeys?: string[]; selectedLineEvidenceFingerprint?: string };
 type SheetFilter = "all" | "mcl" | "toolshop" | "cnc";
 type ReviewFilter = "all" | "needs-review" | "saved" | "unsaved" | "unassigned";
 
@@ -342,7 +342,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         setExpandedGroups(Object.fromEntries(Object.entries(saved.expandedGroups || {}).filter(([key]) => currentKeys.has(key))));
         setExpanded(Object.fromEntries(Object.entries(saved.expandedSourceDetails || {}).filter(([key]) => currentKeys.has(key))));
       }
-      if (returnSelection?.path === path && returnSelection.mode === "select" && returnSelection.groupKey) {
+      if (returnSelection?.path === path && (returnSelection.mode === "select" || returnSelection.mode === "review") && returnSelection.groupKey) {
         const target = result.groups.find(group => group.key === returnSelection.groupKey);
         const requestedLineKeys = returnSelection.lineKeys || [];
         const selectedRows = (target?.rows || []).filter(row => requestedLineKeys.includes(String(row.lineKey || "")));
@@ -354,7 +354,16 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         const validContext = Boolean(target && returnSelection.sourceHash === result.sourceHash
           && returnSelection.associationKey === result.associationKey && returnSelection.associationVersion === result.associationVersion
           && returnSelection.evidenceFingerprint === target.evidenceFingerprint && lineSetMatches);
-        if (validContext && target && returnSelection.partId) {
+        if (validContext && target && returnSelection.mode === "review") {
+          setQuery(""); setSheetFilter("all"); setReviewFilter("all");
+          setExpandedGroups(old => ({...old, [target.key]: true}));
+          setExpanded(old => ({...old, [target.key]: true}));
+          setNotice(`Review ${target.sheet} row ${selectedRows[0]?.row ?? "shown below"} and save any Part assignment explicitly. No assignment was added from the baseline preview.`);
+          const targetId = returnSelection.lineKeys?.[0]
+            ? `part-source-line-${encodeURIComponent(returnSelection.lineKeys[0])}`
+            : `part-source-group-${encodeURIComponent(target.key)}`;
+          window.requestAnimationFrame(() => document.getElementById(targetId)?.scrollIntoView?.({block:"center",behavior:"smooth"}));
+        } else if (validContext && target && returnSelection.partId) {
           try {
             const matches = await api.searchParts(returnSelection.partId, 0, 100, path);
             const selected = (matches.items || []).find((part: Part) => part.id === returnSelection.partId && part.selectable && !part.duplicateName);
@@ -981,7 +990,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
             <option value="saved">Saved · {allGroups.filter(group => group.reviewed).length} groups</option><option value="unsaved">Unsaved changes · {pendingGroups.length} groups</option>
             <option value="unassigned">Unassigned lines · {allGroups.reduce((sum, group) => sum + group.rows.filter(row => !effectivePartForLine(group, row)).length, 0)} lines</option>
           </select></label>
-          <button type="button" className="button primary part-baseline-launcher" disabled={!detail || loading || !baselineParts.length} title={!baselineParts.length ? "Save a Part mapping before reviewing manufacturing baselines." : "Open the full-width baseline review workspace."} onClick={() => onReviewBaselines?.(path, baselineParts[0]?.id || "")}>Review manufacturing baselines</button>
+          <button type="button" className="button primary part-baseline-launcher" disabled={!detail || loading || !baselineParts.length} title={!baselineParts.length ? "Save a Part mapping before confirming manufacturing baselines." : "Preview and confirm every ready mapped Part in this workbook."} onClick={() => onReviewBaselines?.(path, baselineParts[0]?.id || "")}>Confirm manufacturing baselines</button>
           <div className="part-group-expansion-actions" aria-label="Group expansion controls">
             <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, true])) }))}>Expand all displayed</button>
             <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, false])) }))}>Collapse all displayed</button>
@@ -1031,7 +1040,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
             const selectedLinePart = selectedLinesPartFor(group);
             const groupAssigned = group.rows.some(row => row.reviewed && row.part);
             const blocker = !detail.schemaAvailable ? (detail.schemaMessage || "Part review storage is unavailable; saving is blocked.") : !detail.associationKey ? "Save a file association before assigning Parts." : group.sourceDiagnostic?.status && group.sourceDiagnostic.status !== "ok" ? "Resolve the source label column before saving." : groupPending(group) ? "" : !selectedPart && !groupAssigned ? "Choose a canonical Part before saving." : "";
-            return <article className={`part-source-group ${groupIsExpanded ? "is-expanded" : "is-collapsed"}`} key={group.key}>
+            return <article id={`part-source-group-${encodeURIComponent(group.key)}`} className={`part-source-group ${groupIsExpanded ? "is-expanded" : "is-collapsed"}`} key={group.key}>
               {group.previousAssignment && !group.reviewed && <div className="part-compatibility-note" role="status"><strong>{semanticStatus === "legacy_evidence_missing" ? "One-time source evidence confirmation required." : semanticStatus === "association_changed" ? "Prior assignment needs association review." : semanticStatus === "grouping_policy_changed" ? "Prior assignment needs grouping-policy review." : "Prior assignment needs source review."}</strong>
                 <span>{compatibilityMessage}{group.previousAssignment.name ? ` Prior canonical Part: ${group.previousAssignment.partNumber ? `${group.previousAssignment.partNumber} · ` : ""}${group.previousAssignment.name}.` : ""}</span>
                 {proposedPart?.selectable && !proposedPart.duplicateName && <button type="button" className="button" disabled={locked} onClick={() => selectPart(group, proposedPart)}>Use proposed Part in draft</button>}
@@ -1218,7 +1227,7 @@ function SourceDetails({ group, expanded, onToggle, selectionMode, selectedLineK
       const header = group.rows.map(row => row.sourceHeaders?.[column.key]).find(Boolean);
       const available = group.rows.some(row => row.availableFields?.includes(column.key));
       return <th key={column.key} data-source-field={column.key} title={header || (available ? column.label : "Column not found in source")}>{header || `${column.label}${available ? "" : " · not found"}`}</th>;
-    })}<th>Source row</th><th>Canonical Part</th></tr></thead><tbody>{group.rows.map(row => <tr key={`${row.sheet}:${row.row}`} className={selectionMode && selectedLineKeys.includes(String(row.lineKey || "")) ? "is-line-selected" : ""}>{selectionMode && <td className="part-line-select-cell"><input type="checkbox" aria-label={`Select ${group.sheet} row ${row.row} for Part assignment`} checked={selectedLineKeys.includes(String(row.lineKey || ""))} disabled={!row.lineKey} onChange={() => onToggleLine(row)}/></td>}{visibleColumns.map(column => {
+    })}<th>Source row</th><th>Canonical Part</th></tr></thead><tbody>{group.rows.map(row => <tr id={row.lineKey ? `part-source-line-${encodeURIComponent(row.lineKey)}` : undefined} key={`${row.sheet}:${row.row}`} className={selectionMode && selectedLineKeys.includes(String(row.lineKey || "")) ? "is-line-selected" : ""}>{selectionMode && <td className="part-line-select-cell"><input type="checkbox" aria-label={`Select ${group.sheet} row ${row.row} for Part assignment`} checked={selectedLineKeys.includes(String(row.lineKey || ""))} disabled={!row.lineKey} onChange={() => onToggleLine(row)}/></td>}{visibleColumns.map(column => {
       const value = row.fields?.[column.key];
       const cell = row.sourceCells?.[column.key]?.cell;
       const available = row.availableFields?.includes(column.key);

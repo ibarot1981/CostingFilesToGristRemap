@@ -1,0 +1,456 @@
+{
+  "browser": "Google Chrome via Playwright",
+  "baseUrl": "http://127.0.0.1:44571",
+  "jsErrors": [],
+  "nonGetRequests": [
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/2b8d83d9-4927-40ce-b38b-4310cef14b88/manufacturing-baseline/compare"
+    }
+  ],
+  "blockedPreview": {
+    "cardText": "SM-P-000003 · S1K — Bulk CNC Part — Standard\n1 mapped requirement row · blocked\nReview Part\nThis Part's saved source assignment needs review.",
+    "readyConfirmationEnabled": true,
+    "counts": "1\nready\n1\nalready established\n1\nblocked\n0\nrows to review",
+    "resultText": "Workbook baseline confirmation needs review\n1 Part baseline(s) established; 1 already established (retained); 1 blocked; 0 failed; 0 source row(s) remain for review.\nSM-P-000001 · established\nSM-P-000002 · already established · An existing baseline was retained and not overwritten.\nSM-P-000003 · blocked · This Part remains blocked and was not included in workbook confirmation.\nThe mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed."
+  },
+  "stalePreview": {
+    "alert": "The workbook or saved Part mappings changed since this preview. The preview is being refreshed before you can confirm again. ApiError: PART_BASELINE_PREVIEW_STALE: The workbook or saved mapping changed since this preview.",
+    "retryButtons": 0,
+    "freshConfirmEnabled": true,
+    "storedAttempt": null,
+    "interceptedWrites": 1
+  },
+  "bulkRequests": [
+    {
+      "key": "f5a6aa2d-16e2-4c83-a04c-18599606c842",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"016ffc85d5ab576114a2d2aebd58c5c1af02124fbf64ab10c39538b192434f7d\",\"previewKey\":\"aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"35c2b00b-f23f-4c12-8982-cd543f547037\",\"snapshotKey\":\"585b49abb2d16c87fec0f11c3785b7d0602b9b55cc061a8ea68104fdbef08c08\",\"appendExisting\":false},{\"partId\":\"56c90237-bdaf-4f2d-9b6c-b64ebc4b303a\",\"snapshotKey\":\"965da838332a110b8dab5a6d5227b20b6e1a2ef17bc35deb808869e05a9b613f\",\"appendExisting\":false},{\"partId\":\"657587cf-9e58-40fd-9a71-64b7c99dd23c\",\"snapshotKey\":\"39d240545446ffcdcf8cdb0a7f0eae22d86cc84a8e35e82bfd833494e052a436\",\"appendExisting\":false}]}",
+      "status": 200,
+      "result": {
+        "status": "partial",
+        "totalSuccess": false,
+        "results": [
+          {
+            "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+            "partNumber": "SM-P-000003",
+            "name": "S1K — Bulk CNC Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+            "partNumber": "SM-P-000002",
+            "name": "S1K — Bulk Tool Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+            "partNumber": "SM-P-000001",
+            "name": "S1K — Bulk MCL Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+            "partNumber": "SM-P-000004",
+            "name": "S1K — Existing CNC Part — Standard",
+            "status": "already_established",
+            "message": "An existing baseline was retained and not overwritten.",
+            "retryable": false
+          }
+        ],
+        "pendingRows": [
+          {
+            "groupKey": "part-source-labels-v2:f44eff396909cc72099a50a5794947a93b350bed4f4bdf733e4cdad6f882d443",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 3,
+            "description": "Pending MCL review",
+            "lineKey": "part-line:d8a79d521efdd4401e4d3ed6e9d47de97fb2f86bc5c3567129136fa46378447f",
+            "lineFingerprint": "dd8f554d0b8124c26b868494ff09a84aaa405771e5cc0da62bc8718b014cee04",
+            "evidenceFingerprint": "52408ec2c3a0aba5996fcbb81c6528274cb49b7182c5992a5bf932b1d38f8a7f",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          },
+          {
+            "groupKey": "part-source-labels-v2:3ce38da7d3f2796fa7f9ba8d251a0861e2340d19ea715c12447b7da542c3cf39",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 4,
+            "description": "Draft MCL pending",
+            "lineKey": "part-line:c8e3e229eee42f076ef9fb2f488ef500377ff25f9107d9958b94c38b31b2a4b7",
+            "lineFingerprint": "b13211529f07ef3aa266f6a772ed5e8443490981f0b716fdf4ddb3845a8cad9a",
+            "evidenceFingerprint": "a49f65af605eb8a80a3a2b4d3b015c19e1c1df22275b42238dac005b423670ac",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          }
+        ],
+        "counts": {
+          "mappedParts": 4,
+          "readyParts": 3,
+          "alreadyEstablishedParts": 1,
+          "blockedParts": 0,
+          "pendingRows": 2
+        },
+        "workbookComplete": false,
+        "previewKey": "aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11"
+      }
+    },
+    {
+      "key": "f5a6aa2d-16e2-4c83-a04c-18599606c842",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"016ffc85d5ab576114a2d2aebd58c5c1af02124fbf64ab10c39538b192434f7d\",\"previewKey\":\"aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"35c2b00b-f23f-4c12-8982-cd543f547037\",\"snapshotKey\":\"585b49abb2d16c87fec0f11c3785b7d0602b9b55cc061a8ea68104fdbef08c08\",\"appendExisting\":false},{\"partId\":\"56c90237-bdaf-4f2d-9b6c-b64ebc4b303a\",\"snapshotKey\":\"965da838332a110b8dab5a6d5227b20b6e1a2ef17bc35deb808869e05a9b613f\",\"appendExisting\":false},{\"partId\":\"657587cf-9e58-40fd-9a71-64b7c99dd23c\",\"snapshotKey\":\"39d240545446ffcdcf8cdb0a7f0eae22d86cc84a8e35e82bfd833494e052a436\",\"appendExisting\":false}]}",
+      "status": 200,
+      "result": {
+        "status": "partial",
+        "totalSuccess": false,
+        "results": [
+          {
+            "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+            "partNumber": "SM-P-000003",
+            "name": "S1K — Bulk CNC Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": true
+          },
+          {
+            "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+            "partNumber": "SM-P-000002",
+            "name": "S1K — Bulk Tool Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": true
+          },
+          {
+            "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+            "partNumber": "SM-P-000001",
+            "name": "S1K — Bulk MCL Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": true
+          },
+          {
+            "partId": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+            "partNumber": "SM-P-000004",
+            "name": "S1K — Existing CNC Part — Standard",
+            "status": "already_established",
+            "message": "An existing baseline was retained and not overwritten.",
+            "retryable": false
+          }
+        ],
+        "pendingRows": [
+          {
+            "groupKey": "part-source-labels-v2:f44eff396909cc72099a50a5794947a93b350bed4f4bdf733e4cdad6f882d443",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 3,
+            "description": "Pending MCL review",
+            "lineKey": "part-line:d8a79d521efdd4401e4d3ed6e9d47de97fb2f86bc5c3567129136fa46378447f",
+            "lineFingerprint": "dd8f554d0b8124c26b868494ff09a84aaa405771e5cc0da62bc8718b014cee04",
+            "evidenceFingerprint": "52408ec2c3a0aba5996fcbb81c6528274cb49b7182c5992a5bf932b1d38f8a7f",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          },
+          {
+            "groupKey": "part-source-labels-v2:3ce38da7d3f2796fa7f9ba8d251a0861e2340d19ea715c12447b7da542c3cf39",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 4,
+            "description": "Draft MCL pending",
+            "lineKey": "part-line:c8e3e229eee42f076ef9fb2f488ef500377ff25f9107d9958b94c38b31b2a4b7",
+            "lineFingerprint": "b13211529f07ef3aa266f6a772ed5e8443490981f0b716fdf4ddb3845a8cad9a",
+            "evidenceFingerprint": "a49f65af605eb8a80a3a2b4d3b015c19e1c1df22275b42238dac005b423670ac",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          }
+        ],
+        "counts": {
+          "mappedParts": 4,
+          "readyParts": 0,
+          "alreadyEstablishedParts": 4,
+          "blockedParts": 0,
+          "pendingRows": 2
+        },
+        "workbookComplete": false,
+        "previewKey": "2a4bc858875ea2200c4dcbbeb195d03e741a36eda4b060dd55b9e9b3a84cfe7a"
+      }
+    }
+  ],
+  "comparison": {
+    "httpStatus": 200,
+    "status": "incomplete_evidence",
+    "sourceHash": "37fa91a27aa3480c0c807e090e9d17448871721d08c3a8601f50ca53a0be0d33",
+    "baselineSourceHash": "f8dbc2c2f6e62ea9f13524661c549e3ba7a9fbe55581009e6c98998052426b21",
+    "incomingCnc": {
+      "differenceType": "incomplete_evidence",
+      "row": 3,
+      "length": "140"
+    },
+    "baselineCnc": {
+      "differenceType": "incomplete_evidence",
+      "length": "120"
+    },
+    "warnings": [
+      "mcl: comparison evidence is incomplete (ok; unconfirmed).",
+      "toolshop: comparison evidence is incomplete (ok; unconfirmed).",
+      "cnc: comparison evidence is incomplete (ok; unconfirmed).",
+      "5. Material Cut List Price: select Applicable or Confirmed not applicable.",
+      "Tool Shop Items: select Applicable or Confirmed not applicable.",
+      "CNC Cut List: select Applicable or Confirmed not applicable.",
+      "5. Material Cut List Price: 2 source line(s) still need an individual Part assignment; unmatched rows remain outstanding and cannot support additions or deletions."
+    ]
+  },
+  "pendingReturn": {
+    "draftBeforeBulk": {
+      "value": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+      "stickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+    },
+    "notice": "Review 5. Material Cut List Price row 3 and save any Part assignment explicitly. No assignment was added from the baseline preview.",
+    "pendingLineVisible": true,
+    "workbookPath": "Browser-QA-Incoming.ods",
+    "draftValue": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+    "stickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+  },
+  "partsReturn": {
+    "hasAcceptedBaselineSection": true,
+    "showsIncomingWorkbook": true,
+    "baselineText": "Manufacturing baseline"
+  },
+  "workbookSwitch": {
+    "baselineMappingPath": "Browser-QA-Baseline.ods",
+    "restoredPath": "Browser-QA-Incoming.ods",
+    "restoredFilter": "unsaved",
+    "restoredDraftValue": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+    "restoredStickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+  },
+  "finalState": {
+    "baselineCount": 4,
+    "revisionLineCount": 4,
+    "observationCount": 5,
+    "mappingRecordCount": 5,
+    "baselineRequestKeys": [
+      "qa-existing-cnc-baseline",
+      "workbook-baseline:478ae8d326bd22b8736d6e88a712f68ad222fe7f8692cff2806a853ba5850478",
+      "workbook-baseline:6dca7e9a52fea5d0dfb39e6fba4c5338162f065951f776182c889589f04ad729",
+      "workbook-baseline:efb0f268b4dae52eccbb0ba583345387f6c3a87e02ff9207af34da0b56d4d3e6"
+    ],
+    "parts": {
+      "Bulk MCL Part": {
+        "id": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+        "partNumber": "SM-P-000001"
+      },
+      "Bulk Tool Part": {
+        "id": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+        "partNumber": "SM-P-000002"
+      },
+      "Bulk CNC Part": {
+        "id": "35c2b00b-f23f-4c12-8982-cd543f547037",
+        "partNumber": "SM-P-000003"
+      },
+      "Existing CNC Part": {
+        "id": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+        "partNumber": "SM-P-000004"
+      }
+    },
+    "incomingPath": "Browser-QA-Incoming.ods",
+    "incomingHash": "37fa91a27aa3480c0c807e090e9d17448871721d08c3a8601f50ca53a0be0d33",
+    "previousPath": "Browser-QA-Baseline.ods",
+    "previousHash": "f8dbc2c2f6e62ea9f13524661c549e3ba7a9fbe55581009e6c98998052426b21"
+  },
+  "preview": {
+    "counts": "3\nready\n1\nalready established\n0\nblocked\n2\nrows to review",
+    "pendingText": "Pending ODS rows · 2\nThese active rows are excluded from baseline requirements. Review each assignment; this preview does not mark the workbook complete.\n5. Material Cut List Price · row 3 · Pending MCL review\nnew · Review this source row and save a current Part assignment.\nReview in Part Mapping\n5. Material Cut List Price · row 4 · Draft MCL pending\nnew · Review this source row and save a current Part assignment.\nReview in Part Mapping",
+    "readyButtonEnabled": true
+  },
+  "narrow": {
+    "buttonBox": {
+      "x": 31,
+      "y": 406,
+      "width": 328,
+      "height": 32
+    },
+    "viewport": {
+      "innerWidth": 390,
+      "scrollWidth": 390
+    },
+    "enabled": true
+  },
+  "bulkReentry": {
+    "key": "f5a6aa2d-16e2-4c83-a04c-18599606c842",
+    "body": {
+      "path": "Browser-QA-Incoming.ods",
+      "expectedContextKey": "016ffc85d5ab576114a2d2aebd58c5c1af02124fbf64ab10c39538b192434f7d",
+      "previewKey": "aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11",
+      "reason": "Establish initial workbook manufacturing baseline",
+      "parts": [
+        {
+          "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+          "snapshotKey": "585b49abb2d16c87fec0f11c3785b7d0602b9b55cc061a8ea68104fdbef08c08",
+          "appendExisting": false
+        },
+        {
+          "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+          "snapshotKey": "965da838332a110b8dab5a6d5227b20b6e1a2ef17bc35deb808869e05a9b613f",
+          "appendExisting": false
+        },
+        {
+          "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+          "snapshotKey": "39d240545446ffcdcf8cdb0a7f0eae22d86cc84a8e35e82bfd833494e052a436",
+          "appendExisting": false
+        }
+      ]
+    },
+    "retainedAfterReload": true
+  },
+  "bulk": {
+    "requestCount": 2,
+    "key": "f5a6aa2d-16e2-4c83-a04c-18599606c842",
+    "payload": {
+      "path": "Browser-QA-Incoming.ods",
+      "expectedContextKey": "016ffc85d5ab576114a2d2aebd58c5c1af02124fbf64ab10c39538b192434f7d",
+      "previewKey": "aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11",
+      "reason": "Establish initial workbook manufacturing baseline",
+      "parts": [
+        {
+          "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+          "snapshotKey": "585b49abb2d16c87fec0f11c3785b7d0602b9b55cc061a8ea68104fdbef08c08",
+          "appendExisting": false
+        },
+        {
+          "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+          "snapshotKey": "965da838332a110b8dab5a6d5227b20b6e1a2ef17bc35deb808869e05a9b613f",
+          "appendExisting": false
+        },
+        {
+          "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+          "snapshotKey": "39d240545446ffcdcf8cdb0a7f0eae22d86cc84a8e35e82bfd833494e052a436",
+          "appendExisting": false
+        }
+      ]
+    },
+    "firstAttemptHttp": 200,
+    "firstAttemptResults": [
+      {
+        "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+        "status": "established"
+      },
+      {
+        "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+        "status": "established"
+      },
+      {
+        "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+        "status": "established"
+      },
+      {
+        "partId": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+        "status": "already_established"
+      }
+    ],
+    "secondAttemptResults": [
+      {
+        "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+        "status": "established",
+        "idempotent": true
+      },
+      {
+        "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+        "status": "established",
+        "idempotent": true
+      },
+      {
+        "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+        "status": "established",
+        "idempotent": true
+      },
+      {
+        "partId": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+        "status": "already_established"
+      }
+    ],
+    "resultText": "Workbook baseline confirmation needs review\n3 Part baseline(s) established; 1 already established (retained); 0 blocked; 0 failed; 2 source row(s) remain for review.\nSM-P-000003 · established\nSM-P-000002 · established\nSM-P-000001 · established\nSM-P-000004 · already established · An existing baseline was retained and not overwritten.\nThe mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed.",
+    "refreshedCounts": "0\nready\n4\nalready established\n0\nblocked\n2\nrows to review",
+    "reentry": {
+      "key": "f5a6aa2d-16e2-4c83-a04c-18599606c842",
+      "body": {
+        "path": "Browser-QA-Incoming.ods",
+        "expectedContextKey": "016ffc85d5ab576114a2d2aebd58c5c1af02124fbf64ab10c39538b192434f7d",
+        "previewKey": "aaa815fdc0f7f0bea23e99498c9480abb5b04e763f023cea3f28a800991bea11",
+        "reason": "Establish initial workbook manufacturing baseline",
+        "parts": [
+          {
+            "partId": "35c2b00b-f23f-4c12-8982-cd543f547037",
+            "snapshotKey": "585b49abb2d16c87fec0f11c3785b7d0602b9b55cc061a8ea68104fdbef08c08",
+            "appendExisting": false
+          },
+          {
+            "partId": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+            "snapshotKey": "965da838332a110b8dab5a6d5227b20b6e1a2ef17bc35deb808869e05a9b613f",
+            "appendExisting": false
+          },
+          {
+            "partId": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+            "snapshotKey": "39d240545446ffcdcf8cdb0a7f0eae22d86cc84a8e35e82bfd833494e052a436",
+            "appendExisting": false
+          }
+        ]
+      },
+      "retainedAfterReload": true
+    }
+  },
+  "afterConfirm": {
+    "baselineCount": 4,
+    "revisionLineCount": 4,
+    "observationCount": 4,
+    "mappingRecordCount": 5,
+    "baselineRequestKeys": [
+      "qa-existing-cnc-baseline",
+      "workbook-baseline:478ae8d326bd22b8736d6e88a712f68ad222fe7f8692cff2806a853ba5850478",
+      "workbook-baseline:6dca7e9a52fea5d0dfb39e6fba4c5338162f065951f776182c889589f04ad729",
+      "workbook-baseline:efb0f268b4dae52eccbb0ba583345387f6c3a87e02ff9207af34da0b56d4d3e6"
+    ],
+    "parts": {
+      "Bulk MCL Part": {
+        "id": "657587cf-9e58-40fd-9a71-64b7c99dd23c",
+        "partNumber": "SM-P-000001"
+      },
+      "Bulk Tool Part": {
+        "id": "56c90237-bdaf-4f2d-9b6c-b64ebc4b303a",
+        "partNumber": "SM-P-000002"
+      },
+      "Bulk CNC Part": {
+        "id": "35c2b00b-f23f-4c12-8982-cd543f547037",
+        "partNumber": "SM-P-000003"
+      },
+      "Existing CNC Part": {
+        "id": "2b8d83d9-4927-40ce-b38b-4310cef14b88",
+        "partNumber": "SM-P-000004"
+      }
+    },
+    "incomingPath": "Browser-QA-Incoming.ods",
+    "incomingHash": "37fa91a27aa3480c0c807e090e9d17448871721d08c3a8601f50ca53a0be0d33",
+    "previousPath": "Browser-QA-Baseline.ods",
+    "previousHash": "f8dbc2c2f6e62ea9f13524661c549e3ba7a9fbe55581009e6c98998052426b21"
+  }
+}
