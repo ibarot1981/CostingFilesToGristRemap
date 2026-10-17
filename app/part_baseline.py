@@ -229,6 +229,35 @@ def _family_confirmations(mapping: dict[str, Any], part_id: str, submitted: Any,
     return result, errors
 
 
+def _workbook_family_confirmations(mapping: dict[str, Any], part_id: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Derive initial-baseline family evidence without treating pending rows as absence.
+
+    A saved current Part assignment makes a family applicable. A family with no
+    mapped rows but pending source rows remains ``pending_review`` and is saved
+    incomplete, so those excluded rows cannot later support deletion decisions.
+    """
+    current = _family_review_rows(mapping, part_id)
+    result: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for family in FAMILY_ORDER:
+        evidence = current[family]
+        pending_count = int(evidence.get("unmappedLineCount") or 0)
+        deleted_count = int(evidence.get("pendingDeletedLineCount") or 0)
+        if evidence["sourceEvidenceStatus"] != "ok":
+            errors.append(f"{evidence['sheet']}: evidence is {evidence['sourceEvidenceStatus']}; missing or unreadable evidence blocks workbook baseline establishment.")
+        if deleted_count:
+            errors.append(f"{evidence['sheet']}: {deleted_count} previously mapped source line(s) were removed and need explicit review before this Part baseline can be established.")
+        if evidence["mappedGroupCount"]:
+            status = "applicable"
+        elif pending_count:
+            status = "pending_review"
+        else:
+            status = "not_applicable"
+        result[family] = {**evidence, "applicabilityStatus": status,
+            "completenessConfirmed": bool(evidence["sourceEvidenceStatus"] == "ok" and not pending_count and not deleted_count)}
+    return result, errors
+
+
 def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) -> dict[str, Any]:
     fields = dict(row.get("fields") or {})
     sheet = FAMILIES[family]["sheet"]
@@ -535,13 +564,286 @@ class PartBaselineService:
             return table in self.client.tables
         return True
 
+    def _workbook_mapping(self, *, file_id: str, source_hash: str, association: Any,
+                          groups: list[dict[str, Any]], mapping_store: Any) -> dict[str, Any]:
+        self._verify_schema()
+        return mapping_detail(mapping_store, file_id=file_id, source_hash=source_hash,
+            association=association, groups=groups, refresh_parts=True)
+
+    def _workbook_pending_rows(self, mapping: dict[str, Any]) -> list[dict[str, Any]]:
+        pending = []
+        for group in mapping.get("groups", []):
+            family = FAMILY_TO_SHEET.get(str(group.get("sheet") or ""))
+            if not family:
+                continue
+            for row in group.get("rows") or []:
+                assigned_part = _mapping_row_part(row, group) or {}
+                if _mapping_row_reviewed(row, group) and assigned_part.get("id"):
+                    continue
+                previous = row.get("previousAssignment") or {}
+                affected_ids = sorted({str(value) for value in [previous.get("partId"), *(previous.get("assignedPartIds") or [])]
+                    if value})
+                semantic = row.get("semanticComparison") or {}
+                explicit = bool(_mapping_row_reviewed(row, group) and row.get("explicitlyUnassigned"))
+                pending.append({"groupKey": str(group.get("key") or ""), "sheet": str(group.get("sheet") or ""),
+                    "family": family, "row": row.get("row"), "description": str(group.get("description") or ""),
+                    "lineKey": str(row.get("lineKey") or ""),
+                    "lineFingerprint": str((row.get("semanticEvidence") or {}).get("fingerprint") or ""),
+                    "evidenceFingerprint": str(group.get("evidenceFingerprint") or ""),
+                    "status": "explicitly_unassigned" if explicit else str(semantic.get("status") or "needs_review"),
+                    "reason": "This source row was explicitly left without a Part assignment." if explicit else
+                        str(semantic.get("reason") or "Review this source row and save a current Part assignment."),
+                    "affectedPartIds": affected_ids})
+        pending.sort(key=lambda item: (FAMILY_ORDER.index(item["family"]), int(item.get("row") or 0), item["groupKey"]))
+        return pending
+
+    def _workbook_deleted_line_blockers(self, mapping: dict[str, Any]) -> dict[str, list[str]]:
+        blockers: dict[str, list[str]] = defaultdict(list)
+        for group in [*mapping.get("groups", []), *(mapping.get("removedGroups") or [])]:
+            for line in group.get("deletedLines") or []:
+                if line.get("reviewed"):
+                    continue
+                previous = line.get("previousAssignment") or {}
+                affected_ids = {str(value) for value in [previous.get("partId"), *(previous.get("assignedPartIds") or [])]
+                    if value}
+                coordinate = f"{line.get('sheet') or group.get('sheet') or 'Source'} row {line.get('row') or 'unknown'}"
+                for part_id in affected_ids:
+                    blockers[part_id].append(f"{coordinate} was removed from the workbook and needs explicit review.")
+        return blockers
+
+    def _workbook_part_snapshot(self, part_id: str, requirements: list[dict[str, Any]],
+                                mapping: dict[str, Any], pending_rows: list[dict[str, Any]],
+                                deleted_blockers: list[str], source_errors: list[str]) -> dict[str, Any]:
+        part = self.registry.get_part(part_id)
+        if not part:
+            return {"id": part_id, "status": "blocked", "blockers": ["The previously assigned canonical Part no longer exists."],
+                "snapshotKey": _digest([part_id, "missing"]), "mappedLineCount": len(requirements), "requirementCount": len(requirements),
+                "existingContent": {"processRequirements": 0, "components": 0, "purchaseSpecifications": 0,
+                    "requiresAppendConfirmation": False}}
+        base = {"id": part_id, "partNumber": part.get("partNumber"), "name": part.get("name"),
+            "description": part.get("description") or "", "variant": part.get("variant") or "",
+            "engineeringRevision": part.get("engineeringRevision") or "A", "legacy": bool(part.get("legacy")),
+            "selectable": bool(part.get("selectable")), "status": "blocked", "blockers": []}
+        blockers = list(source_errors) + list(deleted_blockers)
+        if part.get("legacy"):
+            blockers.append("Legacy Parts are read-only and cannot receive a new baseline.")
+            base.update({"blockers": blockers, "snapshotKey": _digest([part_id, "legacy"]),
+                "mappedLineCount": len(requirements), "requirementCount": len(requirements),
+                "existingContent": {"processRequirements": 0, "components": 0, "purchaseSpecifications": 0,
+                    "requiresAppendConfirmation": False}})
+            return base
+
+        try:
+            _, revision = self._part_and_revision(part_id)
+        except PartIdentityError as exc:
+            blockers.append(str(exc))
+            base.update({"blockers": blockers, "snapshotKey": _digest([part_id, "revision-unavailable"]),
+                "mappedLineCount": len(requirements), "requirementCount": len(requirements),
+                "existingContent": {"processRequirements": 0, "components": 0, "purchaseSpecifications": 0,
+                    "requiresAppendConfirmation": False}})
+            return base
+        revision_fields = _row_fields(revision)
+        revision_id = int(revision.get("id", 0))
+        baseline_id = _ref_id(revision_fields.get("ManufacturingBaseline"))
+        baseline_rows = self.registry._rows("PartBaselineProcessing") if self._table_available("PartBaselineProcessing") else []
+        baseline_row = next((row for row in baseline_rows if baseline_id and int(row.get("id", -1)) == baseline_id), None)
+        pending_baselines = [row for row in baseline_rows
+            if _ref_id(_row_fields(row).get("ProductPart")) == int(part["gristRecordId"])
+            and str(_row_fields(row).get("Status") or "").casefold() not in {"established", "abandoned"}]
+        active_revision_lines = [row for row in self.registry._rows("PartRevisionLine")
+            if _ref_id(_row_fields(row).get("PartRevision")) == revision_id]
+        component_rows = [row for row in self.registry._rows("PartComponentRevision")
+            if _ref_id(_row_fields(row).get("ParentRevision")) == revision_id]
+        purchase_rows = [row for row in self.registry._rows("PartPurchaseSpecification")
+            if _ref_id(_row_fields(row).get("PartRevision")) == revision_id]
+        existing_content = {"processRequirements": len(active_revision_lines), "components": len(component_rows),
+            "purchaseSpecifications": len(purchase_rows),
+            "requiresAppendConfirmation": bool(active_revision_lines or component_rows or purchase_rows)}
+        lifecycle = str(revision_fields.get("BaselineStatus") or revision_fields.get("Status") or "draft").casefold()
+        baseline_status = str(revision_fields.get("ManufacturingBaselineStatus") or "not_established").casefold()
+        matching_request_keys = [str(_row_fields(row).get("RequestKey") or "") for row in pending_baselines]
+        if baseline_status == "established" and baseline_row and not pending_baselines:
+            state = "already_established"
+        elif pending_baselines:
+            state = "recovery_required"
+            blockers.append("An earlier baseline write is incomplete and must be retried with its original request.")
+        elif baseline_status == "established" or baseline_id:
+            state = "blocked"
+            blockers.append("The established baseline provenance is unavailable; refresh and review this Part.")
+        elif lifecycle == "finalized":
+            state = "blocked"
+            blockers.append("The current Part revision is finalized; a baseline can only be established on a draft revision.")
+        else:
+            state = "ready"
+
+        family_states, family_errors = _workbook_family_confirmations(mapping, part_id)
+        blockers.extend(family_errors)
+        requirement_errors = _validate_requirements(requirements)
+        blockers.extend(requirement_errors)
+        if state == "ready" and blockers:
+            state = "blocked"
+        family_counts = {family: {"mappedGroups": family_states[family]["mappedGroupCount"],
+            "mappedLines": family_states[family]["mappedLineCount"],
+            "pendingLines": family_states[family]["unmappedLineCount"],
+            "requirements": family_states[family]["requirementCount"],
+            "applicabilityStatus": family_states[family]["applicabilityStatus"],
+            "completenessConfirmed": family_states[family]["completenessConfirmed"]} for family in FAMILY_ORDER}
+        assigned_context = sorted((item.get("family"), item.get("mappingGroupKey"), item.get("mappingLineKey"),
+            item.get("mappingLineFingerprint"), item.get("row"), item.get("physical")) for item in requirements)
+        part_pending = [row for row in pending_rows if part_id in row.get("affectedPartIds", [])]
+        blockers.extend(f"{row['sheet']} row {row.get('row') or 'unknown'} has an unresolved prior assignment for this Part."
+            for row in part_pending)
+        if state == "ready" and part_pending:
+            state = "blocked"
+        membership_key = _digest([assigned_context, part_pending, sorted(deleted_blockers)])
+        baseline_snapshot = {"id": baseline_row.get("id") if baseline_row else baseline_id,
+            "status": _row_fields(baseline_row).get("Status") if baseline_row else baseline_status,
+            "requestKey": _row_fields(baseline_row).get("RequestKey") if baseline_row else None,
+            "requestFingerprint": _row_fields(baseline_row).get("RequestFingerprint") if baseline_row else None}
+        content_snapshot = {
+            "requirements": sorted((row.get("id"), _row_fields(row).get("RevisionLineKey"), _row_fields(row).get("RequestKey")) for row in active_revision_lines),
+            "components": sorted((row.get("id"), _row_fields(row).get("ComponentKey"), _row_fields(row).get("Status")) for row in component_rows),
+            "purchases": sorted((row.get("id"), _row_fields(row).get("SpecificationKey"), _row_fields(row).get("Status")) for row in purchase_rows),
+        }
+        snapshot_key = _digest([part_id, part.get("gristRecordId"), revision_id, revision_fields.get("RevisionKey"),
+            lifecycle, baseline_status, baseline_snapshot, content_snapshot, membership_key, family_counts, blockers, state])
+        base.update({"status": state, "blockers": list(dict.fromkeys(blockers)), "baselineStatus": baseline_status,
+            "revisionLifecycle": lifecycle, "revisionId": revision_id, "baseline": baseline_snapshot,
+            "mappedLineCount": len(requirements), "requirementCount": len(requirements),
+            "requirementsByFamily": family_counts, "existingContent": existing_content,
+            "pendingAssignedRows": len(part_pending), "snapshotKey": snapshot_key,
+            "matchingRequestKeys": matching_request_keys})
+        return base
+
+    def preview_workbook(self, *, file_id: str, workbook_path: str, source_hash: str, association: Any,
+                         groups: list[dict[str, Any]], mapping_store: Any) -> dict[str, Any]:
+        mapping = self._workbook_mapping(file_id=file_id, source_hash=source_hash, association=association,
+            groups=groups, mapping_store=mapping_store)
+        pending_rows = self._workbook_pending_rows(mapping)
+        deleted_blockers = self._workbook_deleted_line_blockers(mapping)
+        source_errors = [f"{sheet}: evidence is {diag.get('status') or 'unavailable'}; missing or unreadable sheets block initial baseline establishment."
+            for sheet, diag in (mapping.get("sourceSheets") or {}).items() if diag.get("status") != "ok"]
+        part_ids = {str(part.get("id") or "") for part in mapping.get("parts") or [] if part.get("id")}
+        for group in [*mapping.get("groups", []), *(mapping.get("removedGroups") or [])]:
+            for row in group.get("rows") or []:
+                previous = row.get("previousAssignment") or {}
+                part_ids.update(str(value) for value in [previous.get("partId"), *(previous.get("assignedPartIds") or [])] if value)
+            previous = group.get("previousAssignment") or {}
+            part_ids.update(str(value) for value in [previous.get("partId"), *(previous.get("assignedPartIds") or [])] if value)
+        requirements_by_part = {part_id: _requirements_for_part(mapping, part_id) for part_id in part_ids}
+        parts = [self._workbook_part_snapshot(part_id, requirements_by_part[part_id], mapping, pending_rows,
+            deleted_blockers.get(part_id, []), source_errors) for part_id in sorted(part_ids)]
+        source = {"fileId": file_id, "workbookPath": workbook_path, "sourceHash": source_hash,
+            "associationKey": association.id if association else "", "associationVersion": association.version if association else 0,
+            "mappingVersion": mapping.get("version"), "mappingPolicyVersion": mapping.get("mappingPolicyVersion"),
+            "sourceSheets": mapping.get("sourceSheets") or {}}
+        context_key = _digest([source["fileId"], source["sourceHash"], source["associationKey"], source["associationVersion"],
+            source["mappingVersion"], source["mappingPolicyVersion"], source["sourceSheets"]])
+        preview_key = _digest([context_key, [(part["id"], part["snapshotKey"], part["status"]) for part in parts], pending_rows])
+        ready = sum(part["status"] == "ready" for part in parts)
+        established = sum(part["status"] == "already_established" for part in parts)
+        blocked = sum(part["status"] not in {"ready", "already_established"} for part in parts)
+        return {"source": source, "contextKey": context_key, "previewKey": preview_key, "parts": parts,
+            "pendingRows": pending_rows, "counts": {"mappedParts": len(parts), "readyParts": ready,
+                "alreadyEstablishedParts": established, "blockedParts": blocked, "pendingRows": len(pending_rows)},
+            "canConfirm": bool(ready), "workbookComplete": not pending_rows and blocked == 0}
+
+    def _workbook_request_exists(self, part_id: str, request_key: str) -> bool:
+        if not self._table_available("PartRegistryRequest"):
+            return False
+        return any(_row_fields(row).get("RequestKey") == request_key
+            and _row_fields(row).get("RequestType") == "establish_part_baseline"
+            and str(_row_fields(row).get("EntityUUID") or "") == part_id
+            for row in self.registry._rows("PartRegistryRequest"))
+
+    def confirm_workbook(self, *, file_id: str, workbook_name: str, workbook_path: str, source_hash: str,
+                         association: Any, groups: list[dict[str, Any]], mapping_store: Any,
+                         expected_context_key: str, requested_parts: Any, actor: str, reason: str,
+                         batch_request_key: str, before_write: Callable[[], None] | None = None) -> dict[str, Any]:
+        if not batch_request_key.strip() or not actor.strip():
+            raise PartIdentityError("PART_BASELINE_INPUT_REQUIRED", "A workbook request identity and attributable actor are required.")
+        preview = self.preview_workbook(file_id=file_id, workbook_path=workbook_path, source_hash=source_hash,
+            association=association, groups=groups, mapping_store=mapping_store)
+        if not expected_context_key or expected_context_key != preview["contextKey"]:
+            raise PartIdentityError("PART_BASELINE_STALE", "The workbook, association, saved mappings or source-family evidence changed after preview; refresh before confirming.")
+        submitted = requested_parts if isinstance(requested_parts, list) else []
+        requested_by_id = {str(item.get("partId") or ""): item for item in submitted if isinstance(item, dict) and item.get("partId")}
+        if len(requested_by_id) != len(submitted) or not requested_by_id:
+            raise PartIdentityError("PART_BASELINE_INPUT_REQUIRED", "Confirm the current ready Parts from the workbook preview.")
+        current_by_id = {part["id"]: part for part in preview["parts"]}
+        current_ready = {part["id"] for part in preview["parts"] if part["status"] == "ready"}
+        if not current_ready.issubset(requested_by_id):
+            raise PartIdentityError("PART_BASELINE_STALE", "The ready Part set changed after preview; refresh before confirming all ready Parts.")
+        results = []
+        stale_mid_batch = False
+        for part_id, item in requested_by_id.items():
+            current = current_by_id.get(part_id)
+            expected_snapshot = str(item.get("snapshotKey") or "")
+            if not current or not expected_snapshot:
+                results.append({"partId": part_id, "status": "blocked", "message": "This Part was not present in the reviewed workbook preview."})
+                continue
+            request_key = f"workbook-baseline:{_digest([file_id, batch_request_key, part_id])}"
+            same_request = self._workbook_request_exists(part_id, request_key)
+            if current["snapshotKey"] != expected_snapshot and not same_request:
+                results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
+                    "status": "blocked", "message": "This Part's revision, baseline or saved source-line evidence changed after preview."})
+                continue
+            if current["status"] != "ready" and not same_request:
+                results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
+                    "status": "blocked", "message": "This Part is no longer ready for initial baseline establishment.",
+                    "blockers": current.get("blockers") or [current["status"].replace("_", " ")]})
+                continue
+            append_existing = bool(item.get("appendExisting"))
+            if current.get("existingContent", {}).get("requiresAppendConfirmation") and not append_existing and not same_request:
+                results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
+                    "status": "blocked", "message": "Review the existing Rev A content and explicitly confirm appending before continuing."})
+                continue
+            try:
+                result = self.establish(part_id=part_id, file_id=file_id, workbook_name=workbook_name,
+                    workbook_path=workbook_path, source_hash=source_hash, association=association, groups=groups,
+                    mapping_store=mapping_store, source_families=None, actor=actor,
+                    reason=reason or "Establish initial workbook manufacturing baseline", request_key=request_key,
+                    expected_hash=source_hash, expected_association=association.id,
+                    expected_association_version=association.version, expected_mapping_version=int(preview["source"]["mappingVersion"]),
+                    append_existing=append_existing, before_write=before_write, workbook_initial=True)
+                results.append({"partId": part_id, "partNumber": result.get("partNumber"), "name": current.get("name"),
+                    "status": "established", "baselineStatus": result.get("baselineStatus"),
+                    "requirementCount": result.get("requirementCount"), "idempotent": bool(result.get("idempotent"))})
+            except Exception as exc:
+                code = str(getattr(exc, "code", ""))
+                is_stale = code in {"PART_BASELINE_STALE", "PART_BASELINE_EXISTS"}
+                if code == "PART_BASELINE_STALE":
+                    stale_mid_batch = True
+                retryable_codes = {"PART_BASELINE_WRITE_UNCONFIRMED", "PART_BASELINE_RECOVERY_REQUIRED",
+                    "TimeoutError", "ConnectionError", "OSError"}
+                results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
+                    "status": "blocked" if is_stale else "failed", "message": str(exc),
+                    "code": code or type(exc).__name__, "retryable": (code or type(exc).__name__) in retryable_codes})
+            if stale_mid_batch:
+                break
+        if stale_mid_batch:
+            processed = {item["partId"] for item in results}
+            for part_id in requested_by_id:
+                if part_id not in processed:
+                    current = current_by_id.get(part_id, {})
+                    results.append({"partId": part_id, "partNumber": current.get("partNumber"), "name": current.get("name"),
+                        "status": "blocked", "message": "The workbook or saved mappings changed during confirmation. Refresh before continuing."})
+        failed = any(item["status"] == "failed" for item in results)
+        blocked = any(item["status"] == "blocked" for item in results)
+        successful = all(item["status"] in {"established", "already_established"} for item in results)
+        pending_rows = preview["pendingRows"]
+        status = "completed" if successful and not pending_rows else "partial"
+        return {"status": status, "totalSuccess": status == "completed" and not failed and not blocked,
+            "results": results, "pendingRows": pending_rows, "counts": preview["counts"],
+            "workbookComplete": bool(preview["workbookComplete"] and successful), "previewKey": preview["previewKey"]}
+
     @_serialized
     def establish(self, *, part_id: str, file_id: str, workbook_name: str, workbook_path: str,
                   source_hash: str, association: Any, groups: list[dict[str, Any]], mapping_store: Any,
                   source_families: Any, actor: str, reason: str, request_key: str,
                   expected_hash: str, expected_association: str, expected_association_version: int,
                   append_existing: bool = False, expected_mapping_version: int | None = None,
-                  before_write: Callable[[], None] | None = None) -> dict[str, Any]:
+                  before_write: Callable[[], None] | None = None, workbook_initial: bool = False) -> dict[str, Any]:
         self.registry._verify_writer()
         self._verify_schema()
         if not request_key.strip() or not actor.strip():
@@ -566,7 +868,20 @@ class PartBaselineService:
             if same_pending:
                 raise PartIdentityError("PART_BASELINE_RECOVERY_REQUIRED", "This request already has partial Grist records, but its original saved mapping version changed. Restore the original mapping and retry the saved request before starting another operation.")
             raise PartIdentityError("PART_BASELINE_STALE", "Saved Part mappings changed after baseline review; reload the evidence before publishing.")
-        families, family_errors = _family_confirmations(mapping, part_id, source_families)
+        if workbook_initial:
+            families, family_errors = _workbook_family_confirmations(mapping, part_id)
+            source_families = {"workbookInitial": True, "families": {family: {
+                "applicabilityStatus": state["applicabilityStatus"],
+                "completenessConfirmed": state["completenessConfirmed"],
+                "sourceEvidenceStatus": state["sourceEvidenceStatus"],
+                "mappedGroupCount": state["mappedGroupCount"],
+                "mappedLineCount": state["mappedLineCount"],
+                "unmappedLineCount": state["unmappedLineCount"],
+                "pendingDeletedLineCount": state["pendingDeletedLineCount"],
+                "requirementCount": state["requirementCount"],
+            } for family, state in families.items()}}
+        else:
+            families, family_errors = _family_confirmations(mapping, part_id, source_families)
         if family_errors:
             raise PartIdentityError("PART_BASELINE_INCOMPLETE", "Cannot establish the Part baseline: " + " ".join(family_errors))
         requirements = _requirements_for_part(mapping, part_id)

@@ -1058,6 +1058,60 @@ def review_part_manufacturing_baseline(part_id: str, path: str):
         raise
 
 
+@app.get("/api/parts/manufacturing-baselines/workbook-preview")
+@_part_registry_read_scope
+def preview_workbook_manufacturing_baselines(path: str):
+    repository, file_id, association, source_hash, groups = _part_context(path)
+    if not association:
+        raise _error(409, "PART_BASELINE_ASSOCIATION_REQUIRED", "Save a Product Model association before previewing workbook manufacturing baselines.")
+    result = _part_baseline_service().preview_workbook(file_id=file_id, workbook_path=path,
+        source_hash=source_hash, association=association, groups=groups,
+        mapping_store=_part_mapping_store(repository))
+    result["source"]["sourceEvidenceCacheHit"] = bool(getattr(groups, "source_cache_hit", False))
+    return result
+
+
+@app.post("/api/parts/manufacturing-baselines/workbook-confirm")
+def confirm_workbook_manufacturing_baselines(request: Request, payload: dict[str, Any] = Body(...),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.processing import processing_detail
+    from app.part_mapping import mapping_detail
+    path = str(payload.get("path") or "")
+    if not path or not idempotency_key:
+        raise _error(422, "PART_BASELINE_INPUT_REQUIRED", "A workbook path and stable Idempotency-Key are required.")
+    repository, file_id, association, source_hash, groups = _part_context(path)
+    if not association:
+        raise _error(409, "PART_BASELINE_ASSOCIATION_REQUIRED", "Save a Product Model association before establishing workbook manufacturing baselines.")
+    mapping_store = _part_mapping_store(repository)
+    service = _part_baseline_service()
+    current_preview = service.preview_workbook(file_id=file_id, workbook_path=path, source_hash=source_hash,
+        association=association, groups=groups, mapping_store=mapping_store)
+    if payload.get("expectedContextKey") != current_preview["contextKey"]:
+        raise PartIdentityError("PART_BASELINE_STALE", "The workbook, association, saved mappings or source-family evidence changed after preview; refresh before confirming.")
+
+    def verify_current():
+        fresh_repo, fresh_id, fresh_association, fresh_hash, fresh_groups = _part_context(path)
+        if (fresh_id != file_id or fresh_hash != source_hash or not fresh_association
+                or (fresh_association.id, fresh_association.version) != (association.id, association.version)):
+            raise PartIdentityError("PART_BASELINE_STALE", "The workbook or Product Model association changed while workbook baselines were being processed.")
+        fresh_mapping = mapping_detail(mapping_store, file_id=file_id, source_hash=fresh_hash,
+            association=fresh_association, groups=fresh_groups, refresh_parts=True)
+        if fresh_mapping.get("version") != current_preview["source"].get("mappingVersion"):
+            raise PartIdentityError("PART_BASELINE_STALE", "Saved Part mappings changed while workbook baselines were being processed.")
+        state = processing_detail(fresh_repo.processing_store, file_id, fresh_association, fresh_hash)
+        if state.get("state") == "stale":
+            raise PartIdentityError("PART_BASELINE_STALE", "Workbook processing evidence is stale; reload the source before continuing.")
+
+    result = service.confirm_workbook(file_id=file_id,
+        workbook_name=Path(_resolve_preview_workbook(path)).name, workbook_path=path,
+        source_hash=source_hash, association=association, groups=groups, mapping_store=mapping_store,
+        expected_context_key=str(payload.get("expectedContextKey") or ""),
+        requested_parts=payload.get("parts"), actor=_request_actor(request),
+        reason=str(payload.get("reason") or "Establish initial workbook manufacturing baseline"),
+        batch_request_key=str(idempotency_key), before_write=verify_current)
+    return result
+
+
 def _baseline_write_context(part_id: str, request: Request, payload: dict[str, Any], operation: str, idempotency_key: str | None):
     from app.processing import processing_detail
     path = str(payload.get("path") or "")

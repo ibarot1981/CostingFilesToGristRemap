@@ -49,7 +49,7 @@ function manufacturingBaselineRequirementTitle(item: any): string {
   return `${familyLabel} · ${sourceLabel ? `${sourceLabel}: ` : ""}${text}`;
 }
 
-export function PartsView({ active = true, mappingReturn = null, onReturnToMapping, onReviewBaseline }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void; onReviewBaseline?: (partId: string, part: any, path: string) => void }) {
+export function PartsView({ active = true, mappingReturn = null, onReturnToMapping, onReviewBaseline }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" | "review" } | null; onReturnToMapping?: (partId: string | null) => void; onReviewBaseline?: (partId: string, part: any, path: string) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
   const [query, setQuery] = useState(() => sessionStorage.getItem("parts:search") || "");
@@ -413,7 +413,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
       <div className="panel-footer"><Archive size={15}/><div><strong>Permanent identity</strong><span>Retired numbers remain reserved</span></div></div>
     </aside>
     <section className="parts-work-panel">
-      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed Parts and assemblies, manufacturing evidence, and nested composition.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "view" ? mappingReturn.partId : selected && !selected.legacy ? selected.id : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
+      <div className="parts-work-heading"><div><span className="eyebrow">Safari Manufacturing</span><h1>Parts</h1><p>Managed Parts and assemblies, manufacturing evidence, and nested composition.</p></div><div className="workbench-actions">{mappingReturn && <button className="button" onClick={() => onReturnToMapping?.(mappingReturn.mode === "select" ? selected && !selected.legacy ? selected.id : mappingReturn.partId : mappingReturn.partId)}><ArrowLeft size={14}/>{mappingReturn.mode === "review" ? "Return to source row review" : mappingReturn.mode === "view" ? "Return to Part Mapping" : mappingReturn.groupKey && selected && !selected.legacy ? "Use this Part in mapping" : "Return to Part Mapping"}</button>}<button className="button ghost" onClick={() => void refresh()} disabled={loading}><LoaderCircle size={14}/> Refresh</button></div></div>
       {error && <div className="parts-error" role="alert">{error}{(metadataAttempt || retireAttempt) && <small>Retry uses the original request key and payload.</small>}</div>}
       {notice && <p className="parts-notice" role="status"><Check size={14}/>{notice}</p>}
       {mode === "create" ? <PartCreationForm key={`${creationKind}:${creationFormInstance}`} kind={creationKind} onCreated={created => {
