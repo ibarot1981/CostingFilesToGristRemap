@@ -101,6 +101,22 @@ class WebTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in result["conflicts"]], ["occupied"])
         self.assertEqual(result["conflicts"][0]["owner"]["relativePath"], "owner.ods")
 
+    def test_model_code_management_routes_require_the_canonical_repository(self) -> None:
+        import app.web as web
+        from app.repository import InMemorySafariRepository
+
+        repository = InMemorySafariRepository()
+        with mock.patch.object(web, "_repository", repository):
+            with self.assertRaises(HTTPException) as create_error:
+                web.create_model_code("model-1", {"code": "NEW-CODE", "description": "Description"})
+            with self.assertRaises(HTTPException) as update_error:
+                web.update_model_code_description("code-1", {"description": "Description"})
+
+        self.assertEqual(create_error.exception.status_code, 409)
+        self.assertEqual(create_error.exception.detail["code"], "MODEL_CODE_WRITES_DISABLED")
+        self.assertEqual(update_error.exception.status_code, 409)
+        self.assertEqual(update_error.exception.detail["code"], "MODEL_CODE_WRITES_DISABLED")
+
     def test_grist_adapter_does_not_seed_duplicate_identities_from_local_ods(self) -> None:
         import app.web as web
         from app.domain import Product

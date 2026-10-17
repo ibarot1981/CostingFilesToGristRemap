@@ -149,6 +149,39 @@ def model_codes(model_id: str, include_legacy: bool = False) -> dict[str, Any]:
     }
 
 
+@app.post("/api/models/{model_id}/codes")
+def create_model_code(model_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    repository = _get_repository()
+    if repository.adapter_name != "grist-safari":
+        raise _error(409, "MODEL_CODE_WRITES_DISABLED", "Product Model Code creation requires the canonical Safari Grist repository.")
+    try:
+        saved = repository.create_model_code(model_id, str(payload.get("code") or ""), str(payload.get("description") or ""))
+        return saved.to_dict()
+    except GovernanceConflict as exc:
+        status = 404 if exc.code == "MODEL_NOT_FOUND" else 422 if exc.code in {"MODEL_CODE_INVALID", "MODEL_CODE_DESCRIPTION_REQUIRED", "MODEL_CODE_DESCRIPTION_INVALID"} else 409
+        raise _error(status, exc.code, str(exc))
+    except GristError as exc:
+        raise _error(503, "MODEL_CODE_WRITE_UNAVAILABLE", str(exc))
+
+
+@app.post("/api/model-codes/{code_id}/description")
+def update_model_code_description(code_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    repository = _get_repository()
+    if repository.adapter_name != "grist-safari":
+        raise _error(409, "MODEL_CODE_WRITES_DISABLED", "Product Model Code descriptions require the canonical Safari Grist repository.")
+    if "description" not in payload:
+        raise _error(422, "MODEL_CODE_DESCRIPTION_REQUIRED", "Submit the description field, which may be blank for an existing code.")
+    try:
+        saved = repository.update_model_code_description(code_id, str(payload.get("description") or ""),
+            expected_description=str(payload["expectedDescription"]) if "expectedDescription" in payload else None)
+        return saved.to_dict()
+    except GovernanceConflict as exc:
+        status = 404 if exc.code == "MODEL_CODE_NOT_FOUND" else 422 if exc.code == "MODEL_CODE_DESCRIPTION_INVALID" else 409
+        raise _error(status, exc.code, str(exc))
+    except GristError as exc:
+        raise _error(503, "MODEL_CODE_WRITE_UNAVAILABLE", str(exc))
+
+
 @app.get("/api/associations")
 def associations() -> dict[str, Any]:
     repository = _get_repository()
@@ -585,7 +618,8 @@ def _scope_target(repository: SafariRepository, scope: str, target_id: str) -> d
     product = repository.products.get(model.product_id) if model else None
     if not item or not item.active or item.legacy_spares_only or not model or not model.active or not product or not product.active:
         raise _error(422, "PART_SCOPE_TARGET_INVALID", "Choose an active Model Code under an active Product Model and Product.", {"retryDisposition": "safe_to_edit"})
-    return {"id": item.id, "label": item.code}
+    model_context = " ".join(value for value in (model.model_number, model.name) if value).strip()
+    return {"id": item.id, "label": " · ".join(value for value in (item.code, item.description or "No description", model_context, product.name) if value)}
 
 
 def _part_scope_targets() -> dict[str, Any]:
@@ -598,7 +632,10 @@ def _part_scope_targets() -> dict[str, Any]:
                "label": " ".join(value for value in [item.model_number, item.name] if value).strip(),
                "shortcode": stored.get(("product_model", item.id)), "active": item.active}
               for item in repository.models.values() if item.active and item.product_id in repository.products and repository.products[item.product_id].active]
-    codes = [{"id": item.id, "parentId": item.model_id, "label": item.code,
+    codes = [{"id": item.id, "parentId": item.model_id, "label": item.code, "description": item.description,
+              "displayLabel": " · ".join(value for value in (item.code, item.description or "No description",
+                  " ".join(value for value in (repository.models[item.model_id].model_number, repository.models[item.model_id].name) if value).strip(),
+                  repository.products[repository.models[item.model_id].product_id].name) if value),
               "shortcode": stored.get(("model_code", item.id)), "active": item.active}
              for item in repository.codes.values() if item.active and not item.legacy_spares_only and item.model_id in repository.models
              and repository.models[item.model_id].active and repository.models[item.model_id].product_id in repository.products
@@ -912,15 +949,26 @@ def part_mappings(path: str):
     try:
         repository, file_id, association, source_hash, groups = _part_context(path)
         detail = mapping_detail(_part_mapping_store(repository), file_id=file_id, source_hash=source_hash, association=association, groups=groups)
+        registry = _part_registry()
+        get_canonical_part = getattr(registry, "get_part", None)
+        baseline_statuses = {}
+        for part in detail["parts"]:
+            identity = str(part.get("id") or "")
+            canonical = get_canonical_part(identity) if callable(get_canonical_part) and identity and not part.get("legacy") else None
+            status = str((canonical or {}).get("manufacturingBaselineStatus") or "not_established")
+            part["manufacturingBaselineStatus"] = status
+            baseline_statuses[identity] = status
         warnings = {part["id"]: _part_scope_warnings(repository, association, part) for part in detail["parts"]}
         for part in detail["parts"]:
             part["outOfScopeCodes"] = warnings[part["id"]]
         for group in detail["groups"]:
             if group["part"]:
                 group["part"]["outOfScopeCodes"] = warnings.get(group["part"]["id"], [])
+                group["part"]["manufacturingBaselineStatus"] = baseline_statuses.get(group["part"]["id"], "not_established")
             for row in group.get("rows") or []:
                 if row.get("part"):
                     row["part"]["outOfScopeCodes"] = warnings.get(row["part"]["id"], [])
+                    row["part"]["manufacturingBaselineStatus"] = baseline_statuses.get(row["part"]["id"], "not_established")
         detail["scopeAdvisoryOnly"] = True
         detail["sourceEvidenceCacheHit"] = bool(getattr(groups, "source_cache_hit", False))
         return detail

@@ -6,7 +6,8 @@ const apiMocks = vi.hoisted(() => ({
   summary: vi.fn(), products: vi.fn(), tree: vi.fn(), associations: vi.fn(),
   fileAssociation: vi.fn(), inspect: vi.fn(), preview: vi.fn(), processingState: vi.fn(),
   partMappings: vi.fn(), searchParts: vi.fn(), savePartMappings: vi.fn(), partBaselineReview: vi.fn(),
-  partScopeTargets: vi.fn(), parts: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), partDetails: vi.fn(),
+  partScopeTargets: vi.fn(), parts: vi.fn(), partNamePreview: vi.fn(), createManagedPart: vi.fn(), partDetails: vi.fn(), mappedFiles: vi.fn(),
+  comparePartBaseline: vi.fn(), partManufacturingComparison: vi.fn(), decidePartManufacturingComparison: vi.fn(),
 }));
 vi.mock("../src/api", () => ({api: apiMocks}));
 
@@ -45,6 +46,11 @@ function makeDetail(groups = [1, 2, 3, 4].map(index => makeGroup(index)), overri
       labelHeader: "Machine Piece Description", labelHeaderCell: "A8", ambiguousLabelHeaders: [], headerRow: 8}},
     parts: [], groups, unresolvedGroups: groups.filter((group: any) => !group.reviewed).length, history: [], ...overrides,
   };
+}
+
+function mappedGroup(index: number, part = existingParts[0]) {
+  const group = makeGroup(index, {part, reviewed: true});
+  return {...group, rows: group.rows.map(row => ({...row, part, reviewed: true}))};
 }
 
 let persistedDetail: ReturnType<typeof makeDetail>;
@@ -107,6 +113,10 @@ beforeEach(() => {
       lineAssignments, confirmedRows: []};
   });
   apiMocks.partBaselineReview.mockResolvedValue({});
+  apiMocks.mappedFiles.mockResolvedValue({items: []});
+  apiMocks.comparePartBaseline.mockResolvedValue({});
+  apiMocks.partManufacturingComparison.mockResolvedValue({});
+  apiMocks.decidePartManufacturingComparison.mockResolvedValue({});
   apiMocks.partScopeTargets.mockResolvedValue({scopes: [
     {id: "global", label: "Global", target: {id: "global", label: "Safari Manufacturing", shortcode: "SM"}},
     {id: "product", label: "Product", targets: [{id: "product-1", label: "Safari 1000", shortcode: "S1K"}]},
@@ -116,8 +126,11 @@ beforeEach(() => {
   apiMocks.parts.mockImplementation(async () => ({items: [newPart], legacyItems: []}));
   apiMocks.partNamePreview.mockResolvedValue({name: newPart.name, available: true, collision: []});
   apiMocks.createManagedPart.mockResolvedValue({part: newPart, idempotent: false});
-  apiMocks.partDetails.mockResolvedValue({part: newPart, manufacturingBaseline: {status: "not_established"}, intendedSharing: {items: []},
-    processLines: {items: []}, components: {items: []}, purchases: {items: []}, drawings: {items: []}, usedIn: {items: []}});
+  apiMocks.partDetails.mockImplementation(async (id: string) => {
+    const selectedPart = [...existingParts, newPart].find(item => item.id === id) || newPart;
+    return {part: selectedPart, manufacturingBaseline: {status: "not_established"}, intendedSharing: {items: []},
+      processLines: {items: []}, components: {items: []}, purchases: {items: []}, drawings: {items: []}, usedIn: {items: []}};
+  });
 });
 
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
@@ -273,3 +286,133 @@ it("keeps cached Parts and Mapping separate and preserves a view-only Part retur
   expectPendingChanges(1);
   expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
 }, 20000);
+
+it("keeps cross-workbook replacement drafts on B after return selection is consumed and preserves A's separate draft", async () => {
+  const pathA = "Browser-QA.ods";
+  const pathB = "Browser-QA-2.ods";
+  const groupB = mappedGroup(1);
+  const detailA = makeDetail([mappedGroup(1), makeGroup(2)], {
+    sourceHash: "hash-A", associationKey: "association-A", associationVersion: 4, version: 3, parts: [existingParts[0]],
+  });
+  const detailB = makeDetail([groupB, makeGroup(2)], {
+    sourceHash: "hash-B", associationKey: "association-B", associationVersion: 7, version: 5, parts: [existingParts[0]],
+  });
+  const comparison = {
+    comparison: {ComparisonKey: "comparison-B", Status: "complete", WorkbookName: pathB, SourceHash: "incoming-B", BaselineSourceHash: "accepted-hash"},
+    families: [],
+    differences: [{DifferenceKey: "difference-B", DifferenceType: "proposed_modification", Status: "pending_review", Family: "mcl",
+      SourceSheet: "5. Material Cut List Price", SourceRow: 11, MappingGroupKey: groupB.key, IncomingObservation: 801,
+      IncomingValues: "{}", BaselineValues: "{}", FieldDifferences: "[]"}],
+    decisions: [], proposals: [],
+  };
+  const review = {
+    baselineStatus: "established",
+    source: {fileId: pathB, workbookPath: pathB, sourceHash: "hash-B", associationKey: "association-B", associationVersion: 7,
+      mappingVersion: 5, mappingPolicyVersion: "part-source-labels-v2"},
+    families: {mcl: {family: "mcl", sheet: "5. Material Cut List Price", sourceEvidenceStatus: "ok", mappedGroupCount: 1,
+      mappedLineCount: 1, requirementCount: 1, applicabilityStatus: "applicable", completenessConfirmed: true},
+      toolshop: {family: "toolshop", sheet: "Tool Shop Items", sourceEvidenceStatus: "ok", mappedGroupCount: 0, mappedLineCount: 0,
+        requirementCount: 0, applicabilityStatus: "not_applicable", completenessConfirmed: true},
+      cnc: {family: "cnc", sheet: "CNC Cut List", sourceEvidenceStatus: "ok", mappedGroupCount: 0, mappedLineCount: 0,
+        requirementCount: 0, applicabilityStatus: "not_applicable", completenessConfirmed: true}},
+    existingContent: {processRequirements: 0, components: 0, purchaseSpecifications: 0, requiresAppendConfirmation: false},
+  };
+  const files = [pathA, pathB].map(path => ({id: path, name: path, type: "file", relative_path: path, extension: ".ods"}));
+  apiMocks.tree.mockResolvedValue({items: files});
+  apiMocks.fileAssociation.mockImplementation(async (path: string) => ({fileId: `file:${path}`, current: null, product: null, model: null,
+    codes: [], history: [], mappingStatus: "unmapped", processingBatch: null}));
+  apiMocks.inspect.mockImplementation(async (path: string) => ({id: path, name: path, type: "file", relative_path: path, extension: ".ods",
+    content_hash: path === pathA ? "hash-A" : "hash-B"}));
+  apiMocks.preview.mockImplementation(async (path: string) => ({path, sheets: ["5. Material Cut List Price"], sheet: "5. Material Cut List Price",
+    startRow: 1, totalRows: 1, totalColumns: 1, truncatedColumns: false, rows: [["Cost"]], cells: [[{value: "Cost", kind: "value"}]]}));
+  apiMocks.partMappings.mockImplementation(async (path: string) => structuredClone(path === pathA ? detailA : detailB));
+  apiMocks.parts.mockResolvedValue({items: [existingParts[0], existingParts[1]], legacyItems: []});
+  apiMocks.partDetails.mockResolvedValue({part: {...existingParts[0], identityKind: "part", scope: "global", scopeTarget: "Safari Manufacturing",
+    metadataVersion: 1, status: "active", actor: "QA", createdAt: "2026-10-16", reason: "QA"},
+    manufacturingBaseline: {status: "established", baseline: {WorkbookName: pathB, WorkbookPath: pathB, SourceHash: "accepted-hash"}, requirements: [], families: []},
+    mappedLines: {status: "available", items: [{assignmentStatus: "current", sourceStatus: "readable", workbookPath: pathB,
+      key: "saved-line-B", sheet: "5. Material Cut List Price", row: 11, description: "Item 1", sourceHash: "hash-B"}]},
+    intendedSharing: {items: []}, processLines: {items: []}, components: {items: []}, purchases: {items: []}, drawings: {items: []}, usedIn: {items: []}});
+  apiMocks.mappedFiles.mockResolvedValue({items: [{file: {relative_path: pathB}, association: {product_name: "Safari 1000", model_name: "Model 1000"}, issues: []}]});
+  apiMocks.partBaselineReview.mockResolvedValue(review);
+  apiMocks.comparePartBaseline.mockResolvedValue(comparison);
+  apiMocks.partManufacturingComparison.mockResolvedValue(comparison);
+  apiMocks.decidePartManufacturingComparison.mockResolvedValue({
+    ...comparison,
+    replacementMapping: {groupKey: groupB.key, lineKey: groupB.rows[0].lineKey,
+      lineEvidenceFingerprint: groupB.rows[0].semanticEvidence.fingerprint},
+  });
+  apiMocks.searchParts.mockImplementation(async (query: string) => {
+    if (query === existingParts[1].id) return {items: [existingParts[1]], total: 1, offset: 0, limit: 30, hasMore: false};
+    return {items: [...existingParts, newPart], total: 4, offset: 0, limit: 30, hasMore: false};
+  });
+
+  render(<App/>);
+  fireEvent.click(await screen.findByRole("button", {name: pathA}));
+  await screen.findByText("No saved association");
+  fireEvent.click(screen.getByRole("button", {name: "Part Mapping"}));
+  await screen.findByText("Showing 2 of 2 source groups");
+
+  await chooseExistingPart(2, 1);
+  expectPendingChanges(1);
+  await expandGroup(1);
+  const mappedPartGroup = screen.getByRole("button", {name: /source evidence · Item 1/i}).closest(".part-source-group")!;
+  fireEvent.click(within(mappedPartGroup).getByRole("button", {name: "View Part"}));
+  await screen.findByRole("heading", {name: "Parts"});
+  await screen.findByRole("heading", {name: existingParts[0].name});
+  await waitFor(() => expect((screen.getByLabelText("Source workbook for Part baseline review") as HTMLSelectElement).value).toBe(pathB));
+  fireEvent.click(screen.getByRole("button", {name: "Review this Part in the selected workbook"}));
+  await screen.findByRole("heading", {name: "Review manufacturing baselines"});
+  await screen.findByRole("heading", {name: existingParts[0].name});
+  await screen.findByRole("button", {name: "Compare incoming workbook"});
+  fireEvent.click(screen.getByRole("button", {name: "Compare incoming workbook"}));
+  await screen.findByRole("heading", {name: /Workbook comparison · complete/i});
+  fireEvent.change(screen.getByLabelText("Decision reason"), {target: {value: "Reviewed explicit replacement for the changed incoming line"}});
+  fireEvent.change(screen.getByLabelText("Replacement canonical Part"), {target: {value: existingParts[1].name}});
+  const replacement = await within(await screen.findByRole("listbox")).findByRole("option", {name: /SM-P-000002/});
+  fireEvent.click(replacement);
+  fireEvent.click(screen.getByRole("button", {name: "Use a different Part"}));
+
+  await screen.findByRole("heading", {name: "Part Mapping"});
+  await screen.findByText("Showing 2 of 2 source groups");
+  await waitFor(() => expectPendingChanges(1));
+  expect(screen.getByText(pathB, {selector: ".part-workbook"})).toBeTruthy();
+  const bGroupToggle = screen.getByRole("button", {name: /source evidence · Item 1/i});
+  const bGroup = bGroupToggle.closest(".part-source-group")!;
+  fireEvent.click(bGroupToggle);
+  fireEvent.click(within(bGroup).getByRole("button", {name: "Expand source details"}));
+  expect(bGroup.querySelector(".part-line-assignment-cell strong")?.textContent).toContain("SM-P-000002 · Safari Manufacturing — Existing 2");
+  expect(apiMocks.partMappings).toHaveBeenCalledWith(pathB);
+
+  fireEvent.click(within(bGroup.querySelector(".part-line-assignment-cell")!).getByRole("button", {name: "View"}));
+  await screen.findByRole("heading", {name: "Parts"});
+  fireEvent.click(screen.getByRole("button", {name: "Return to Part Mapping"}));
+  await screen.findByRole("heading", {name: "Part Mapping"});
+  await screen.findByText("Showing 2 of 2 source groups");
+  await waitFor(() => expectPendingChanges(1));
+  expect(screen.getByText(pathB, {selector: ".part-workbook"})).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", {name: "Parts", exact: true}));
+  await screen.findByRole("heading", {name: "Parts"});
+  fireEvent.click(screen.getByRole("button", {name: "Part Mapping"}));
+  await screen.findByText("Showing 2 of 2 source groups");
+  await waitFor(() => expectPendingChanges(1));
+  expect(screen.getByText(pathB, {selector: ".part-workbook"})).toBeTruthy();
+  const returnedBGroup = screen.getByRole("button", {name: /source evidence · Item 1/i}).closest(".part-source-group")!;
+  expect(returnedBGroup.querySelector(".part-line-assignment-cell strong")?.textContent).toContain("SM-P-000002 · Safari Manufacturing — Existing 2");
+
+  fireEvent.click(screen.getByRole("button", {name: "Files", exact: true}));
+  fireEvent.click(screen.getByRole("button", {name: pathA}));
+  await screen.findByText("No saved association");
+  fireEvent.click(screen.getByRole("button", {name: "Part Mapping"}));
+  await screen.findByText("Showing 2 of 2 source groups");
+  await waitFor(() => expectPendingChanges(1));
+  const aGroup1 = screen.getByRole("button", {name: /source evidence · Item 1/i}).closest(".part-source-group")!;
+  const aGroup2 = screen.getByRole("button", {name: /source evidence · Item 2/i}).closest(".part-source-group")!;
+  const aGroupToggle = screen.getByRole("button", {name: /source evidence · Item 1/i});
+  if (aGroupToggle.getAttribute("aria-expanded") === "false") fireEvent.click(aGroupToggle);
+  fireEvent.click(within(aGroup1).getByRole("button", {name: "Expand source details"}));
+  expect(aGroup1.querySelector(".part-line-assignment-cell strong")?.textContent).toContain("SM-P-000001 · Safari Manufacturing — Existing 1");
+  expect(aGroup2.querySelector<HTMLInputElement>("input[role=combobox]")?.value).toContain("SM-P-000002");
+  expect(apiMocks.savePartMappings).not.toHaveBeenCalled();
+}, 30000);

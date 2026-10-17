@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, ChevronRight, LoaderCircle, Search } from "lucide-react";
 import { api } from "./api";
 import "./partBaseline.css";
@@ -29,10 +29,10 @@ const pretty = (value: unknown) => {
   return JSON.stringify(value, null, 2);
 };
 
-export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: { path: string; parts: Part[]; groups: Group[]; onUseDifferentPart: (groupKey: string, part: Part, lineKey?: string, lineFingerprint?: string) => void }) {
+export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart, initialPartId = "", autoOpen = false, autoLoadReview = false, showPartSelector = true, onStatusChange }: { path: string; parts: Part[]; groups: Group[]; onUseDifferentPart: (groupKey: string, part: Part, lineKey?: string, lineFingerprint?: string) => void; initialPartId?: string; autoOpen?: boolean; autoLoadReview?: boolean; showPartSelector?: boolean; onStatusChange?: (partId: string, status: string) => void }) {
   const choices = useMemo(() => [...new Map(parts.filter(part => !part.legacy && part.status !== "retired").map(part => [part.id, part])).values()], [parts]);
-  const [open, setOpen] = useState(false);
-  const [partId, setPartId] = useState("");
+  const [open, setOpen] = useState(autoOpen);
+  const [partId, setPartId] = useState(initialPartId);
   const [review, setReview] = useState<Review | null>(null);
   const [families, setFamilies] = useState<Record<string, { status: string; confirmedComplete: boolean }>>({});
   const [appendExisting, setAppendExisting] = useState(false);
@@ -45,6 +45,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const autoLoadRequest = useRef("");
 
   useEffect(() => {
     if (!choices.some(part => part.id === partId)) setPartId(choices[0]?.id || "");
@@ -74,6 +75,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
         restoredDecision ? api.partManufacturingComparison(restoredDecision.comparisonKey) : Promise.resolve(null),
       ]).then(([nextReview, savedComparison]) => {
         setReview(nextReview as Review);
+        onStatusChange?.(partId, (nextReview as Review).baselineStatus);
         setFamilies(Object.fromEntries(Object.entries((nextReview as Review).families || {}).map(([key, family]) => [key, {
           status: family.applicabilityStatus === "unconfirmed" ? "" : family.applicabilityStatus,
           confirmedComplete: false,
@@ -89,6 +91,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
     try {
       const result = await api.partBaselineReview(partId, path) as Review;
       setReview(result);
+      onStatusChange?.(partId, result.baselineStatus);
       setFamilies(Object.fromEntries(Object.entries(result.families || {}).map(([key, family]) => [key, {
         status: family.applicabilityStatus === "unconfirmed" ? "" : family.applicabilityStatus,
         confirmedComplete: false,
@@ -97,6 +100,15 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
     } catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
   }
+
+  useEffect(() => {
+    if (!autoLoadReview || !open || !partId) return;
+    const request = `${path}:${partId}`;
+    if (autoLoadRequest.current === request) return;
+    autoLoadRequest.current = request;
+    if (localStorage.getItem(attemptStorageKey(path, partId)) || localStorage.getItem(decisionAttemptStorageKey(path, partId))) return;
+    void loadReview();
+  }, [autoLoadReview, open, path, partId]);
 
   function makePayload(operation: Attempt["operation"]) {
     if (!review) return null;
@@ -232,12 +244,13 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
   if (!path) return null;
   const selected = choices.find(part => part.id === partId);
   return <section className="part-baseline-panel" aria-label="Part manufacturing baseline and workbook comparison">
-    <button className="part-baseline-toggle" type="button" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+    {!autoOpen && <button className="part-baseline-toggle" type="button" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       {open ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}<span><strong>Manufacturing baseline &amp; workbook comparison</strong><small>Explicitly establish Rev A requirements or compare another mapped workbook.</small></span>
-    </button>
+    </button>}
     {open && <div className="part-baseline-content">
-      <div className="part-baseline-toolbar"><label>Canonical Part<select name="part-baseline-canonical-part" autoComplete="off" value={partId} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !choices.length} onChange={event => { setPartId(event.target.value); setReview(null); setComparison(null); }}><option value="">Choose a saved mapping</option>{choices.map(part => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label>
-        <button className="button" disabled={!partId || busy || Boolean(attempt) || Boolean(decisionAttempt)} onClick={() => void loadReview()}>{busy ? <LoaderCircle size={13}/> : <Search size={13}/>} Review this workbook</button></div>
+      <div className="part-baseline-toolbar">{showPartSelector ? <label>Canonical Part<select name="part-baseline-canonical-part" autoComplete="off" value={partId} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt) || !choices.length} onChange={event => { setPartId(event.target.value); setReview(null); setComparison(null); }}><option value="">Choose a saved mapping</option>{choices.map(part => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label>
+        : <div className="part-baseline-selected-part"><strong>Canonical Part</strong><span>{selected?.partNumber || "Number unavailable"} · {selected?.name || "Part unavailable"} · Rev {selected?.engineeringRevision || "A"}</span></div>}
+        {(!autoLoadReview || (!review && (Boolean(error) || busy))) && <button className="button" disabled={!partId || busy || Boolean(attempt) || Boolean(decisionAttempt)} onClick={() => void loadReview()}>{busy ? <LoaderCircle size={13}/> : <Search size={13}/>} {autoLoadReview ? "Refresh review" : "Review this workbook"}</button>}</div>
       {!choices.length && <p className="part-baseline-muted">Save at least one source-group mapping to a canonical Part before baseline processing.</p>}
       {error && <div className="part-baseline-error" role="alert"><AlertTriangle size={14}/><span>{error}</span></div>}
       {notice && <p role="status" className="part-baseline-notice"><Check size={14}/>{notice}</p>}
@@ -261,9 +274,13 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart }: {
           </article>;
         })}</div>
         <label className="part-baseline-reason">Processing reason<input name="part-baseline-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} disabled={busy || Boolean(attempt) || Boolean(decisionAttempt)} onChange={event => setReason(event.target.value)} placeholder="Optional audit context"/></label>
-        <div className="part-baseline-actions">{attempt?.operation === "establish" || review.baselineStatus !== "established"
-          ? <button className="button primary" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "establish") || (!attempt && (establishmentIssues.length > 0 || review.baselineStatus === "recovery_required"))} onClick={() => void runWrite("establish")}>{attempt?.operation === "establish" ? "Retry baseline publication" : "Establish Part baseline"}</button>
-          : <button className="button primary" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "compare")} onClick={() => void runWrite("compare")}>{attempt?.operation === "compare" ? "Retry comparison" : "Compare incoming workbook"}</button>}
+        <div className="part-baseline-actions">
+          <button className="button primary" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "establish") || (!attempt && (establishmentIssues.length > 0 || review.baselineStatus === "recovery_required" || review.baselineStatus === "established"))} onClick={() => void runWrite("establish")}>{attempt?.operation === "establish" ? "Retry baseline publication" : "Establish Part baseline"}</button>
+          <button className="button" disabled={busy || Boolean(decisionAttempt) || (attempt !== null && attempt.operation !== "compare") || review.baselineStatus !== "established"} onClick={() => void runWrite("compare")}>{attempt?.operation === "compare" ? "Retry comparison" : "Compare incoming workbook"}</button>
+          {!attempt && review.baselineStatus === "established" && <small>A Rev A baseline already exists. Compare workbook evidence to review incoming changes.</small>}
+          {!attempt && review.baselineStatus !== "established" && review.baselineStatus !== "recovery_required" && establishmentIssues.length > 0 && <small>Publication is disabled until the listed source and completeness blockers are resolved.</small>}
+          {!attempt && review.baselineStatus === "recovery_required" && <small>Publication is blocked until the original saved request is recovered.</small>}
+          {review.baselineStatus !== "established" && <small>Compare is available after an accepted baseline exists.</small>}
           {attempt && <small>Outcome is unresolved. Retry uses the original request identity and exact payload before another operation can start.</small>}
         </div>
       </>}

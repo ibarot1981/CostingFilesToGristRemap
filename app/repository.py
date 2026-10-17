@@ -113,6 +113,8 @@ class SafariRepository(Protocol):
     def add_product(self, item: Product) -> None: ...
     def add_model(self, item: ProductModel) -> None: ...
     def add_code(self, item: ProductModelCode) -> None: ...
+    def update_model_code_description(self, code_id: str, description: str, *, expected_description: str | None = None) -> ProductModelCode: ...
+    def create_model_code(self, model_id: str, code: str, description: str) -> ProductModelCode: ...
     def list_models(self, product_id: str | None = None) -> list[ProductModel]: ...
     def list_codes(self, model_id: str, include_legacy: bool = False) -> list[ProductModelCode]: ...
     def get_file(self, file_id: str) -> CostingFile | None: ...
@@ -185,6 +187,38 @@ class SafariRepositoryState:
         if item.model_id not in self.models:
             raise ValueError(f"Unknown model {item.model_id}")
         self.codes[item.id] = item
+
+    def update_model_code_description(self, code_id: str, description: str, *, expected_description: str | None = None) -> ProductModelCode:
+        current = self.codes.get(str(code_id))
+        if current is None:
+            raise GovernanceConflict("MODEL_CODE_NOT_FOUND", "Product Model Code was not found.")
+        value = _validated_identity_text(description, "MODEL_CODE_DESCRIPTION_INVALID", allow_blank=True)
+        if expected_description is not None and current.description != expected_description:
+            raise GovernanceConflict("MODEL_CODE_DESCRIPTION_STALE", "This description changed after it was loaded. Reload before editing.", current)
+        updated = replace(current, description=value)
+        self.codes[updated.id] = updated
+        return updated
+
+    def create_model_code(self, model_id: str, code: str, description: str) -> ProductModelCode:
+        model = self.models.get(str(model_id))
+        if model is None:
+            raise GovernanceConflict("MODEL_NOT_FOUND", "Product Model was not found.")
+        product = self.products.get(model.product_id)
+        if not model.active or not product or not product.active:
+            raise GovernanceConflict("MODEL_NOT_ACTIVE", "Choose an active Product Model under an active Product.")
+        code_value = _validated_identity_text(code, "MODEL_CODE_INVALID")
+        description_value = _validated_identity_text(description, "MODEL_CODE_DESCRIPTION_REQUIRED")
+        if not description_value:
+            raise GovernanceConflict("MODEL_CODE_DESCRIPTION_REQUIRED", "A nonblank description is required for a new Model Code.")
+        normalized_code = normalize_text(code_value)
+        if any(item.model_id == model.id and normalize_text(item.code) == normalized_code for item in self.codes.values()):
+            raise GovernanceConflict("MODEL_CODE_EXISTS", "That Model Code already exists under this Product Model.")
+        identity_digest = sha256(f"{model.id}\0{normalized_code}".encode("utf-8")).hexdigest()[:24]
+        legacy = model.legacy_spares_only or "bush" in " ".join((code_value, description_value, model.model_number)).casefold()
+        created = ProductModelCode(id=f"manual-code:{identity_digest}", model_id=model.id, code=code_value,
+            description=description_value, legacy_spares_only=legacy)
+        self.codes[created.id] = created
+        return created
 
 
 class SafariRepositoryBase(SafariRepositoryState):
@@ -888,6 +922,17 @@ def normalize_relative_directory(value: str) -> tuple[str, str]:
     parts = [part for part in raw.split("/") if part not in {"", "."}]
     normalized = "/".join(parts).casefold()
     return "/".join(parts), normalized
+
+
+def _validated_identity_text(value: str, error_code: str, *, allow_blank: bool = False) -> str:
+    text = str(value or "").strip()
+    if not allow_blank and not text:
+        message = "A Product Model Code is required." if error_code == "MODEL_CODE_INVALID" else "A nonblank description is required for a new Model Code."
+        raise GovernanceConflict(error_code, message)
+    from app.catalog_import import _has_invalid_identity_text
+    if _has_invalid_identity_text(text):
+        raise GovernanceConflict(error_code, "Product Model Code text contains unsupported control or invalid Unicode characters.")
+    return text
 
 
 def _issue_fingerprint(issue: ReconciliationIssue) -> str:

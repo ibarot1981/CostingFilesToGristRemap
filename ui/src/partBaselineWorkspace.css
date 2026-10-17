@@ -1,0 +1,36 @@
+.part-baseline-workspace{max-width:1680px;margin:18px auto;padding:0 24px 28px;color:#34435a}
+.baseline-workspace-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin:10px 0 16px}
+.baseline-workspace-heading h1{margin:3px 0 4px;font-size:24px;color:#26364b}
+.baseline-workspace-heading p{margin:0;color:#788393;font-size:12px;overflow-wrap:anywhere}
+.baseline-workspace-context{margin:0 0 14px;border:1px solid #cbd8e5;border-radius:8px;background:#f1f7fc;padding:10px 12px;color:#48647d;font-size:11px}
+.baseline-workspace-layout{display:grid;grid-template-columns:minmax(245px,310px) minmax(0,1fr);gap:16px;align-items:start}
+.baseline-workspace-nav,.baseline-workspace-main{min-width:0;background:#fff;border:1px solid #dfe2e6;border-radius:9px;box-shadow:0 1px 3px #25364a0b}
+.baseline-workspace-nav{position:sticky;top:16px;max-height:calc(100vh - 190px);display:flex;flex-direction:column;overflow:hidden}
+.baseline-workspace-nav-heading{display:flex;align-items:center;justify-content:space-between;padding:13px 14px;border-bottom:1px solid #e7e9ec;font-size:12px}
+.baseline-workspace-nav-heading span{display:inline-grid;place-items:center;min-width:22px;height:22px;border-radius:999px;background:#f0f2f4;color:#637083;font-size:10px}
+.baseline-workspace-search{display:flex;align-items:center;gap:7px;margin:10px 10px 7px;padding:7px 8px;border:1px solid #d9dee4;border-radius:6px;color:#788393}
+.baseline-workspace-search input{width:100%;border:0;outline:0;background:transparent;color:#34435a;font:inherit;font-size:10px}
+.baseline-workspace-part-list{overflow:auto;padding:0 7px 8px}
+.baseline-workspace-part{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;padding:9px 8px;border:1px solid transparent;border-radius:6px;background:#fff;color:#526176;cursor:pointer}
+.baseline-workspace-part:hover{background:#f7f9fb}
+.baseline-workspace-part.is-selected{border-color:#b9cddd;background:#edf5fb;color:#2f536c}
+.baseline-workspace-part>span{min-width:0;display:grid;gap:3px}
+.baseline-workspace-part strong{font-size:10px;line-height:1.35;overflow-wrap:anywhere}
+.baseline-workspace-part small{font-size:9px;color:#7d8795;line-height:1.35;overflow-wrap:anywhere}
+.baseline-workspace-part .baseline-workspace-status{color:#587365;text-transform:capitalize}
+.baseline-workspace-next{margin:0 10px 10px;justify-content:center}
+.baseline-workspace-main{min-height:360px;padding:16px}
+.baseline-workspace-part-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:0 2px 12px;border-bottom:1px solid #e7e9ec}
+.baseline-workspace-part-heading h2{margin:3px 0 4px;font-size:19px;color:#293a4f}
+.baseline-workspace-part-heading p{margin:0;color:#788393;font-size:11px}
+.baseline-workspace-status-pill{flex:none;padding:6px 9px;border-radius:999px;background:#f1f4f2;color:#587365;font-size:9px;text-transform:capitalize}
+.baseline-workspace-main .part-baseline-panel{max-width:none;margin:12px 0 0;border:0;border-radius:0;box-shadow:none;overflow:visible}
+.baseline-workspace-main .part-baseline-content{padding:0}
+.baseline-workspace-main .part-baseline-selected-part{display:grid;gap:4px;padding:8px 10px;background:#f7f8f7;border:1px solid #e3e7e5;border-radius:6px;font-size:10px}
+.baseline-workspace-main .part-baseline-selected-part span{color:#657286}
+.baseline-workspace-empty,.baseline-workspace-loading{margin:9px 12px 14px;color:#7a8694;font-size:10px;line-height:1.5}
+.baseline-workspace-loading{display:flex;align-items:center;gap:8px}
+.baseline-workspace-empty-state{min-height:300px;display:grid;place-content:center;gap:8px;text-align:center;color:#758092;font-size:11px}
+.baseline-workspace-empty-state strong{font-size:14px;color:#44546a}
+@media(max-width:900px){.part-baseline-workspace{padding:0 14px 22px}.baseline-workspace-layout{grid-template-columns:1fr}.baseline-workspace-nav{position:static;max-height:360px}.baseline-workspace-part-list{max-height:220px}.baseline-workspace-main{padding:12px}}
+@media(max-width:560px){.baseline-workspace-heading{align-items:flex-start;flex-direction:column}.baseline-workspace-heading h1{font-size:20px}.baseline-workspace-part-heading{flex-direction:column}.baseline-workspace-status-pill{align-self:flex-start}}

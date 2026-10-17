@@ -6,7 +6,7 @@ import { PartBaselinePanel } from "./PartBaselinePanel";
 import { MAPPING_PART_CREATE_ATTEMPT_KEY, PartCreationForm, restoredMappingPartCreateAttempt, type ExistingPart, type PartCreateAttempt, type PartCreationOrigin } from "./PartCreationForm";
 import "./partMapping.css";
 
-type Part = { id: string; name: string; description?: string; variant?: string; selectable: boolean; duplicateName: boolean; partNumber?: string | null; engineeringRevision?: string | null; legacy?: boolean; outOfScopeCodes?: { id: string; code: string }[] };
+export type Part = { id: string; name: string; description?: string; variant?: string; selectable: boolean; duplicateName: boolean; partNumber?: string | null; engineeringRevision?: string | null; manufacturingBaselineStatus?: string; status?: string; publishStatus?: string; legacy?: boolean; outOfScopeCodes?: { id: string; code: string }[] };
 type SourceRow = { sheet: string; row: number; fields: Record<string, unknown>; sourceHeaders: Record<string, string>; sourceHeaderCells: Record<string, string>; sourceCells: Record<string, { cell?: string }>; headerRow?: number; availableFields: string[]; lineKey?: string; semanticEvidence?: { fingerprint?: string }; part?: Part | null; reviewed?: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment | null; semanticComparison?: SemanticComparison };
 type SemanticField = { field: string; state: string; value?: string | null; display?: string | null };
 type SemanticLine = { fingerprint: string; fields: SemanticField[] };
@@ -14,7 +14,7 @@ type SemanticDifference = { type: string; previous: SemanticLine | null; current
 type SemanticComparison = { status: string; previousFingerprint?: string | null; currentFingerprint?: string | null; previousPolicyVersion?: string; sourceHashChanged?: boolean; associationChanged?: boolean; groupingPolicyChanged?: boolean; differences: SemanticDifference[]; requiresReview: boolean };
 type PreviousAssignment = { partId?: string | null; partNumber?: string | null; name?: string | null; sourceDescription?: string; requiresReview: boolean; sourceChanged?: boolean; associationChanged?: boolean; previousRowsAgree?: boolean; previousRowsReviewed?: number; currentRows?: number; assignedPartIds?: string[]; hasPriorAssignment?: boolean; contextChanged?: boolean; groupingPolicyChanged?: boolean; evidenceStatus?: string };
 type DeletedLineReview = { reviewKey: string; priorReviewKey?: string; lineKey?: string; groupKey: string; sheet: string; description: string; row: number | null; semanticEvidence?: SemanticLine | null; evidenceStatus?: string; previousAssignment: PreviousAssignment; semanticComparison: SemanticComparison; provenance?: { reviewKey?: string; version?: number; actor?: string; reason?: string; occurredAt?: string; sourceHash?: string }; reviewed?: boolean; resolution?: { actor?: string; reason?: string; version?: number } | null };
-type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; semanticFingerprint?: string; semanticComparison?: SemanticComparison; assignmentSummary?: { partCount: number; mappedLineCount: number; unassignedLineCount: number }; pendingLineKeys?: string[]; deletedLines?: DeletedLineReview[]; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment; needsCompatibilityReview?: boolean; version: number };
+export type Group = { key: string; mappingPolicyVersion: string; evidenceFingerprint: string; semanticFingerprint?: string; semanticComparison?: SemanticComparison; assignmentSummary?: { partCount: number; mappedLineCount: number; unassignedLineCount: number }; pendingLineKeys?: string[]; deletedLines?: DeletedLineReview[]; sheet: string; labelField: string; sourceDiagnostic?: { status?: string }; description: string; blankDescription: boolean; rows: SourceRow[]; part: Part | null; reviewed: boolean; explicitlyUnassigned?: boolean; previousAssignment?: PreviousAssignment; needsCompatibilityReview?: boolean; version: number };
 type RemovedGroup = { key: string; sheet: string; description: string; removed: true; reviewed?: boolean; deletedLines?: DeletedLineReview[]; previousAssignment?: PreviousAssignment; semanticComparison?: SemanticComparison };
 type Detail = { sourceHash: string; associationKey: string; associationVersion: number; version: number; schemaAvailable: boolean; schemaMessage?: string | null; legacyHistoryAvailable?: boolean; mappingPolicyVersion: string; semanticPolicyVersion?: string; sourceSheets: Record<string, { present: boolean; status: string; labelField: string; labelHeader: string | null; labelHeaderCell: string | null; ambiguousLabelHeaders: string[]; headerRow: number | null }>; parts: Part[]; groups: Group[]; removedGroups?: RemovedGroup[]; unresolvedGroups: number; unresolvedLines?: number; unresolvedDeletedLines?: number; history: { ReviewKey: string; Version: number; SourceDescription: string; SheetName: string; SourceRow: number; Actor: string; Reason: string; OccurredAt: string; ActionType?: string; NameUsed?: string; PartNumberUsed?: string }[] };
 type Attempt = { key: string; payload: Record<string, unknown>; groupKeys: string[]; lineKeys?: string[]; deletedLineReviewKeys?: string[] };
@@ -178,7 +178,7 @@ function narrowScreen() {
   return typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 1000px)").matches : window.innerWidth <= 1000;
 }
 
-export function PartMappingView({ path, active = true, onOpenParts, returnSelection, onReturnSelectionConsumed }: { path: string; active?: boolean; onOpenParts?: (groupKey: string, partId: string | null, mode?: "select" | "view", context?: Partial<ReturnSelection>) => void; returnSelection?: ReturnSelection | null; onReturnSelectionConsumed?: () => void }) {
+export function PartMappingView({ path, active = true, onOpenParts, returnSelection, onReturnSelectionConsumed, onReviewBaselines }: { path: string; active?: boolean; onOpenParts?: (groupKey: string, partId: string | null, mode?: "select" | "view", context?: Partial<ReturnSelection>) => void; returnSelection?: ReturnSelection | null; onReturnSelectionConsumed?: () => void; onReviewBaselines?: (path: string, initialPartId: string) => void }) {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [decisions, setDecisions] = useState<Record<string, string>>({});
   const [draftParts, setDraftParts] = useState<Record<string, Part>>({});
@@ -212,6 +212,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   const acceptedMappingRef = useRef({ path, detail, loading, createOrigin });
   acceptedMappingRef.current = { path, detail, loading, createOrigin };
   const generation = useRef(0);
+  const detailPath = useRef("");
   const inFlight = useRef(false);
   const tableScroll = useRef<HTMLDivElement>(null);
   const contextPanel = useRef<HTMLElement>(null);
@@ -374,7 +375,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
         onReturnSelectionConsumed?.();
       }
       if (revision !== generation.current) return;
-      setDecisions(nextDecisions); setDraftParts(nextParts); setLineDecisions(nextLineDecisions); setLineDraftParts(nextLineParts); setDetail(result);
+      setDecisions(nextDecisions); setDraftParts(nextParts); setLineDecisions(nextLineDecisions); setLineDraftParts(nextLineParts); detailPath.current = path; setDetail(result);
     } catch (cause) { if (revision === generation.current) { setDetail(null); setError(String(cause)); } }
     finally { if (revision === generation.current) setLoading(false); }
   }
@@ -385,6 +386,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
     const revision = ++generation.current;
     const returningToSamePath = loadedPath.current === path && Boolean(detail);
     if (!returningToSamePath) {
+      detailPath.current = "";
       setDetail(null); setDecisions({}); setDraftParts({}); setLineDecisions({}); setLineDraftParts({}); setSelectedLineKeys([]); setSplitModes({}); setLineReasons({}); setDeletedLineReasons({}); setStaleDrafts([]); setReason("");
       setGroupReasons({}); setExpandedGroups({}); setExpanded({}); setNotice(""); setError(""); setBusy(false);
       setMappingAttempt(null); setConfirmBatch(false); inFlight.current = false;
@@ -394,7 +396,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   }, [path, active]);
 
   useEffect(() => {
-    if (!detail || !path) return;
+    if (!detail || !path || detailPath.current !== path) return;
     const saved: Draft = { path, sourceHash: detail.sourceHash, version: detail.version, associationKey: detail.associationKey,
       associationVersion: detail.associationVersion, decisions, draftParts, lineDecisions, lineDraftParts, selectedLineKeys, splitModes, lineReasons,
       groupReasons, expandedGroups, expandedSourceDetails: expanded, reason, query, sheetFilter, reviewFilter,
@@ -979,6 +981,7 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
             <option value="saved">Saved · {allGroups.filter(group => group.reviewed).length} groups</option><option value="unsaved">Unsaved changes · {pendingGroups.length} groups</option>
             <option value="unassigned">Unassigned lines · {allGroups.reduce((sum, group) => sum + group.rows.filter(row => !effectivePartForLine(group, row)).length, 0)} lines</option>
           </select></label>
+          <button type="button" className="button primary part-baseline-launcher" disabled={!detail || loading || !baselineParts.length} title={!baselineParts.length ? "Save a Part mapping before reviewing manufacturing baselines." : "Open the full-width baseline review workspace."} onClick={() => onReviewBaselines?.(path, baselineParts[0]?.id || "")}>Review manufacturing baselines</button>
           <div className="part-group-expansion-actions" aria-label="Group expansion controls">
             <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, true])) }))}>Expand all displayed</button>
             <button type="button" className="button quiet" disabled={!visibleGroups.length} onClick={() => setExpandedGroups(old => ({ ...old, ...Object.fromEntries(displayedKeys.map(key => [key, false])) }))}>Collapse all displayed</button>
@@ -1209,17 +1212,17 @@ function SourceDetails({ group, expanded, onToggle, selectionMode, selectedLineK
   const withoutCncDimensions = withoutInUse.filter(column => !(group.sheet === "CNC Cut List"
     && ["length", "width", "thickness"].includes(column.key)));
   const visibleColumns = expanded ? withoutCncDimensions : withoutCncDimensions.filter(column => (compactKeys[group.sheet] || []).includes(column.key));
-  return <section className={`part-source-details ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
+  return <section className={`part-source-details ${group.sheet === "CNC Cut List" ? "cnc" : ""} ${expanded ? "expanded" : ""}`} aria-label={`${group.sheet} source details`}>
     <div className="part-source-details-heading"><strong>Source evidence</strong><button type="button" className="button quiet" aria-expanded={expanded} onClick={onToggle}>{expanded ? "Show key fields" : "Expand source details"}</button></div>
     {!columns.length ? <p>Source-specific fields are not configured for this sheet.</p> : <div className="part-detail-scroll"><table><thead><tr>{selectionMode && <th>Assign line</th>}{visibleColumns.map(column => {
       const header = group.rows.map(row => row.sourceHeaders?.[column.key]).find(Boolean);
       const available = group.rows.some(row => row.availableFields?.includes(column.key));
-      return <th key={column.key} title={header || (available ? column.label : "Column not found in source")}>{header || `${column.label}${available ? "" : " · not found"}`}</th>;
+      return <th key={column.key} data-source-field={column.key} title={header || (available ? column.label : "Column not found in source")}>{header || `${column.label}${available ? "" : " · not found"}`}</th>;
     })}<th>Source row</th><th>Canonical Part</th></tr></thead><tbody>{group.rows.map(row => <tr key={`${row.sheet}:${row.row}`} className={selectionMode && selectedLineKeys.includes(String(row.lineKey || "")) ? "is-line-selected" : ""}>{selectionMode && <td className="part-line-select-cell"><input type="checkbox" aria-label={`Select ${group.sheet} row ${row.row} for Part assignment`} checked={selectedLineKeys.includes(String(row.lineKey || ""))} disabled={!row.lineKey} onChange={() => onToggleLine(row)}/></td>}{visibleColumns.map(column => {
       const value = row.fields?.[column.key];
       const cell = row.sourceCells?.[column.key]?.cell;
       const available = row.availableFields?.includes(column.key);
-      return <td className="part-source-value" key={column.key} title={cell ? `Source cell ${cell}${row.sourceHeaders?.[column.key] ? ` · ${row.sourceHeaders[column.key]}` : ""}` : undefined}>
+      return <td className="part-source-value" data-source-field={column.key} key={column.key} title={cell ? `Source cell ${cell}${row.sourceHeaders?.[column.key] ? ` · ${row.sourceHeaders[column.key]}` : ""}` : undefined}>
         {value === null || value === undefined || String(value).trim() === "" ? <span className={available ? "part-source-blank" : "part-source-missing"}>{available ? "— blank in source" : "Not in sheet"}</span> : <>{String(value)}{cell && <small className="part-cell-ref">{cell}</small>}</>}
       </td>;
     })}<td><strong className={`part-sheet-label ${sheetFamilyClass(row.sheet)}`}>{row.sheet}</strong><small>row {row.row}{row.headerRow ? ` · headers row ${row.headerRow}` : ""}</small></td><td className="part-line-assignment-cell">{effectivePart(row) ? <><strong>{formatPart(effectivePart(row))}</strong><button type="button" className="button quiet" disabled={!row.reviewed} onClick={() => onViewPart(row)}>View</button></> : row.previousAssignment?.name ? <span className="part-line-prior-proposal">Needs review · proposed {row.previousAssignment.partNumber ? `${row.previousAssignment.partNumber} · ` : ""}{row.previousAssignment.name}</span> : <span className="part-source-blank">Unassigned</span>}{effectivePart(row)?.outOfScopeCodes?.length ? <small className="part-scope-advisory">Scope advisory: {effectivePart(row)!.outOfScopeCodes!.map(code => code.code).join(", ")}</small> : null}{row.lineKey && Object.prototype.hasOwnProperty.call(row, "reviewed") && !row.reviewed && <small>{row.semanticComparison?.status === "ambiguous_correspondence" ? "Ambiguous match · confirm this line" : row.explicitlyUnassigned ? "Explicitly cleared" : "Needs assignment"}</small>}</td></tr>)}</tbody></table></div>}

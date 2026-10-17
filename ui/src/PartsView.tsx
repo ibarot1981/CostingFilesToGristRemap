@@ -5,7 +5,7 @@ import { CascadeCodePicker, PartCreationForm } from "./PartCreationForm";
 import "./parts.css";
 
 type Scope = "global" | "product" | "product_model" | "model_code";
-type Target = { id: string; label: string; parentId?: string; shortcode?: string | null };
+type Target = { id: string; label: string; displayLabel?: string; description?: string; parentId?: string; shortcode?: string | null };
 type ScopeOption = { id: Scope; label: string; target?: Target; targets?: Target[] };
 type Part = { id: string; partNumber: string | null; name: string; description: string; variant: string; scope: string; scopeTargetId: string | null; scopeTarget: string; shortcode?: string; engineeringRevision: string | null; identityKind?: "part" | "assembly"; status: string; metadataVersion: number | null; manufacturingBaselineStatus?: string; aliases: string[]; legacy: boolean; createdAt?: string; actor?: string; reason?: string; legacyRevisionValues?: string[]; partKey?: string; ambiguousName?: boolean; metadataHistory?: any[]; lifecycleHistory?: any[] };
 type Preview = { name: string; available: boolean; collision: { source: string; id: string; number: string | null; status: string }[]; before?: any; after?: any; affectedSourceAssignments?: any[]; usageFingerprint?: string };
@@ -49,7 +49,7 @@ function manufacturingBaselineRequirementTitle(item: any): string {
   return `${familyLabel} · ${sourceLabel ? `${sourceLabel}: ` : ""}${text}`;
 }
 
-export function PartsView({ active = true, mappingReturn = null, onReturnToMapping }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void }) {
+export function PartsView({ active = true, mappingReturn = null, onReturnToMapping, onReviewBaseline }: { active?: boolean; mappingReturn?: { path: string; groupKey: string; partId: string | null; mode?: "select" | "view" } | null; onReturnToMapping?: (partId: string | null) => void; onReviewBaseline?: (partId: string, part: any, path: string) => void }) {
   const [scopes, setScopes] = useState<ScopeOption[]>([]);
   const [register, setRegister] = useState<Register>(emptyRegister);
   const [query, setQuery] = useState(() => sessionStorage.getItem("parts:search") || "");
@@ -65,6 +65,9 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   });
   const [fullDetails, setFullDetails] = useState(Boolean(window.location.hash.match(/^#parts\//)));
   const [details, setDetails] = useState<any>(null);
+  const [baselineWorkbookOptions, setBaselineWorkbookOptions] = useState<{ path: string; label: string }[]>([]);
+  const [baselineWorkbookPath, setBaselineWorkbookPath] = useState("");
+  const [baselineWorkbookLoading, setBaselineWorkbookLoading] = useState(false);
   const [requestedDetailSection, setRequestedDetailSection] = useState<{ partId: string; sectionId: string } | null>(null);
   const [scope, setScope] = useState<Scope>("global");
   const [targetId, setTargetId] = useState("global");
@@ -139,12 +142,54 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
 
   useEffect(() => {
     if (!selectedId || mode !== "selected") { setDetails(null); return; }
+    if (!active) return;
     const generation = ++detailsGeneration.current;
-    setDetails(null);
     api.partDetails(selectedId).then(value => { if (generation === detailsGeneration.current) { setDetails(value); setRegister(old => ({ ...old, items: old.items.map(part => part.id === selectedId ? { ...part, ...value.part } : part) })); } })
       .catch(cause => { if (generation === detailsGeneration.current) setError(String(cause)); });
     return () => { ++detailsGeneration.current; };
-  }, [selectedId, mode]);
+  }, [active, selectedId, mode]);
+
+  useEffect(() => {
+    setBaselineWorkbookOptions([]);
+    setBaselineWorkbookPath("");
+    setBaselineWorkbookLoading(false);
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!selectedId || !fullDetails || details?.part?.id !== selectedId || details?.part?.identityKind === "assembly") return;
+    const normalizePath = (value: unknown) => String(value || "").trim().replaceAll("\\", "/").toLocaleLowerCase();
+    const mappedPaths = new Set((details.mappedLines?.items || [])
+      .filter((line: any) => line.assignmentStatus === "current" && line.sourceStatus === "readable")
+      .map((line: any) => normalizePath(line.workbookPath))
+      .filter(Boolean));
+    if (!mappedPaths.size) {
+      setBaselineWorkbookOptions([]);
+      setBaselineWorkbookPath("");
+      setBaselineWorkbookLoading(false);
+      return;
+    }
+    let active = true;
+    setBaselineWorkbookLoading(true);
+    api.mappedFiles().then(result => {
+      if (!active) return;
+      const byPath = new Map<string, { path: string; label: string }>();
+      for (const item of result.items || []) {
+        const path = String(item.file?.relative_path || "").trim();
+        if (!path || !mappedPaths.has(normalizePath(path)) || !item.association) continue;
+        const blockers = new Set(["missing_file", "parse_error", "catalog_mismatch", "duplicate_code_ownership"]);
+        if ((item.issues || []).some((issue: string) => blockers.has(issue))) continue;
+        const association = item.association || {};
+        const product = String(association.product_name || item.product?.name || "");
+        const model = String(association.model_name || item.model?.name || "");
+        byPath.set(path.toLocaleLowerCase(), { path, label: [product, model, path].filter(Boolean).join(" · ") });
+      }
+      const options = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+      setBaselineWorkbookOptions(options);
+      setBaselineWorkbookPath(current => options.some(option => option.path === current) ? current : options.length === 1 ? options[0].path : "");
+    }).catch(cause => { if (active) setError(String(cause)); })
+      .finally(() => { if (active) setBaselineWorkbookLoading(false); });
+    return () => { active = false; };
+  }, [selectedId, fullDetails, details, details?.part?.identityKind]);
 
   useEffect(() => {
     if (!requestedDetailSection) return;
@@ -173,6 +218,14 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const allParts = useMemo(() => [...register.items, ...register.legacyItems], [register]);
   const tree = useMemo(() => buildPartsTree(scopes, allParts, expandedIds), [scopes, allParts, expandedIds]);
   const selected = allParts.find(part => part.id === selectedId) || null;
+  const currentMappedLines = details?.part?.id === selectedId
+    ? (details?.mappedLines?.items || []).filter((line: any) => line.assignmentStatus === "current" && line.sourceStatus === "readable")
+    : [];
+  const baselineWorkbookEmptyMessage = details?.mappedLines?.status === "unavailable"
+    ? details.mappedLines.message || "Saved workbook mapping evidence is unavailable for this Part."
+    : !currentMappedLines.length
+      ? "No current saved workbook line assignments are linked to this Part. Map one of its source lines before baseline review."
+      : "Mapped workbooks for this Part are currently unavailable or need revalidation. Restore or revalidate a source file and its Product Model association first.";
 
   function toggleTree(entry: TreeEntry) {
     if (!entry.hasChildren) return;
@@ -258,6 +311,14 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     openFullDetails();
   }
 
+  function reviewBaselineInWorkbook() {
+    if (!selected || !baselineWorkbookPath || !onReviewBaseline) return;
+    onReviewBaseline(selected.id, { id: selected.id, name: selected.name, description: selected.description, partNumber: selected.partNumber,
+      engineeringRevision: selected.engineeringRevision, status: selected.status, selectable: !selected.legacy && selected.status !== "retired",
+      duplicateName: Boolean(selected.ambiguousName), manufacturingBaselineStatus: details?.manufacturingBaseline?.status || selected.manufacturingBaselineStatus,
+      legacy: selected.legacy }, baselineWorkbookPath);
+  }
+
   function openComposition() {
     if (!selectedId) return;
     setRequestedDetailSection({ partId: selectedId, sectionId: "components" });
@@ -320,7 +381,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const editForm = <section className="parts-form-card" aria-label="Review Part metadata change">
     <div><span className="eyebrow">Reviewed metadata change</span><h2>Change Part name or scope</h2><p>The physical design identity stays fixed. This change creates a new metadata version.</p></div>
     <label>Name derives from<select name="part-metadata-scope" autoComplete="off" disabled={formLocked} value={scope} onChange={event => setScope(event.target.value as Scope)}>{scopes.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
-    {scope !== "global" && <label>Scope target<select name="part-metadata-target" autoComplete="off" disabled={formLocked} value={targetId} onChange={event => setTargetId(event.target.value)}><option value="">Choose {scopeLabels[scope]}</option>{targets.map(item => <option key={item.id} value={item.id}>{item.label}{item.shortcode ? ` · ${item.shortcode}` : " · shortcode needed"}</option>)}</select></label>}
+    {scope !== "global" && <label>Scope target<select name="part-metadata-target" autoComplete="off" disabled={formLocked} value={targetId} onChange={event => setTargetId(event.target.value)}><option value="">Choose {scopeLabels[scope]}</option>{targets.map(item => <option key={item.id} value={item.id}>{item.displayLabel || item.label}{item.shortcode ? ` · ${item.shortcode}` : " · shortcode needed"}</option>)}</select></label>}
     {target && <div className="parts-shortcode-box"><div><strong>Maintained shortcode</strong><span>{target.shortcode || "Not set for this target"}</span></div></div>}
     {shortcodeMissing && <p className="parts-validation warning">Resolve the missing shortcode before generating a Part name. The app will not guess it.</p>}
     <label>What is the Part called?<input name="part-metadata-description" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={description} maxLength={120} onChange={event => setDescription(event.target.value)} placeholder="For example, Chassis" disabled={formLocked}/></label>
@@ -371,10 +432,19 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>
           <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full {selected.identityKind === "assembly" ? "Assembly" : "Part"} details</button>{selected.identityKind === "assembly" ? <button className="button" onClick={openComposition}><PackagePlus size={14}/> Open composition</button> : <><button className="button" onClick={openManufacturingBaseline}><Wrench size={14}/> Manufacturing baseline</button><button className="button" onClick={openMappedWorkbookLines}><FileText size={14}/> Mapped workbook lines</button></>}<button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
           {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
-          {fullDetails && details ? <>
+          {fullDetails && details?.part?.id === selectedId ? <>
             <div className="parts-detail-tabs" aria-label={`${selected.identityKind === "assembly" ? "Assembly" : "Part"} detail sections`}>{(selected.identityKind === "assembly" ? ["Overview", "Components", "Drawings", "Used in configurations", "History"] : ["Overview", "Manufacturing baseline", "Intended sharing", "Mapped workbook lines", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"]).map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" aria-controls={id} onClick={() => openPartDetailSection(id)}>{label}</button>; })}</div>
             <PartDetailSection id="overview" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></PartDetailSection>
             {selected.identityKind === "assembly" ? <PartDetailSection id="manufacturing-baseline" title="Manufacturing baseline"><p>Assembly requirements are represented by its pinned child composition. Workbook mapping, baseline roll-up, and purchased/store composition are deferred.</p></PartDetailSection> : <PartDetailSection id="manufacturing-baseline" title="Accepted Manufacturing baseline">
+              <div className="parts-baseline-launcher">
+                <div><strong>{details.manufacturingBaseline?.baseline ? "Review this Part against a workbook" : "Review the empty baseline for this Part"}</strong><p>Choose a source workbook to open the full-width review. Initial publication stays separate from Rev A finalization.</p></div>
+                <label>Source workbook<select aria-label="Source workbook for Part baseline review" value={baselineWorkbookPath} disabled={baselineWorkbookLoading || !baselineWorkbookOptions.length} onChange={event => setBaselineWorkbookPath(event.target.value)}>
+                  <option value="">{baselineWorkbookLoading ? "Loading associated workbooks…" : baselineWorkbookOptions.length > 1 ? "Choose a workbook explicitly" : baselineWorkbookOptions.length === 1 ? "Select workbook" : "No associated workbook available"}</option>
+                  {baselineWorkbookOptions.map(option => <option key={option.path} value={option.path}>{option.label}</option>)}
+                </select></label>
+                <button type="button" className="button primary" disabled={!baselineWorkbookPath || baselineWorkbookLoading} onClick={reviewBaselineInWorkbook}>Review this Part in the selected workbook</button>
+                {!baselineWorkbookLoading && !baselineWorkbookOptions.length && <small className="parts-unavailable">{baselineWorkbookEmptyMessage}</small>}
+              </div>
               {details.manufacturingBaseline?.baseline ? <>
                 <p><strong>Status:</strong> {String(details.manufacturingBaseline.status || "established").replaceAll("_", " ")} · Rev {details.manufacturingBaseline.revisionLabel || "A"} · {details.manufacturingBaseline.revisionLifecycle || "draft"}</p>
                 <p><strong>Originating workbook:</strong> {details.manufacturingBaseline.baseline.WorkbookName} · {details.manufacturingBaseline.baseline.WorkbookPath}</p>
@@ -488,7 +558,7 @@ function buildPartsTree(scopes: ScopeOption[], parts: Part[], expandedState: Rec
             modelCodes.forEach(code => {
               const items = codeParts.filter(part => part.scopeTargetId === code.id);
               const id = `target:model_code:${code.id}`;
-              if (expandable(id, code.label, 3, modelNode, items.length, items.length > 0, false, "target")) appendParts(items, id, 4);
+              if (expandable(id, `${code.label} · ${code.description || "No description"}`, 3, modelNode, items.length, items.length > 0, false, "target")) appendParts(items, id, 4);
             });
           }
         });

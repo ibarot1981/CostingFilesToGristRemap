@@ -16,7 +16,7 @@ from app.domain import AuditEvent, CostingChangeSetItem, CostingFile, CostingSna
 from app.exceptions import GristError, GristValidationError
 from app.grist import GristClient
 from app.grist_admin import GristAdminClient
-from app.grist_types import datetime_text as _datetime_text, grist_datetime as _grist_datetime
+from app.grist_types import datetime_text as _datetime_text, grist_datetime as _grist_datetime, grist_list
 from app.repository import AssociationConflict, AssociationProposal, AssociationSaveResult, AssociationValidation, GovernanceConflict, SafariRepositoryBase, ValidationError, normalize_relative_directory
 from app.schema import plan_schema
 
@@ -55,6 +55,54 @@ class GristSafariRepository(SafariRepositoryBase):
         with self._association_write_lock:
             self._refresh_preserving_file(proposal.file_id)
             return super().validate_association(proposal, current_file_hash=current_file_hash)
+
+    def update_model_code_description(self, code_id: str, description: str, *, expected_description: str | None = None) -> ProductModelCode:
+        with self._association_write_lock:
+            self.client.validate_safari_write_target()
+            self.refresh_identity()
+            updated = super().update_model_code_description(code_id, description, expected_description=expected_description)
+            try:
+                record_id = int(updated.id)
+            except (TypeError, ValueError) as exc:
+                raise GristValidationError("The Product Model Code does not have a valid Grist record identity.") from exc
+            try:
+                self.client.update_table_records(TABLE_CODE, [{"id": record_id, "fields": {"Description": updated.description}}])
+                self.refresh_identity()
+            except Exception:
+                # Reconcile local state after both known failures and uncertain
+                # responses; the remote record remains the source of truth.
+                self.refresh_identity()
+                raise
+            saved = self.codes.get(updated.id)
+            if saved is None or saved.description != updated.description:
+                raise GristValidationError("Grist did not confirm the saved Product Model Code description.")
+            return saved
+
+    def create_model_code(self, model_id: str, code: str, description: str) -> ProductModelCode:
+        with self._association_write_lock:
+            self.client.validate_safari_write_target()
+            self.refresh_identity()
+            created = super().create_model_code(model_id, code, description)
+            try:
+                model_record_id = int(model_id)
+            except (TypeError, ValueError) as exc:
+                self.codes.pop(created.id, None)
+                raise GristValidationError("The selected Product Model does not have a valid Grist record identity.") from exc
+            fields = {"ProductModel": model_record_id, "Code": created.code, "Description": created.description,
+                "LegacySparesOnly": created.legacy_spares_only, "SourceValues": grist_list(()), "SourceFile": "",
+                "SourceRow": 0, "Active": True}
+            try:
+                records = self.client.create_table_records(TABLE_CODE, [{"fields": fields}])
+                if len(records) != 1 or records[0].get("id") is None:
+                    raise GristValidationError("Grist did not confirm the new Product Model Code record.")
+                self.refresh_identity()
+            except Exception:
+                self.refresh_identity()
+                raise
+            saved = self.codes.get(str(records[0]["id"]))
+            if saved is None or saved.code != created.code or saved.description != created.description or saved.model_id != str(model_id):
+                raise GristValidationError("Grist did not confirm the new Product Model Code identity and description.")
+            return saved
 
     def association_detail(self, file_id: str) -> dict[str, Any]:
         with self._association_write_lock:

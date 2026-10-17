@@ -104,6 +104,8 @@ export const api = {
   products: () => get<Product[]>("/api/products"),
   models: (productId?: string) => get<ProductModel[]>(`/api/products/models${productId ? `?product_id=${encodeURIComponent(productId)}` : ""}`),
   codes: (modelId: string) => get<{ active: ModelCode[]; available: ModelCode[]; legacy: ModelCode[]; conflicts: ModelCode[] }>(`/api/models/${encodeURIComponent(modelId)}/codes`),
+  createModelCode: (modelId: string, payload: { code: string; description: string }) => send<ModelCode>(`/api/models/${encodeURIComponent(modelId)}/codes`, payload),
+  updateModelCodeDescription: (codeId: string, payload: { description: string; expectedDescription: string }) => send<ModelCode>(`/api/model-codes/${encodeURIComponent(codeId)}/description`, payload),
   tree: (path = "") => get<{ root: string; path: string; items: ExplorerItem[] }>(`/api/explorer/tree?path=${encodeURIComponent(path)}`),
   files: (query = "") => get<{ total: number; items: ExplorerItem[]; source?: "filesystem" | "cached-report" }>(`/api/catalog/files?limit=1000&extension=.ods&query=${encodeURIComponent(query)}`),
   inspect: (path: string) => get<ExplorerItem>(`/api/explorer/inspect?path=${encodeURIComponent(path)}`),

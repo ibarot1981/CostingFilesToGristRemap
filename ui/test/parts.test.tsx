@@ -5,6 +5,7 @@ import {PartsView} from "../src/PartsView";
 
 const mocks = vi.hoisted(() => ({
   parts: vi.fn(), partScopeTargets: vi.fn(), partDetails: vi.fn(),
+  mappedFiles: vi.fn(),
   partNamePreview: vi.fn(), createManagedPart: vi.fn(), createAssembly: vi.fn(), maintainPartShortcode: vi.fn(), savePartIntendedSharing: vi.fn(),
   addPartComponent: vi.fn(), recordPartPurchase: vi.fn(),
 }));
@@ -23,7 +24,7 @@ const scopeTargets = (modelShortcode: string | null) => ({scopes:[
   {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
   {id:"product",label:"Product",targets:[{id:"product-1",label:"Safari 1000",shortcode:"S1K"}]},
   {id:"product_model",label:"Product Model",targets:[{id:"model-1",parentId:"product-1",label:"Safari 1000 HF",shortcode:modelShortcode}]},
-  {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD"}]},
+  {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP",description:"Long exhaust pipe",displayLabel:"S1KHFELP · Long exhaust pipe · Safari 1000 HF"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD",description:"Standard trim",displayLabel:"S1KHFSTD · Standard trim · Safari 1000 HF"}]},
 ]});
 
 function deferred<T>() {
@@ -54,7 +55,7 @@ beforeEach(() => {
     {id:"global",label:"Global",target:{id:"global",label:"Safari Manufacturing",shortcode:"SM"}},
     {id:"product",label:"Product",targets:[{id:"product-1",label:"Safari 1000",shortcode:"S1K"},{id:"product-2",label:"Safari 500",shortcode:"S500"}]},
     {id:"product_model",label:"Product Model",targets:[{id:"model-1",parentId:"product-1",label:"Safari 1000 HF",shortcode:"S1KHF"},{id:"model-2",parentId:"product-1",label:"Safari 1000 HD",shortcode:"S1KHD"}]},
-    {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD"},{id:"code-3",parentId:"model-2",label:"S1KHDSTD"}]},
+    {id:"model_code",label:"Model Code",targets:[{id:"code-1",parentId:"model-1",label:"S1KHFELP",description:"Long exhaust pipe",displayLabel:"S1KHFELP · Long exhaust pipe · Safari 1000 HF"},{id:"code-2",parentId:"model-1",label:"S1KHFSTD",description:"Standard trim",displayLabel:"S1KHFSTD · Standard trim · Safari 1000 HF"},{id:"code-3",parentId:"model-2",label:"S1KHDSTD",description:"Heavy duty",displayLabel:"S1KHDSTD · Heavy duty · Safari 1000 HD"}]},
   ]});
   mocks.partNamePreview.mockImplementation(async (scope, targetId, description, variant) => ({name:`${targetId === "model-1" ? "S1KHF" : "S1K"} — ${description}${variant ? ` — ${variant}` : ""}`,available:true,collision:[]}));
   mocks.createManagedPart.mockResolvedValue({part:{...part,id:"new-part",partNumber:"SM-P-000002",name:"S1KHF — Chassis — Standard"}});
@@ -63,6 +64,7 @@ beforeEach(() => {
   mocks.savePartIntendedSharing.mockResolvedValue({partId:part.id,version:1,activeCodeIds:["code-2"]});
   mocks.parts.mockResolvedValue({items:[part],legacyItems:[],storage:"Grist Safari Manufacturing"});
   mocks.partDetails.mockResolvedValue(details);
+  mocks.mappedFiles.mockResolvedValue({items:[]});
 });
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
 
@@ -143,6 +145,8 @@ it("filters one Model's code list and keeps intended codes separate from its nam
   fireEvent.change(modelFilter, {target:{value:"model-1"}});
   expect(screen.getByRole("checkbox", {name:/S1KHFELP/})).toBeTruthy();
   expect(screen.getByRole("checkbox", {name:/S1KHFSTD/})).toBeTruthy();
+  expect(screen.getByText(/Long exhaust pipe · Safari 1000 HF/)).toBeTruthy();
+  expect(screen.getByText(/Standard trim · Safari 1000 HF/)).toBeTruthy();
   expect(screen.queryByRole("checkbox", {name:/S1KHDSTD/})).toBeNull();
   fireEvent.click(screen.getByRole("checkbox", {name:/S1KHFELP/}));
   fireEvent.click(screen.getByRole("checkbox", {name:/S1KHFSTD/}));
@@ -676,4 +680,75 @@ it("keeps Part detail sections collapsed until opened, and section shortcuts reo
   fireEvent.click(screen.getByRole("button", {name:"Intended sharing"}));
   expect(sharing.open).toBe(true);
   expect(screen.getByText(/Advisory links only/)).toBeTruthy();
+});
+
+it("requires an explicit workbook when several associated sources are available for an empty baseline", async () => {
+  mocks.mappedFiles.mockResolvedValue({items:[
+    {file:{relative_path:"pilot-a.ods",name:"pilot-a.ods"},association:{product_name:"Safari",model_name:"Model A"}},
+    {file:{relative_path:"pilot-b.ods",name:"pilot-b.ods"},association:{product_name:"Safari",model_name:"Model B"}},
+    {file:{relative_path:"unrelated.ods",name:"unrelated.ods"},association:{product_name:"Safari",model_name:"Other Model"}},
+    {file:{relative_path:"missing.ods",name:"missing.ods"},association:{product_name:"Safari",model_name:"Missing Model"},issues:["missing_file"]},
+  ]});
+  mocks.partDetails.mockResolvedValue({...details, mappedLines:{status:"available",historical:[],items:[
+    {workbookPath:"pilot-a.ods",assignmentStatus:"current",sourceStatus:"readable"},
+    {workbookPath:"pilot-b.ods",assignmentStatus:"current",sourceStatus:"readable"},
+  ]}});
+  const review = vi.fn();
+  render(<PartsView onReviewBaseline={review}/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+  const source = await screen.findByRole("combobox", {name:"Source workbook for Part baseline review"});
+  await waitFor(() => expect((source as HTMLSelectElement).options).toHaveLength(3));
+  expect((source as HTMLSelectElement).value).toBe("");
+  expect(Array.from((source as HTMLSelectElement).options).some(option => option.value === "missing.ods")).toBe(false);
+  expect(Array.from((source as HTMLSelectElement).options).some(option => option.value === "unrelated.ods")).toBe(false);
+  expect((screen.getByRole("button", {name:"Review this Part in the selected workbook"}) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.change(source,{target:{value:"pilot-b.ods"}});
+  fireEvent.click(screen.getByRole("button", {name:"Review this Part in the selected workbook"}));
+  expect(review).toHaveBeenCalledWith("part-uuid",expect.objectContaining({id:"part-uuid",name:part.name}),"pilot-b.ods");
+});
+
+it("explains when the selected Part has no current mapped workbook source", async () => {
+  mocks.mappedFiles.mockResolvedValue({items:[
+    {file:{relative_path:"unrelated.ods",name:"unrelated.ods"},association:{product_name:"Safari",model_name:"Model B"}},
+  ]});
+  mocks.partDetails.mockResolvedValue({...details, mappedLines:{status:"empty",items:[],historical:[],message:"No saved workbook line assignments are linked to this Part."}});
+  render(<PartsView/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+
+  const source = await screen.findByRole("combobox", {name:"Source workbook for Part baseline review"});
+  expect((source as HTMLSelectElement).disabled).toBe(true);
+  expect(screen.getByText(/No current saved workbook line assignments are linked to this Part/)).toBeTruthy();
+  expect(mocks.mappedFiles).not.toHaveBeenCalled();
+});
+
+it("reloads selected Part details on return to Parts while keeping the current detail section open", async () => {
+  const baseline = {status:"not_established",baseline:null,requirements:[],families:[],message:"No baseline yet."};
+  mocks.partDetails.mockResolvedValueOnce({...details, manufacturingBaseline:baseline})
+    .mockResolvedValue({...details, manufacturingBaseline:{...baseline,status:"established",baseline:{WorkbookName:"pilot.ods",WorkbookPath:"pilot.ods",SourceHash:"fresh"},requirements:[{key:"fresh-requirement"}]}});
+  const view = render(<PartsView active/>);
+  await screen.findByRole("treeitem", {name:/Product Model/});
+  const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
+  fireEvent.click(productParent!);
+  fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
+  fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
+  fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+  await waitFor(() => expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement).open).toBe(true));
+  await screen.findByText("No baseline yet.");
+
+  view.rerender(<PartsView active={false}/>);
+  view.rerender(<PartsView active/>);
+  await waitFor(() => expect(mocks.partDetails).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("established")).toBeTruthy();
+  expect((document.getElementById("manufacturing-baseline") as HTMLDetailsElement).open).toBe(true);
+  expect(screen.getByRole("heading", {name:part.name})).toBeTruthy();
 });

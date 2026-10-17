@@ -151,7 +151,7 @@ it("retains an uncertain baseline publication identity and blocks competing acti
   const saved = JSON.parse(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1") || "null");
   expect(saved).toMatchObject({operation:"establish",partId:"part-1",key:"request-1"});
   expect(screen.getByRole("button", {name:"Retry baseline publication"}).hasAttribute("disabled")).toBe(false);
-  expect(screen.queryByRole("button", {name:"Compare incoming workbook"})).toBeNull();
+  expect((screen.getByRole("button", {name:"Compare incoming workbook"}) as HTMLButtonElement).disabled).toBe(true);
   first.unmount();
 
   renderPanel();
@@ -162,6 +162,49 @@ it("retains an uncertain baseline publication identity and blocks competing acti
   await screen.findByText(/Initial manufacturing baseline is published in Grist/);
   expect(apiMocks.establishPartBaseline).toHaveBeenCalledTimes(2);
   expect(apiMocks.establishPartBaseline.mock.calls[1]).toEqual(apiMocks.establishPartBaseline.mock.calls[0]);
+  expect(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1")).toBeNull();
+});
+
+it("keeps establishment visible but disabled after a baseline is accepted, with a clear next action", async () => {
+  apiMocks.partBaselineReview.mockResolvedValue(review("established"));
+  renderPanel();
+  await openAndReview();
+  expect((screen.getByRole("button", {name:"Establish Part baseline"}) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText(/A Rev A baseline already exists/)).toBeTruthy();
+  expect((screen.getByRole("button", {name:"Compare incoming workbook"}) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("offers a manual refresh after the workspace's first automatic review fails", async () => {
+  apiMocks.partBaselineReview.mockRejectedValueOnce(new Error("Temporary review failure"));
+  render(<PartBaselinePanel path="pilot.ods" parts={[part,replacement]} groups={[group]} onUseDifferentPart={() => {}}
+    initialPartId={part.id} autoOpen autoLoadReview showPartSelector={false}/>);
+
+  expect((await screen.findByRole("alert")).textContent).toContain("Temporary review failure");
+  fireEvent.click(screen.getByRole("button", {name:"Refresh review"}));
+  await screen.findByText("5. Material Cut List Price");
+  expect(apiMocks.partBaselineReview).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("button", {name:"Refresh review"})).toBeNull();
+});
+
+it("refreshes after stale comparison evidence, then permits a fresh guarded comparison", async () => {
+  apiMocks.partBaselineReview.mockResolvedValue(review("established"));
+  apiMocks.comparePartBaseline.mockRejectedValueOnce(Object.assign(new Error("The source workbook changed; refresh review evidence."), {
+    code:"PART_COMPARISON_STALE", retryDisposition:"refresh_required",
+  })).mockResolvedValueOnce(comparison());
+  render(<PartBaselinePanel path="pilot.ods" parts={[part,replacement]} groups={[group]} onUseDifferentPart={() => {}}
+    initialPartId={part.id} autoOpen autoLoadReview showPartSelector={false}/>);
+
+  expect(await screen.findByRole("button", {name:"Compare incoming workbook"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", {name:"Compare incoming workbook"}));
+  expect((await screen.findByRole("alert")).textContent).toContain("source workbook changed");
+  expect(screen.queryByRole("heading", {name:/Workbook comparison/})).toBeNull();
+  expect(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1")).toBeNull();
+  fireEvent.click(await screen.findByRole("button", {name:"Refresh review"}));
+  await waitFor(() => expect(apiMocks.partBaselineReview).toHaveBeenCalledTimes(2));
+  fireEvent.click(await screen.findByRole("button", {name:"Compare incoming workbook"}));
+  expect(await screen.findByRole("heading", {name:/Workbook comparison/})).toBeTruthy();
+  expect(apiMocks.comparePartBaseline).toHaveBeenCalledTimes(2);
+  expect(apiMocks.comparePartBaseline.mock.calls[1][2]).not.toBe(apiMocks.comparePartBaseline.mock.calls[0][2]);
   expect(localStorage.getItem("part-baseline-attempt:pilot.ods:part-1")).toBeNull();
 });
 
