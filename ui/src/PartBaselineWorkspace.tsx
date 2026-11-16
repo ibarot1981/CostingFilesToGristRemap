@@ -13,6 +13,7 @@ type WorkbookPart = { id: string; partNumber?: string | null; name?: string; des
 type WorkbookPreview = { source: PreviewSource; contextKey: string; previewKey: string; parts: WorkbookPart[]; pendingRows: PendingSourceRow[]; counts: { mappedParts: number; readyParts: number; alreadyEstablishedParts: number; blockedParts: number; pendingRows: number }; canConfirm: boolean; workbookComplete: boolean };
 type BulkAttempt = { key: string; payload: Record<string, unknown> };
 type BulkResult = { status: string; totalSuccess: boolean; results: { partId: string; partNumber?: string; name?: string; status: string; message?: string; requirementCount?: number; idempotent?: boolean; retryable?: boolean }[]; pendingRows: PendingSourceRow[]; workbookComplete: boolean };
+type BulkReconciliation = BulkResult & { confirmedCount: number; totalParts: number; allOutcomesResolved: boolean; contextMatches: boolean | null; batchActive: boolean };
 
 function baselineLabel(status?: string) {
   const value = String(status || "").replaceAll("_", " ").trim();
@@ -48,8 +49,11 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
   const [appendChoices, setAppendChoices] = useState<Record<string, boolean>>({});
   const [bulkAttempt, setBulkAttempt] = useState<BulkAttempt | null>(null);
   const [bulkResult, setBulkResult] = useState<BulkResult | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<BulkReconciliation | null>(null);
   const [bulkError, setBulkError] = useState("");
+  const [bulkRecoveryError, setBulkRecoveryError] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [recoveryCheckEpoch, setRecoveryCheckEpoch] = useState(0);
   const [reviewEpoch, setReviewEpoch] = useState(0);
   const generation = useRef(0);
   const bulkInFlight = useRef(false);
@@ -98,6 +102,7 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
   }, [path, initialPartId]);
 
   useEffect(() => {
+    setBulkAttempt(null);
     try {
       const restored = JSON.parse(localStorage.getItem(bulkAttemptKey(path)) || "null") as BulkAttempt | null;
       if (restored?.key && restored.payload && typeof restored.payload === "object") setBulkAttempt(restored);
@@ -107,7 +112,49 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
     }
     setBulkResult(null);
     setBulkError("");
+    setBulkRecoveryError("");
+    setBulkProgress(null);
   }, [path]);
+
+  useEffect(() => {
+    if (!bulkAttempt || String(bulkAttempt.payload.path || "") !== path) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let checking = false;
+    async function reconcile() {
+      if (cancelled || checking) return;
+      checking = true;
+      let keepPolling = false;
+      try {
+        const status = await api.reconcileWorkbookPartBaselines(bulkAttempt!.payload, bulkAttempt!.key) as BulkReconciliation;
+        if (cancelled) return;
+        setBulkProgress(status);
+        setBulkRecoveryError("");
+        if (status.allOutcomesResolved) {
+          localStorage.removeItem(bulkAttemptKey(path));
+          setBulkResult(status);
+          setBulkAttempt(null);
+          setBulkError("");
+          setReviewEpoch(value => value + 1);
+          void refreshData();
+          return;
+        }
+        keepPolling = bulkBusy || status.batchActive || status.results?.some(item => item.status === "in_progress") === true;
+      } catch (cause) {
+        if (cancelled) return;
+        setBulkRecoveryError(`The server could not verify this saved confirmation. Its original request and payload remain saved; retry the same confirmation after recovery is available. ${String(cause)}`);
+        keepPolling = bulkBusy;
+      } finally {
+        checking = false;
+        if (!cancelled && keepPolling) timer = setTimeout(() => void reconcile(), 2000);
+      }
+    }
+    void reconcile();
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [bulkAttempt?.key, path, bulkBusy, recoveryCheckEpoch]);
 
   const parts = useMemo(() => {
     const available = [...(detail?.parts || [])];
@@ -158,9 +205,11 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
     bulkInFlight.current = true;
     setBulkBusy(true);
     setBulkError("");
+    setBulkRecoveryError("");
     try {
       const result = await api.confirmWorkbookPartBaselines(attempt.payload, attempt.key) as BulkResult;
       setBulkResult(result);
+      setBulkRecoveryError("");
       const outcomes = Array.isArray(result.results) ? result.results : [];
       const hasUncertainOutcome = outcomes.length === 0 || outcomes.some(item => {
         if (["established", "already_established"].includes(item.status)) return false;
@@ -205,6 +254,9 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
         appendExisting: Boolean(appendChoices[part.id]) })),
     } };
     localStorage.setItem(bulkAttemptKey(path), JSON.stringify(attempt));
+    setBulkResult(null);
+    setBulkProgress(null);
+    setBulkRecoveryError("");
     setBulkAttempt(attempt);
     void submitBulk(attempt);
   }
@@ -252,6 +304,16 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
         </section>}
         {!preview.workbookComplete && !preview.pendingRows.length && <p className="baseline-bulk-hint">Some Parts are blocked. Resolve their listed evidence issues before confirming them.</p>}
         {bulkError && <p className="baseline-bulk-error" role="alert">{bulkError}</p>}
+        {bulkRecoveryError && <p className="baseline-bulk-error" role="alert">{bulkRecoveryError}</p>}
+        {bulkAttempt && <div className="baseline-bulk-progress" role="status" aria-live="polite">
+          <strong>{bulkBusy ? "Workbook confirmation is running" : bulkProgress?.batchActive || bulkProgress?.status === "in_progress" ? "The server is still processing this confirmation" : "Saved confirmation recovery status"}</strong>
+          {bulkProgress ? <>
+            <span>Server evidence confirms {bulkProgress.confirmedCount} of {bulkProgress.totalParts} requested Part baselines. {bulkProgress.results.filter(item => item.status === "in_progress").length} in progress; {bulkProgress.results.filter(item => ["not_started", "uncertain"].includes(item.status) || (item.retryable && item.status !== "in_progress")).length} waiting for recovery.</span>
+            {bulkProgress.contextMatches === false && <small>The workbook, association or saved mappings changed. Completed original requests can still be verified, but remaining Parts must not be retried against this preview.</small>}
+            <ul>{bulkProgress.results.map((item, index) => <li key={`${item.partId}:${index}`}><strong>{item.partNumber || item.name || item.partId}</strong> · {baselineLabel(item.status)}{item.message ? ` · ${item.message}` : ""}</li>)}</ul>
+          </> : <span>Checking the server for results from the original saved request. No completion percentage is inferred.</span>}
+          {bulkRecoveryError && <button type="button" className="button quiet" onClick={() => setRecoveryCheckEpoch(value => value + 1)}>Check saved request status again</button>}
+        </div>}
         {bulkResult && <div className={`baseline-bulk-results ${bulkResult.totalSuccess ? "is-success" : "is-partial"}`} role="status" aria-live="polite">
           <strong>{bulkResult.totalSuccess ? "Workbook baseline confirmation complete" : "Workbook baseline confirmation needs review"}</strong>
           <span>{bulkResult.results.filter(item => item.status === "established").length} Part baseline(s) established; {bulkResult.results.filter(item => item.status === "already_established").length} already established (retained); {bulkResult.results.filter(item => item.status === "blocked").length} blocked; {bulkResult.results.filter(item => item.status === "failed").length} failed; {bulkResult.pendingRows?.length || 0} source row(s) remain for review.</span>
@@ -259,7 +321,7 @@ export function PartBaselineWorkspace({ path, initialPartId = "", initialPart = 
           {!bulkResult.workbookComplete && <small>The mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed.</small>}
         </div>}
         <div className="baseline-bulk-actions">
-          {bulkAttempt ? <><span>The original workbook confirmation is retained for safe retry.</span><button type="button" className="button primary" disabled={bulkBusy} onClick={() => void submitBulk(bulkAttempt)}>{bulkBusy ? <><LoaderCircle className="spin" size={14}/>Confirming Parts…</> : "Retry same confirmation"}</button></>
+          {bulkAttempt ? <><span>{bulkBusy || bulkProgress?.batchActive ? "Waiting for the original server confirmation and per-Part results…" : "The original request identity and payload are retained for recovery."}</span><button type="button" className="button primary" disabled={bulkBusy || bulkProgress?.batchActive === true || bulkProgress?.status === "in_progress" || bulkProgress?.results.some(item => item.status === "in_progress") === true} onClick={() => void submitBulk(bulkAttempt)}>{bulkBusy || bulkProgress?.batchActive || bulkProgress?.status === "in_progress" || bulkProgress?.results.some(item => item.status === "in_progress") ? <><LoaderCircle className="spin" size={14}/>Waiting for server…</> : "Retry same confirmation"}</button></>
             : <><span>{readyParts.length} ready Part{readyParts.length === 1 ? "" : "s"} in this fresh preview.</span><button type="button" className="button primary" disabled={!preview.canConfirm || !appendChoicesReady || bulkBusy} onClick={confirmAllReadyParts}>{bulkBusy ? "Confirming Parts…" : `Confirm ${readyParts.length} ready baseline${readyParts.length === 1 ? "" : "s"}`}</button></>}
         </div>
       </>}

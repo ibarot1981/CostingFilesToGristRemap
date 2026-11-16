@@ -1112,6 +1112,35 @@ def confirm_workbook_manufacturing_baselines(request: Request, payload: dict[str
     return result
 
 
+@app.post("/api/parts/manufacturing-baselines/workbook-confirm-status")
+@_part_registry_read_scope
+def reconcile_workbook_manufacturing_baselines(payload: dict[str, Any] = Body(...),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    """Read-only status lookup for a saved workbook confirmation attempt."""
+    path = str(payload.get("path") or "")
+    if not path or not idempotency_key:
+        raise _error(422, "PART_BASELINE_INPUT_REQUIRED", "The original workbook path and Idempotency-Key are required to recover a saved confirmation.")
+    service = _part_baseline_service()
+    current_preview = None
+    if service.workbook_confirmation_active(str(idempotency_key)):
+        file_id = str(file_association(path).get("fileId") or "")
+    else:
+        try:
+            repository, file_id, association, source_hash, groups = _part_context(path)
+            if association:
+                mapping_store = _part_mapping_store(repository)
+                current_preview = service.preview_workbook(file_id=file_id, workbook_path=path, source_hash=source_hash,
+                    association=association, groups=groups, mapping_store=mapping_store)
+        except Exception:
+            # Request identity and durable per-Part outcomes can still be read
+            # when source files or the current association are unavailable.
+            # In that case overall workbook completeness remains unverified.
+            file_id = str(file_association(path).get("fileId") or "")
+    return service.reconcile_workbook_confirmation(file_id=file_id, workbook_path=path,
+        batch_request_key=str(idempotency_key), requested_parts=payload.get("parts"),
+        expected_context_key=str(payload.get("expectedContextKey") or ""), current_preview=current_preview)
+
+
 def _baseline_write_context(part_id: str, request: Request, payload: dict[str, Any], operation: str, idempotency_key: str | None):
     from app.processing import processing_detail
     path = str(payload.get("path") or "")
