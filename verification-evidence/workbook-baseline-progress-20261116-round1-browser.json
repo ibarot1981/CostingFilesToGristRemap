@@ -1,0 +1,494 @@
+{
+  "browser": "Google Chrome via Playwright",
+  "baseUrl": "http://127.0.0.1:44571",
+  "jsErrors": [],
+  "nonGetRequests": [
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/9d380980-abdc-4263-b703-1a40779c1655/manufacturing-baseline/compare"
+    }
+  ],
+  "reconciliationReads": [
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+    }
+  ],
+  "blockedPreview": {
+    "cardText": "SM-P-000001 · S1K — Bulk MCL Part — Standard\n1 mapped requirement row · blocked\nReview Part\nThis Part's saved source assignment needs review.",
+    "readyConfirmationEnabled": true,
+    "counts": "1\nready\n1\nalready established\n1\nblocked\n0\nrows to review",
+    "resultText": "Workbook baseline confirmation needs review\n1 Part baseline(s) established; 1 already established (retained); 1 blocked; 0 failed; 0 source row(s) remain for review.\nSM-P-000001 · established\nSM-P-000002 · already established · An existing baseline was retained and not overwritten.\nSM-P-000003 · blocked · This Part remains blocked and was not included in workbook confirmation.\nThe mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed."
+  },
+  "stalePreview": {
+    "alert": "The workbook or saved Part mappings changed since this preview. The preview is being refreshed before you can confirm again. ApiError: PART_BASELINE_PREVIEW_STALE: The workbook or saved mapping changed since this preview.",
+    "retryButtons": 0,
+    "freshConfirmEnabled": true,
+    "storedAttempt": null,
+    "interceptedWrites": 1
+  },
+  "bulkRequests": [
+    {
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}",
+      "status": 200,
+      "result": {
+        "status": "partial",
+        "totalSuccess": false,
+        "results": [
+          {
+            "partId": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+            "partNumber": "SM-P-000001",
+            "name": "S1K — Bulk MCL Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "87518aba-760d-45a9-82da-c4fe6813589e",
+            "partNumber": "SM-P-000003",
+            "name": "S1K — Bulk CNC Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "991c9abd-e0cd-4742-9395-a1e43249845d",
+            "partNumber": "SM-P-000002",
+            "name": "S1K — Bulk Tool Part — Standard",
+            "status": "established",
+            "baselineStatus": "established",
+            "requirementCount": 1,
+            "idempotent": false
+          },
+          {
+            "partId": "9d380980-abdc-4263-b703-1a40779c1655",
+            "partNumber": "SM-P-000004",
+            "name": "S1K — Existing CNC Part — Standard",
+            "status": "already_established",
+            "message": "An existing baseline was retained and not overwritten.",
+            "retryable": false
+          }
+        ],
+        "pendingRows": [
+          {
+            "groupKey": "part-source-labels-v2:f44eff396909cc72099a50a5794947a93b350bed4f4bdf733e4cdad6f882d443",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 3,
+            "description": "Pending MCL review",
+            "lineKey": "part-line:58c0fa49cf765404472de8878e29a36f93c745128c86c27d5040c4100252c42c",
+            "lineFingerprint": "dd8f554d0b8124c26b868494ff09a84aaa405771e5cc0da62bc8718b014cee04",
+            "evidenceFingerprint": "52408ec2c3a0aba5996fcbb81c6528274cb49b7182c5992a5bf932b1d38f8a7f",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          },
+          {
+            "groupKey": "part-source-labels-v2:3ce38da7d3f2796fa7f9ba8d251a0861e2340d19ea715c12447b7da542c3cf39",
+            "sheet": "5. Material Cut List Price",
+            "family": "mcl",
+            "row": 4,
+            "description": "Draft MCL pending",
+            "lineKey": "part-line:71c7801d66d3f76220bd2e5b0469e3e0f5f7410add4e97e7b17c68c9e32df15a",
+            "lineFingerprint": "b13211529f07ef3aa266f6a772ed5e8443490981f0b716fdf4ddb3845a8cad9a",
+            "evidenceFingerprint": "a49f65af605eb8a80a3a2b4d3b015c19e1c1df22275b42238dac005b423670ac",
+            "status": "new",
+            "reason": "Review this source row and save a current Part assignment.",
+            "affectedPartIds": []
+          }
+        ],
+        "counts": {
+          "mappedParts": 4,
+          "readyParts": 3,
+          "alreadyEstablishedParts": 1,
+          "blockedParts": 0,
+          "pendingRows": 2
+        },
+        "workbookComplete": false,
+        "previewKey": "36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649"
+      },
+      "clientRoundTripMs": 31463,
+      "responseAborted": true
+    }
+  ],
+  "longOperation": {
+    "serverDelaySeconds": 31,
+    "requestRoundTripMs": 31463,
+    "liveProgressText": "Workbook confirmation is running\nServer evidence confirms 0 of 3 requested Part baselines. 3 in progress; 0 waiting for recovery.\nSM-P-000001 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.\nSM-P-000003 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.\nSM-P-000002 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.",
+    "responseLost": true,
+    "attemptClearedAfterVerifiedCompletion": true
+  },
+  "recovery": {
+    "legacyPr6PayloadFormat": true,
+    "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+    "body": {
+      "path": "Browser-QA-Incoming.ods",
+      "expectedContextKey": "a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e",
+      "previewKey": "36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649",
+      "reason": "Establish initial workbook manufacturing baseline",
+      "parts": [
+        {
+          "partId": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+          "snapshotKey": "e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a",
+          "appendExisting": false
+        },
+        {
+          "partId": "87518aba-760d-45a9-82da-c4fe6813589e",
+          "snapshotKey": "5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e",
+          "appendExisting": false
+        },
+        {
+          "partId": "991c9abd-e0cd-4742-9395-a1e43249845d",
+          "snapshotKey": "5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58",
+          "appendExisting": false
+        }
+      ]
+    },
+    "attemptClearedAfterReload": true,
+    "confirmationRequestsAfterReload": 1,
+    "statusReadRequests": [
+      {
+        "method": "POST",
+        "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+        "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+        "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+      }
+    ]
+  },
+  "comparison": {
+    "httpStatus": 200,
+    "status": "incomplete_evidence",
+    "sourceHash": "8e1765502c447d5c96246160767915eaabe896929705a5cb342cb4af5c997ba2",
+    "baselineSourceHash": "9b7c67ef191dd9719789606dea5c559f66bd1897ac04306cb76bec7aad37b495",
+    "incomingCnc": {
+      "differenceType": "incomplete_evidence",
+      "row": 3,
+      "length": "140"
+    },
+    "baselineCnc": {
+      "differenceType": "incomplete_evidence",
+      "length": "120"
+    },
+    "warnings": [
+      "mcl: comparison evidence is incomplete (ok; unconfirmed).",
+      "toolshop: comparison evidence is incomplete (ok; unconfirmed).",
+      "cnc: comparison evidence is incomplete (ok; unconfirmed).",
+      "5. Material Cut List Price: select Applicable or Confirmed not applicable.",
+      "Tool Shop Items: select Applicable or Confirmed not applicable.",
+      "CNC Cut List: select Applicable or Confirmed not applicable.",
+      "5. Material Cut List Price: 2 source line(s) still need an individual Part assignment; unmatched rows remain outstanding and cannot support additions or deletions."
+    ]
+  },
+  "pendingReturn": {
+    "draftBeforeBulk": {
+      "value": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+      "stickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+    },
+    "notice": "Review 5. Material Cut List Price row 3 and save any Part assignment explicitly. No assignment was added from the baseline preview.",
+    "pendingLineVisible": true,
+    "workbookPath": "Browser-QA-Incoming.ods",
+    "draftValue": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+    "stickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+  },
+  "partsReturn": {
+    "hasAcceptedBaselineSection": true,
+    "showsIncomingWorkbook": true,
+    "baselineText": "Manufacturing baseline"
+  },
+  "workbookSwitch": {
+    "baselineMappingPath": "Browser-QA-Baseline.ods",
+    "restoredPath": "Browser-QA-Incoming.ods",
+    "restoredFilter": "unsaved",
+    "restoredDraftValue": "SM-P-000001 · S1K — Bulk MCL Part — Standard · Rev A",
+    "restoredStickyText": "1 group · 1 unsaved line\n0 groups have affected prior assignments\nInitial line assignments need no reason. Replacement and clear reasons apply only to previously assigned lines being changed.\nSave pending mappings"
+  },
+  "finalState": {
+    "baselineCount": 4,
+    "revisionLineCount": 4,
+    "observationCount": 5,
+    "mappingRecordCount": 5,
+    "baselineRequestKeys": [
+      "qa-existing-cnc-baseline",
+      "workbook-baseline:26d42698adcbb8e631f5e14eac5c612d4aa5ac621cd7875fb365a8f43a9b1ddc",
+      "workbook-baseline:2a7bdb420d76f3690aff2fbbb5acf7d9f579672ee8e08814bd16595201335297",
+      "workbook-baseline:7b3e0fb98d5d1c1d4df887d8b7ede77791b37b022e31b44b9f75b6c1a691a370"
+    ],
+    "parts": {
+      "Bulk MCL Part": {
+        "id": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+        "partNumber": "SM-P-000001"
+      },
+      "Bulk Tool Part": {
+        "id": "991c9abd-e0cd-4742-9395-a1e43249845d",
+        "partNumber": "SM-P-000002"
+      },
+      "Bulk CNC Part": {
+        "id": "87518aba-760d-45a9-82da-c4fe6813589e",
+        "partNumber": "SM-P-000003"
+      },
+      "Existing CNC Part": {
+        "id": "9d380980-abdc-4263-b703-1a40779c1655",
+        "partNumber": "SM-P-000004"
+      }
+    },
+    "incomingPath": "Browser-QA-Incoming.ods",
+    "incomingHash": "8e1765502c447d5c96246160767915eaabe896929705a5cb342cb4af5c997ba2",
+    "previousPath": "Browser-QA-Baseline.ods",
+    "previousHash": "9b7c67ef191dd9719789606dea5c559f66bd1897ac04306cb76bec7aad37b495"
+  },
+  "preview": {
+    "counts": "3\nready\n1\nalready established\n0\nblocked\n2\nrows to review",
+    "pendingText": "Pending ODS rows · 2\nThese active rows are excluded from baseline requirements. Review each assignment; this preview does not mark the workbook complete.\n5. Material Cut List Price · row 3 · Pending MCL review\nnew · Review this source row and save a current Part assignment.\nReview in Part Mapping\n5. Material Cut List Price · row 4 · Draft MCL pending\nnew · Review this source row and save a current Part assignment.\nReview in Part Mapping",
+    "readyButtonEnabled": true
+  },
+  "narrow": {
+    "buttonBox": {
+      "x": 31,
+      "y": 406,
+      "width": 328,
+      "height": 32
+    },
+    "viewport": {
+      "innerWidth": 390,
+      "scrollWidth": 390
+    },
+    "enabled": true
+  },
+  "bulk": {
+    "requestCount": 1,
+    "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+    "payload": {
+      "path": "Browser-QA-Incoming.ods",
+      "expectedContextKey": "a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e",
+      "previewKey": "36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649",
+      "reason": "Establish initial workbook manufacturing baseline",
+      "parts": [
+        {
+          "partId": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+          "snapshotKey": "e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a",
+          "appendExisting": false
+        },
+        {
+          "partId": "87518aba-760d-45a9-82da-c4fe6813589e",
+          "snapshotKey": "5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e",
+          "appendExisting": false
+        },
+        {
+          "partId": "991c9abd-e0cd-4742-9395-a1e43249845d",
+          "snapshotKey": "5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58",
+          "appendExisting": false
+        }
+      ]
+    },
+    "firstAttemptHttp": 200,
+    "firstAttemptResults": [
+      {
+        "partId": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+        "status": "established"
+      },
+      {
+        "partId": "87518aba-760d-45a9-82da-c4fe6813589e",
+        "status": "established"
+      },
+      {
+        "partId": "991c9abd-e0cd-4742-9395-a1e43249845d",
+        "status": "established"
+      },
+      {
+        "partId": "9d380980-abdc-4263-b703-1a40779c1655",
+        "status": "already_established"
+      }
+    ],
+    "resultText": "Workbook baseline confirmation needs review\n3 Part baseline(s) established; 1 already established (retained); 0 blocked; 0 failed; 2 source row(s) remain for review.\nSM-P-000001 · established · The original request is verified against its established baseline and Part revision.\nSM-P-000003 · established · The original request is verified against its established baseline and Part revision.\nSM-P-000002 · established · The original request is verified against its established baseline and Part revision.\nSM-P-000004 · already established · An existing baseline was retained and was not attributed to the saved request.\nThe mapped Parts can be established individually, but pending rows or blocked results mean the workbook is not fully reviewed.",
+    "refreshedCounts": "0\nready\n4\nalready established\n0\nblocked\n2\nrows to review",
+    "longOperation": {
+      "serverDelaySeconds": 31,
+      "requestRoundTripMs": 31463,
+      "liveProgressText": "Workbook confirmation is running\nServer evidence confirms 0 of 3 requested Part baselines. 3 in progress; 0 waiting for recovery.\nSM-P-000001 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.\nSM-P-000003 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.\nSM-P-000002 · in progress · The server is processing this confirmation; no durable result is available for this Part yet.",
+      "responseLost": true,
+      "attemptClearedAfterVerifiedCompletion": true
+    },
+    "recovery": {
+      "legacyPr6PayloadFormat": true,
+      "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+      "body": {
+        "path": "Browser-QA-Incoming.ods",
+        "expectedContextKey": "a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e",
+        "previewKey": "36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649",
+        "reason": "Establish initial workbook manufacturing baseline",
+        "parts": [
+          {
+            "partId": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+            "snapshotKey": "e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a",
+            "appendExisting": false
+          },
+          {
+            "partId": "87518aba-760d-45a9-82da-c4fe6813589e",
+            "snapshotKey": "5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e",
+            "appendExisting": false
+          },
+          {
+            "partId": "991c9abd-e0cd-4742-9395-a1e43249845d",
+            "snapshotKey": "5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58",
+            "appendExisting": false
+          }
+        ]
+      },
+      "attemptClearedAfterReload": true,
+      "confirmationRequestsAfterReload": 1,
+      "statusReadRequests": [
+        {
+          "method": "POST",
+          "url": "http://127.0.0.1:44571/api/parts/manufacturing-baselines/workbook-confirm-status",
+          "key": "81f25274-1872-4aed-99bb-9083d98f80ed",
+          "body": "{\"path\":\"Browser-QA-Incoming.ods\",\"expectedContextKey\":\"a11de8341ab076a4c89ed8b56354061d0a1764bc90facc64d423b9be8105465e\",\"previewKey\":\"36b511df15686bf83c5c5c25e7e2402cf8e2c0596f36e3b0161955ef24f1d649\",\"reason\":\"Establish initial workbook manufacturing baseline\",\"parts\":[{\"partId\":\"7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2\",\"snapshotKey\":\"e7bda9bf5d9468ec02983dde1fd42300b023c6e8bca48845700897b5649f424a\",\"appendExisting\":false},{\"partId\":\"87518aba-760d-45a9-82da-c4fe6813589e\",\"snapshotKey\":\"5027211239555631df8fae11663e064eef7885256ebab61f225e2cb9ed4a2c7e\",\"appendExisting\":false},{\"partId\":\"991c9abd-e0cd-4742-9395-a1e43249845d\",\"snapshotKey\":\"5e968fec2733352870d4f13798ef1198b800d9117478855ef07b600210786e58\",\"appendExisting\":false}]}"
+        }
+      ]
+    }
+  },
+  "afterConfirm": {
+    "baselineCount": 4,
+    "revisionLineCount": 4,
+    "observationCount": 4,
+    "mappingRecordCount": 5,
+    "baselineRequestKeys": [
+      "qa-existing-cnc-baseline",
+      "workbook-baseline:26d42698adcbb8e631f5e14eac5c612d4aa5ac621cd7875fb365a8f43a9b1ddc",
+      "workbook-baseline:2a7bdb420d76f3690aff2fbbb5acf7d9f579672ee8e08814bd16595201335297",
+      "workbook-baseline:7b3e0fb98d5d1c1d4df887d8b7ede77791b37b022e31b44b9f75b6c1a691a370"
+    ],
+    "parts": {
+      "Bulk MCL Part": {
+        "id": "7d0255ec-d20f-4a7c-88e2-cf7cb82b95d2",
+        "partNumber": "SM-P-000001"
+      },
+      "Bulk Tool Part": {
+        "id": "991c9abd-e0cd-4742-9395-a1e43249845d",
+        "partNumber": "SM-P-000002"
+      },
+      "Bulk CNC Part": {
+        "id": "87518aba-760d-45a9-82da-c4fe6813589e",
+        "partNumber": "SM-P-000003"
+      },
+      "Existing CNC Part": {
+        "id": "9d380980-abdc-4263-b703-1a40779c1655",
+        "partNumber": "SM-P-000004"
+      }
+    },
+    "incomingPath": "Browser-QA-Incoming.ods",
+    "incomingHash": "8e1765502c447d5c96246160767915eaabe896929705a5cb342cb4af5c997ba2",
+    "previousPath": "Browser-QA-Baseline.ods",
+    "previousHash": "9b7c67ef191dd9719789606dea5c559f66bd1897ac04306cb76bec7aad37b495"
+  }
+}

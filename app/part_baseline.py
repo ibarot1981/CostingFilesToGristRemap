@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import math
+from threading import Lock
 from typing import Any, Callable
 
 from app.domain import utc_now
@@ -44,6 +45,8 @@ TABLE_KEY_FIELDS = {
     "PartComparisonFamily": "ComparisonFamilyKey", "PartRequirementDifference": "DifferenceKey",
     "PartWorkbookDecision": "DecisionKey", "PartChangeProposal": "ProposalKey",
 }
+_ACTIVE_WORKBOOK_CONFIRMATIONS: dict[tuple[int, str], int] = {}
+_ACTIVE_WORKBOOK_CONFIRMATIONS_LOCK = Lock()
 
 
 def _digest(value: Any) -> str:
@@ -415,6 +418,10 @@ class PartBaselineService:
         self.registry = registry
         self.client = registry.client
 
+    def workbook_confirmation_active(self, batch_request_key: str) -> bool:
+        with _ACTIVE_WORKBOOK_CONFIRMATIONS_LOCK:
+            return _ACTIVE_WORKBOOK_CONFIRMATIONS.get((id(self.registry), batch_request_key), 0) > 0
+
     def _verify_schema(self):
         if not hasattr(self.client, "api_key"):
             return
@@ -756,7 +763,200 @@ class PartBaselineService:
             and str(_row_fields(row).get("EntityUUID") or "") == part_id
             for row in self.registry._rows("PartRegistryRequest"))
 
-    def confirm_workbook(self, *, file_id: str, workbook_name: str, workbook_path: str, source_hash: str,
+    def reconcile_workbook_confirmation(self, *, file_id: str, workbook_path: str,
+            batch_request_key: str, requested_parts: Any, expected_context_key: str,
+            current_preview: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read the durable per-Part journal to recover an original batch response.
+
+        This method is intentionally read-only. A baseline counts as completed
+        only when the exact batch-derived request key, request fingerprint,
+        published baseline row and PartRevision link agree. An unrelated
+        established baseline is never treated as evidence for this attempt.
+        """
+        submitted = requested_parts if isinstance(requested_parts, list) else []
+        requested_by_id = {str(item.get("partId") or ""): item for item in submitted
+            if isinstance(item, dict) and item.get("partId")}
+        if (not batch_request_key.strip() or not submitted or len(requested_by_id) != len(submitted)
+                or any(not str(item.get("snapshotKey") or "").strip() for item in requested_by_id.values())):
+            raise PartIdentityError("PART_BASELINE_INPUT_REQUIRED", "The saved workbook request identity and original Part payload are required for recovery.")
+
+        context_matches = (bool(expected_context_key and expected_context_key == current_preview.get("contextKey"))
+            if current_preview else None)
+        batch_active = self.workbook_confirmation_active(batch_request_key)
+        current_parts = {str(item.get("id") or ""): item for item in (current_preview or {}).get("parts", [])}
+        requests = self.registry._rows("PartRegistryRequest") if self._table_available("PartRegistryRequest") else []
+        baselines = self.registry._rows("PartBaselineProcessing") if self._table_available("PartBaselineProcessing") else []
+        revisions = self.registry._rows("PartRevision") if self._table_available("PartRevision") else []
+        results = []
+        for part_id in requested_by_id:
+            request_key = f"workbook-baseline:{_digest([file_id, batch_request_key, part_id])}"
+            part = self.registry.get_part(part_id)
+            part_number = part.get("partNumber") if part else None
+            name = part.get("name") if part else None
+            request_matches = [row for row in requests if _row_fields(row).get("RequestKey") == request_key]
+            baseline_matches = [row for row in baselines if _row_fields(row).get("RequestKey") == request_key]
+            result = {"partId": part_id, "partNumber": part_number, "name": name,
+                "requestKey": request_key, "retryable": True}
+
+            if len(request_matches) > 1 or len(baseline_matches) > 1:
+                result.update(status="uncertain", message="The original request has conflicting durable records. Keep this saved attempt and contact an administrator.")
+                results.append(result)
+                continue
+
+            request = request_matches[0] if request_matches else None
+            baseline = baseline_matches[0] if baseline_matches else None
+            if request:
+                request_fields = _row_fields(request)
+                if (request_fields.get("RequestType") != "establish_part_baseline"
+                        or str(request_fields.get("EntityUUID") or "") != part_id
+                        or not request_fields.get("RequestFingerprint")):
+                    result.update(status="uncertain", message="The saved request identity conflicts with the durable request journal. Keep this attempt for recovery.")
+                    results.append(result)
+                    continue
+
+                baseline_fields = _row_fields(baseline) if baseline else {}
+                part_record_id = int(part.get("gristRecordId") or 0) if part else 0
+                baseline_owned = bool(baseline and part_record_id
+                    and _ref_id(baseline_fields.get("ProductPart")) == part_record_id
+                    and str(baseline_fields.get("FileKey") or "") == file_id
+                    and str(baseline_fields.get("WorkbookPath") or "") == workbook_path
+                    and baseline_fields.get("RequestFingerprint") == request_fields.get("RequestFingerprint"))
+                revision_id = _ref_id(baseline_fields.get("PartRevision")) if baseline_owned else None
+                revision = next((row for row in revisions if revision_id and int(row.get("id", -1)) == revision_id), None)
+                revision_fields = _row_fields(revision) if revision else {}
+                revision_linked = bool(revision and _ref_id(revision_fields.get("ProductPart")) == part_record_id
+                    and _ref_id(revision_fields.get("ManufacturingBaseline")) == int(baseline["id"])
+                    and str(revision_fields.get("ManufacturingBaselineStatus") or "").casefold() == "established")
+                completed = bool(baseline_owned and revision_linked
+                    and str(baseline_fields.get("Status") or "").casefold() == "established")
+                if completed:
+                    result.update(status="established", retryable=False, idempotent=True,
+                        requirementCount=baseline_fields.get("RequirementCount"),
+                        message="The original request is verified against its established baseline and Part revision.")
+                elif str(request_fields.get("Status") or "").casefold() == "publishing" and batch_active:
+                    result.update(status="in_progress", message="The server is processing this original request; publication is still being reconciled.")
+                elif str(request_fields.get("Status") or "").casefold() == "publishing":
+                    result.update(status="uncertain", message="The request journal is still publishing, but no server operation is active. Keep the original request and retry it to resume safely.")
+                else:
+                    result.update(status="uncertain", message="The durable request exists, but its complete baseline publication is not verified. Keep the original attempt and retry it when recovery is available.")
+                results.append(result)
+                continue
+
+            if baseline:
+                result.update(status="uncertain", message="Baseline data exists under the original request key, but its request journal is missing. Keep this attempt for recovery.")
+                results.append(result)
+                continue
+
+            if batch_active:
+                result.update(status="in_progress", message="The server is processing this confirmation; no durable result is available for this Part yet.")
+                results.append(result)
+                continue
+
+            if context_matches is False:
+                result.update(status="blocked", retryable=False,
+                    message="The workbook, association or saved mappings changed before this Part was durably reserved. Refresh the preview before starting another confirmation.")
+                results.append(result)
+                continue
+
+            current = current_parts.get(part_id)
+            if current:
+                if current.get("status") == "already_established":
+                    result.update(status="blocked", retryable=False,
+                        message="A different established baseline is present. It does not verify this saved request and will not be replaced.")
+                elif current.get("status") == "recovery_required":
+                    result.update(status="blocked", retryable=True,
+                        message="Another incomplete baseline request is blocking this saved request. Resolve that request, then retry this exact confirmation.")
+                elif current.get("status") == "ready":
+                    result.update(status="not_started", message="No durable record exists yet for this Part. The original saved request is ready for a safe retry.")
+                else:
+                    blockers = " ".join(str(item) for item in current.get("blockers") or [])
+                    result.update(status="blocked", retryable=False,
+                        message=blockers or "The current Part preview does not allow this saved baseline request.")
+            else:
+                part = self.registry.get_part(part_id)
+                if not part:
+                    result.update(status="blocked", retryable=False,
+                        message="This Part no longer exists. The original saved request cannot be resumed.")
+                    results.append(result)
+                    continue
+                try:
+                    revision = self.registry.current_revision(part_id)
+                except PartIdentityError as exc:
+                    result.update(status="blocked", retryable=False, message=str(exc))
+                    results.append(result)
+                    continue
+                revision_fields = _row_fields(revision)
+                baseline_id = _ref_id(revision_fields.get("ManufacturingBaseline"))
+                baseline_link = next((row for row in baselines if baseline_id and int(row.get("id", -1)) == baseline_id), None)
+                if baseline_link:
+                    result.update(status="blocked", retryable=False,
+                        message="A different established baseline is present. It does not verify this saved request and will not be replaced.")
+                else:
+                    part_record_id = int(part.get("gristRecordId") or 0)
+                    other_pending = [row for row in baselines
+                        if _ref_id(_row_fields(row).get("ProductPart")) == part_record_id
+                        and str(_row_fields(row).get("Status") or "").casefold() not in {"established", "abandoned"}]
+                    if other_pending:
+                        result.update(status="blocked", retryable=True,
+                            message="Another incomplete baseline request is blocking this saved request. Resolve that request, then retry this exact confirmation.")
+                    elif str(revision_fields.get("ManufacturingBaselineStatus") or "").casefold() == "established":
+                        result.update(status="uncertain", message="The Part reports an established baseline whose durable provenance is unavailable. Keep the original request and review the Part before retrying.")
+                    else:
+                        result.update(status="not_started", message="No durable record exists yet for this Part. The original request remains available; the server will revalidate workbook and mapping freshness before any retry writes.")
+            results.append(result)
+
+        requested_results = list(results)
+        requested_ids = set(requested_by_id)
+        for part_id, current in current_parts.items():
+            if part_id in requested_ids:
+                continue
+            part = self.registry.get_part(part_id)
+            result = {"partId": part_id, "partNumber": part.get("partNumber") if part else None,
+                "name": part.get("name") if part else None, "retryable": False}
+            if current.get("status") == "already_established":
+                result.update(status="already_established", message="An existing baseline was retained and was not attributed to the saved request.")
+            elif current.get("status") != "ready":
+                blockers = " ".join(str(item) for item in current.get("blockers") or [])
+                result.update(status="blocked", message=blockers or "This Part remains blocked and was not included in the saved confirmation.")
+            else:
+                result.update(status="blocked", message="This ready Part was not present in the saved request and was not published by it.")
+            results.append(result)
+
+        terminal = {"established", "already_established", "blocked", "failed"}
+        all_terminal = all(item["status"] in terminal and item.get("retryable") is False for item in results)
+        all_requested_established = all(item["status"] == "established" and item.get("retryable") is False
+            for item in requested_results)
+        in_progress = batch_active or any(item["status"] == "in_progress" for item in results)
+        all_no_blocked = all(item["status"] in {"established", "already_established"} for item in results)
+        status = "in_progress" if in_progress else "completed" if all_terminal and all_no_blocked else "partial"
+        total_success = bool(current_preview and all_requested_established and all_no_blocked and context_matches
+            and current_preview.get("workbookComplete") and not current_preview.get("pendingRows"))
+        return {"status": status, "totalSuccess": total_success, "completionVerified": all_requested_established,
+            "contextMatches": context_matches, "results": results, "pendingRows": (current_preview or {}).get("pendingRows", []),
+            "counts": (current_preview or {}).get("counts", {}), "workbookComplete": bool(total_success),
+            "previewKey": (current_preview or {}).get("previewKey"), "confirmedCount": sum(item["status"] == "established" for item in requested_results),
+            "totalParts": len(requested_results), "allOutcomesResolved": all_terminal and not batch_active,
+            "batchActive": batch_active,
+            "previewAvailable": current_preview is not None}
+
+    def confirm_workbook(self, **kwargs: Any) -> dict[str, Any]:
+        batch_request_key = str(kwargs.get("batch_request_key") or "").strip()
+        if not batch_request_key:
+            return self._confirm_workbook_inner(**kwargs)
+        active_key = (id(self.registry), batch_request_key)
+        with _ACTIVE_WORKBOOK_CONFIRMATIONS_LOCK:
+            _ACTIVE_WORKBOOK_CONFIRMATIONS[active_key] = _ACTIVE_WORKBOOK_CONFIRMATIONS.get(active_key, 0) + 1
+        try:
+            return self._confirm_workbook_inner(**kwargs)
+        finally:
+            with _ACTIVE_WORKBOOK_CONFIRMATIONS_LOCK:
+                remaining = _ACTIVE_WORKBOOK_CONFIRMATIONS.get(active_key, 1) - 1
+                if remaining > 0:
+                    _ACTIVE_WORKBOOK_CONFIRMATIONS[active_key] = remaining
+                else:
+                    _ACTIVE_WORKBOOK_CONFIRMATIONS.pop(active_key, None)
+
+    def _confirm_workbook_inner(self, *, file_id: str, workbook_name: str, workbook_path: str, source_hash: str,
                          association: Any, groups: list[dict[str, Any]], mapping_store: Any,
                          expected_context_key: str, requested_parts: Any, actor: str, reason: str,
                          batch_request_key: str, before_write: Callable[[], None] | None = None) -> dict[str, Any]:

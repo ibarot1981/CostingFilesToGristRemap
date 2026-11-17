@@ -63,6 +63,12 @@
 .baseline-bulk-pending li strong{font-size:10px;color:#5b4b34;overflow-wrap:anywhere}
 .baseline-bulk-pending li small{font-size:9px;color:#81745e;overflow-wrap:anywhere}
 .baseline-bulk-error{margin:0;border:1px solid #efc3b1;border-radius:6px;background:#fff0e9;padding:9px;color:#963f29;font-size:10px;overflow-wrap:anywhere}
+.baseline-bulk-progress{display:grid;gap:6px;border:1px solid #cbd8e5;border-radius:7px;background:#f4f8fb;padding:10px;color:#48647d;font-size:10px;line-height:1.45}
+.baseline-bulk-progress>strong{font-size:11px;color:#344e64}
+.baseline-bulk-progress small{color:#805324}
+.baseline-bulk-progress ul{display:grid;gap:3px;max-height:170px;overflow:auto;margin:0;padding-left:18px}
+.baseline-bulk-progress li{overflow-wrap:anywhere}
+.baseline-bulk-progress li strong{color:#34435a}
 .baseline-bulk-results{display:grid;gap:6px;border:1px solid #eccb9e;border-radius:7px;background:#fff9ee;padding:10px;color:#725522;font-size:10px}
 .baseline-bulk-results.is-success{border-color:#c8dfce;background:#eff8f1;color:#38684a}
 .baseline-bulk-results>strong{font-size:11px}

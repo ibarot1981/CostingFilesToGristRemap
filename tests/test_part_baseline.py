@@ -362,6 +362,7 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             route_paths = web.app.openapi()["paths"]
             self.assertIn("get", route_paths["/api/parts/manufacturing-baselines/workbook-preview"])
             self.assertIn("post", route_paths["/api/parts/manufacturing-baselines/workbook-confirm"])
+            self.assertIn("post", route_paths["/api/parts/manufacturing-baselines/workbook-confirm-status"])
             preview = web.preview_workbook_manufacturing_baselines("pilot.ods")
             self.assertEqual(preview["counts"], {"mappedParts": 2, "readyParts": 2,
                 "alreadyEstablishedParts": 0, "blockedParts": 0, "pendingRows": 1})
@@ -373,6 +374,11 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             request = Request({"type": "http", "method": "POST", "headers": []})
             result = web.confirm_workbook_manufacturing_baselines(request, payload,
                 idempotency_key="isolated-api-workbook-confirmation")
+            before_read_only_reconciliation = json.loads(json.dumps(self.client.tables))
+            reconciled = web.reconcile_workbook_manufacturing_baselines({**payload, "previewKey": "legacy-payload-preview"},
+                idempotency_key="isolated-api-workbook-confirmation")
+            self.assertEqual(self.client.tables, before_read_only_reconciliation,
+                "read-only confirmation reconciliation must not publish or update Grist business data")
 
         self.assertEqual(result["status"], "partial", "the pending source row remains an open review exception")
         self.assertFalse(result["totalSuccess"])
@@ -382,16 +388,61 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.client.tables["PartRevisionLine"]), 4)
         self.assertEqual(len(self.client.tables["SourceLineObservation"]), 4)
         self.assertFalse(any(row["fields"].get("SourceRow") == 12 for row in self.client.tables["SourceLineObservation"]))
+        self.assertEqual(reconciled["confirmedCount"], 2)
+        self.assertEqual(reconciled["totalParts"], 2)
+        self.assertTrue(reconciled["allOutcomesResolved"])
+        self.assertTrue(reconciled["completionVerified"])
+        self.assertFalse(reconciled["totalSuccess"], "the pending workbook row prevents an overall completion claim")
+        self.assertEqual({item["status"] for item in reconciled["results"]}, {"established"})
 
         reloaded = GristPartRegistry(self.client, Path(self.temp.name) / "fresh-reload.sqlite3")
         reloaded.mapping_evidence_schema_available = lambda: True
         reloaded_service = PartBaselineService(reloaded)
+        fresh_preview = reloaded_service.preview_workbook(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            source_hash="bulk-baseline-source", association=self.association, groups=groups,
+            mapping_store=self.mapping_store)
+        fresh_reconciled = reloaded_service.reconcile_workbook_confirmation(file_id="pilot.ods",
+            workbook_path="pilot.ods", batch_request_key="isolated-api-workbook-confirmation",
+            requested_parts=payload["parts"], expected_context_key=payload["expectedContextKey"],
+            current_preview=fresh_preview)
+        self.assertEqual(fresh_reconciled["confirmedCount"], 2,
+            "a fresh adapter must reconcile completion from persisted Grist records")
+        self.assertTrue(fresh_reconciled["allOutcomesResolved"])
         for part_id in (self.part["id"], other["id"]):
             detail = reloaded_service.baseline_detail(part_id)
             self.assertEqual(detail["status"], "established")
             self.assertEqual(detail["sourceHash"], "bulk-baseline-source")
             self.assertEqual(len(detail["requirements"]), 2)
             self.assertEqual(detail["baseline"]["Actor"], "baseline reviewer")
+
+    def test_workbook_reconciliation_does_not_attribute_an_unrelated_baseline_to_saved_attempt(self):
+        groups, _ = self.save_rows([source_row(20)], "unrelated-baseline-source")
+        preview = self.service.preview_workbook(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            source_hash="unrelated-baseline-source", association=self.association, groups=groups,
+            mapping_store=self.mapping_store)
+        part_preview = next(part for part in preview["parts"] if part["id"] == self.part["id"])
+        self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="pilot.ods",
+            workbook_path="C:/isolated/pilot.ods", source_hash="unrelated-baseline-source", association=self.association,
+            groups=groups, mapping_store=self.mapping_store, source_families=None, actor="baseline reviewer",
+            reason="A different confirmation established this baseline", request_key="unrelated-original-request",
+            expected_hash="unrelated-baseline-source", expected_association=self.association.id,
+            expected_association_version=self.association.version,
+            expected_mapping_version=preview["source"]["mappingVersion"], workbook_initial=True)
+        current_preview = self.service.preview_workbook(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            source_hash="unrelated-baseline-source", association=self.association, groups=groups,
+            mapping_store=self.mapping_store)
+        before_reconcile = json.loads(json.dumps(self.client.tables))
+        outcome = self.service.reconcile_workbook_confirmation(file_id="pilot.ods", workbook_path="C:/isolated/pilot.ods",
+            batch_request_key="unrelated-saved-attempt", requested_parts=[{"partId": self.part["id"],
+                "snapshotKey": part_preview["snapshotKey"], "appendExisting": False}],
+            expected_context_key=preview["contextKey"], current_preview=current_preview)
+
+        self.assertEqual(outcome["results"][0]["status"], "blocked")
+        self.assertEqual(outcome["confirmedCount"], 0)
+        self.assertFalse(outcome["completionVerified"])
+        self.assertEqual(self.client.tables, before_reconcile, "reconciliation must remain read-only")
+        baseline = next(row["fields"] for row in self.client.tables["PartBaselineProcessing"])
+        self.assertEqual(baseline["RequestKey"], "unrelated-original-request")
 
     def test_workbook_api_retries_grist_error_after_durable_family_write_with_original_batch(self):
         from app import web
@@ -439,6 +490,15 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             self.assertEqual(len(self.client.tables["PartBaselineFamily"]), 6)
             counts_after_uncertain_response = {table: len(self.client.tables.get(table, [])) for table in (
                 "PartBaselineProcessing", "PartBaselineFamily", "PartRevisionLine", "SourceLineObservation")}
+            before_read_only_status = json.loads(json.dumps(self.client.tables))
+            recovered_status = web.reconcile_workbook_manufacturing_baselines(payload,
+                idempotency_key="isolated-grist-error-workbook-confirmation")
+            self.assertEqual(self.client.tables, before_read_only_status,
+                "a failed request's status reconciliation must remain read-only")
+            self.assertEqual({item["status"] for item in recovered_status["results"]}, {"uncertain", "established"})
+            self.assertFalse(recovered_status["allOutcomesResolved"])
+            self.assertFalse(any(item["status"] == "in_progress" for item in recovered_status["results"]),
+                "an interrupted journal after the operation returns must not be mislabeled as active work")
 
             recovered = web.confirm_workbook_manufacturing_baselines(request, payload,
                 idempotency_key="isolated-grist-error-workbook-confirmation")

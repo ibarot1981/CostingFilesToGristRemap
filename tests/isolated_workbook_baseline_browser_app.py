@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import json
+import os
 from pathlib import Path
 import sys
+import time
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +157,27 @@ incoming_hash, incoming_groups, incoming_saved = _save_file_mappings(incoming_pa
     (CNC, 2): parts["Bulk CNC Part"]["id"],
     (CNC, 3): parts["Existing CNC Part"]["id"],
 }, "qa-incoming-mappings")
+
+# The browser verification may opt into a real server-side delay for its
+# isolated incoming-workbook confirmation. The production app has no delay
+# hook; this test-only wrapper makes the browser exercise a request lasting
+# beyond the former client timeout while the read-only status route observes
+# the same in-flight request.
+_original_confirm_inner = PartBaselineService._confirm_workbook_inner
+_qa_confirmation_delay_used = False
+
+
+def _delayed_isolated_confirmation(self, **kwargs):
+    global _qa_confirmation_delay_used
+    delay = max(0.0, float(os.environ.get("WORKBOOK_BASELINE_QA_CONFIRM_DELAY_SECONDS", "0")))
+    if (delay and not _qa_confirmation_delay_used
+            and kwargs.get("workbook_path") == incoming_path.name):
+        _qa_confirmation_delay_used = True
+        time.sleep(delay)
+    return _original_confirm_inner(self, **kwargs)
+
+
+PartBaselineService._confirm_workbook_inner = _delayed_isolated_confirmation
 
 app = web.app
 

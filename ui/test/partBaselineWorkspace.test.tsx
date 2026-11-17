@@ -2,7 +2,7 @@ import {cleanup, fireEvent, render, screen, waitFor} from "@testing-library/reac
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
 import {PartBaselineWorkspace} from "../src/PartBaselineWorkspace";
 
-const mocks = vi.hoisted(() => ({partMappings:vi.fn(),partBaselineWorkbookPreview:vi.fn(),confirmWorkbookPartBaselines:vi.fn(),partBaselineReview:vi.fn(),establishPartBaseline:vi.fn(),comparePartBaseline:vi.fn(),partManufacturingComparison:vi.fn(),decidePartManufacturingComparison:vi.fn(),searchParts:vi.fn()}));
+const mocks = vi.hoisted(() => ({partMappings:vi.fn(),partBaselineWorkbookPreview:vi.fn(),confirmWorkbookPartBaselines:vi.fn(),reconcileWorkbookPartBaselines:vi.fn(),partBaselineReview:vi.fn(),establishPartBaseline:vi.fn(),comparePartBaseline:vi.fn(),partManufacturingComparison:vi.fn(),decidePartManufacturingComparison:vi.fn(),searchParts:vi.fn()}));
 vi.mock("../src/api",() => ({api:mocks}));
 
 const chassis = {id:"part-1",partNumber:"SM-P-000001",name:"Chassis",description:"Main chassis",engineeringRevision:"A",selectable:true,duplicateName:false,status:"active",manufacturingBaselineStatus:"not_established"};
@@ -22,6 +22,7 @@ beforeEach(() => {
   mocks.partMappings.mockResolvedValue(mapping);
   mocks.partBaselineWorkbookPreview.mockResolvedValue(preview());
   mocks.confirmWorkbookPartBaselines.mockResolvedValue({status:"partial",totalSuccess:false,results:[{partId:"part-1",partNumber:"SM-P-000001",status:"established",requirementCount:2},{partId:"part-2",partNumber:"SM-P-000002",status:"established",requirementCount:1}],pendingRows:preview().pendingRows,workbookComplete:false});
+  mocks.reconcileWorkbookPartBaselines.mockResolvedValue({status:"partial",totalSuccess:false,completionVerified:false,contextMatches:true,results:[{partId:"part-1",status:"not_started",retryable:true},{partId:"part-2",status:"not_started",retryable:true}],pendingRows:preview().pendingRows,workbookComplete:false,confirmedCount:0,totalParts:2,allOutcomesResolved:false});
   mocks.partBaselineReview.mockImplementation((partId:string) => Promise.resolve(review(partId === "part-2" ? "established" : "not_established")));
 });
 afterEach(() => {cleanup();});
@@ -123,6 +124,43 @@ it("keeps the same bulk idempotency key after an uncertain response and workspac
   await waitFor(() => expect(mocks.confirmWorkbookPartBaselines).toHaveBeenCalledTimes(2));
   expect(mocks.confirmWorkbookPartBaselines.mock.calls[1]).toEqual(firstCall);
   await waitFor(() => expect(localStorage.getItem("workbook-baseline-confirm-attempt:pilot.ods")).toBeNull());
+});
+
+it("clears a legacy saved attempt only after read-only server proof of its original request", async () => {
+  const saved = {key:"pr6-bulk-attempt-uuid",payload:{path:"pilot.ods",expectedContextKey:"context-4",previewKey:"preview-from-pr6",
+    reason:"Establish initial workbook manufacturing baseline",parts:[{partId:"part-1",snapshotKey:"snap-1",appendExisting:false}]}};
+  localStorage.setItem("workbook-baseline-confirm-attempt:pilot.ods",JSON.stringify(saved));
+  mocks.reconcileWorkbookPartBaselines.mockResolvedValueOnce({status:"completed",totalSuccess:false,completionVerified:true,
+    contextMatches:true,results:[{partId:"part-1",partNumber:"SM-P-000001",status:"established",retryable:false,
+      message:"The original request is verified against its established baseline and Part revision."}],
+    pendingRows:preview().pendingRows,workbookComplete:false,confirmedCount:1,totalParts:1,allOutcomesResolved:true});
+
+  render(<PartBaselineWorkspace path="pilot.ods" initialPartId="part-1" returnLabel="Return to Part Mapping" onBack={() => {}} onUseDifferentPart={() => {}} onReviewPendingRow={() => {}}/>);
+  await screen.findByText(/1 Part baseline\(s\) established/);
+
+  expect(mocks.reconcileWorkbookPartBaselines).toHaveBeenCalledWith(saved.payload,saved.key);
+  expect(mocks.confirmWorkbookPartBaselines).not.toHaveBeenCalled();
+  expect(localStorage.getItem("workbook-baseline-confirm-attempt:pilot.ods")).toBeNull();
+  expect(screen.queryByRole("button",{name:"Retry same confirmation"})).toBeNull();
+  expect(screen.getByText(/confirmation needs review/)).toBeTruthy();
+});
+
+it("shows server-confirmed Part progress while the long confirmation request is still running", async () => {
+  let resolveRequest: ((value: unknown) => void) | undefined;
+  mocks.confirmWorkbookPartBaselines.mockImplementationOnce(() => new Promise(resolve => {resolveRequest = resolve;}));
+  mocks.reconcileWorkbookPartBaselines.mockResolvedValue({status:"in_progress",totalSuccess:false,completionVerified:false,
+    contextMatches:true,results:[{partId:"part-1",status:"in_progress",retryable:true},{partId:"part-2",status:"in_progress",retryable:true}],
+    pendingRows:[],workbookComplete:false,confirmedCount:0,totalParts:2,allOutcomesResolved:false});
+  render(<PartBaselineWorkspace path="pilot.ods" initialPartId="part-1" returnLabel="Return to Part Mapping" onBack={() => {}} onUseDifferentPart={() => {}} onReviewPendingRow={() => {}}/>);
+  await screen.findByRole("heading",{name:"Confirm manufacturing baselines"});
+  fireEvent.click(screen.getByLabelText(/Append these workbook rows while preserving existing Rev A content/));
+  fireEvent.click(screen.getByRole("button",{name:"Confirm 2 ready baselines"}));
+
+  await screen.findByText(/Server evidence confirms 0 of 2 requested Part baselines\. 2 in progress/);
+  expect((screen.getByRole("button",{name:/Waiting for server/}) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByText(/% complete/)).toBeNull();
+  resolveRequest?.({status:"completed",totalSuccess:false,results:[{partId:"part-1",status:"established"},{partId:"part-2",status:"established"}],pendingRows:[],workbookComplete:false});
+  await screen.findByText(/2 Part baseline\(s\) established/);
 });
 
 it("drops a stale bulk attempt and refreshes evidence before allowing another confirmation", async () => {
