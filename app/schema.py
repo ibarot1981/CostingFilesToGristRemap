@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-baseline-reconciliation-grist-2026-10-14.v15"
+SCHEMA_VERSION = "safari-spares-foundation-grist-2026-11-17.v16"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -86,6 +86,21 @@ def _merge_table_definitions(tables: tuple[dict[str, Any], ...]) -> tuple[dict[s
     return tuple(merged[table_id] for table_id in order)
 
 
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# v16 adds an independent Grist-backed spare master and immutable source
+# evidence. The new tables are additive; existing Part and Assembly identities,
+# coordinators, and number series remain unchanged.
+FOUNDATION_TABLES += (
+    _table("SpareMaster", {"SpareKey": "Text", "SpareCode": "Text", "Description": "Text", "Category": "Text", "Unit": "Text", "SourcingType": "Text", "Status": "Text", "CreatedAt": "DateTime", "CreatedBy": "Text", "UpdatedAt": "DateTime", "UpdatedBy": "Text", "Version": "Numeric", "SourceProvenance": "Any", "CreateRequestKey": "Text", "CreateFingerprint": "Text"}),
+    _table("SpareMasterRequest", {"RequestKey": "Text", "RequestType": "Text", "RequestFingerprint": "Text", "SpareKey": "Text", "SpareCode": "Text", "Status": "Text", "RecordId": "Text", "Actor": "Text", "Reason": "Text", "StartedAt": "DateTime", "UpdatedAt": "DateTime", "CompletedAt": "DateTime", "Result": "Any"}),
+    _table("SpareAlias", {"AliasKey": "Text", "SpareMaster": "Ref:SpareMaster", "Value": "Text", "NormalizedValue": "Text", "SourceFile": "Text", "SourceHash": "Text", "SourceKind": "Text", "SheetName": "Text", "SourceRow": "Numeric", "SourceCell": "Text", "CreatedAt": "DateTime", "IdentityStatus": "Text", "EvidenceFingerprint": "Text"}),
+    _table("SpareHistory", {"HistoryKey": "Text", "SpareMaster": "Ref:SpareMaster", "Version": "Numeric", "EventType": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text", "Snapshot": "Any"}),
+    _table("SpareSourceEvidence", {"EvidenceKey": "Text", "SpareMaster": "Ref:SpareMaster", "SourceKind": "Text", "SourceFile": "Text", "SourceHash": "Text", "SheetName": "Text", "SourceRow": "Numeric", "SourceCell": "Text", "LegacyItemCode": "Text", "Formula": "Text", "CachedValue": "Any", "SourceDateRaw": "Text", "SourceDateISO": "Text", "SourceDateMeaning": "Text", "ClassificationCandidate": "Text", "ResolutionStatus": "Text", "ObservedAt": "DateTime", "RawCells": "Any", "EvidenceFingerprint": "Text"}),
+    _table("SpareCompositionEvidence", {"CompositionKey": "Text", "ParentSpare": "Ref:SpareMaster", "SourceKind": "Text", "SourceFile": "Text", "SourceHash": "Text", "SheetName": "Text", "SourceRow": "Numeric", "SourceIdentity": "Text", "SourceLineType": "Text", "SourceLineCode": "Text", "ManufacturingLineCode": "Text", "StoresLineCode": "Text", "NestedLegacySpareCode": "Text", "NestedReferenceStatus": "Text", "Quantity": "Numeric", "QuantityUnit": "Text", "QuantityOverride": "Numeric", "OverrideUnit": "Text", "ResolutionStatus": "Text", "SourceCells": "Any", "ObservedAt": "DateTime", "EvidenceFingerprint": "Text"}),
+    _table("SpareSourceCost", {"CostEvidenceKey": "Text", "SpareMaster": "Ref:SpareMaster", "CostKind": "Text", "SourceValue": "Numeric", "Unit": "Text", "Currency": "Text", "SourceReference": "Text", "SourceHash": "Text", "SheetName": "Text", "SourceRow": "Numeric", "SourceCell": "Text", "Formula": "Text", "CachedValue": "Any", "SourceDateRaw": "Text", "SourceDateISO": "Text", "SourceDateMeaning": "Text", "EntryAt": "DateTime", "UpdatedAt": "DateTime", "EffectiveAt": "DateTime", "TransactionAt": "DateTime", "ObservedAt": "DateTime", "ImportedAt": "DateTime", "RecalculatedAt": "DateTime", "DateBasis": "Text", "ApprovalStatus": "Text", "EvidenceFingerprint": "Text"}),
+    _table("SpareImportBatch", {"BatchKey": "Text", "RequestKey": "Text", "RequestFingerprint": "Text", "PreviewFingerprint": "Text", "SourceHashes": "Any", "Status": "Text", "Actor": "Text", "StartedAt": "DateTime", "UpdatedAt": "DateTime", "CompletedAt": "DateTime", "Result": "Any"}),
+)
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 
 # v11: Part manufacturing baselines are established from a complete, explicitly

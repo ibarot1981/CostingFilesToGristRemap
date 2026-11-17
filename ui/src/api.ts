@@ -29,6 +29,7 @@ async function send<T>(path: string, body: unknown, headers: Record<string, stri
 }
 
 const PART_BASELINE_WRITE_TIMEOUT_MS = 30_000;
+const SPARES_IMPORT_WRITE_TIMEOUT_MS = 300_000;
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code = "", readonly retryDisposition: RetryDisposition = "retry_same_request", readonly detail: unknown = null) {
@@ -88,6 +89,15 @@ export const api = {
   saveCostPolicy: (scope: string, payload: unknown, key: string) => send<any>(`/api/cost-snapshot-policies/${encodeURIComponent(scope)}`, payload, { "Idempotency-Key": key }, "PUT"),
   recordProcessRate: (lineMasterId: number, payload: unknown, key: string) => send<any>(`/api/line-masters/${lineMasterId}/process-rates`, payload, { "Idempotency-Key": key }),
   savePartPurchaseRateEvidence: (id: string, payload: unknown) => send<any>(`/api/parts/${encodeURIComponent(id)}/purchase-rate-evidence`, payload),
+  spares: (search = "", sourcingType = "", status = "active", offset = 0, limit = 100) => get<any>(`/api/spares?${new URLSearchParams({ search, sourcing_type: sourcingType, status, offset: String(offset), limit: String(limit) })}`),
+  spareSources: () => get<any>("/api/spares/sources"),
+  spareDetail: (spareKey: string) => get<any>(`/api/spares/${encodeURIComponent(spareKey)}`),
+  createSpare: (payload: unknown, key: string) => send<any>("/api/spares", payload, { "Idempotency-Key": key }),
+  updateSpare: (spareKey: string, payload: unknown, key: string) => send<any>(`/api/spares/${encodeURIComponent(spareKey)}`, payload, { "Idempotency-Key": key }, "PUT"),
+  retireSpare: (spareKey: string, payload: unknown, key: string) => send<any>(`/api/spares/${encodeURIComponent(spareKey)}/retire`, payload, { "Idempotency-Key": key }),
+  spareImportPreview: (path: string, offset = 0, limit = 100, evidenceOffset = 0, evidenceLimit = 50) => get<any>(`/api/spares/import-preview?${new URLSearchParams({ path, offset: String(offset), limit: String(limit), evidence_offset: String(evidenceOffset), evidence_limit: String(evidenceLimit) })}`),
+  applySpareImport: (payload: unknown, key: string) => send<any>("/api/spares/import-apply", payload, { "Idempotency-Key": key }, "POST", SPARES_IMPORT_WRITE_TIMEOUT_MS),
+  spareImportStatus: (key: string) => get<any>(`/api/spares/import-status/${encodeURIComponent(key)}`),
   partMappings: (path: string) => get<any>(`/api/parts/mappings?path=${encodeURIComponent(path)}`),
   savePartMappings: (payload: unknown, key: string) => send<any>("/api/parts/mappings", payload, {"Idempotency-Key": key}),
   partBaselineReview: (id: string, path: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/review?path=${encodeURIComponent(path)}`),

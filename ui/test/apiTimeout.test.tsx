@@ -39,6 +39,22 @@ it("keeps a workbook confirmation request alive beyond the former 30-second cuto
   await expect(pending).resolves.toMatchObject({status:"completed"});
 });
 
+it("keeps a reviewed spare import alive beyond the former 30-second cutoff", async () => {
+  vi.useFakeTimers();
+  let resolveFetch: ((response: Response) => void) | undefined;
+  const fetchMock = vi.fn((_path: string, _init?: RequestInit) => new Promise<Response>(resolve => { resolveFetch = resolve; }));
+  vi.stubGlobal("fetch", fetchMock);
+
+  const pending = api.applySpareImport({ path: "isolated.ods", previewFingerprint: "reviewed-preview" }, "spare-import-attempt-1");
+  await vi.advanceTimersByTimeAsync(31_000);
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(false);
+  expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ "Idempotency-Key": "spare-import-attempt-1" });
+  resolveFetch?.(new Response(JSON.stringify({ status: "complete" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+  await expect(pending).resolves.toMatchObject({ status: "complete" });
+});
+
 it("explains an incomplete baseline response as an uncertain retry", async () => {
   const fetchMock = vi.fn().mockResolvedValue(new Response("", {status: 200}));
   vi.stubGlobal("fetch", fetchMock);
