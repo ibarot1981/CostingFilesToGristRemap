@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
+from threading import Barrier, Lock
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,7 @@ from unittest.mock import patch
 from app.schema import FOUNDATION_TABLES
 from app.spare_import import apply_import_plan, build_import_plan, preview_payload
 from app.spares import GristSpareRegistry, SpareRegistryError, SPARE_TABLE_IDS, parse_source_date, source_cost_age
+from app.part_identity import request_fingerprint
 from app.milestone2 import OdsCell, OdsDocument, OdsSheet
 
 
@@ -27,6 +30,7 @@ class _Grist:
         self.tables: dict[str, list[dict]] = {}
         self.next_id = 1
         self.fail_once_on: str | None = None
+        self.lose_response_once_on: str | None = None
         self.writes = 0
 
     def validate_safari_write_target(self):
@@ -43,6 +47,9 @@ class _Grist:
         for record in records:
             saved.append({"id": self.next_id, "fields": dict(record["fields"])})
             self.next_id += 1
+        if self.lose_response_once_on == table:
+            self.lose_response_once_on = None
+            raise RuntimeError(f"injected lost response after durable write at {table}")
 
     def update_table_records(self, table: str, records: list[dict]):
         saved = self.tables.setdefault(table, [])
@@ -86,6 +93,172 @@ class SpareRegistryTests(unittest.TestCase):
         self.assertEqual([row["EventType"] for row in retired["history"]], ["created", "updated", "retired"])
         with self.assertRaises(SpareRegistryError):
             self.registry.update_spare(spare_key=first["spareKey"], expected_version=3, updates={"description": "No"}, actor="qa", reason="stale", request_key="edit-retired")
+
+    def test_duplicate_alias_is_rejected_before_reservation_or_active_publication(self):
+        first = self.registry.create_spare(description="First", actor="qa", reason="reviewed", request_key="alias-first", aliases=[{"value": "W-LEG-100"}])
+        with self.assertRaises(SpareRegistryError) as caught:
+            self.registry.create_spare(description="Rejected duplicate", actor="qa", reason="reviewed", request_key="alias-duplicate", aliases=[{"value": " W-LEG-100 "}])
+
+        self.assertEqual((caught.exception.code, caught.exception.status_code, caught.exception.retry_disposition), ("SPARE_ALIAS_CONFLICT", 409, "safe_to_edit"))
+        self.assertEqual([(item["spareCode"], item["status"]) for item in self.registry.list_spares(status="active")["items"]], [("SM-S-000001", "active")])
+        self.assertEqual(len(self.grist.tables["SpareMaster"]), 1)
+        self.assertFalse(any(row["fields"].get("RequestKey") == "alias-duplicate" for row in self.grist.tables.get("SpareMasterRequest", [])))
+
+        second = self.registry.create_spare(description="Second", actor="qa", reason="reviewed", request_key="alias-second")
+        self.assertEqual(second["spareCode"], "SM-S-000002")
+        self.assertEqual(first["legacyAliases"], ["W-LEG-100"])
+
+    def test_partial_create_stays_hidden_and_recovers_same_request_after_lost_alias_response(self):
+        self.grist.lose_response_once_on = "SpareAlias"
+        with self.assertRaisesRegex(RuntimeError, "lost response after durable write"):
+            self.registry.create_spare(description="Recoverable", actor="qa", reason="reviewed", request_key="lost-alias-response", aliases=[{"value": "RECOVER-1"}])
+
+        master = self.grist.tables["SpareMaster"][0]["fields"]
+        self.assertEqual(master["Status"], "pending")
+        self.assertEqual(self.registry.list_spares(status="active")["total"], 0)
+        self.assertEqual(self.registry._find(self.grist.tables["SpareMasterRequest"], "RequestKey", "lost-alias-response")["fields"]["Status"], "started")
+
+        recovered = self.registry.create_spare(description="Recoverable", actor="qa", reason="reviewed", request_key="lost-alias-response", aliases=[{"value": "RECOVER-1"}])
+        replay = self.registry.create_spare(description="Recoverable", actor="qa", reason="reviewed", request_key="lost-alias-response", aliases=[{"value": "RECOVER-1"}])
+        self.assertEqual((recovered["spareCode"], recovered["status"], replay["idempotent"]), ("SM-S-000001", "active", True))
+        self.assertEqual((len(self.grist.tables["SpareMaster"]), len(self.grist.tables["SpareAlias"]), len(self.grist.tables["SpareHistory"])), (1, 1, 1))
+
+    def test_existing_rejected_duplicate_orphan_is_retired_with_auditable_history(self):
+        self.registry.create_spare(description="Existing", actor="qa", reason="reviewed", request_key="orphan-owner", aliases=[{"value": "W-LEG-100"}])
+        request_key = "reviewer-partial-create"
+        description = "Reviewer rejected duplicate alias probe"
+        alias = "W-LEG-100"
+        fingerprint = request_fingerprint({"type": "create", "description": description, "category": "", "unit": "", "sourcingType": "unclassified", "aliases": [{"value": alias, "provenance": {}}], "sourceProvenance": {}})
+        spare_key, spare_code = self.registry._reserve_code(request_key, fingerprint)
+        self.registry._ensure_request(request_key=request_key, request_type="create", fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, actor="qa", reason="Isolated duplicate check")
+        fields = {"SpareKey": spare_key, "SpareCode": spare_code, "Description": description, "Category": "", "Unit": "", "SourcingType": "unclassified", "Status": "active", "CreatedAt": "2026-11-17T00:00:00Z", "CreatedBy": "qa", "UpdatedAt": "2026-11-17T00:00:00Z", "UpdatedBy": "qa", "Version": 1, "SourceProvenance": "{}", "CreateRequestKey": request_key, "CreateFingerprint": fingerprint}
+        self.grist.create_table_records("SpareMaster", [{"fields": fields}])
+
+        with self.assertRaises(SpareRegistryError) as caught:
+            self.registry.create_spare(description=description, actor="qa", reason="Isolated duplicate check", request_key=request_key, aliases=[{"value": alias}])
+
+        self.assertEqual((caught.exception.code, caught.exception.retry_disposition), ("SPARE_ALIAS_CONFLICT", "safe_to_edit"))
+        orphan_row = next(row for row in self.grist.tables["SpareMaster"] if row["fields"]["SpareCode"] == "SM-S-000002")
+        orphan = orphan_row["fields"]
+        self.assertEqual((orphan["Status"], orphan["Version"]), ("retired", 2))
+        rejection = next(row["fields"] for row in self.grist.tables["SpareHistory"] if row["fields"]["SpareMaster"] == orphan_row["id"])
+        self.assertEqual(rejection["EventType"], "creation_rejected")
+        self.assertTrue(rejection["Reason"].startswith("Create rejected: Legacy code"))
+        rejected_request = next(row["fields"] for row in self.grist.tables["SpareMasterRequest"] if row["fields"]["RequestKey"] == request_key)
+        self.assertEqual(rejected_request["Status"], "rejected")
+        self.assertEqual(self.registry.list_spares(status="active")["total"], 1)
+        next_spare = self.registry.create_spare(description="Next number", actor="qa", reason="reviewed", request_key="after-orphan")
+        self.assertEqual(next_spare["spareCode"], "SM-S-000003")
+
+    def test_concurrent_create_alias_reservations_allow_only_one_identity(self):
+        barrier = Barrier(2)
+        with tempfile.TemporaryDirectory() as directory:
+            first_registry = _registry(directory, self.grist)
+            second_registry = _registry(directory, self.grist)
+            for registry in (first_registry, second_registry):
+                original = registry.identity_index
+                gate = {"first": True}
+                gate_lock = Lock()
+                def synchronized(original=original, gate=gate, gate_lock=gate_lock):
+                    with gate_lock:
+                        wait = gate["first"]
+                        gate["first"] = False
+                    result = original()
+                    if wait:
+                        barrier.wait(timeout=5)
+                    return result
+                registry.identity_index = synchronized
+
+            def create(registry, key):
+                try:
+                    return registry.create_spare(description=key, actor="qa", reason="race", request_key=key, aliases=[{"value": "RACE-ALIAS"}])
+                except SpareRegistryError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda args: create(*args), [(first_registry, "race-a"), (second_registry, "race-b")]))
+
+        self.assertEqual(sum(not isinstance(result, SpareRegistryError) for result in results), 1)
+        conflict = next(result for result in results if isinstance(result, SpareRegistryError))
+        self.assertEqual((conflict.code, conflict.retry_disposition), ("SPARE_ALIAS_CONFLICT", "safe_to_edit"))
+        self.assertEqual(self.registry.list_spares(status="active")["total"], 1)
+        self.assertEqual(len(self.grist.tables["SpareAlias"]), 1)
+        self.assertEqual(len(self.grist.tables["SpareHistory"]), 1)
+
+    def test_identical_ods_bytes_at_distinct_paths_keep_separate_import_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path_a, path_b, template_path = root / "A.ods", root / "B.ods", root / "Template.ods"
+            path_a.write_bytes(b"identical associated workbook bytes")
+            path_b.write_bytes(path_a.read_bytes())
+            template_path.write_bytes(b"shared template workbook bytes")
+            product = OdsDocument(path_a, {
+                "SparesDB": OdsSheet("SparesDB", {8: {1: _cell(8, 1, "COPY-1"), 3: _cell(8, 3, "Copy washer"), 4: _cell(8, 4, "EA"), 5: _cell(8, 5, 10.0)}}),
+                "Spares Detail": OdsSheet("Spares Detail", {9: {2: _cell(9, 2, "COPY-1"), 4: _cell(9, 4, "MCL"), 5: _cell(9, 5, "MCL-7"), 8: _cell(9, 8, 2), 10: _cell(9, 10, 3)}}),
+                "Spares Summary": OdsSheet("Spares Summary", {}),
+            })
+            template = OdsDocument(template_path, {"Master": OdsSheet("Master", {2: {1: _cell(2, 1, "COPY-1"), 4: _cell(2, 4, "EA"), 8: _cell(2, 8, "Store")}})})
+
+            def build(path: Path, association: str):
+                with patch("app.spare_import.read_ods", side_effect=lambda candidate, _sheets: template if Path(candidate) == template_path else product):
+                    return build_import_plan(product_path=path, template_path=template_path, registry=self.registry, costing_root=root, association_key=association)
+
+            plan_a = build(path_a, "association-A")
+            first = apply_import_plan(plan=plan_a, registry=self.registry, actor="qa", request_key="copy-import-A")
+            plan_b = build(path_b, "association-B")
+            preview_b = preview_payload(plan_b)
+
+            self.assertEqual(path_a.read_bytes(), path_b.read_bytes())
+            self.assertEqual(plan_b["identities"][0]["action"], "noop")
+            self.assertEqual(plan_a["sourceHashes"]["associatedWorkbook"], plan_b["sourceHashes"]["associatedWorkbook"])
+            self.assertNotEqual(plan_a["associationKey"], plan_b["associationKey"])
+            self.assertNotEqual(plan_a["previewFingerprint"], plan_b["previewFingerprint"])
+            self.assertNotEqual(next(row["key"] for row in plan_a["sourceEvidence"] if row["sourceKind"] == "SparesDB"), next(row["key"] for row in plan_b["sourceEvidence"] if row["sourceKind"] == "SparesDB"))
+            self.assertNotEqual(plan_a["costEvidence"][0]["key"], plan_b["costEvidence"][0]["key"])
+            self.assertNotEqual(plan_a["compositions"][0]["key"], plan_b["compositions"][0]["key"])
+            self.assertFalse(any(key.startswith("_") for row in preview_b["costEvidenceRows"] + preview_b["compositionEvidenceRows"] for key in row))
+
+            second = apply_import_plan(plan=plan_b, registry=self.registry, actor="qa", request_key="copy-import-B")
+            repeat = apply_import_plan(plan=plan_b, registry=self.registry, actor="qa", request_key="copy-import-B")
+            self.assertEqual(first["created"], {"sourceEvidence": 2, "costEvidence": 1, "compositionEvidence": 1})
+            self.assertEqual(second["created"], {"sourceEvidence": 1, "costEvidence": 1, "compositionEvidence": 1})
+            self.assertTrue(repeat["idempotent"])
+            self.assertEqual({row["fields"]["SourceFile"] for row in self.grist.tables["SpareAlias"] if row["fields"].get("SourceKind") == "SparesDB"}, {"A.ods", "B.ods"})
+            self.assertEqual({row["fields"]["SourceFile"] for row in self.grist.tables["SpareSourceEvidence"] if row["fields"].get("SourceKind") == "SparesDB"}, {"A.ods", "B.ods"})
+            self.assertEqual({row["fields"]["SourceReference"].split("#", 1)[0] for row in self.grist.tables["SpareSourceCost"]}, {"A.ods", "B.ods"})
+            self.assertEqual({row["fields"]["SourceFile"] for row in self.grist.tables["SpareCompositionEvidence"]}, {"A.ods", "B.ods"})
+
+    def test_legacy_evidence_keys_are_read_idempotently_by_source_occurrence(self):
+        source_file = "A.ods"
+        source_hash = "same-content-hash"
+        source_rows = [{"EvidenceKey": "src:legacy-content-key", "SourceFile": source_file, "SourceHash": source_hash, "SourceKind": "SparesDB", "SheetName": "SparesDB", "SourceRow": 8, "SourceCell": "A8", "EvidenceFingerprint": "source-fingerprint"}]
+        self.grist.tables["SpareSourceEvidence"] = [{"id": 101, "fields": dict(source_rows[0])}]
+        source_incoming = [{**source_rows[0], "EvidenceKey": "src:path-specific-key"}]
+        result = self.registry.ensure_rows("SpareSourceEvidence", "EvidenceKey", source_incoming)
+        self.assertEqual(result, {"created": 0, "existing": 1})
+        self.assertEqual(len(self.grist.tables["SpareSourceEvidence"]), 1)
+        self.assertEqual(self.grist.tables["SpareSourceEvidence"][0]["fields"]["EvidenceKey"], "src:legacy-content-key")
+
+        cost_rows = [{"CostEvidenceKey": "cost:legacy-key", "SourceReference": "A.ods#SparesDB.E8", "SourceHash": source_hash, "SheetName": "SparesDB", "SourceRow": 8, "SourceCell": "E8", "CostKind": "source_purchase_price", "EvidenceFingerprint": "legacy-cost-fingerprint"}]
+        self.grist.tables["SpareSourceCost"] = [{"id": 102, "fields": dict(cost_rows[0])}]
+        cost_incoming = [{**cost_rows[0], "CostEvidenceKey": "cost:path-specific-key", "EvidenceFingerprint": "new-cost-fingerprint", "_legacyEvidenceFingerprint": "legacy-cost-fingerprint"}]
+        self.assertEqual(self.registry.ensure_rows("SpareSourceCost", "CostEvidenceKey", cost_incoming), {"created": 0, "existing": 1})
+        self.assertEqual(len(self.grist.tables["SpareSourceCost"]), 1)
+
+        composition_rows = [{"CompositionKey": "composition:legacy-key", "SourceFile": source_file, "SourceHash": source_hash, "SourceKind": "SparesDetail", "SheetName": "Spares Detail", "SourceRow": 9, "EvidenceFingerprint": "legacy-composition-fingerprint"}]
+        self.grist.tables["SpareCompositionEvidence"] = [{"id": 103, "fields": dict(composition_rows[0])}]
+        composition_incoming = [{**composition_rows[0], "CompositionKey": "composition:path-specific-key", "EvidenceFingerprint": "new-composition-fingerprint", "_legacyFingerprint": "legacy-composition-fingerprint"}]
+        self.assertEqual(self.registry.ensure_rows("SpareCompositionEvidence", "CompositionKey", composition_incoming), {"created": 0, "existing": 1})
+        self.assertEqual(len(self.grist.tables["SpareCompositionEvidence"]), 1)
+
+        master = self.registry.create_spare(description="Legacy alias master", actor="qa", reason="reviewed", request_key="legacy-alias-master")
+        alias = self.registry.ensure_alias(spare_key=master["spareKey"], spare_record_id=master["recordId"], value="COPY-1", provenance={"sourceKind": "SparesDB", "sourceHash": source_hash, "sheetName": "SparesDB", "sourceRow": 8, "sourceCell": "A8"}, evidence_fingerprint="alias-fingerprint")
+        self.grist.tables["SpareAlias"][0]["fields"]["SourceFile"] = source_file
+        reused = self.registry.ensure_alias(spare_key=master["spareKey"], spare_record_id=master["recordId"], value="COPY-1", provenance={"sourceKind": "SparesDB", "sourceFile": source_file, "sourceHash": source_hash, "sheetName": "SparesDB", "sourceRow": 8, "sourceCell": "A8"}, evidence_fingerprint="alias-fingerprint")
+        self.assertEqual(reused["id"], alias["id"])
+        second_occurrence = self.registry.ensure_alias(spare_key=master["spareKey"], spare_record_id=master["recordId"], value="COPY-1", provenance={"sourceKind": "SparesDB", "sourceFile": "B.ods", "sourceHash": source_hash, "sheetName": "SparesDB", "sourceRow": 8, "sourceCell": "A8"}, evidence_fingerprint="alias-fingerprint-B")
+        self.assertNotEqual(second_occurrence["id"], alias["id"])
+        self.assertEqual(len(self.grist.tables["SpareAlias"]), 2)
 
     def test_source_cost_age_uses_explicit_india_calendar_date(self):
         as_of = date(2026, 11, 17)

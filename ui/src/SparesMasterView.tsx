@@ -120,7 +120,7 @@ export function SparesMasterView({ active = true }: { active?: boolean }) {
       await refreshList();
       setNotice(attempt.operation === "create" ? `Created ${result.spareCode || "spare"}.` : attempt.operation === "retire" ? "Spare retired; its history and references are preserved." : "Spare changes saved.");
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status < 500) clearMasterAttempt();
+      if (cause instanceof ApiError && cause.retryDisposition === "safe_to_edit") clearMasterAttempt();
       setError(errorMessage(cause));
     }
   };

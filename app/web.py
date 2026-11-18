@@ -54,7 +54,7 @@ from app.spares import SpareRegistryError
 
 @app.exception_handler(SpareRegistryError)
 async def _spare_registry_error_handler(request: Request, exc: SpareRegistryError):
-    return JSONResponse(status_code=exc.status_code, content={"detail": {"code": exc.code, "message": str(exc)}})
+    return JSONResponse(status_code=exc.status_code, content={"detail": {"code": exc.code, "message": str(exc), "retryDisposition": exc.retry_disposition}})
 
 
 @app.get("/api/health")

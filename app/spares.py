@@ -38,10 +38,11 @@ _INDIA = ZoneInfo("Asia/Kolkata")
 
 
 class SpareRegistryError(ValueError):
-    def __init__(self, code: str, message: str, status_code: int = 422):
+    def __init__(self, code: str, message: str, status_code: int = 422, retry_disposition: str = "retry_same_request"):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.retry_disposition = retry_disposition
 
 
 def normalize_alias(value: Any) -> str:
@@ -171,6 +172,11 @@ class GristSpareRegistry:
                     request_key TEXT PRIMARY KEY, request_fingerprint TEXT NOT NULL,
                     spare_key TEXT NOT NULL, spare_code TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL, record_id TEXT, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS spare_registry_alias_reservations (
+                    normalized_alias TEXT PRIMARY KEY, request_key TEXT NOT NULL,
+                    spare_key TEXT NOT NULL, request_fingerprint TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 INSERT OR IGNORE INTO spare_registry_settings(singleton,next_spare_number) VALUES(1,1);
             """)
@@ -330,7 +336,15 @@ class GristSpareRegistry:
     def _public_evidence(fields: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in fields.items() if key not in {"SpareMaster", "ParentSpare"}}
 
-    def _reserve_code(self, request_key: str, fingerprint: str) -> tuple[str, str]:
+    def _reservation_for_request(self, request_key: str) -> dict[str, Any] | None:
+        db = self._connect()
+        try:
+            row = db.execute("SELECT * FROM spare_registry_reservations WHERE request_key=?", (request_key,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            db.close()
+
+    def _reserve_code(self, request_key: str, fingerprint: str, aliases: Iterable[str] = ()) -> tuple[str, str]:
         remote_request = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
         if remote_request:
             fields = remote_request.get("fields", {})
@@ -378,6 +392,14 @@ class GristSpareRegistry:
                     spare_code = f"SM-S-{number:06d}"
                     db.execute("INSERT INTO spare_registry_reservations(request_key,request_fingerprint,spare_key,spare_code,status,updated_at) VALUES(?,?,?,?,?,?)", (request_key, fingerprint, spare_key, spare_code, "reserved", _now()))
                     db.execute("UPDATE spare_registry_settings SET next_spare_number=? WHERE singleton=1", (number + 1,))
+                for alias in sorted({normalize_alias(value) for value in aliases if normalize_alias(value)}):
+                    prior_alias = db.execute("SELECT * FROM spare_registry_alias_reservations WHERE normalized_alias=?", (alias,)).fetchone()
+                    if prior_alias:
+                        if str(prior_alias["request_key"]) != request_key or str(prior_alias["spare_key"]) != spare_key or str(prior_alias["request_fingerprint"]) != fingerprint:
+                            db.rollback()
+                            raise SpareRegistryError("SPARE_ALIAS_CONFLICT", "This legacy code is reserved by another create attempt. Resume that exact request before assigning it elsewhere.", 409, "safe_to_edit")
+                    else:
+                        db.execute("INSERT INTO spare_registry_alias_reservations(normalized_alias,request_key,spare_key,request_fingerprint,updated_at) VALUES(?,?,?,?,?)", (alias, request_key, spare_key, fingerprint, _now()))
                 db.commit()
             finally:
                 db.close()
@@ -408,6 +430,45 @@ class GristSpareRegistry:
         fields = row.get("fields", {})
         self.client.update_table_records("SpareMasterRequest", [{"id": row["id"], "fields": {"Status": "complete", "UpdatedAt": grist_datetime(_now()), "CompletedAt": grist_datetime(_now()), "Result": canonical_grist_json_cell(result)}}])
 
+    def _reject_request(self, request_key: str, fingerprint: str, result: dict[str, Any]) -> None:
+        row = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
+        if not row or str(row.get("fields", {}).get("RequestFingerprint") or "") != fingerprint:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not retain the rejected spare request audit record.", 503)
+        if str(row.get("fields", {}).get("Status") or "") == "rejected":
+            return
+        now = grist_datetime(_now())
+        self.client.update_table_records("SpareMasterRequest", [{"id": row["id"], "fields": {"Status": "rejected", "UpdatedAt": now, "CompletedAt": now, "Result": canonical_grist_json_cell(result)}}])
+        confirmed = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
+        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "rejected":
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the rejected spare request.", 503)
+
+    def _release_alias_reservations(self, request_key: str) -> None:
+        db = self._connect()
+        try:
+            db.execute("DELETE FROM spare_registry_alias_reservations WHERE request_key=?", (request_key,))
+        finally:
+            db.close()
+
+    def _retire_rejected_create(self, *, row: dict[str, Any], actor: str, reason: str, request_key: str, fingerprint: str) -> dict[str, Any]:
+        fields = row.get("fields", {})
+        spare_key = str(fields.get("SpareKey") or "")
+        if not spare_key:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The partial spare identity cannot be safely reconciled without its canonical key.", 503)
+        current_version = int(fields.get("Version") or 1)
+        existing_history = self.history(spare_key)
+        if any(str(item.get("RequestKey") or "") == request_key and str(item.get("EventType") or "") == "creation_rejected" for item in existing_history):
+            return row
+        has_current_version = any(int(item.get("Version") or 0) == current_version for item in existing_history)
+        status = str(fields.get("Status") or "active").casefold()
+        next_version = current_version + 1 if status != "retired" or has_current_version else current_version
+        if status != "retired" or next_version != current_version:
+            self.client.update_table_records("SpareMaster", [{"id": row["id"], "fields": {"Status": "retired", "Version": next_version, "UpdatedAt": grist_datetime(_now()), "UpdatedBy": actor}}])
+            row = self._spare_master_by_key(spare_key)
+            if not row or str(row.get("fields", {}).get("Status") or "").casefold() != "retired":
+                raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm retirement of the rejected partial spare.", 503)
+        self._ensure_history(row=row, event_type="creation_rejected", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=self._public_master(row))
+        return row
+
     def _spare_master_by_key(self, spare_key: str) -> dict[str, Any] | None:
         return self._find(self._rows("SpareMaster", refresh=True), "SpareKey", spare_key)
 
@@ -428,9 +489,26 @@ class GristSpareRegistry:
         self._check_alias_available(value, spare_key)
         provenance = provenance or {}
         key_data = {"spareKey": spare_key, "normalized": normalized, "sourceHash": provenance.get("sourceHash", ""), "sourceKind": provenance.get("sourceKind", "manual"), "sheet": provenance.get("sheetName", ""), "row": provenance.get("sourceRow", 0), "cell": provenance.get("sourceCell", "")}
+        source_file = str(provenance.get("sourceFile") or "")
+        if source_file:
+            key_data["sourceFile"] = source_file
         alias_key = "alias:" + hashlib.sha256(json.dumps(key_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         fingerprint = evidence_fingerprint or request_fingerprint({**key_data, "value": value})
-        fields = {"AliasKey": alias_key, "SpareMaster": spare_record_id, "Value": value, "NormalizedValue": normalized, "SourceFile": str(provenance.get("sourceFile") or ""), "SourceHash": str(provenance.get("sourceHash") or ""), "SourceKind": str(provenance.get("sourceKind") or "manual"), "SheetName": str(provenance.get("sheetName") or ""), "SourceRow": int(provenance.get("sourceRow") or 0), "SourceCell": str(provenance.get("sourceCell") or ""), "CreatedAt": grist_datetime(_now()), "IdentityStatus": str(provenance.get("identityStatus") or "resolved"), "EvidenceFingerprint": fingerprint}
+        fields = {"AliasKey": alias_key, "SpareMaster": spare_record_id, "Value": value, "NormalizedValue": normalized, "SourceFile": source_file, "SourceHash": str(provenance.get("sourceHash") or ""), "SourceKind": str(provenance.get("sourceKind") or "manual"), "SheetName": str(provenance.get("sheetName") or ""), "SourceRow": int(provenance.get("sourceRow") or 0), "SourceCell": str(provenance.get("sourceCell") or ""), "CreatedAt": grist_datetime(_now()), "IdentityStatus": str(provenance.get("identityStatus") or "resolved"), "EvidenceFingerprint": fingerprint}
+        row = self._find(self._rows("SpareAlias", refresh=True), "AliasKey", alias_key)
+        if row:
+            if str(row.get("fields", {}).get("EvidenceFingerprint") or "") != fingerprint:
+                raise SpareRegistryError("SPARE_REQUEST_CONFLICT", "The existing SpareAlias record has a different immutable fingerprint.", 409)
+            return row
+        if source_file:
+            legacy_data = {key: value for key, value in key_data.items() if key != "sourceFile"}
+            legacy_key = "alias:" + hashlib.sha256(json.dumps(legacy_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            legacy = self._find(self._rows("SpareAlias", refresh=True), "AliasKey", legacy_key)
+            if legacy:
+                legacy_fields = legacy.get("fields", {})
+                if (_ref_id(legacy_fields.get("SpareMaster")) == spare_record_id and str(legacy_fields.get("SourceFile") or "") == source_file
+                        and str(legacy_fields.get("EvidenceFingerprint") or "") == fingerprint):
+                    return legacy
         return self._ensure_keyed("SpareAlias", "AliasKey", alias_key, fields, "EvidenceFingerprint")
 
     def _ensure_history(self, *, row: dict[str, Any], event_type: str, actor: str, reason: str, request_key: str, fingerprint: str, snapshot: dict[str, Any]) -> None:
@@ -444,22 +522,85 @@ class GristSpareRegistry:
     def create_spare(self, *, description: str, category: str = "", unit: str = "", sourcing_type: str = "unclassified", actor: str, reason: str = "", request_key: str, aliases: Iterable[dict[str, Any]] = (), source_provenance: dict[str, Any] | None = None) -> dict[str, Any]:
         description = " ".join(str(description or "").split())
         if not description:
-            raise SpareRegistryError("SPARE_DESCRIPTION_REQUIRED", "Description is required.")
+            raise SpareRegistryError("SPARE_DESCRIPTION_REQUIRED", "Description is required.", retry_disposition="safe_to_edit")
         if not str(request_key or "").strip():
-            raise SpareRegistryError("SPARE_REQUEST_KEY_REQUIRED", "A unique idempotency key is required for spare creation.")
+            raise SpareRegistryError("SPARE_REQUEST_KEY_REQUIRED", "A unique idempotency key is required for spare creation.", retry_disposition="safe_to_edit")
         sourcing = normalize_sourcing_type(sourcing_type)
         alias_items = [dict(item) for item in aliases]
-        fingerprint = request_fingerprint({"type": "create", "description": description, "category": category.strip(), "unit": unit.strip(), "sourcingType": sourcing, "aliases": [{"value": str(x.get("value") or "").strip(), "provenance": x.get("provenance") or {}} for x in alias_items], "sourceProvenance": source_provenance or {}})
+        normalized_aliases = [normalize_alias(item.get("value")) for item in alias_items if normalize_alias(item.get("value"))]
+        if len(set(normalized_aliases)) != len(normalized_aliases):
+            raise SpareRegistryError("SPARE_ALIAS_DUPLICATE_INPUT", "Enter each legacy code only once.", retry_disposition="safe_to_edit")
+        fingerprint = request_fingerprint({"type": "create", "description": description, "category": category.strip(), "unit": unit.strip(), "sourcingType": sourcing, "aliases": [{"value": str(x.get("value") or "").strip(), "provenance": x.get("provenance") or {}, **({"evidenceFingerprint": str(x.get("evidenceFingerprint"))} if x.get("evidenceFingerprint") else {})} for x in alias_items], "sourceProvenance": source_provenance or {}})
         self._assert_schema(write=True)
-        spare_key, spare_code = self._reserve_code(request_key, fingerprint)
-        self._ensure_request(request_key=request_key, request_type="create", fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, actor=actor, reason=reason)
+
+        request_row = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
+        if request_row:
+            request_fields = request_row.get("fields", {})
+            if str(request_fields.get("RequestType") or "") != "create" or str(request_fields.get("RequestFingerprint") or "") != fingerprint:
+                raise SpareRegistryError("SPARE_REQUEST_CONFLICT", "This idempotency key was already used for different spare details.", 409)
+            if str(request_fields.get("Status") or "") == "complete":
+                completed_key = str(request_fields.get("SpareKey") or "")
+                completed = self._spare_master_by_key(completed_key)
+                if not completed or completed.get("fields", {}).get("CreateRequestKey") != request_key or completed.get("fields", {}).get("CreateFingerprint") != fingerprint:
+                    raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request no longer matches its Grist spare identity.", 503)
+                if str(completed.get("fields", {}).get("Status") or "").casefold() != "pending":
+                    result = self.get_spare(completed_key)
+                    result["idempotent"] = True
+                    return result
+            if str(request_fields.get("Status") or "") == "rejected":
+                result = _object_cell(request_fields.get("Result"))
+                raise SpareRegistryError(str(result.get("code") or "SPARE_ALIAS_CONFLICT"), str(result.get("message") or "This create request was already rejected; edit the legacy code and start a new request."), 409, "safe_to_edit")
+        reservation = self._reservation_for_request(request_key)
+        known_spare_key = str((request_row or {}).get("fields", {}).get("SpareKey") or (reservation or {}).get("spare_key") or "")
+
+        def reject_alias_conflict(error: SpareRegistryError, *, spare_key: str, spare_code: str) -> None:
+            nonlocal request_row
+            existing_master = self._spare_master_by_key(spare_key) if spare_key else None
+            if not request_row and reservation:
+                request_row = self._ensure_request(request_key=request_key, request_type="create", fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, actor=actor, reason=reason)
+            if existing_master:
+                actual = existing_master.get("fields", {})
+                if actual.get("CreateRequestKey") != request_key or actual.get("CreateFingerprint") != fingerprint or str(actual.get("SpareCode") or "") != spare_code:
+                    raise SpareRegistryError("SPARE_REQUEST_CONFLICT", "The reserved number is already attached to different Grist data.", 409)
+                self._retire_rejected_create(row=existing_master, actor=actor, reason=f"Create rejected: {error}", request_key=request_key, fingerprint=fingerprint)
+            if request_row or reservation:
+                self._reject_request(request_key, fingerprint, {"code": error.code, "message": str(error), "spareKey": spare_key, "spareCode": spare_code})
+                self._finish_reservation(request_key, "rejected", _row_id(existing_master))
+                self._release_alias_reservations(request_key)
+            raise SpareRegistryError(error.code, str(error), 409, "safe_to_edit")
+
+        for alias in alias_items:
+            try:
+                self._check_alias_available(str(alias.get("value") or ""), known_spare_key)
+            except SpareRegistryError as exc:
+                if exc.code != "SPARE_ALIAS_CONFLICT":
+                    raise
+                reject_alias_conflict(exc, spare_key=known_spare_key, spare_code=str((request_row or {}).get("fields", {}).get("SpareCode") or (reservation or {}).get("spare_code") or ""))
+
+        spare_key, spare_code = self._reserve_code(request_key, fingerprint, normalized_aliases)
+        request_row = self._ensure_request(request_key=request_key, request_type="create", fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, actor=actor, reason=reason)
+        for alias in alias_items:
+            try:
+                self._check_alias_available(str(alias.get("value") or ""), spare_key)
+            except SpareRegistryError as exc:
+                if exc.code != "SPARE_ALIAS_CONFLICT":
+                    raise
+                reject_alias_conflict(exc, spare_key=spare_key, spare_code=spare_code)
+
         existing = self._spare_master_by_key(spare_key)
         now = grist_datetime(_now())
-        fields = {"SpareKey": spare_key, "SpareCode": spare_code, "Description": description, "Category": str(category or "").strip(), "Unit": str(unit or "").strip(), "SourcingType": sourcing, "Status": "active", "CreatedAt": now, "CreatedBy": actor, "UpdatedAt": now, "UpdatedBy": actor, "Version": 1, "SourceProvenance": canonical_grist_json_cell(_json_value(source_provenance or {})), "CreateRequestKey": request_key, "CreateFingerprint": fingerprint}
+        fields = {"SpareKey": spare_key, "SpareCode": spare_code, "Description": description, "Category": str(category or "").strip(), "Unit": str(unit or "").strip(), "SourcingType": sourcing, "Status": "pending", "CreatedAt": now, "CreatedBy": actor, "UpdatedAt": now, "UpdatedBy": actor, "Version": 1, "SourceProvenance": canonical_grist_json_cell(_json_value(source_provenance or {})), "CreateRequestKey": request_key, "CreateFingerprint": fingerprint}
         if existing:
             actual = existing.get("fields", {})
             if actual.get("CreateRequestKey") != request_key or actual.get("CreateFingerprint") != fingerprint or actual.get("SpareCode") != spare_code:
                 raise SpareRegistryError("SPARE_REQUEST_CONFLICT", "The reserved number is already attached to different Grist data.", 409)
+            if str(actual.get("Status") or "active").casefold() == "retired" and str(request_row.get("fields", {}).get("Status") or "") != "complete":
+                raise SpareRegistryError("SPARE_CREATE_RECOVERY_BLOCKED", "This incomplete create was already retired. Resume the same request with an administrator reviewing its history before changing it.", 409)
+            if str(actual.get("Status") or "active").casefold() == "active" and str(request_row.get("fields", {}).get("Status") or "") != "complete":
+                self.client.update_table_records("SpareMaster", [{"id": existing["id"], "fields": {"Status": "pending", "UpdatedAt": grist_datetime(_now()), "UpdatedBy": actor}}])
+                existing = self._spare_master_by_key(spare_key)
+                if not existing or str(existing.get("fields", {}).get("Status") or "").casefold() != "pending":
+                    raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not hide the incomplete spare while recovery is running.", 503)
             row = existing
         else:
             row = self._ensure_keyed("SpareMaster", "SpareKey", spare_key, fields, "CreateFingerprint")
@@ -467,10 +608,19 @@ class GristSpareRegistry:
         if not record_id:
             raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not return the created spare record ID.", 503)
         for alias in alias_items:
-            self.ensure_alias(spare_key=spare_key, spare_record_id=record_id, value=str(alias.get("value") or ""), provenance=alias.get("provenance") or {})
-        snapshot = self._public_master(row)
+            self.ensure_alias(spare_key=spare_key, spare_record_id=record_id, value=str(alias.get("value") or ""), provenance=alias.get("provenance") or {}, evidence_fingerprint=str(alias.get("evidenceFingerprint") or "") or None)
+        snapshot_row = {"id": row["id"], "fields": {**row.get("fields", {}), "Status": "active"}}
+        snapshot = self._public_master(snapshot_row)
         self._ensure_history(row=row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=snapshot)
         self._complete_request(request_key, fingerprint, {"spareKey": spare_key, "spareCode": spare_code, "recordId": record_id})
+        current = self._spare_master_by_key(spare_key)
+        if not current:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the created spare before activation.", 503)
+        if str(current.get("fields", {}).get("Status") or "").casefold() != "active":
+            self.client.update_table_records("SpareMaster", [{"id": current["id"], "fields": {"Status": "active"}}])
+            current = self._spare_master_by_key(spare_key)
+            if not current or str(current.get("fields", {}).get("Status") or "").casefold() != "active":
+                raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the completed spare identity before activation.", 503)
         self._finish_reservation(request_key, "complete", record_id)
         result = self.get_spare(spare_key)
         result["idempotent"] = bool(existing)
@@ -537,7 +687,15 @@ class GristSpareRegistry:
         if not rows:
             return {"created": 0, "existing": 0}
         existing_rows = self._rows(table, refresh=True)
-        existing = {str(r.get("fields", {}).get(key_field) or ""): r for r in existing_rows if r.get("fields", {}).get(key_field)}
+        keyed_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in existing_rows:
+            key = str(row.get("fields", {}).get(key_field) or "")
+            if key:
+                keyed_rows.setdefault(key, []).append(row)
+        duplicates = [key for key, matches in keyed_rows.items() if len(matches) > 1]
+        if duplicates:
+            raise SpareRegistryError("SPARE_DUPLICATE_KEY", f"Grist contains duplicate {key_field} rows; writes are paused until the duplicate is reviewed.", 409)
+        existing = {key: matches[0] for key, matches in keyed_rows.items()}
         missing = []
         skipped = 0
         for fields in rows:
@@ -545,21 +703,39 @@ class GristSpareRegistry:
             if not key:
                 raise SpareRegistryError("SPARE_EVIDENCE_KEY_REQUIRED", f"{table} evidence needs a stable key.")
             prior = existing.get(key)
+            if not prior and table in {"SpareSourceEvidence", "SpareSourceCost", "SpareCompositionEvidence"}:
+                matches = [row for row in existing_rows if self._same_source_occurrence(table, row.get("fields", {}), fields)]
+                if len(matches) > 1:
+                    raise SpareRegistryError("SPARE_DUPLICATE_KEY", f"Grist contains duplicate source occurrences for {key_field}; writes are paused until the duplicate is reviewed.", 409)
+                prior = matches[0] if matches else None
             if prior:
                 expected = str(fields.get(fingerprint_field) or "")
                 actual = str(prior.get("fields", {}).get(fingerprint_field) or "")
-                if expected and actual != expected:
+                legacy = {str(fields.get("_legacyEvidenceFingerprint") or ""), str(fields.get("_legacyFingerprint") or "")}
+                if expected and actual != expected and actual not in legacy:
                     raise SpareRegistryError("SPARE_EVIDENCE_CONFLICT", f"The existing {table} evidence key has different source facts.", 409)
                 skipped += 1
             else:
-                missing.append(fields)
+                missing.append({key: value for key, value in fields.items() if not key.startswith("_")})
         for start in range(0, len(missing), chunk_size):
             self.client.create_table_records(table, [{"fields": fields} for fields in missing[start:start + chunk_size]])
-        confirmed = {str(r.get("fields", {}).get(key_field) or "") for r in self._rows(table, refresh=True)}
-        absent = [str(row.get(key_field)) for row in rows if str(row.get(key_field)) not in confirmed]
+        confirmed_rows = self._rows(table, refresh=True)
+        confirmed = {str(r.get("fields", {}).get(key_field) or "") for r in confirmed_rows}
+        absent = [str(row.get(key_field)) for row in rows if str(row.get(key_field)) not in confirmed and not any(self._same_source_occurrence(table, prior.get("fields", {}), row) for prior in confirmed_rows)]
         if absent:
             raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", f"Grist did not confirm {len(absent)} {table} evidence records after writing.", 503)
         return {"created": len(missing), "existing": skipped}
+
+    @staticmethod
+    def _same_source_occurrence(table: str, stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
+        fields = {
+            "SpareSourceEvidence": ("SourceFile", "SourceHash", "SourceKind", "SheetName", "SourceRow", "SourceCell"),
+            "SpareSourceCost": ("SourceReference", "SourceHash", "SheetName", "SourceRow", "SourceCell", "CostKind"),
+            "SpareCompositionEvidence": ("SourceFile", "SourceHash", "SourceKind", "SheetName", "SourceRow"),
+        }.get(table)
+        if not fields:
+            return False
+        return all(str(stored.get(key) or "") == str(incoming.get(key) or "") for key in fields)
 
     def start_import(self, *, request_key: str, fingerprint: str, preview_fingerprint: str, source_hashes: dict[str, str], actor: str) -> dict[str, Any]:
         self._assert_schema(write=True)
