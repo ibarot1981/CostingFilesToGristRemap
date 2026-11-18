@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
+import json
+import sqlite3
 import tempfile
 from threading import Barrier, Lock
 import unittest
@@ -117,6 +120,144 @@ class SpareRegistryTests(unittest.TestCase):
         self.assertEqual([row["EventType"] for row in retired["history"]], ["created", "updated", "retired"])
         with self.assertRaises(SpareRegistryError):
             self.registry.update_spare(spare_key=first["spareKey"], expected_version=3, updates={"description": "No"}, actor="qa", reason="stale", request_key="edit-retired")
+
+    def test_completed_create_replay_preserves_creation_history_after_edit_and_retirement(self):
+        request = {"description": "Original washer", "category": "Washer", "unit": "EA", "actor": "creator", "reason": "initial review", "request_key": "create-edit-retire-replay"}
+        created = self.registry.create_spare(**request)
+        original_history = copy.deepcopy(self.grist.tables["SpareHistory"])
+        original_snapshot = json.loads(original_history[0]["fields"]["Snapshot"])
+
+        updated = self.registry.update_spare(spare_key=created["spareKey"], expected_version=1, updates={"description": "Corrected washer"}, actor="editor", reason="description correction", request_key="update-before-create-replay")
+        history_after_edit = copy.deepcopy(self.grist.tables["SpareHistory"])
+        replay_after_edit = self.registry.create_spare(**request)
+        self.assertEqual((replay_after_edit["idempotent"], replay_after_edit["version"], replay_after_edit["description"]), (True, 2, "Corrected washer"))
+        self.assertEqual(self.grist.tables["SpareHistory"], history_after_edit)
+        self.assertEqual(json.loads(self.grist.tables["SpareHistory"][0]["fields"]["Snapshot"]), original_snapshot)
+        self.assertEqual(updated["history"][0]["snapshot"], original_snapshot)
+
+        retired = self.registry.update_spare(spare_key=created["spareKey"], expected_version=2, updates={}, actor="retirer", reason="replacement", request_key="retire-before-create-replay", retire=True)
+        history_after_retirement = copy.deepcopy(self.grist.tables["SpareHistory"])
+        replay_after_retirement = self.registry.create_spare(**request)
+        self.assertEqual((retired["version"], replay_after_retirement["status"], replay_after_retirement["version"], replay_after_retirement["idempotent"]), (3, "retired", 3, True))
+        self.assertEqual(self.grist.tables["SpareHistory"], history_after_retirement)
+        self.assertEqual([json.loads(row["fields"]["Snapshot"])["status"] for row in self.grist.tables["SpareHistory"]], ["active", "active", "retired"])
+
+    def test_missing_creation_history_repairs_from_saved_original_snapshot_on_fresh_adapter(self):
+        request = {"description": "Original repair washer", "category": "Washer", "unit": "EA", "actor": "creator", "reason": "initial review", "request_key": "repair-original-create-history"}
+        created = self.registry.create_spare(**request)
+        original = self.registry.create_request_record(request["request_key"])
+        original_result = json.loads(original["fields"]["Result"])
+        evidence = original_result["creationEvidence"]
+        self.registry.update_spare(spare_key=created["spareKey"], expected_version=1, updates={"description": "Edited repair washer"}, actor="editor", reason="corrected", request_key="repair-update")
+        retired = self.registry.update_spare(spare_key=created["spareKey"], expected_version=2, updates={}, actor="retirer", reason="retired", request_key="repair-retire", retire=True)
+        later_history = copy.deepcopy([row for row in self.grist.tables["SpareHistory"] if row["fields"]["HistoryKey"] != f"{created['spareKey']}:v1"])
+        self.grist.tables["SpareHistory"] = later_history
+
+        fresh_grist = _Grist()
+        fresh_grist.tables = copy.deepcopy(self.grist.tables)
+        fresh_grist.next_id = self.grist.next_id
+        with tempfile.TemporaryDirectory() as fresh_directory:
+            fresh_registry = _registry(fresh_directory, fresh_grist)
+            replay = fresh_registry.create_spare(**request)
+            journal_path = Path(fresh_directory) / "coordination.sqlite3"
+            db = sqlite3.connect(journal_path)
+            try:
+                reservation_count = db.execute("SELECT COUNT(*) FROM spare_registry_reservations").fetchone()[0]
+                alias_reservation_count = db.execute("SELECT COUNT(*) FROM spare_registry_alias_reservations").fetchone()[0]
+            finally:
+                db.close()
+
+        self.assertEqual((retired["status"], replay["status"], replay["version"], replay["idempotent"]), ("retired", "retired", 3, True))
+        self.assertEqual(reservation_count, 0)
+        self.assertEqual(alias_reservation_count, 0)
+        repaired = next(row["fields"] for row in fresh_grist.tables["SpareHistory"] if row["fields"]["HistoryKey"] == f"{created['spareKey']}:v1")
+        self.assertEqual(repaired["Version"], 1)
+        self.assertEqual(repaired["EventType"], "created")
+        self.assertEqual(repaired["RequestKey"], request["request_key"])
+        self.assertEqual(repaired["SpareMaster"], created["recordId"])
+        self.assertEqual(repaired["Actor"], evidence["actor"])
+        self.assertEqual(repaired["Reason"], evidence["reason"])
+        self.assertEqual(repaired["OccurredAt"], evidence["occurredAt"])
+        self.assertEqual(json.loads(repaired["Snapshot"]), evidence["snapshot"])
+        self.assertEqual([row for row in fresh_grist.tables["SpareHistory"] if row["fields"]["HistoryKey"] != f"{created['spareKey']}:v1"], later_history)
+
+    def test_missing_creation_history_without_original_snapshot_fails_closed(self):
+        request = {"description": "Legacy request", "actor": "creator", "reason": "initial", "request_key": "legacy-create-no-snapshot"}
+        created = self.registry.create_spare(**request)
+        self.registry.update_spare(spare_key=created["spareKey"], expected_version=1, updates={"description": "Current description"}, actor="editor", reason="legitimate edit", request_key="legacy-edit")
+        request_row = self.registry.create_request_record(request["request_key"])
+        result = json.loads(request_row["fields"]["Result"])
+        result.pop("creationEvidence")
+        stored_request = next(row for row in self.grist.tables["SpareMasterRequest"] if row["fields"]["RequestKey"] == request["request_key"])
+        stored_request["fields"]["Result"] = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        self.grist.tables["SpareHistory"] = [row for row in self.grist.tables["SpareHistory"] if row["fields"]["HistoryKey"] != f"{created['spareKey']}:v1"]
+        history_before = copy.deepcopy(self.grist.tables["SpareHistory"])
+        aliases_before = copy.deepcopy(self.grist.tables.get("SpareAlias", []))
+
+        with self.assertRaises(SpareRegistryError) as caught:
+            self.registry.create_spare(**request)
+
+        self.assertEqual((caught.exception.code, caught.exception.status_code), ("SPARE_WRITE_UNCONFIRMED", 503))
+        self.assertIn("cannot safely reconstruct it from current metadata", str(caught.exception))
+        self.assertEqual(self.grist.tables["SpareHistory"], history_before)
+        self.assertEqual(self.grist.tables.get("SpareAlias", []), aliases_before)
+
+    def test_legacy_completed_create_replay_uses_intact_version_one_history(self):
+        request = {"description": "Legacy history", "actor": "creator", "reason": "initial", "request_key": "legacy-create-with-history"}
+        created = self.registry.create_spare(**request)
+        request_row = next(row for row in self.grist.tables["SpareMasterRequest"] if row["fields"]["RequestKey"] == request["request_key"])
+        result = json.loads(request_row["fields"]["Result"])
+        result.pop("creationEvidence")
+        request_row["fields"]["Result"] = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        self.registry.update_spare(spare_key=created["spareKey"], expected_version=1, updates={"description": "Legacy history edited"}, actor="editor", reason="legitimate edit", request_key="legacy-history-edit")
+        history_before = copy.deepcopy(self.grist.tables["SpareHistory"])
+
+        replay = self.registry.create_spare(**request)
+
+        self.assertEqual((replay["idempotent"], replay["version"], replay["description"]), (True, 2, "Legacy history edited"))
+        self.assertEqual(self.grist.tables["SpareHistory"], history_before)
+
+    def test_conflicting_original_creation_history_is_not_rewritten(self):
+        request = {"description": "Protected history", "actor": "creator", "reason": "initial", "request_key": "protected-create-history"}
+        created = self.registry.create_spare(**request)
+        self.registry.update_spare(spare_key=created["spareKey"], expected_version=1, updates={"description": "Protected history edited"}, actor="editor", reason="legitimate edit", request_key="protected-history-edit")
+        original = next(row for row in self.grist.tables["SpareHistory"] if row["fields"]["HistoryKey"] == f"{created['spareKey']}:v1")
+        snapshot = json.loads(original["fields"]["Snapshot"])
+        snapshot["description"] = "tampered history"
+        original["fields"]["Snapshot"] = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        history_before = copy.deepcopy(self.grist.tables["SpareHistory"])
+
+        with self.assertRaises(SpareRegistryError) as caught:
+            self.registry.create_spare(**request)
+
+        self.assertEqual(caught.exception.code, "SPARE_WRITE_UNCONFIRMED")
+        self.assertEqual(self.grist.tables["SpareHistory"], history_before)
+
+    def test_completed_create_lost_response_replays_with_fresh_empty_journal(self):
+        request = {"description": "Lost response washer", "actor": "creator", "reason": "initial", "request_key": "lost-final-create-response"}
+        self.grist.lose_response_once_on_update = ("SpareMaster", "Status", "active")
+        with self.assertRaisesRegex(RuntimeError, "lost response after durable update"):
+            self.registry.create_spare(**request)
+        self.assertEqual(self.registry.create_request_record(request["request_key"])["fields"]["Status"], "complete")
+        saved_history = copy.deepcopy(self.grist.tables["SpareHistory"])
+
+        fresh_grist = _Grist()
+        fresh_grist.tables = copy.deepcopy(self.grist.tables)
+        fresh_grist.next_id = self.grist.next_id
+        with tempfile.TemporaryDirectory() as fresh_directory:
+            fresh_registry = _registry(fresh_directory, fresh_grist)
+            replay = fresh_registry.create_spare(**request)
+            db = sqlite3.connect(Path(fresh_directory) / "coordination.sqlite3")
+            try:
+                reservation_count = db.execute("SELECT COUNT(*) FROM spare_registry_reservations").fetchone()[0]
+            finally:
+                db.close()
+
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["status"], "active")
+        self.assertEqual(len(fresh_grist.tables["SpareMaster"]), 1)
+        self.assertEqual(fresh_grist.tables["SpareHistory"], saved_history)
+        self.assertEqual(reservation_count, 0)
 
     def test_duplicate_alias_is_rejected_before_reservation_or_active_publication(self):
         first = self.registry.create_spare(description="First", actor="qa", reason="reviewed", request_key="alias-first", aliases=[{"value": "W-LEG-100"}])

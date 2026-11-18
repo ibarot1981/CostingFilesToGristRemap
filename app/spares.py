@@ -518,13 +518,137 @@ class GristSpareRegistry:
                     return legacy
         return self._ensure_keyed("SpareAlias", "AliasKey", alias_key, fields, "EvidenceFingerprint")
 
-    def _ensure_history(self, *, row: dict[str, Any], event_type: str, actor: str, reason: str, request_key: str, fingerprint: str, snapshot: dict[str, Any]) -> None:
+    def _ensure_history(self, *, row: dict[str, Any], event_type: str, actor: str, reason: str, request_key: str, fingerprint: str, snapshot: dict[str, Any], history_version: int | None = None, occurred_at: Any = None) -> None:
         fields = row.get("fields", {})
         spare_key = str(fields.get("SpareKey") or "")
-        version = int(fields.get("Version") or 1)
+        version = int(history_version if history_version is not None else fields.get("Version") or 1)
         history_key = f"{spare_key}:v{version}"
         history_fp = request_fingerprint({"historyKey": history_key, "eventType": event_type, "requestKey": request_key, "requestFingerprint": fingerprint, "snapshot": snapshot})
-        self._ensure_keyed("SpareHistory", "HistoryKey", history_key, {"HistoryKey": history_key, "SpareMaster": _row_id(row), "Version": version, "EventType": event_type, "Actor": actor, "Reason": reason, "OccurredAt": grist_datetime(_now()), "RequestKey": request_key, "RequestFingerprint": history_fp, "Snapshot": canonical_grist_json_cell(snapshot)}, "RequestFingerprint")
+        self._ensure_keyed("SpareHistory", "HistoryKey", history_key, {"HistoryKey": history_key, "SpareMaster": _row_id(row), "Version": version, "EventType": event_type, "Actor": actor, "Reason": reason, "OccurredAt": grist_datetime(_now() if occurred_at is None else occurred_at), "RequestKey": request_key, "RequestFingerprint": history_fp, "Snapshot": canonical_grist_json_cell(snapshot)}, "RequestFingerprint")
+
+    @staticmethod
+    def _creation_evidence_fingerprint(evidence: dict[str, Any]) -> str:
+        return request_fingerprint({key: value for key, value in evidence.items() if key != "fingerprint"})
+
+    @staticmethod
+    def _same_record_id(value: Any, record_id: int) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            return int(value) == record_id
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _same_integer(value: Any, expected: int) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            return int(value) == expected
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _same_datetime(first: Any, second: Any) -> bool:
+        try:
+            return grist_datetime(first) == grist_datetime(second)
+        except (TypeError, ValueError):
+            return False
+
+    def _validate_creation_snapshot(self, *, snapshot: Any, completed: dict[str, Any], spare_key: str, spare_code: str, record_id: int) -> dict[str, Any]:
+        fields = completed.get("fields", {})
+        if not isinstance(snapshot, dict):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The original create history is missing and its durable creation snapshot is unavailable.", 503)
+        if (
+            not self._same_record_id(snapshot.get("recordId"), record_id)
+            or str(snapshot.get("spareKey") or "") != spare_key
+            or str(snapshot.get("spareCode") or "") != spare_code
+            or str(snapshot.get("status") or "").casefold() != "active"
+            or not self._same_integer(snapshot.get("version"), 1)
+            or snapshot.get("createdAt") in (None, "")
+            or not self._same_datetime(snapshot.get("createdAt"), fields.get("CreatedAt"))
+            or str(snapshot.get("createdBy") or "") != str(fields.get("CreatedBy") or "")
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The original create history does not match the completed Grist spare identity; replay is paused for review.", 503)
+        return snapshot
+
+    def _completed_create_evidence(self, *, request_row: dict[str, Any], completed: dict[str, Any], request_key: str, fingerprint: str, spare_key: str, spare_code: str, record_id: int) -> dict[str, Any] | None:
+        request_fields = request_row.get("fields", {})
+        result = _object_cell(request_fields.get("Result"))
+        if (
+            str(result.get("spareKey") or "") != spare_key
+            or str(result.get("spareCode") or "") != spare_code
+            or not self._same_record_id(result.get("recordId"), record_id)
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed create result no longer matches its Grist spare identity.", 503)
+
+        raw_evidence = result.get("creationEvidence")
+        if raw_evidence is None:
+            return None
+        if not isinstance(raw_evidence, dict):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The durable original create evidence is malformed; replay is paused for review.", 503)
+        evidence = dict(raw_evidence)
+        if (
+            evidence.get("schemaVersion") != 1
+            or str(evidence.get("requestKey") or "") != request_key
+            or str(evidence.get("requestFingerprint") or "") != fingerprint
+            or str(evidence.get("spareKey") or "") != spare_key
+            or str(evidence.get("spareCode") or "") != spare_code
+            or not self._same_record_id(evidence.get("recordId"), record_id)
+            or "actor" not in evidence
+            or "reason" not in evidence
+            or evidence.get("occurredAt") in (None, "")
+            or str(evidence.get("fingerprint") or "") != self._creation_evidence_fingerprint(evidence)
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The durable original create evidence failed its identity or integrity check; replay is paused for review.", 503)
+        evidence["snapshot"] = self._validate_creation_snapshot(snapshot=evidence.get("snapshot"), completed=completed, spare_key=spare_key, spare_code=spare_code, record_id=record_id)
+        return evidence
+
+    def _completed_create_history_exists(self, *, completed: dict[str, Any], request_key: str, fingerprint: str, spare_key: str, spare_code: str, record_id: int, evidence: dict[str, Any] | None) -> bool:
+        history_key = f"{spare_key}:v1"
+        all_history = self._rows("SpareHistory", refresh=True)
+        keyed = [row for row in all_history if str(row.get("fields", {}).get("HistoryKey") or "") == history_key]
+        linked = [row for row in all_history if _ref_id(row.get("fields", {}).get("SpareMaster")) == record_id]
+        version_one = [row for row in linked if self._same_integer(row.get("fields", {}).get("Version"), 1)]
+        request_creates = [row for row in all_history if str(row.get("fields", {}).get("EventType") or "") == "created" and str(row.get("fields", {}).get("RequestKey") or "") == request_key]
+        if len(keyed) > 1 or len(version_one) > 1 or len(request_creates) > 1:
+            raise SpareRegistryError("SPARE_DUPLICATE_KEY", "Grist contains duplicate original creation history; replay is paused until the history is reviewed.", 409)
+        if not keyed:
+            if version_one or request_creates:
+                raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist contains conflicting version-one creation history; replay is paused to preserve the audit trail.", 503)
+            return False
+
+        history = keyed[0]
+        fields = history.get("fields", {})
+        if (
+            _ref_id(fields.get("SpareMaster")) != record_id
+            or not self._same_integer(fields.get("Version"), 1)
+            or str(fields.get("EventType") or "") != "created"
+            or str(fields.get("RequestKey") or "") != request_key
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist's original creation history key belongs to different identity evidence; replay is paused for review.", 503)
+        snapshot = self._validate_creation_snapshot(snapshot=_object_cell(fields.get("Snapshot")), completed=completed, spare_key=spare_key, spare_code=spare_code, record_id=record_id)
+        expected_history_fingerprint = request_fingerprint({"historyKey": history_key, "eventType": "created", "requestKey": request_key, "requestFingerprint": fingerprint, "snapshot": snapshot})
+        if str(fields.get("RequestFingerprint") or "") != expected_history_fingerprint:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist's original creation history fingerprint does not match its stored snapshot; replay is paused for review.", 503)
+        if evidence is not None and (
+            evidence.get("snapshot") != snapshot
+            or str(fields.get("Actor") or "") != str(evidence.get("actor") or "")
+            or str(fields.get("Reason") or "") != str(evidence.get("reason") or "")
+            or not self._same_datetime(fields.get("OccurredAt"), evidence.get("occurredAt"))
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The original create request evidence disagrees with its immutable history; replay is paused for review.", 503)
+        return True
+
+    def _ensure_completed_create_history(self, *, request_row: dict[str, Any], completed: dict[str, Any], request_key: str, fingerprint: str, spare_key: str, spare_code: str, record_id: int) -> None:
+        evidence = self._completed_create_evidence(request_row=request_row, completed=completed, request_key=request_key, fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, record_id=record_id)
+        if self._completed_create_history_exists(completed=completed, request_key=request_key, fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, record_id=record_id, evidence=evidence):
+            return
+        if evidence is None:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The original create history is missing and this completed request has no durable original snapshot; replay cannot safely reconstruct it from current metadata.", 503)
+        self._ensure_history(row=completed, event_type="created", actor=str(evidence.get("actor") or ""), reason=str(evidence.get("reason") or ""), request_key=request_key, fingerprint=fingerprint, snapshot=evidence["snapshot"], history_version=1, occurred_at=evidence["occurredAt"])
+        if not self._completed_create_history_exists(completed=completed, request_key=request_key, fingerprint=fingerprint, spare_key=spare_key, spare_code=spare_code, record_id=record_id, evidence=evidence):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm repair of the original create history.", 503)
 
     def create_spare(self, *, description: str, category: str = "", unit: str = "", sourcing_type: str = "unclassified", actor: str, reason: str = "", request_key: str, aliases: Iterable[dict[str, Any]] = (), source_provenance: dict[str, Any] | None = None) -> dict[str, Any]:
         description = " ".join(str(description or "").split())
@@ -550,15 +674,16 @@ class GristSpareRegistry:
                 completed = self._spare_master_by_key(completed_key)
                 if not completed or completed.get("fields", {}).get("CreateRequestKey") != request_key or completed.get("fields", {}).get("CreateFingerprint") != fingerprint:
                     raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request no longer matches its Grist spare identity.", 503)
+                if str(completed.get("fields", {}).get("SpareCode") or "") != str(request_fields.get("SpareCode") or ""):
+                    raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request no longer matches its reserved spare code.", 503)
                 completed_status = str(completed.get("fields", {}).get("Status") or "").casefold()
                 if completed_status in {"active", "retired"}:
                     record_id = _row_id(completed)
                     if not record_id:
                         raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request has no confirmed Grist record ID.", 503)
+                    self._ensure_completed_create_history(request_row=request_row, completed=completed, request_key=request_key, fingerprint=fingerprint, spare_key=completed_key, spare_code=str(request_fields.get("SpareCode") or ""), record_id=record_id)
                     for alias in alias_items:
                         self.ensure_alias(spare_key=completed_key, spare_record_id=record_id, value=str(alias.get("value") or ""), provenance=alias.get("provenance") or {}, evidence_fingerprint=str(alias.get("evidenceFingerprint") or "") or None)
-                    snapshot_row = {**completed, "fields": {**completed.get("fields", {}), "Status": "active"}}
-                    self._ensure_history(row=snapshot_row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=self._public_master(snapshot_row))
                     result = self.get_spare(completed_key)
                     result["idempotent"] = True
                     return result
@@ -626,8 +751,22 @@ class GristSpareRegistry:
             self.ensure_alias(spare_key=spare_key, spare_record_id=record_id, value=str(alias.get("value") or ""), provenance=alias.get("provenance") or {}, evidence_fingerprint=str(alias.get("evidenceFingerprint") or "") or None)
         snapshot_row = {"id": row["id"], "fields": {**row.get("fields", {}), "Status": "active"}}
         snapshot = self._public_master(snapshot_row)
-        self._ensure_history(row=row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=snapshot)
-        self._complete_request(request_key, fingerprint, {"spareKey": spare_key, "spareCode": spare_code, "recordId": record_id})
+        history_occurred_at = grist_datetime(_now())
+        self._ensure_history(row=row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=snapshot, occurred_at=history_occurred_at)
+        creation_evidence = {
+            "schemaVersion": 1,
+            "requestKey": request_key,
+            "requestFingerprint": fingerprint,
+            "spareKey": spare_key,
+            "spareCode": spare_code,
+            "recordId": record_id,
+            "actor": str(actor or ""),
+            "reason": str(reason or ""),
+            "occurredAt": history_occurred_at,
+            "snapshot": snapshot,
+        }
+        creation_evidence["fingerprint"] = self._creation_evidence_fingerprint(creation_evidence)
+        self._complete_request(request_key, fingerprint, {"spareKey": spare_key, "spareCode": spare_code, "recordId": record_id, "creationEvidence": creation_evidence})
         current = self._spare_master_by_key(spare_key)
         if not current:
             raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the created spare before activation.", 503)
