@@ -322,7 +322,7 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
-    def test_schema_v15_plans_only_additive_identity_kind_and_mapping_evidence_columns(self) -> None:
+    def test_schema_v16_plans_only_additive_identity_kind_and_mapping_evidence_columns(self) -> None:
         client = _SchemaClient()
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
@@ -340,7 +340,7 @@ class Phase0Tests(unittest.TestCase):
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-part-baseline-reconciliation-grist-2026-10-14.v15")
+        self.assertEqual(SCHEMA_VERSION, "safari-spares-foundation-grist-2026-11-17.v16")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
         additions = {item["tableId"]: item["columns"] for item in plan.add_columns}
@@ -353,6 +353,24 @@ class Phase0Tests(unittest.TestCase):
             "ProductPart": [{"id": "IdentityKind", "type": "Text"}],
             "PartRegistryRequest": [{"id": "IdentityKind", "type": "Text"}],
         })
+        self.assertEqual(client.writes, [])
+
+    def test_spares_v16_migration_from_v15_only_creates_additive_spare_tables(self) -> None:
+        client = _SchemaClient()
+        spare_tables = {"SpareMaster", "SpareMasterRequest", "SpareAlias", "SpareHistory", "SpareSourceEvidence", "SpareCompositionEvidence", "SpareSourceCost", "SpareImportBatch"}
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": column["type"]}}
+                for column in table["columns"]
+            ]}
+            for table in FOUNDATION_TABLES if table["id"] not in spare_tables
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual({table["id"] for table in plan.create_tables}, spare_tables)
+        self.assertEqual(plan.add_columns, ())
+        self.assertEqual(plan.update_columns, ())
         self.assertEqual(client.writes, [])
 
     def test_schema_plan_accepts_grist_text_inference_for_legacy_engineering_attributes(self) -> None:

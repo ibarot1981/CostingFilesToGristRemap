@@ -37,15 +37,24 @@ DEFAULT_CATALOG = PROJECT_ROOT / "reports" / "first_pass_costing_catalog.json"
 DEFAULT_CATALOG_NAME = "Product-ProductModelNo-ModelCode.ods"
 
 app = FastAPI(title="Safari Manufacturing ERP", version="0.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4320", "http://localhost:4320"], allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4320", "http://localhost:4320"], allow_credentials=True, allow_methods=["GET", "POST", "PUT"], allow_headers=["*"])
 _repository: SafariRepository | None = None
 _part_identity_registry = None
+_spare_master_registry = None
 
 
 @app.exception_handler(PartIdentityError)
 async def _part_identity_error_handler(request: Request, exc: PartIdentityError):
     error = _part_http_error(exc)
     return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+
+
+from app.spares import SpareRegistryError
+
+
+@app.exception_handler(SpareRegistryError)
+async def _spare_registry_error_handler(request: Request, exc: SpareRegistryError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": {"code": exc.code, "message": str(exc), "retryDisposition": exc.retry_disposition}})
 
 
 @app.get("/api/health")
@@ -296,6 +305,20 @@ def _part_registry():
         except Exception as exc:
             raise _error(503, "PART_DATABASE_UNAVAILABLE", "The durable Part registry could not be opened.") from exc
     return _part_identity_registry
+
+
+def _spare_registry():
+    global _spare_master_registry
+    repository = _get_repository()
+    if repository.adapter_name != "grist-safari":
+        raise _error(503, "SPARE_GRIST_REQUIRED", "The spare master requires the configured Safari Manufacturing Grist adapter; local storage is not used as a business-data fallback.")
+    if _spare_master_registry is None:
+        from app.spares import GristSpareRegistry
+        try:
+            _spare_master_registry = GristSpareRegistry(repository.client)
+        except Exception as exc:
+            raise _error(503, "SPARE_DATABASE_UNAVAILABLE", "The Grist-backed spare registry could not be opened.") from exc
+    return _spare_master_registry
 
 
 def _part_registry_read_scope(endpoint):
@@ -709,6 +732,124 @@ def _part_http_error(exc) -> HTTPException:
     }
     disposition = "refresh_required" if exc.code in refresh_codes else "safe_to_edit" if exc.code in safe_codes else "retry_same_request"
     return _error(status, exc.code, str(exc), {"retryDisposition": disposition})
+
+
+@app.get("/api/spares/sources")
+def spare_import_sources() -> dict[str, Any]:
+    repository = _get_repository()
+    if repository.adapter_name != "grist-safari":
+        raise _error(503, "SPARE_GRIST_REQUIRED", "Associated workbook import requires the configured Safari Manufacturing Grist adapter.")
+    items = []
+    for entry in repository.list_mapped_files():
+        file = entry.get("file") or {}
+        association = entry.get("association") or {}
+        if not association or not association.get("active", True):
+            continue
+        path = str(file.get("relative_path") or "")
+        if not path.lower().endswith(".ods"):
+            continue
+        product = entry.get("product") or {}
+        model = entry.get("model") or {}
+        items.append({"path": path, "fileName": str(file.get("name") or Path(path).name), "product": str(product.get("name") or ""), "model": str(model.get("model_number") or model.get("name") or ""), "associationId": str(association.get("id") or ""), "associationVersion": int(association.get("version") or 1)})
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/spares")
+def spares_list(search: str = "", sourcing_type: str = "", status: str = "active", offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    return _spare_registry().list_spares(search=search, sourcing_type=sourcing_type, status=status, offset=offset, limit=limit)
+
+
+def _spare_import_context(path: str):
+    repository, file_id, association, current_hash = _processing_context(path)
+    if repository.adapter_name != "grist-safari":
+        raise _error(503, "SPARE_GRIST_REQUIRED", "Spares import requires the configured Safari Manufacturing Grist adapter.")
+    if association is None or not association.active:
+        raise _error(409, "SPARE_IMPORT_UNASSOCIATED", "Associate this workbook with its Product and Model before reviewing spare imports.")
+    product_path = _resolve_preview_workbook(path)
+    template_setting = os.getenv("SPARES_TEMPLATE_ODS_PATH", "").strip()
+    template_path = Path(template_setting).expanduser().resolve() if template_setting else (_costing_root() / "Template DB" / "Spares List - Master.ods").resolve()
+    if template_path.suffix.casefold() != ".ods" or not template_path.is_file():
+        raise _error(503, "SPARE_TEMPLATE_UNAVAILABLE", "The configured Template DB/Spares List - Master.ods lineage workbook is unavailable.")
+    association_key = f"{association.id}:{association.version}:{current_hash}"
+    return repository, association_key, product_path, template_path
+
+
+def _spare_import_plan(path: str):
+    from app.spare_import import build_import_plan
+    repository, association_key, product_path, template_path = _spare_import_context(path)
+    try:
+        return build_import_plan(product_path=product_path, template_path=template_path, registry=_spare_registry(), costing_root=_costing_root(), association_key=association_key)
+    except SpareRegistryError:
+        raise
+    except (OSError, ValueError, KeyError, BadZipFile, ET.ParseError) as exc:
+        raise _error(422, "SPARE_IMPORT_SOURCE_INVALID", "The read-only spare source preview could not be built.", {"reason": str(exc)})
+
+
+@app.get("/api/spares/import-preview")
+def spare_import_preview(path: str, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=250), evidence_offset: int = Query(0, ge=0), evidence_limit: int = Query(50, ge=1, le=100)) -> dict[str, Any]:
+    from app.spare_import import preview_payload
+    plan = _spare_import_plan(path)
+    return preview_payload(plan, offset=offset, limit=limit, evidence_offset=evidence_offset, evidence_limit=evidence_limit)
+
+
+@app.post("/api/spares/import-apply")
+def spare_import_apply(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    from app.spare_import import apply_import_plan
+    registry = _spare_registry()
+    request_key = str(idempotency_key or payload.get("requestKey") or "").strip()
+    preview_fingerprint = str(payload.get("previewFingerprint") or "")
+    if not request_key or not preview_fingerprint:
+        raise _error(422, "SPARE_IMPORT_REQUEST_INVALID", "A unique retry key and the reviewed preview fingerprint are required.")
+    existing = None
+    try:
+        existing = registry.import_status(request_key)
+    except SpareRegistryError as exc:
+        if exc.code != "SPARE_IMPORT_NOT_FOUND":
+            raise
+    if existing and existing["previewFingerprint"] != preview_fingerprint:
+        raise SpareRegistryError("SPARE_IMPORT_REQUEST_CONFLICT", "This retry key belongs to a different reviewed preview.", 409)
+    path = str(payload.get("path") or "")
+    if not path:
+        raise _error(422, "SPARE_IMPORT_PATH_REQUIRED", "Choose the associated ODS workbook to import.")
+    plan = _spare_import_plan(path)
+    if existing:
+        if existing["sourceHashes"] != plan["sourceHashes"]:
+            raise SpareRegistryError("SPARE_IMPORT_STALE", "The source file or workbook association changed during an interrupted import. Do not apply this obsolete preview.", 409)
+    elif plan["previewFingerprint"] != preview_fingerprint:
+        raise SpareRegistryError("SPARE_IMPORT_STALE", "The source or canonical spare identities changed after preview. Review a fresh preview before applying.", 409)
+    return apply_import_plan(plan=plan, registry=registry, actor=_request_actor(request), request_key=request_key, expected_preview_fingerprint=preview_fingerprint)
+
+
+@app.get("/api/spares/import-status/{request_key}")
+def spare_import_status(request_key: str) -> dict[str, Any]:
+    return _spare_registry().import_status(request_key)
+
+
+@app.post("/api/spares")
+def spare_create(request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    aliases = payload.get("legacyAliases") or []
+    return _spare_registry().create_spare(description=str(payload.get("description") or ""), category=str(payload.get("category") or ""), unit=str(payload.get("unit") or ""), sourcing_type=str(payload.get("sourcingType") or "unclassified"), actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=str(idempotency_key or payload.get("requestKey") or ""), aliases=[{"value": str(item)} for item in aliases if str(item).strip()])
+
+
+@app.put("/api/spares/{spare_key}")
+def spare_update(request: Request, spare_key: str, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    updates = {key: payload[key] for key in ("description", "category", "unit", "sourcingType") if key in payload}
+    return _spare_registry().update_spare(spare_key=spare_key, expected_version=int(payload.get("expectedVersion") or 0), updates=updates, actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=str(idempotency_key or payload.get("requestKey") or ""))
+
+
+@app.post("/api/spares/{spare_key}/retire")
+def spare_retire(request: Request, spare_key: str, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    return _spare_registry().update_spare(spare_key=spare_key, expected_version=int(payload.get("expectedVersion") or 0), updates={}, actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=str(idempotency_key or payload.get("requestKey") or ""), retire=True)
+
+
+@app.get("/api/spares/{spare_key}/history")
+def spare_history(spare_key: str) -> list[dict[str, Any]]:
+    return _spare_registry().history(spare_key)
+
+
+@app.get("/api/spares/{spare_key}")
+def spare_detail(spare_key: str) -> dict[str, Any]:
+    return _spare_registry().get_spare(spare_key)
 
 
 @app.get("/api/parts")
