@@ -808,10 +808,6 @@ def spare_import_apply(request: Request, payload: dict[str, Any] = Body(...), id
             raise
     if existing and existing["previewFingerprint"] != preview_fingerprint:
         raise SpareRegistryError("SPARE_IMPORT_REQUEST_CONFLICT", "This retry key belongs to a different reviewed preview.", 409)
-    if existing and existing["status"] == "complete":
-        result = existing["progress"]
-        return {**result, "idempotent": True}
-
     path = str(payload.get("path") or "")
     if not path:
         raise _error(422, "SPARE_IMPORT_PATH_REQUIRED", "Choose the associated ODS workbook to import.")

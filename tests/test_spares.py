@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.schema import FOUNDATION_TABLES
-from app.spare_import import apply_import_plan, build_import_plan, preview_payload
+from app.spare_import import _stable_key, apply_import_plan, build_import_plan, preview_payload
 from app.spares import GristSpareRegistry, SpareRegistryError, SPARE_TABLE_IDS, parse_source_date, source_cost_age
 from app.part_identity import request_fingerprint
 from app.milestone2 import OdsCell, OdsDocument, OdsSheet
@@ -31,6 +31,7 @@ class _Grist:
         self.next_id = 1
         self.fail_once_on: str | None = None
         self.lose_response_once_on: str | None = None
+        self.lose_response_once_on_update: tuple[str, str, object] | None = None
         self.writes = 0
 
     def validate_safari_write_target(self):
@@ -54,8 +55,15 @@ class _Grist:
     def update_table_records(self, table: str, records: list[dict]):
         saved = self.tables.setdefault(table, [])
         by_id = {row["id"]: row for row in saved}
+        lost = False
         for record in records:
             by_id[int(record["id"])]["fields"].update(record["fields"])
+            rule = self.lose_response_once_on_update
+            if rule and rule[0] == table and record.get("fields", {}).get(rule[1]) == rule[2]:
+                self.lose_response_once_on_update = None
+                lost = True
+        if lost:
+            raise RuntimeError(f"injected lost response after durable update at {table}")
 
 
 def _cell(row: int, column: int, value=None, *, formula=None, value_type=None, display="") -> OdsCell:
@@ -64,6 +72,22 @@ def _cell(row: int, column: int, value=None, *, formula=None, value_type=None, d
 
 def _registry(directory: str, grist: _Grist) -> GristSpareRegistry:
     return GristSpareRegistry(grist, journal_path=Path(directory) / "coordination.sqlite3")
+
+
+def _recovery_plan(root: Path, registry: GristSpareRegistry):
+    product_path = root / "Interrupted.ods"
+    template_path = root / "Template.ods"
+    product_path.write_bytes(b"F3 import recovery fixture v1")
+    template_path.write_bytes(b"F3 template recovery fixture v1")
+    product = OdsDocument(product_path, {
+        "SparesDB": OdsSheet("SparesDB", {8: {1: _cell(8, 1, "F3-ALIAS"), 2: _cell(8, 2, "Washer"), 3: _cell(8, 3, "Imported washer"), 4: _cell(8, 4, "EA"), 5: _cell(8, 5, 12.5)}}),
+        "Spares Detail": OdsSheet("Spares Detail", {}),
+        "Spares Summary": OdsSheet("Spares Summary", {}),
+    })
+    template = OdsDocument(template_path, {"Master": OdsSheet("Master", {2: {1: _cell(2, 1, "F3-ALIAS"), 4: _cell(2, 4, "EA"), 8: _cell(2, 8, "Store")}})})
+    with patch("app.spare_import.read_ods", side_effect=lambda candidate, _sheets: product if Path(candidate) == product_path else template):
+        plan = build_import_plan(product_path=product_path, template_path=template_path, registry=registry, costing_root=root, association_key="f3-import-recovery-test")
+    return product_path, plan
 
 
 class SpareRegistryTests(unittest.TestCase):
@@ -291,6 +315,112 @@ class SpareRegistryTests(unittest.TestCase):
         self.assertEqual(len(self.grist.tables["SpareSourceCost"]), 1)
         self.assertEqual(len(self.grist.tables["SpareCompositionEvidence"]), 1)
         self.assertEqual(self.registry.import_status("import-request-1")["status"], "complete")
+
+    def test_rebuilt_route_retry_recovers_a_false_complete_alias_loss_auditably(self):
+        import app.web as web
+        from starlette.requests import Request
+
+        request_key = "import-recovery-false-complete"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = _registry(str(root / "first"), self.grist)
+            product_path, original_plan = _recovery_plan(root, first)
+            self.grist.lose_response_once_on = "SpareAlias"
+            with self.assertRaisesRegex(RuntimeError, "lost response after durable write"):
+                apply_import_plan(plan=original_plan, registry=first, actor="qa", request_key=request_key)
+
+            batch = next(row for row in self.grist.tables["SpareImportBatch"] if row["fields"].get("RequestKey") == request_key)
+            batch["fields"].update({"Status": "complete", "CompletedAt": "legacy-false-completion", "Result": {"requestKey": request_key, "status": "complete", "legacyFalseComplete": True}})
+            fresh = _registry(str(root / "fresh"), self.grist)
+            rebuilt_plan = _recovery_plan(root, fresh)[1]
+            self.assertEqual((rebuilt_plan["identities"][0]["action"], rebuilt_plan["identities"][0]["canonicalStatus"]), ("noop", "pending"))
+            request = Request({"type": "http", "method": "POST", "path": "/api/spares/import-apply", "headers": [(b"x-authentik-username", b"Isolated QA")], "query_string": b""})
+            payload = {"path": str(product_path), "previewFingerprint": original_plan["previewFingerprint"]}
+            with patch.object(web, "_spare_registry", return_value=fresh), patch.object(web, "_spare_import_plan", return_value=rebuilt_plan):
+                recovered = web.spare_import_apply(request, payload, idempotency_key=request_key)
+
+            self.assertEqual(recovered["status"], "complete")
+            self.assertFalse(recovered["idempotent"])
+            status = fresh.import_status(request_key)
+            self.assertEqual(status["status"], "complete")
+            self.assertEqual(status["progress"]["recoveryHistory"][0]["event"], "reopened_after_incomplete_identity")
+            detail = fresh.get_spare(rebuilt_plan["identities"][0]["spareKey"])
+            self.assertEqual(detail["status"], "active")
+            self.assertEqual(detail["legacyAliases"], ["F3-ALIAS"])
+            self.assertEqual(len([row for row in detail["history"] if row.get("EventType") == "created"]), 1)
+            request_row = fresh.create_request_record("import-create:" + _stable_key(request_key, "f3-alias"))
+            self.assertEqual(request_row["fields"]["Status"], "complete")
+            counts = {table: len(rows) for table, rows in self.grist.tables.items()}
+
+            replay_plan = _recovery_plan(root, fresh)[1]
+            with patch.object(web, "_spare_registry", return_value=fresh), patch.object(web, "_spare_import_plan", return_value=replay_plan):
+                replay = web.spare_import_apply(request, payload, idempotency_key=request_key)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual({table: len(rows) for table, rows in self.grist.tables.items()}, counts)
+
+    def test_import_never_adopts_another_request_pending_identity(self):
+        request_key = "import-must-not-adopt-pending"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = _registry(str(root / "first"), self.grist)
+            self.grist.lose_response_once_on = "SpareAlias"
+            with self.assertRaisesRegex(RuntimeError, "lost response after durable write"):
+                first.create_spare(description="Other request", actor="qa", reason="separate operation", request_key="other-pending-create", aliases=[{"value": "F3-ALIAS"}])
+            product_path, plan = _recovery_plan(root, first)
+            self.assertEqual((plan["identities"][0]["action"], plan["identities"][0]["canonicalStatus"]), ("noop", "pending"))
+
+            with self.assertRaises(SpareRegistryError) as caught:
+                apply_import_plan(plan=plan, registry=first, actor="qa", request_key=request_key)
+            self.assertEqual(caught.exception.code, "SPARE_IMPORT_RECOVERY_REQUIRED")
+            batch = first.import_status(request_key)
+            self.assertEqual(batch["status"], "recovery_required")
+            self.assertEqual(batch["progress"]["details"]["identities"][0]["reason"], "pending_identity_is_not_owned_by_this_import_create")
+            self.assertIsNone(first.create_request_record("import-create:" + _stable_key(request_key, "f3-alias")))
+            self.assertEqual(first.list_spares(status="active")["total"], 0)
+            pending = first.get_spare(plan["identities"][0]["spareKey"])
+            self.assertEqual((pending["status"], len(pending["history"])), ("pending", 0))
+
+    def test_import_create_recovery_survives_durable_losses_across_write_boundaries(self):
+        cases = [
+            ("create-request", "SpareMasterRequest", None),
+            ("master-create", "SpareMaster", None),
+            ("alias-create", "SpareAlias", None),
+            ("history-create", "SpareHistory", None),
+            ("request-complete", None, ("SpareMasterRequest", "Status", "complete")),
+            ("master-activate", None, ("SpareMaster", "Status", "active")),
+            ("batch-complete", None, ("SpareImportBatch", "Status", "complete")),
+        ]
+        for label, create_table, update_rule in cases:
+            with self.subTest(boundary=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                grist = _Grist()
+                first = _registry(str(root / "first"), grist)
+                _product_path, plan = _recovery_plan(root, first)
+                request_key = f"import-boundary-{label}"
+                if create_table:
+                    grist.lose_response_once_on = create_table
+                if update_rule:
+                    grist.lose_response_once_on_update = update_rule
+                with self.assertRaisesRegex(RuntimeError, "lost response after durable"):
+                    apply_import_plan(plan=plan, registry=first, actor="qa", request_key=request_key)
+
+                fresh = _registry(str(root / "fresh"), grist)
+                rebuilt = _recovery_plan(root, fresh)[1]
+                self.assertEqual(rebuilt["sourceHashes"], plan["sourceHashes"])
+                recovered = apply_import_plan(plan=rebuilt, registry=fresh, actor="qa", request_key=request_key, expected_preview_fingerprint=plan["previewFingerprint"])
+                self.assertEqual(recovered["status"], "complete")
+                spare = fresh.get_spare(rebuilt["identities"][0].get("spareKey") or next(iter(fresh.identity_index()["masters_by_id"].values()))["fields"]["SpareKey"])
+                self.assertEqual(spare["status"], "active")
+                self.assertEqual(len(spare["legacyAliases"]), 1)
+                self.assertEqual(len([row for row in spare["history"] if row.get("EventType") == "created"]), 1)
+                self.assertEqual(fresh.import_status(request_key)["status"], "complete")
+                self.assertEqual(len(grist.tables["SpareMaster"]), 1)
+                self.assertEqual(len(grist.tables["SpareAlias"]), 2)
+                self.assertEqual(len(grist.tables["SpareHistory"]), 1)
+                replay_plan = _recovery_plan(root, fresh)[1]
+                replay = apply_import_plan(plan=replay_plan, registry=fresh, actor="qa", request_key=request_key, expected_preview_fingerprint=plan["previewFingerprint"])
+                self.assertTrue(replay["idempotent"])
+                self.assertEqual((len(grist.tables["SpareMaster"]), len(grist.tables["SpareAlias"]), len(grist.tables["SpareHistory"])), (1, 2, 1))
 
     def test_fresh_noop_import_reuses_source_alias_fingerprints_without_duplicates(self):
         identity = {"action": "create", "normalizedLegacyCode": "washer-1", "legacyCode": "WASHER-1", "description": "Pilot washer", "category": "Washer", "unit": "EA", "sourcingTypeCandidate": "purchased", "sourceRow": 8}

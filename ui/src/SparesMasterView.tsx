@@ -178,8 +178,9 @@ export function SparesMasterView({ active = true }: { active?: boolean }) {
       try {
         const statusResult = await api.spareImportStatus(attempt.key);
         setImportStatus(statusResult);
-        if (statusResult.status === "complete") { clearImportAttempt(); setNotice("The previous import completed; its saved result has been recovered."); await refreshList(); }
-        else if (statusResult.status !== "applying" || statusResult.previewFingerprint !== attempt.previewFingerprint || JSON.stringify(statusResult.sourceHashes) !== JSON.stringify(attempt.sourceHashes)) clearImportAttempt();
+        if (statusResult.status === "complete") setNotice("Grist reports this import as complete. Rebuild the original preview and resume the same request to verify its imported identities before clearing recovery data.");
+        else if (statusResult.status !== "applying" && statusResult.status !== "recovery_required") clearImportAttempt();
+        else if (statusResult.previewFingerprint !== attempt.previewFingerprint || JSON.stringify(statusResult.sourceHashes) !== JSON.stringify(attempt.sourceHashes)) clearImportAttempt();
       } catch (statusCause) {
         if (statusCause instanceof ApiError && statusCause.status === 404) clearImportAttempt();
         // Without an authoritative Grist status, retain the exact key and payload for safe recovery.
@@ -191,7 +192,8 @@ export function SparesMasterView({ active = true }: { active?: boolean }) {
     if (!importAttempt) return;
     try {
       const result = await api.spareImportStatus(importAttempt.key); setImportStatus(result);
-      if (result.status === "complete") { clearImportAttempt(); setNotice("The previous import completed; its saved result has been recovered."); await refreshList(); }
+      if (result.status === "complete") setNotice("Grist reports this import as complete. Rebuild the original preview and resume the same request to verify its imported identities before clearing recovery data.");
+      else if (result.status === "recovery_required") setNotice("This import is waiting for its exact unfinished spare create request to be resolved. The original retry key has been retained.");
     } catch (cause) { setError(errorMessage(cause)); }
   };
 
@@ -249,7 +251,8 @@ export function SparesMasterView({ active = true }: { active?: boolean }) {
         <p className="spares-note">Source cost evidence stays labelled by its recorded date meaning. Missing dates remain unknown; future dates are flagged. Formula caches are preserved as unapproved source evidence and are never promoted to live rates.</p>
         {importAttempt && <div className="spares-pending"><Clock3 size={17}/><div><strong>Import request {importAttempt.key.slice(0, 8)} is retained in this browser session.</strong><span>{importStatus ? `Status: ${importStatus.status} · ${pretty(importStatus.progress)}` : "Resume only with the same source preview and request key."}</span></div><button className="button" type="button" onClick={() => void pollImport()}>Check saved status</button></div>}
         {importStatus?.status === "applying" && <p className="spares-inline-warning" role="status">Import is applying in Grist: {pretty(importStatus.progress)}. Retry with the same key if the connection was interrupted.</p>}
-        {importStatus?.status === "complete" && <div className="spares-inline-success" role="status">Completed import result: {pretty(importStatus.progress)}</div>}
+        {importStatus?.status === "recovery_required" && <p className="spares-inline-warning" role="status">Import recovery needs attention: {pretty(importStatus.progress)}. The saved request is retained and will not be cleared from this browser.</p>}
+        {importStatus?.status === "complete" && importAttempt && <p className="spares-inline-warning" role="status">Grist reports completion. Rebuild the original source preview and resume this request so the server can verify every imported identity before recovery data is cleared.</p>}
         <label className="spares-review-check"><input type="checkbox" checked={reviewed} onChange={event => setReviewed(event.target.checked)} disabled={previewLoading || importBusy}/><span>I reviewed the identity decisions, source hashes and evidence, and approve this exact preview.</span></label>
         <div className="spares-form-actions"><button type="button" className="button primary" disabled={!reviewed || importBusy || previewLoading || Boolean(importAttempt && (importAttempt.path !== importPath || JSON.stringify(importAttempt.sourceHashes) !== JSON.stringify(preview.sourceHashes)))} onClick={() => void applyImport()}>{importBusy ? <><LoaderCircle size={15} className="spin"/>Applying reviewed import…</> : importAttempt ? "Resume same reviewed import" : "Apply reviewed import in Grist"}</button></div>
       </div>}

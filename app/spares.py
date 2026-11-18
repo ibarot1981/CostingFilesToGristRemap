@@ -427,8 +427,15 @@ class GristSpareRegistry:
         row = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
         if not row or str(row.get("fields", {}).get("RequestFingerprint") or "") != fingerprint:
             raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not retain the spare request journal record.", 503)
-        fields = row.get("fields", {})
-        self.client.update_table_records("SpareMasterRequest", [{"id": row["id"], "fields": {"Status": "complete", "UpdatedAt": grist_datetime(_now()), "CompletedAt": grist_datetime(_now()), "Result": canonical_grist_json_cell(result)}}])
+        completed_at = grist_datetime(_now())
+        self.client.update_table_records("SpareMasterRequest", [{"id": row["id"], "fields": {"Status": "complete", "UpdatedAt": completed_at, "CompletedAt": completed_at, "Result": canonical_grist_json_cell(result)}}])
+        confirmed = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
+        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "complete" or str(confirmed.get("fields", {}).get("RequestFingerprint") or "") != fingerprint:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the completed spare request journal record.", 503)
+
+    def create_request_record(self, request_key: str) -> dict[str, Any] | None:
+        """Return the durable request row used to prove same-request create recovery."""
+        return self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
 
     def _reject_request(self, request_key: str, fingerprint: str, result: dict[str, Any]) -> None:
         row = self._find(self._rows("SpareMasterRequest", refresh=True), "RequestKey", request_key)
@@ -543,7 +550,15 @@ class GristSpareRegistry:
                 completed = self._spare_master_by_key(completed_key)
                 if not completed or completed.get("fields", {}).get("CreateRequestKey") != request_key or completed.get("fields", {}).get("CreateFingerprint") != fingerprint:
                     raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request no longer matches its Grist spare identity.", 503)
-                if str(completed.get("fields", {}).get("Status") or "").casefold() != "pending":
+                completed_status = str(completed.get("fields", {}).get("Status") or "").casefold()
+                if completed_status in {"active", "retired"}:
+                    record_id = _row_id(completed)
+                    if not record_id:
+                        raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "The completed request has no confirmed Grist record ID.", 503)
+                    for alias in alias_items:
+                        self.ensure_alias(spare_key=completed_key, spare_record_id=record_id, value=str(alias.get("value") or ""), provenance=alias.get("provenance") or {}, evidence_fingerprint=str(alias.get("evidenceFingerprint") or "") or None)
+                    snapshot_row = {**completed, "fields": {**completed.get("fields", {}), "Status": "active"}}
+                    self._ensure_history(row=snapshot_row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=self._public_master(snapshot_row))
                     result = self.get_spare(completed_key)
                     result["idempotent"] = True
                     return result
@@ -761,7 +776,49 @@ class GristSpareRegistry:
         fields = row.get("fields", {})
         if str(fields.get("Status") or "") == "complete":
             return
-        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "applying", "UpdatedAt": grist_datetime(_now()), "Result": canonical_grist_json_cell(progress)}}])
+        previous = _object_cell(fields.get("Result"))
+        recovery_history = previous.get("recoveryHistory")
+        saved_progress = dict(progress)
+        if isinstance(recovery_history, list) and recovery_history:
+            saved_progress["recoveryHistory"] = recovery_history
+        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "applying", "UpdatedAt": grist_datetime(_now()), "CompletedAt": None, "Result": canonical_grist_json_cell(saved_progress)}}])
+
+    def reopen_import_for_recovery(self, request_key: str, *, reason: str, details: dict[str, Any]) -> None:
+        row = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
+        if not row:
+            raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "The import recovery record is missing from Grist.", 503)
+        fields = row.get("fields", {})
+        if str(fields.get("Status") or "") != "complete":
+            return
+        previous_result = _object_cell(fields.get("Result"))
+        recovery_history = list(previous_result.get("recoveryHistory") or [])
+        now = grist_datetime(_now())
+        recovery_history.append({"event": "reopened_after_incomplete_identity", "at": now, "reason": reason, "details": _json_value(details), "previousStatus": "complete", "previousResult": previous_result})
+        progress = {"stage": "identity-recovery", "details": _json_value(details), "recoveryHistory": recovery_history}
+        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "applying", "UpdatedAt": now, "CompletedAt": None, "Result": canonical_grist_json_cell(progress)}}])
+        confirmed = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
+        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "applying":
+            raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "Grist did not confirm that the incomplete import batch was reopened for recovery.", 503)
+
+    def require_import_recovery(self, request_key: str, *, details: dict[str, Any]) -> None:
+        row = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
+        if not row:
+            raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "The import recovery record is missing from Grist.", 503)
+        fields = row.get("fields", {})
+        previous_result = _object_cell(fields.get("Result"))
+        recovery_history = list(previous_result.get("recoveryHistory") or [])
+        current_status = str(fields.get("Status") or "unknown")
+        now = grist_datetime(_now())
+        if current_status == "complete":
+            recovery_history.append({"event": "invalid_completion_detected", "at": now, "previousStatus": "complete", "previousResult": previous_result})
+        last_block = recovery_history[-1] if recovery_history else {}
+        if last_block.get("event") != "recovery_required" or last_block.get("details") != _json_value(details):
+            recovery_history.append({"event": "recovery_required", "at": now, "details": _json_value(details)})
+        progress = {"stage": "recovery_required", "details": _json_value(details), "recoveryHistory": recovery_history}
+        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "recovery_required", "UpdatedAt": now, "CompletedAt": None, "Result": canonical_grist_json_cell(progress)}}])
+        confirmed = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
+        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "recovery_required":
+            raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "Grist did not confirm the import recovery blocker.", 503)
 
     def import_status(self, request_key: str) -> dict[str, Any]:
         self._assert_schema()
@@ -775,8 +832,13 @@ class GristSpareRegistry:
         row = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
         if not row:
             raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "Grist did not retain the import batch.", 503)
+        previous_result = _object_cell(row.get("fields", {}).get("Result"))
+        recovery_history = previous_result.get("recoveryHistory")
+        final_result = dict(result)
+        if isinstance(recovery_history, list) and recovery_history:
+            final_result["recoveryHistory"] = recovery_history
         now = grist_datetime(_now())
-        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "complete", "UpdatedAt": now, "CompletedAt": now, "Result": canonical_grist_json_cell(result)}}])
+        self.client.update_table_records("SpareImportBatch", [{"id": row["id"], "fields": {"Status": "complete", "UpdatedAt": now, "CompletedAt": now, "Result": canonical_grist_json_cell(final_result)}}])
         confirmed = self._find(self._rows("SpareImportBatch", refresh=True), "RequestKey", request_key)
-        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "complete":
+        if not confirmed or str(confirmed.get("fields", {}).get("Status") or "") != "complete" or _object_cell(confirmed.get("fields", {}).get("Result")) != final_result:
             raise SpareRegistryError("SPARE_IMPORT_UNCONFIRMED", "Grist did not confirm import completion.", 503)

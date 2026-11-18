@@ -81,6 +81,8 @@ it("requires preview acknowledgement and applies the exact reviewed source finge
   fireEvent.click(apply);
 
   expect(await screen.findByText(/Reviewed source import completed/)).toBeTruthy();
+  expect(screen.queryByText(/Grist reports completion\. Rebuild the original source preview/)).toBeNull();
+  expect(sessionStorage.getItem("spares:import-write-attempt")).toBeNull();
   const write = fetchMock.mock.calls.find(([input]) => new URL(String(input), "http://localhost").pathname === "/api/spares/import-apply");
   expect(write?.[1]?.headers).toMatchObject({ "Idempotency-Key": "import-request-1" });
   expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({ path: "Pilot.ods", previewFingerprint: "preview-1" });
@@ -129,4 +131,81 @@ it("retains the exact import key while Grist reports a matching request is still
   expect(writes).toHaveLength(2);
   expect(writes.map(([, init]) => (init?.headers as Record<string, string>)["Idempotency-Key"])).toEqual(["import-retry-key", "import-retry-key"]);
   expect(sessionStorage.getItem("spares:import-write-attempt")).toBeNull();
+});
+
+it("retains the original retry key when status says complete until route replay succeeds", async () => {
+  const sourceHashes = { associatedWorkbook: "workbook-hash", templateMaster: "template-hash", associationContext: "association-hash" };
+  const preview = {
+    previewFingerprint: "preview-complete-retry", sourceHashes,
+    sourceLabels: { associatedWorkbook: "Pilot.ods", templateMaster: "Template/Spares List - Master.ods" },
+    counts: { creates: 1, updates: 0, noops: 0, conflicts: 0, unresolvedIdentities: 0, sourceEvidence: 1, costEvidence: 0, compositionEvidence: 0 },
+    identityRows: [{ legacyCode: "W-NEW", sourceRow: 8, action: "create", description: "New washer", sourcingTypeCandidate: null, resolution: "new_unique_source_identity" }],
+    identityOffset: 0, identityLimit: 100, identityTotal: 1, sourceEvidenceRows: [], costEvidenceRows: [], compositionEvidenceRows: [], evidenceOffset: 0, evidenceLimit: 50,
+    evidenceTotals: { sourceEvidence: 1, costEvidence: 0, compositionEvidence: 0 }, reviewRequired: true, readOnly: true,
+  };
+  let applyCalls = 0;
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/spares/sources") return new Response(JSON.stringify({ items: [{ path: "Pilot.ods", fileName: "Pilot.ods", product: "Safari", model: "S1" }], total: 1 }), { status: 200 });
+    if (url.pathname === "/api/spares/import-preview") return new Response(JSON.stringify(preview), { status: 200 });
+    if (url.pathname === "/api/spares/import-apply") {
+      applyCalls += 1;
+      if (applyCalls === 1) return new Response(JSON.stringify({ detail: { code: "SPARE_IMPORT_UNCONFIRMED", message: "The earlier batch result needs route verification." } }), { status: 503 });
+      return new Response(JSON.stringify({ status: "complete", requestKey: "import-complete-retry", idempotent: true }), { status: 200 });
+    }
+    if (url.pathname === "/api/spares/import-status/import-complete-retry") return new Response(JSON.stringify({ status: "complete", previewFingerprint: "preview-complete-retry", sourceHashes, progress: { status: "complete", legacyFalseComplete: true } }), { status: 200 });
+    if (url.pathname === "/api/spares") return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+    throw new Error(`Unexpected request ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("crypto", { randomUUID: () => "import-complete-retry" });
+
+  render(<SparesMasterView/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Build read-only preview" }));
+  expect(await screen.findByText(/Preview preview-complete-retry/)).toBeTruthy();
+  fireEvent.click(screen.getByLabelText(/I reviewed the identity decisions/));
+  fireEvent.click(screen.getByRole("button", { name: "Apply reviewed import in Grist" }));
+
+  expect(await screen.findByText(/Grist reports this import as complete/)).toBeTruthy();
+  expect(await screen.findByText(/Status: complete/)).toBeTruthy();
+  expect(JSON.parse(sessionStorage.getItem("spares:import-write-attempt") || "null")).toMatchObject({ key: "import-complete-retry", previewFingerprint: "preview-complete-retry", sourceHashes });
+  fireEvent.click(screen.getByRole("button", { name: "Resume same reviewed import" }));
+
+  expect(await screen.findByText(/Reviewed source import completed/)).toBeTruthy();
+  const writes = fetchMock.mock.calls.filter(([input]) => new URL(String(input), "http://localhost").pathname === "/api/spares/import-apply");
+  expect(writes).toHaveLength(2);
+  expect(writes.map(([, init]) => (init?.headers as Record<string, string>)["Idempotency-Key"])).toEqual(["import-complete-retry", "import-complete-retry"]);
+  expect(sessionStorage.getItem("spares:import-write-attempt")).toBeNull();
+});
+
+it("retains the original retry key when the server explicitly requires identity recovery", async () => {
+  const sourceHashes = { associatedWorkbook: "workbook-hash", templateMaster: "template-hash", associationContext: "association-hash" };
+  const preview = {
+    previewFingerprint: "preview-recovery-required", sourceHashes,
+    sourceLabels: { associatedWorkbook: "Pilot.ods", templateMaster: "Template/Spares List - Master.ods" },
+    counts: { creates: 0, updates: 0, noops: 1, conflicts: 0, unresolvedIdentities: 0, sourceEvidence: 1, costEvidence: 0, compositionEvidence: 0 },
+    identityRows: [], identityOffset: 0, identityLimit: 100, identityTotal: 0, sourceEvidenceRows: [], costEvidenceRows: [], compositionEvidenceRows: [], evidenceOffset: 0, evidenceLimit: 50,
+    evidenceTotals: { sourceEvidence: 1, costEvidence: 0, compositionEvidence: 0 }, reviewRequired: true, readOnly: true,
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/spares/sources") return new Response(JSON.stringify({ items: [{ path: "Pilot.ods", fileName: "Pilot.ods", product: "Safari", model: "S1" }], total: 1 }), { status: 200 });
+    if (url.pathname === "/api/spares/import-preview") return new Response(JSON.stringify(preview), { status: 200 });
+    if (url.pathname === "/api/spares/import-apply") return new Response(JSON.stringify({ detail: { code: "SPARE_IMPORT_RECOVERY_REQUIRED", message: "A different create request owns the pending identity." } }), { status: 409 });
+    if (url.pathname === "/api/spares/import-status/import-blocked-retry") return new Response(JSON.stringify({ status: "recovery_required", previewFingerprint: "preview-recovery-required", sourceHashes, progress: { details: { reason: "pending identity belongs to another request" } } }), { status: 200 });
+    if (url.pathname === "/api/spares") return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+    throw new Error(`Unexpected request ${url.pathname}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("crypto", { randomUUID: () => "import-blocked-retry" });
+
+  render(<SparesMasterView/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Build read-only preview" }));
+  expect(await screen.findByText(/Preview preview-recovery-required/)).toBeTruthy();
+  fireEvent.click(screen.getByLabelText(/I reviewed the identity decisions/));
+  fireEvent.click(screen.getByRole("button", { name: "Apply reviewed import in Grist" }));
+
+  expect(await screen.findByText(/Import recovery needs attention/)).toBeTruthy();
+  expect(await screen.findByText(/Status: recovery_required/)).toBeTruthy();
+  expect(JSON.parse(sessionStorage.getItem("spares:import-write-attempt") || "null")).toMatchObject({ key: "import-blocked-retry", previewFingerprint: "preview-recovery-required", sourceHashes });
 });

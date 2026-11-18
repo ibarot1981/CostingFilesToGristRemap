@@ -12,7 +12,7 @@ from typing import Any
 from app.milestone2 import OdsCell, OdsDocument, OdsSheet, read_ods
 from app.grist_types import canonical_grist_json_cell, grist_datetime
 from app.part_identity import request_fingerprint
-from app.spares import GristSpareRegistry, SpareRegistryError, _json_value, normalize_alias, normalize_sourcing_type, parse_source_date, source_cost_age
+from app.spares import GristSpareRegistry, SpareRegistryError, _json_value, _object_cell, normalize_alias, normalize_sourcing_type, parse_source_date, source_cost_age
 
 
 PRODUCT_SHEETS = ("SparesDB", "Spares Detail", "Spares Summary")
@@ -328,6 +328,64 @@ def _grist_ref(spare_key: str, resolved: dict[str, dict[str, Any]]) -> int | Non
     return int(item["recordId"]) if item and item.get("recordId") else None
 
 
+def _import_create_context(plan: dict[str, Any], identity: dict[str, Any], request_key: str) -> dict[str, Any]:
+    normalized_code = identity["normalizedLegacyCode"]
+    operation_key = "import-create:" + _stable_key(request_key, normalized_code)
+    provenance = {"sourceKind": "SparesDB", "sourceFile": plan["sourceLabels"]["associatedWorkbook"], "sourceHash": plan["sourceHashes"]["associatedWorkbook"], "sheetName": "SparesDB", "sourceRow": identity["sourceRow"], "sourceCell": f"A{identity['sourceRow']}"}
+    alias_evidence = next((item for item in plan["sourceEvidence"] if item["sourceKind"] == "SparesDB" and normalize_alias(item["legacyCode"]) == normalized_code), None)
+    aliases = [{"value": identity["legacyCode"], "provenance": {**provenance, "identityStatus": alias_evidence["resolutionStatus"]}, "evidenceFingerprint": alias_evidence["fingerprint"]}] if alias_evidence else []
+    return {"requestKey": operation_key, "description": identity["description"], "category": identity["category"], "unit": identity["unit"], "sourcingType": identity["sourcingTypeCandidate"] or "unclassified", "aliases": aliases, "sourceProvenance": {"importRequestKey": request_key, **provenance}}
+
+
+def _owned_import_create(master: dict[str, Any] | None, request_row: dict[str, Any] | None, *, operation_key: str, import_key: str) -> bool:
+    if not master or not request_row:
+        return False
+    master_fields = master.get("fields", {})
+    request_fields = request_row.get("fields", {})
+    source_provenance = _object_cell(master_fields.get("SourceProvenance"))
+    spare_key = str(master_fields.get("SpareKey") or "")
+    return (
+        str(master_fields.get("CreateRequestKey") or "") == operation_key
+        and str(request_fields.get("RequestKey") or "") == operation_key
+        and str(request_fields.get("RequestType") or "") == "create"
+        and str(request_fields.get("SpareKey") or "") == spare_key
+        and str(master_fields.get("CreateFingerprint") or "") == str(request_fields.get("RequestFingerprint") or "")
+        and str(source_provenance.get("importRequestKey") or "") == import_key
+    )
+
+
+def _import_create_gate(registry: GristSpareRegistry, *, record_id: int, identity: dict[str, Any], context: dict[str, Any], import_key: str, allow_retired: bool) -> tuple[bool, str]:
+    index = registry.identity_index()
+    master = index["masters_by_id"].get(int(record_id))
+    if not master:
+        return False, "master_missing"
+    fields = master.get("fields", {})
+    operation_key = context["requestKey"]
+    request_row = registry.create_request_record(operation_key)
+    if not _owned_import_create(master, request_row, operation_key=operation_key, import_key=import_key):
+        return False, "create_request_not_owned_by_import"
+    request_fields = request_row.get("fields", {})
+    status = str(fields.get("Status") or "").casefold()
+    allowed_statuses = {"active", "retired"} if allow_retired else {"active"}
+    if status not in allowed_statuses:
+        return False, f"master_status_{status or 'unknown'}"
+    if str(request_fields.get("Status") or "") != "complete":
+        return False, f"create_request_status_{str(request_fields.get('Status') or 'unknown')}"
+    spare_key = str(fields.get("SpareKey") or "")
+    if not spare_key or str(request_fields.get("SpareCode") or "") != str(fields.get("SpareCode") or ""):
+        return False, "create_request_identity_mismatch"
+    normalized_code = normalize_alias(identity["legacyCode"])
+    alias_rows = index["by_alias"].get(normalized_code, [])
+    matching_alias = next((item["alias"].get("fields", {}) for item in alias_rows if int(item["master"].get("id") or 0) == int(record_id)), None)
+    expected_alias = context["aliases"][0] if context["aliases"] else None
+    if not matching_alias or (expected_alias and str(matching_alias.get("EvidenceFingerprint") or "") != str(expected_alias.get("evidenceFingerprint") or "")):
+        return False, "required_source_alias_unconfirmed"
+    detail = registry.get_spare(spare_key)
+    if not any(str(item.get("EventType") or "").casefold() == "created" and str(item.get("RequestKey") or "") == operation_key for item in detail.get("history", [])):
+        return False, "created_history_unconfirmed"
+    return True, "complete"
+
+
 def apply_import_plan(*, plan: dict[str, Any], registry: GristSpareRegistry, actor: str, request_key: str, expected_preview_fingerprint: str | None = None) -> dict[str, Any]:
     preview_fingerprint = expected_preview_fingerprint or str(plan.get("previewFingerprint") or "")
     if not preview_fingerprint or not request_key.strip():
@@ -335,14 +393,8 @@ def apply_import_plan(*, plan: dict[str, Any], registry: GristSpareRegistry, act
     request_fingerprint_value = request_fingerprint({"previewFingerprint": preview_fingerprint, "sourceHashes": plan["sourceHashes"]})
     batch = registry.start_import(request_key=request_key, fingerprint=request_fingerprint_value, preview_fingerprint=preview_fingerprint, source_hashes=plan["sourceHashes"], actor=actor)
     batch_fields = batch.get("fields", {})
-    if str(batch_fields.get("Status") or "") == "complete":
-        result = batch_fields.get("Result")
-        try:
-            result = json.loads(result) if isinstance(result, str) else result
-        except (TypeError, ValueError):
-            result = {}
-        if isinstance(result, dict):
-            return {**result, "idempotent": True}
+    batch_status = str(batch_fields.get("Status") or "applying")
+    saved_result = _object_cell(batch_fields.get("Result"))
 
     resolved: dict[str, dict[str, Any]] = {}
     index = registry.identity_index()
@@ -352,14 +404,90 @@ def apply_import_plan(*, plan: dict[str, Any], registry: GristSpareRegistry, act
             spare_key, master = next(iter(unique.items()))
             resolved[normalized_code] = {"spareKey": spare_key, "recordId": int(master["id"])}
 
+    contexts: dict[str, dict[str, Any]] = {}
+    owned_operations: list[tuple[int, dict[str, Any], dict[str, Any], bool]] = []
+    recovery_codes: set[str] = set()
+    blockers: list[dict[str, Any]] = []
+    for identity in plan["identities"]:
+        if identity["action"] not in {"create", "noop"}:
+            continue
+        norm = identity["normalizedLegacyCode"]
+        context = _import_create_context(plan, identity, request_key)
+        contexts[norm] = context
+        operation_key = context["requestKey"]
+        request_row = registry.create_request_record(operation_key)
+        master = None
+        if identity["action"] == "noop" and identity.get("recordId"):
+            master = index["masters_by_id"].get(int(identity["recordId"]))
+        elif identity["action"] == "create":
+            master = next((item for item in index["masters"] if str(item.get("fields", {}).get("CreateRequestKey") or "") == operation_key), None)
+        owned = _owned_import_create(master, request_row, operation_key=operation_key, import_key=request_key)
+        request_status = str(request_row.get("fields", {}).get("Status") or "") if request_row else ""
+
+        if identity["action"] == "create":
+            # A complete batch with a newly unresolved alias must re-run the
+            # original create request so the alias/history gates can be proved.
+            if batch_status == "complete":
+                if owned and master and str(master.get("fields", {}).get("Status") or "").casefold() in {"active", "retired"}:
+                    complete, _reason = _import_create_gate(registry, record_id=int(master["id"]), identity=identity, context=context, import_key=request_key, allow_retired=True)
+                    if complete:
+                        owned_operations.append((int(master["id"]), identity, context, True))
+                    else:
+                        recovery_codes.add(norm)
+                else:
+                    recovery_codes.add(norm)
+            continue
+
+        if not master:
+            blockers.append({"legacyCode": identity["legacyCode"], "recordId": identity.get("recordId"), "reason": "resolved_alias_master_missing"})
+            continue
+        master_fields = master.get("fields", {})
+        master_status = str(master_fields.get("Status") or "").casefold()
+        if master_status == "pending":
+            if owned and request_status in {"started", "complete"}:
+                recovery_codes.add(norm)
+            else:
+                blockers.append({"legacyCode": identity["legacyCode"], "recordId": int(master["id"]), "spareKey": str(master_fields.get("SpareKey") or ""), "status": master_status, "reason": "pending_identity_is_not_owned_by_this_import_create"})
+            continue
+        if master_status not in {"active", "retired"}:
+            blockers.append({"legacyCode": identity["legacyCode"], "recordId": int(master["id"]), "spareKey": str(master_fields.get("SpareKey") or ""), "status": master_status or "unknown", "reason": "identity_status_cannot_be_confirmed"})
+            continue
+        if owned:
+            complete, reason = _import_create_gate(registry, record_id=int(master["id"]), identity=identity, context=context, import_key=request_key, allow_retired=True)
+            if complete:
+                owned_operations.append((int(master["id"]), identity, context, True))
+            elif request_status in {"started", "complete"}:
+                recovery_codes.add(norm)
+            else:
+                blockers.append({"legacyCode": identity["legacyCode"], "recordId": int(master["id"]), "spareKey": str(master_fields.get("SpareKey") or ""), "status": master_status, "reason": reason})
+
+    if blockers:
+        details = {"requestKey": request_key, "identities": blockers}
+        registry.require_import_recovery(request_key, details=details)
+        raise SpareRegistryError("SPARE_IMPORT_RECOVERY_REQUIRED", "This import contains an unfinished identity owned by another request or an identity whose recovery cannot be confirmed. The batch remains unavailable until that exact request is resolved.", 409)
+
+    if batch_status == "complete" and recovery_codes:
+        details = {"requestKey": request_key, "legacyCodes": sorted(recovery_codes)}
+        registry.reopen_import_for_recovery(request_key, reason="A supposedly complete batch contains an unresolved or incomplete identity.", details=details)
+    elif batch_status == "complete":
+        if saved_result:
+            return {**saved_result, "idempotent": True}
+        details = {"requestKey": request_key, "reason": "completed_batch_result_missing"}
+        registry.require_import_recovery(request_key, details=details)
+        raise SpareRegistryError("SPARE_IMPORT_RECOVERY_REQUIRED", "Grist marked this import complete without a recoverable saved result. The batch is held for review.", 409)
+
     for identity in plan["identities"]:
         norm = identity["normalizedLegacyCode"]
-        if identity["action"] == "create":
-            operation_key = "import-create:" + _stable_key(request_key, norm)
-            provenance = {"sourceKind": "SparesDB", "sourceFile": plan["sourceLabels"]["associatedWorkbook"], "sourceHash": plan["sourceHashes"]["associatedWorkbook"], "sheetName": "SparesDB", "sourceRow": identity["sourceRow"], "sourceCell": f"A{identity['sourceRow']}"}
-            alias_evidence = next((item for item in plan["sourceEvidence"] if item["sourceKind"] == "SparesDB" and normalize_alias(item["legacyCode"]) == norm), None)
-            aliases = [{"value": identity["legacyCode"], "provenance": {**provenance, "identityStatus": alias_evidence["resolutionStatus"]}, "evidenceFingerprint": alias_evidence["fingerprint"]}] if alias_evidence else []
-            result = registry.create_spare(description=identity["description"], category=identity["category"], unit=identity["unit"], sourcing_type=identity["sourcingTypeCandidate"] or "unclassified", actor=actor, reason="Reviewed import from associated costing workbook.", request_key=operation_key, aliases=aliases, source_provenance={"importRequestKey": request_key, **provenance})
+        if identity["action"] == "create" or (identity["action"] == "noop" and norm in recovery_codes):
+            context = contexts[norm]
+            result = registry.create_spare(description=context["description"], category=context["category"], unit=context["unit"], sourcing_type=context["sourcingType"], actor=actor, reason="Reviewed import from associated costing workbook.", request_key=context["requestKey"], aliases=context["aliases"], source_provenance=context["sourceProvenance"])
+            allow_retired = str(result.get("status") or "").casefold() == "retired"
+            complete, reason = _import_create_gate(registry, record_id=int(result["recordId"]), identity=identity, context=context, import_key=request_key, allow_retired=allow_retired)
+            if not complete:
+                details = {"requestKey": request_key, "legacyCode": identity["legacyCode"], "recordId": int(result["recordId"]), "reason": reason}
+                registry.require_import_recovery(request_key, details=details)
+                raise SpareRegistryError("SPARE_IMPORT_RECOVERY_REQUIRED", "Grist did not confirm the imported identity's alias, create history, request completion and activation state.", 503)
+            owned_operations.append((int(result["recordId"]), identity, context, allow_retired))
             resolved[norm] = {"spareKey": result["spareKey"], "recordId": int(result["recordId"])}
         elif identity["action"] == "noop":
             resolved[norm] = {"spareKey": identity["spareKey"], "recordId": int(identity["recordId"])}
@@ -396,5 +524,11 @@ def apply_import_plan(*, plan: dict[str, Any], registry: GristSpareRegistry, act
     composition_result = registry.ensure_rows("SpareCompositionEvidence", "CompositionKey", composition_rows)
     result = {"requestKey": request_key, "previewFingerprint": preview_fingerprint, "status": "complete", "counts": plan["counts"], "created": {"sourceEvidence": source_result["created"], "costEvidence": cost_result["created"], "compositionEvidence": composition_result["created"]}, "existing": {"sourceEvidence": source_result["existing"], "costEvidence": cost_result["existing"], "compositionEvidence": composition_result["existing"]}, "resolvedSpareCount": len(resolved), "unresolvedEvidenceCount": plan["counts"]["unresolvedEvidenceRows"], "idempotent": False}
     registry.update_import_progress(request_key, {"stage": "composition-evidence", "created": composition_result["created"], "existing": composition_result["existing"], "total": len(composition_rows)})
+    for record_id, identity, context, allow_retired in owned_operations:
+        complete, reason = _import_create_gate(registry, record_id=record_id, identity=identity, context=context, import_key=request_key, allow_retired=allow_retired)
+        if not complete:
+            details = {"requestKey": request_key, "legacyCode": identity["legacyCode"], "recordId": record_id, "reason": reason}
+            registry.require_import_recovery(request_key, details=details)
+            raise SpareRegistryError("SPARE_IMPORT_RECOVERY_REQUIRED", "An imported identity lost its required completion evidence before the batch could finish.", 503)
     registry.finish_import(request_key, result)
     return result
