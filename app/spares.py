@@ -518,13 +518,32 @@ class GristSpareRegistry:
                     return legacy
         return self._ensure_keyed("SpareAlias", "AliasKey", alias_key, fields, "EvidenceFingerprint")
 
-    def _ensure_history(self, *, row: dict[str, Any], event_type: str, actor: str, reason: str, request_key: str, fingerprint: str, snapshot: dict[str, Any], history_version: int | None = None, occurred_at: Any = None) -> None:
+    def _ensure_history(self, *, row: dict[str, Any], event_type: str, actor: str, reason: str, request_key: str, fingerprint: str, snapshot: dict[str, Any], history_version: int | None = None, occurred_at: Any = None) -> dict[str, Any]:
         fields = row.get("fields", {})
         spare_key = str(fields.get("SpareKey") or "")
         version = int(history_version if history_version is not None else fields.get("Version") or 1)
         history_key = f"{spare_key}:v{version}"
         history_fp = request_fingerprint({"historyKey": history_key, "eventType": event_type, "requestKey": request_key, "requestFingerprint": fingerprint, "snapshot": snapshot})
-        self._ensure_keyed("SpareHistory", "HistoryKey", history_key, {"HistoryKey": history_key, "SpareMaster": _row_id(row), "Version": version, "EventType": event_type, "Actor": actor, "Reason": reason, "OccurredAt": grist_datetime(_now() if occurred_at is None else occurred_at), "RequestKey": request_key, "RequestFingerprint": history_fp, "Snapshot": canonical_grist_json_cell(snapshot)}, "RequestFingerprint")
+        confirmed = self._ensure_keyed("SpareHistory", "HistoryKey", history_key, {"HistoryKey": history_key, "SpareMaster": _row_id(row), "Version": version, "EventType": event_type, "Actor": actor, "Reason": reason, "OccurredAt": grist_datetime(_now() if occurred_at is None else occurred_at), "RequestKey": request_key, "RequestFingerprint": history_fp, "Snapshot": canonical_grist_json_cell(snapshot)}, "RequestFingerprint")
+        confirmed_fields = confirmed.get("fields", {})
+        try:
+            confirmed_occurred_at = grist_datetime(confirmed_fields.get("OccurredAt"))
+        except (TypeError, ValueError):
+            confirmed_occurred_at = None
+        if (
+            str(confirmed_fields.get("HistoryKey") or "") != history_key
+            or _ref_id(confirmed_fields.get("SpareMaster")) != _row_id(row)
+            or not self._same_integer(confirmed_fields.get("Version"), version)
+            or str(confirmed_fields.get("EventType") or "") != event_type
+            or str(confirmed_fields.get("RequestKey") or "") != request_key
+            or str(confirmed_fields.get("RequestFingerprint") or "") != history_fp
+            or _object_cell(confirmed_fields.get("Snapshot")) != snapshot
+            or not isinstance(confirmed_fields.get("Actor"), str)
+            or not isinstance(confirmed_fields.get("Reason"), str)
+            or confirmed_occurred_at is None
+        ):
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist's persisted history event did not match the requested immutable identity and snapshot.", 503)
+        return confirmed
 
     @staticmethod
     def _creation_evidence_fingerprint(evidence: dict[str, Any]) -> str:
@@ -752,7 +771,15 @@ class GristSpareRegistry:
         snapshot_row = {"id": row["id"], "fields": {**row.get("fields", {}), "Status": "active"}}
         snapshot = self._public_master(snapshot_row)
         history_occurred_at = grist_datetime(_now())
-        self._ensure_history(row=row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=snapshot, occurred_at=history_occurred_at)
+        history_event = self._ensure_history(row=row, event_type="created", actor=actor, reason=reason, request_key=request_key, fingerprint=fingerprint, snapshot=snapshot, occurred_at=history_occurred_at)
+        history_fields = history_event.get("fields", {})
+        try:
+            original_occurred_at = grist_datetime(history_fields.get("OccurredAt"))
+        except (TypeError, ValueError):
+            original_occurred_at = None
+        if original_occurred_at is None:
+            raise SpareRegistryError("SPARE_WRITE_UNCONFIRMED", "Grist did not confirm the original creation event timestamp.", 503)
+        original_snapshot = _object_cell(history_fields.get("Snapshot"))
         creation_evidence = {
             "schemaVersion": 1,
             "requestKey": request_key,
@@ -760,10 +787,10 @@ class GristSpareRegistry:
             "spareKey": spare_key,
             "spareCode": spare_code,
             "recordId": record_id,
-            "actor": str(actor or ""),
-            "reason": str(reason or ""),
-            "occurredAt": history_occurred_at,
-            "snapshot": snapshot,
+            "actor": str(history_fields.get("Actor") or ""),
+            "reason": str(history_fields.get("Reason") or ""),
+            "occurredAt": original_occurred_at,
+            "snapshot": original_snapshot,
         }
         creation_evidence["fingerprint"] = self._creation_evidence_fingerprint(creation_evidence)
         self._complete_request(request_key, fingerprint, {"spareKey": spare_key, "spareCode": spare_code, "recordId": record_id, "creationEvidence": creation_evidence})

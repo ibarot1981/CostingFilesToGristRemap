@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.schema import FOUNDATION_TABLES
-from app.spare_import import _stable_key, apply_import_plan, build_import_plan, preview_payload
+from app.spare_import import _import_create_context, _stable_key, apply_import_plan, build_import_plan, preview_payload
 from app.spares import GristSpareRegistry, SpareRegistryError, SPARE_TABLE_IDS, parse_source_date, source_cost_age
 from app.part_identity import request_fingerprint
 from app.milestone2 import OdsCell, OdsDocument, OdsSheet
@@ -258,6 +258,48 @@ class SpareRegistryTests(unittest.TestCase):
         self.assertEqual(len(fresh_grist.tables["SpareMaster"]), 1)
         self.assertEqual(fresh_grist.tables["SpareHistory"], saved_history)
         self.assertEqual(reservation_count, 0)
+
+    def test_create_history_response_loss_reuses_original_event_metadata_on_fresh_replay(self):
+        request = {"description": "Lost history response washer", "category": "Washer", "actor": "original creator", "reason": "initial review", "request_key": "lost-create-history-response", "aliases": [{"value": "HISTORY-LOSS-1"}]}
+        self.grist.lose_response_once_on = "SpareHistory"
+        with self.assertRaisesRegex(RuntimeError, "lost response after durable write"):
+            self.registry.create_spare(**request)
+
+        original_history = copy.deepcopy(self.grist.tables["SpareHistory"])
+        self.assertEqual(len(original_history), 1)
+        self.assertEqual(self.grist.tables["SpareMaster"][0]["fields"]["Status"], "pending")
+        retry_request = {**request, "actor": "retry actor", "reason": "retry reason"}
+        fresh_grist = _Grist()
+        fresh_grist.tables = copy.deepcopy(self.grist.tables)
+        fresh_grist.next_id = self.grist.next_id
+
+        with tempfile.TemporaryDirectory() as fresh_directory:
+            fresh_registry = _registry(fresh_directory, fresh_grist)
+            recovered = fresh_registry.create_spare(**retry_request)
+            request_row = fresh_registry.create_request_record(request["request_key"])
+            result = json.loads(request_row["fields"]["Result"])
+            evidence = result["creationEvidence"]
+            original_event = original_history[0]["fields"]
+            self.assertEqual((evidence["actor"], evidence["reason"]), (original_event["Actor"], original_event["Reason"]))
+            self.assertEqual(evidence["occurredAt"], original_event["OccurredAt"])
+            self.assertEqual(evidence["snapshot"], json.loads(original_event["Snapshot"]))
+            self.assertEqual(evidence["fingerprint"], fresh_registry._creation_evidence_fingerprint(evidence))
+            self.assertEqual(fresh_grist.tables["SpareHistory"], original_history)
+
+            replay = fresh_registry.create_spare(**retry_request)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(replay["spareKey"], recovered["spareKey"])
+            self.assertEqual(fresh_grist.tables["SpareHistory"], original_history)
+
+            fresh_registry.update_spare(spare_key=recovered["spareKey"], expected_version=1, updates={"description": "Edited after history recovery"}, actor="editor", reason="legitimate edit", request_key="history-recovery-edit")
+            fresh_registry.update_spare(spare_key=recovered["spareKey"], expected_version=2, updates={}, actor="retirer", reason="retired after history recovery", request_key="history-recovery-retire", retire=True)
+            history_after_retirement = copy.deepcopy(fresh_grist.tables["SpareHistory"])
+            retired_replay = fresh_registry.create_spare(**retry_request)
+
+        self.assertTrue(retired_replay["idempotent"])
+        self.assertEqual((retired_replay["status"], retired_replay["version"]), ("retired", 3))
+        self.assertEqual(fresh_grist.tables["SpareHistory"], history_after_retirement)
+        self.assertEqual(fresh_grist.tables["SpareHistory"][0], original_history[0])
 
     def test_duplicate_alias_is_rejected_before_reservation_or_active_publication(self):
         first = self.registry.create_spare(description="First", actor="qa", reason="reviewed", request_key="alias-first", aliases=[{"value": "W-LEG-100"}])
@@ -562,6 +604,54 @@ class SpareRegistryTests(unittest.TestCase):
                 replay = apply_import_plan(plan=replay_plan, registry=fresh, actor="qa", request_key=request_key, expected_preview_fingerprint=plan["previewFingerprint"])
                 self.assertTrue(replay["idempotent"])
                 self.assertEqual((len(grist.tables["SpareMaster"]), len(grist.tables["SpareAlias"]), len(grist.tables["SpareHistory"])), (1, 2, 1))
+
+    def test_imported_per_item_create_replay_preserves_history_after_durable_response_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            grist = _Grist()
+            first = _registry(str(root / "first"), grist)
+            _product_path, plan = _recovery_plan(root, first)
+            import_key = "import-history-stage-response-loss"
+            original_context = _import_create_context(plan, plan["identities"][0], import_key)
+            grist.lose_response_once_on = "SpareHistory"
+            with self.assertRaisesRegex(RuntimeError, "lost response after durable write"):
+                apply_import_plan(plan=plan, registry=first, actor="original import actor", request_key=import_key)
+
+            original_history = copy.deepcopy([row for row in grist.tables["SpareHistory"] if row["fields"].get("RequestKey") == original_context["requestKey"]])
+            self.assertEqual(len(original_history), 1)
+            fresh = _registry(str(root / "fresh"), grist)
+            rebuilt = _recovery_plan(root, fresh)[1]
+            context = _import_create_context(rebuilt, rebuilt["identities"][0], import_key)
+            recovered = apply_import_plan(plan=rebuilt, registry=fresh, actor="retry import actor", request_key=import_key, expected_preview_fingerprint=plan["previewFingerprint"])
+            self.assertEqual(recovered["status"], "complete")
+
+            request_row = fresh.create_request_record(context["requestKey"])
+            evidence = json.loads(request_row["fields"]["Result"])["creationEvidence"]
+            original_event = original_history[0]["fields"]
+            self.assertEqual((evidence["actor"], evidence["reason"]), (original_event["Actor"], original_event["Reason"]))
+            self.assertEqual(evidence["occurredAt"], original_event["OccurredAt"])
+            self.assertEqual(evidence["snapshot"], json.loads(original_event["Snapshot"]))
+            self.assertEqual([row for row in grist.tables["SpareHistory"] if row["fields"].get("RequestKey") == context["requestKey"]], original_history)
+
+            def retry_imported_create(actor: str, reason: str):
+                return fresh.create_spare(description=context["description"], category=context["category"], unit=context["unit"], sourcing_type=context["sourcingType"], actor=actor, reason=reason, request_key=context["requestKey"], aliases=context["aliases"], source_provenance=context["sourceProvenance"])
+
+            replay = retry_imported_create("per-item retry actor", "different retry reason")
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual([row for row in grist.tables["SpareHistory"] if row["fields"].get("RequestKey") == context["requestKey"]], original_history)
+
+            spare = fresh.get_spare(replay["spareKey"])
+            fresh.update_spare(spare_key=replay["spareKey"], expected_version=1, updates={"description": "Edited imported washer"}, actor="editor", reason="legitimate import edit", request_key="import-history-recovery-edit")
+            fresh.update_spare(spare_key=replay["spareKey"], expected_version=2, updates={}, actor="retirer", reason="retired imported washer", request_key="import-history-recovery-retire", retire=True)
+            history_after_retirement = copy.deepcopy(grist.tables["SpareHistory"])
+            retired_replay = retry_imported_create("final replay actor", "final retry reason")
+
+        self.assertEqual(spare["status"], "active")
+        self.assertTrue(retired_replay["idempotent"])
+        self.assertEqual((retired_replay["status"], retired_replay["version"]), ("retired", 3))
+        self.assertEqual(grist.tables["SpareHistory"], history_after_retirement)
+        self.assertEqual(grist.tables["SpareHistory"][0], original_history[0])
+        self.assertEqual((len(grist.tables["SpareMaster"]), len(grist.tables["SpareAlias"])), (1, 2))
 
     def test_fresh_noop_import_reuses_source_alias_fingerprints_without_duplicates(self):
         identity = {"action": "create", "normalizedLegacyCode": "washer-1", "legacyCode": "WASHER-1", "description": "Pilot washer", "category": "Washer", "unit": "EA", "sourcingTypeCandidate": "purchased", "sourceRow": 8}
