@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-spares-foundation-grist-2026-11-17.v16"
+SCHEMA_VERSION = "safari-part-definition-maintenance-grist-2026-11-19.v17"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -86,6 +86,24 @@ def _merge_table_definitions(tables: tuple[dict[str, Any], ...]) -> tuple[dict[s
     return tuple(merged[table_id] for table_id in order)
 
 
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# v17 adds the durable B2-P1 Part-definition draft, approved change request,
+# immutable accepted-definition snapshot and recoverable publication journal.
+# Existing revisions, configurations and requirement rows remain readable;
+# new revision/cause references are additive.
+FOUNDATION_TABLES += (
+    _table("PartRevision", {"PreviousRevision": "Ref:PartRevision", "ChangeRequest": "Ref:PartEngineeringChangeRequest", "PublicationCause": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime"}),
+    _table("PartRevisionLine", {"ProvenanceType": "Text", "ProvenanceEvidence": "Any"}),
+    _table("PartComponentRevision", {"ComponentIdentity": "Text"}),
+    _table("PartPurchaseSpecification", {"SpecificationIdentity": "Text"}),
+    _table("ConfigurationPartSelection", {"PartRevision": "Ref:PartRevision"}),
+    _table("CostingConfigurationRevision", {"ChangeRequest": "Ref:PartEngineeringChangeRequest", "PublicationCause": "Text"}),
+    _table("PartDefinitionDraft", {"DraftKey": "Text", "ProductPart": "Ref:ProductPart", "BaseRevision": "Ref:PartRevision", "SaveVersion": "Numeric", "Status": "Text", "Content": "Any", "ContentFingerprint": "Text", "Actor": "Text", "Reason": "Text", "CreatedAt": "DateTime", "UpdatedAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartEngineeringChangeRequest", {"ChangeRequestKey": "Text", "ProductPart": "Ref:ProductPart", "Draft": "Ref:PartDefinitionDraft", "BaseRevision": "Ref:PartRevision", "Status": "Text", "Reason": "Text", "BeforeDefinition": "Any", "AfterDefinition": "Any", "ImpactPreview": "Any", "ImpactFingerprint": "Text", "InitiatedBy": "Text", "CreatedAt": "DateTime", "ApprovedBy": "Text", "ApprovedAt": "DateTime", "PublishedRevision": "Ref:PartRevision", "PublicationKey": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartDefinitionVersion", {"DefinitionKey": "Text", "ProductPart": "Ref:ProductPart", "PartRevision": "Ref:PartRevision", "ChangeRequest": "Ref:PartEngineeringChangeRequest", "PreviousDefinition": "Ref:PartDefinitionVersion", "Content": "Any", "ContentFingerprint": "Text", "PublicationCause": "Text", "Actor": "Text", "Reason": "Text", "OccurredAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("PartDefinitionPublication", {"PublicationKey": "Text", "ChangeRequest": "Ref:PartEngineeringChangeRequest", "Status": "Text", "Plan": "Any", "PlanFingerprint": "Text", "AffectedParts": "Any", "AffectedCodes": "Any", "CompletedStages": "Any", "LastError": "Text", "CreatedAt": "DateTime", "UpdatedAt": "DateTime", "CompletedAt": "DateTime", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+)
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 
 # v16 adds an independent Grist-backed spare master and immutable source

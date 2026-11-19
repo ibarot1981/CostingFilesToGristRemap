@@ -422,10 +422,10 @@ export function PartMappingView({ path, active = true, onOpenParts, returnSelect
   function openParts(group: Group | null, partId: string | null, mode: "select" | "view", selectedRows: SourceRow[] = []) {
     if (!detail) return;
     const lineKeys = selectedRows.map(row => String(row.lineKey || "")).filter(Boolean).sort();
-    onOpenParts?.(group?.key || "", partId, mode, group ? { sourceHash: detail.sourceHash, associationKey: detail.associationKey,
+    onOpenParts?.(group?.key || "", partId, mode, group ? { path, sourceHash: detail.sourceHash, associationKey: detail.associationKey,
       associationVersion: detail.associationVersion, evidenceFingerprint: group.evidenceFingerprint,
       ...(lineKeys.length ? { lineKeys, selectedLineEvidenceFingerprint: lineEvidenceContext(selectedRows) } : {}) } : { sourceHash: detail.sourceHash,
-      associationKey: detail.associationKey, associationVersion: detail.associationVersion });
+      path, associationKey: detail.associationKey, associationVersion: detail.associationVersion });
   }
 
   function currentOriginMatches(origin: PartCreationOrigin | null | undefined) {

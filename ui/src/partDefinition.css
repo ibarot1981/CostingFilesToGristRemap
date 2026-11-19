@@ -1,0 +1,41 @@
+.parts-definition-card{display:block;margin:12px 0;padding:16px;background:#fff;border:1px solid #dfe2e6;border-radius:10px;color:#34435a}
+.parts-definition-heading,.parts-definition-list-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.parts-definition-heading{border-bottom:1px solid #e7eaee;padding-bottom:12px;margin-bottom:10px}
+.parts-definition-heading h3,.parts-definition-list-heading h4{margin:0;color:#34435a;font-size:13px}
+.parts-definition-heading p,.parts-definition-source{margin:4px 0 0;color:#728093;font-size:10px}
+.parts-definition-actions{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.parts-definition-applicability{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px;margin:10px 0;border:1px solid #e2e7ed;border-radius:7px;background:#f8fafc;color:#536176;font-size:10px}
+.parts-definition-applicability strong{color:#34435a;margin-right:4px}
+.parts-definition-applicability label{display:flex;align-items:center;gap:5px;font-weight:600}
+.parts-definition-applicability input,.parts-definition-finalize input{width:auto}
+.parts-definition-list-heading{margin:14px 0 8px}
+.parts-definition-list-heading>span{font-size:10px;color:#728093}
+.parts-definition-items{display:grid;gap:7px;margin:8px 0 12px}
+.parts-definition-items article,.parts-definition-history article{display:grid;gap:4px;padding:9px 11px;border:1px solid #e2e6eb;border-radius:7px;background:#fcfcfb}
+.parts-definition-items strong,.parts-definition-history strong{font-size:10px;color:#34435a}
+.parts-definition-items span,.parts-definition-history span{font-size:10px;color:#536176}
+.parts-definition-items small,.parts-definition-history p{font-size:9px;color:#7b8796;margin:0}
+.parts-definition-editor{display:grid;gap:10px;margin-top:12px;padding-top:10px;border-top:1px solid #e7eaee}
+.parts-definition-row{min-width:0;margin:0;padding:10px;border:1px solid #dfe4e9;border-radius:8px;background:#fff}
+.parts-definition-row legend{padding:0 5px;color:#647286;font-size:9px;font-weight:700;overflow-wrap:anywhere}
+.parts-definition-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.parts-definition-grid label,.parts-definition-reason{display:grid;gap:4px;color:#536176;font-size:9px;font-weight:700}
+.parts-definition-grid input,.parts-definition-grid select,.parts-definition-reason input{min-width:0;width:100%;border:1px solid #ccd3dd;border-radius:6px;padding:7px 8px;background:#fff;color:#34435a;font-size:10px}
+.parts-definition-grid .parts-definition-wide{grid-column:1/-1}
+.parts-definition-grid textarea{min-width:0;width:100%;min-height:88px;resize:vertical;border:1px solid #ccd3dd;border-radius:6px;padding:8px;background:#fff;color:#34435a;font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}
+.parts-definition-finalize{display:flex;align-items:center;gap:7px;color:#536176;font-size:10px;font-weight:700}
+.parts-definition-reason{max-width:520px}
+.parts-definition-pending{display:grid;gap:7px;margin:12px 0;padding:11px;border:1px solid #e2d5b8;border-radius:8px;background:#fffcf5;font-size:10px;color:#536176}
+.parts-definition-pending strong{color:#634d26}
+.parts-definition-pending p{margin:0}
+.parts-definition-notice{margin:8px 0;padding:8px 10px;border-radius:6px;background:#eef7f0;color:#365f40;font-size:10px}
+.parts-definition-error{margin:8px 0;padding:8px 10px;border-radius:6px;background:#fff1ef;color:#963d31;font-size:10px}
+.parts-definition-history{margin-top:15px;padding-top:10px;border-top:1px solid #e6e9ed}
+.parts-definition-history summary{cursor:pointer;color:#34435a;font-size:10px;font-weight:700}
+.parts-definition-history article{margin-top:7px}
+@media(max-width:760px){.parts-definition-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.parts-definition-heading{align-items:flex-start}.parts-definition-actions{width:100%}}
+@media(max-width:480px){.parts-definition-grid{grid-template-columns:1fr}}
+.parts-definition-impact { display: grid; gap: 0.65rem; margin-block: 0.75rem; }
+.parts-definition-impact > article, .parts-definition-impact-path { display: grid; gap: 0.3rem; padding: 0.65rem; border: 1px solid var(--parts-border, #d8dde5); border-radius: 0.4rem; }
+.parts-definition-impact-path { margin-top: 0.45rem; background: var(--parts-muted, #f6f7f9); }
+.parts-definition-field-status { display: block; }

@@ -211,9 +211,11 @@ class PartIdentityWebTests(unittest.TestCase):
              mock.patch.object(web, "_part_identity_registry", reopened), \
              mock.patch.object(web, "_part_context", return_value=(self.repository, "file:pilot.ods", association, "hash-a", groups)):
             detail = web.part_details(part["id"])
-        self.assertEqual(detail["mappedLines"]["status"], "available")
-        self.assertEqual(len(detail["mappedLines"]["items"]), 1)
-        mapped = detail["mappedLines"]["items"][0]
+            self.assertEqual(detail["mappedLines"]["status"], "deferred")
+            mapped_lines = web.part_mapped_lines(part["id"])
+        self.assertEqual(mapped_lines["status"], "available")
+        self.assertEqual(len(mapped_lines["items"]), 1)
+        mapped = mapped_lines["items"][0]
         self.assertEqual((mapped["family"], mapped["description"], mapped["sheet"], mapped["row"]),
             ("Tool Shop", "Source shaft", "Tool Shop Items", 10))
         self.assertEqual(mapped["assignmentStatus"], "current")
@@ -221,7 +223,7 @@ class PartIdentityWebTests(unittest.TestCase):
         with mock.patch.object(web, "_repository", self.repository), \
              mock.patch.object(web, "_part_identity_registry", reopened), \
              mock.patch.object(web, "_part_context", side_effect=OSError("fixture workbook is unavailable")):
-            unavailable = web.part_details(part["id"])["mappedLines"]
+            unavailable = web.part_mapped_lines(part["id"])
         self.assertEqual(unavailable["items"], [])
         self.assertEqual(len(unavailable["historical"]), 1)
         self.assertEqual(unavailable["historical"][0]["assignmentStatus"], "unverifiable")

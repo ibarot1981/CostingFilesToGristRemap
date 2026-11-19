@@ -108,6 +108,9 @@ class GristLiveCostService:
         return row
 
     def _configuration(self, tables: dict[str, list[dict[str, Any]]], code_record_id: int) -> dict[str, Any] | None:
+        guard = getattr(self.registry, "assert_definition_generation_ready", None)
+        if guard:
+            guard(code_record_id=code_record_id)
         matches = [row for row in tables["CostingConfiguration"]
                    if ref_id(_fields(row).get("ProductModelCode")) == code_record_id
                    and str(_fields(row).get("Status") or "active").casefold() == "active"]
@@ -142,7 +145,8 @@ class GristLiveCostService:
                 "partId": _fields(row).get("StablePartId") or _fields(row).get("ProductPart"),
                 "partName": metadata_rows.get(ref_id(part_rows.get(ref_id(_fields(row).get("ProductPart")), {}).get("CurrentMetadataVersion")) or -1, {}).get("DisplayName")
                     or part_rows.get(ref_id(_fields(row).get("ProductPart")) or -1, {}).get("DisplayName") or "",
-                "productPartRecordId": ref_id(_fields(row).get("ProductPart")), "quantity": _fields(row).get("Quantity"),
+                "productPartRecordId": ref_id(_fields(row).get("ProductPart")), "partRevisionId": ref_id(_fields(row).get("PartRevision")),
+                "quantity": _fields(row).get("Quantity"),
                 "uom": _fields(row).get("QuantityUOM"), "sourcingRoute": _fields(row).get("SourcingRoute") or "auto",
                 "label": _fields(row).get("OccurrenceLabel") or "", "optionGroup": _fields(row).get("OptionGroup") or ""} for row in config["selections"]]}}
 
@@ -201,6 +205,9 @@ class GristLiveCostService:
         code = next((row for row in self._rows("ProductModelCode") if int(row.get("id", -1)) == code_record_id), None)
         if not code or not _fields(code).get("Active", True):
             raise PartIdentityError("MODEL_CODE_NOT_FOUND", "Choose an active Model Code stored in Safari Grist.")
+        guard = getattr(self.registry, "assert_definition_generation_ready", None)
+        if guard:
+            guard(code_record_id=code_record_id)
         reason = str(payload.get("reason") or "").strip()
         currency = str(payload.get("currency") or "INR").strip().upper()
         raw = payload.get("selections")
@@ -227,6 +234,7 @@ class GristLiveCostService:
                 raise PartIdentityError("COST_CONFIGURATION_PART_INACTIVE", "Retired Parts cannot be added to a current Model Code configuration.")
             selections.append({"selectionIdentity": identity, "partRecordId": int(part["id"]), "partId": stable_id,
                 "quantity": quantity, "uom": uom, "sourcingRoute": route,
+                "partRevisionId": ref_id(_fields(part).get("CurrentPartRevision")),
                 "label": str(item.get("label") or "").strip(), "optionGroup": str(item.get("optionGroup") or "").strip()})
         fingerprint = request_fingerprint([code_record_id, currency, selections, actor.strip(), reason])
         with self.registry.lock:
@@ -259,7 +267,8 @@ class GristLiveCostService:
                 selection_key = f"{revision_key}:{selection['selectionIdentity']}"
                 fields = {"SelectionKey": selection_key, "SelectionIdentity": selection["selectionIdentity"],
                     "ConfigurationRevision": int(revision["id"]), "ProductPart": selection["partRecordId"],
-                    "StablePartId": selection["partId"], "Quantity": selection["quantity"], "QuantityUOM": selection["uom"],
+                    "StablePartId": selection["partId"], "PartRevision": selection["partRevisionId"],
+                    "Quantity": selection["quantity"], "QuantityUOM": selection["uom"],
                     "SourcingRoute": selection["sourcingRoute"], "OccurrenceLabel": selection["label"],
                     "OptionGroup": selection["optionGroup"], "Status": "active", "Actor": actor.strip(),
                     "Reason": reason, "RequestKey": request_key, "RequestFingerprint": item_fingerprint}
@@ -350,8 +359,10 @@ class GristLiveCostService:
             if revision_id:
                 details_by_revision.setdefault(revision_id, []).append({"id": row.get("id"), "fields": _fields(row)})
         specs_by_revision: dict[int, list[dict[str, Any]]] = {}
+        specification_by_id: dict[int, dict[str, Any]] = {}
         for row in tables["PartPurchaseSpecification"]:
             fields = _fields(row)
+            specification_by_id[int(row["id"])] = fields
             if str(fields.get("Status") or "active").casefold() == "active":
                 revision_id = ref_id(fields.get("PartRevision"))
                 if revision_id:
@@ -487,7 +498,7 @@ class GristLiveCostService:
             if part_ref is None:
                 warn("CONFIGURATION_PART_UNAVAILABLE", "A configured canonical Part no longer resolves.", str(sf.get("SelectionIdentity") or sf.get("SelectionKey")))
                 continue
-            rev_id = ref_id(part_fields.get("CurrentPartRevision"))
+            rev_id = ref_id(sf.get("PartRevision")) or ref_id(part_fields.get("CurrentPartRevision"))
             qty, uom = _num(sf.get("Quantity")), str(sf.get("QuantityUOM") or "").strip()
             if not rev_id or qty is None or qty <= 0 or not uom:
                 warn("CONFIGURATION_QUANTITY_INVALID", "A configured Part quantity, unit or current engineering revision is missing.", str(sf.get("SelectionIdentity") or sf.get("SelectionKey")))
@@ -509,9 +520,31 @@ class GristLiveCostService:
         for candidate in candidates:
             if candidate["kind"] == "purchase":
                 sf = _fields(candidate["specification"])
-                purchase_rows = [row for row in tables["PartPurchaseRecord"] if ref_id(_fields(row).get("PartPurchaseSpecification")) == int(candidate["specification"]["id"])]
-                unit_rows = [_fields(row) for row in tables["PartPurchaseUnitConversion"] if ref_id(_fields(row).get("PartPurchaseSpecification")) == int(candidate["specification"]["id"])]
-                currency_rows = [_fields(row) for row in tables["PartPurchaseCurrencyConversion"] if ref_id(_fields(row).get("PartPurchaseSpecification")) == int(candidate["specification"]["id"])]
+                specification_id = int(candidate["specification"]["id"])
+                specification_identity = str(sf.get("SpecificationIdentity") or "")
+                specification_part = ref_id(sf.get("ProductPart"))
+                related_specification_ids = {row_id for row_id, fields in specification_by_id.items()
+                    if specification_identity and str(fields.get("SpecificationIdentity") or "") == specification_identity
+                    and ref_id(fields.get("ProductPart")) == specification_part}
+                related_specification_ids.add(specification_id)
+                purchase_rows = []
+                for row in tables["PartPurchaseRecord"]:
+                    pf = _fields(row)
+                    source_spec_id = ref_id(pf.get("PartPurchaseSpecification"))
+                    if source_spec_id not in related_specification_ids:
+                        continue
+                    source_spec = specification_by_id.get(source_spec_id, {})
+                    # Purchase records are immutable and keep their original
+                    # specification/revision references. Inject the stable
+                    # identity only into this calculation view so history can
+                    # follow an approved successor of the same specification.
+                    if specification_identity and str(source_spec.get("SpecificationIdentity") or "") == specification_identity:
+                        pf["SpecificationIdentity"] = specification_identity
+                    purchase_rows.append({**row, "fields": pf})
+                unit_rows = [_fields(row) for row in tables["PartPurchaseUnitConversion"]
+                    if ref_id(_fields(row).get("PartPurchaseSpecification")) in related_specification_ids]
+                currency_rows = [_fields(row) for row in tables["PartPurchaseCurrencyConversion"]
+                    if ref_id(_fields(row).get("PartPurchaseSpecification")) in related_specification_ids]
                 vendor_maps = {int(row["id"]): _fields(row) for row in tables["VendorPartMapping"]}
                 valid_records = []
                 for row in purchase_rows:
@@ -520,7 +553,7 @@ class GristLiveCostService:
                     if str(mapping.get("Status") or "").casefold() == "reviewed":
                         valid_records.append(row)
                 from app.purchased_parts import resolve_purchased_part_rate
-                rate = resolve_purchased_part_rate({**sf, "recordId": str(candidate["specification"]["id"])}, valid_records,
+                rate = resolve_purchased_part_rate({**sf, "ProductPart": specification_part, "recordId": str(specification_id)}, valid_records,
                     unit_conversions=unit_rows, currency_conversions=currency_rows)
                 if rate.get("status") != "available":
                     warn("PURCHASE_RATE_" + str(rate.get("status", "unavailable")).upper(), str(rate.get("reason") or "Purchased-Part rate is unavailable."), candidate["occurrencePath"])

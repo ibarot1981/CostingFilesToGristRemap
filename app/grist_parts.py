@@ -215,6 +215,15 @@ class GristPartRegistry:
             return scope[table]
         return self.client.fetch_table_records_with_ids(table)
 
+    def _optional_baseline_rows(self) -> list[dict[str, Any]]:
+        try:
+            return self._rows("PartBaselineProcessing")
+        except GristError as exc:
+            message = str(exc).casefold()
+            if "404" in message and ("partbaselineprocessing" in message or "table" in message):
+                return []
+            raise
+
     def _invalidate_search_cache(self) -> None:
         try:
             from app.part_mapping import invalidate_part_search_cache
@@ -787,10 +796,32 @@ class GristPartRegistry:
         arguments["identity_kind"] = "assembly"
         return self.create_part(**arguments)
 
+    def assert_definition_generation_ready(self, part_record_id: int | None = None, code_record_id: int | None = None) -> None:
+        """Fail closed while an approved multi-table successor is only partly applied."""
+        try:
+            journals = self._rows("PartDefinitionPublication")
+        except GristError as exc:
+            message = str(exc).casefold()
+            if "404" in message and ("table" in message or "partdefinitionpublication" in message):
+                return  # additive v17 table is not installed yet
+            raise
+        for journal in journals:
+            fields = journal.get("fields", {})
+            if str(fields.get("Status") or "").casefold() == "published":
+                continue
+            plan = decode_grist_any_object(fields.get("Plan")) or {}
+            affected_parts = plan.get("affectedPartRecordIds") or []
+            affected_codes = plan.get("affectedCodeRecordIds") or []
+            if part_record_id is not None and int(part_record_id) in [int(value) for value in affected_parts]:
+                raise PartIdentityError("PART_DEFINITION_PUBLICATION_PENDING", "An approved Part-definition publication is recovering. Reload after its reviewed Part and dependent revisions are confirmed.")
+            if code_record_id is not None and int(code_record_id) in [int(value) for value in affected_codes]:
+                raise PartIdentityError("PART_CONFIGURATION_PUBLICATION_PENDING", "An approved Part-definition publication is recovering this Model Code configuration. Reload after its successor is confirmed.")
+
     def get_part(self, stable_id: str) -> dict[str, Any] | None:
         row = self._find(self._rows("ProductPart"), "StablePartId", stable_id)
         if not row:
             return None
+        self.assert_definition_generation_ready(int(row["id"]))
         fields = row.get("fields", {})
         meta_id = _ref(fields.get("CurrentMetadataVersion"))
         rev_id = _ref(fields.get("CurrentPartRevision"))
@@ -798,6 +829,9 @@ class GristPartRegistry:
         revision = next((item for item in self._rows("PartRevision") if int(item.get("id", -1)) == rev_id), None)
         meta = metadata.get("fields", {}) if metadata else {}
         rev = revision.get("fields", {}) if revision else {}
+        baseline_id = _ref(rev.get("ManufacturingBaseline"))
+        baseline = next((item for item in self._optional_baseline_rows() if baseline_id and int(item.get("id", -1)) == baseline_id), None)
+        baseline_fields = baseline.get("fields", {}) if baseline else {}
         aliases = [item.get("fields", {}).get("DisplayName", "") for item in self._rows("PartNameAlias") if _ref(item.get("fields", {}).get("ProductPart")) == int(row["id"]) and not item.get("fields", {}).get("IsCurrent")]
         scope_type = str(meta.get("ScopeType") or fields.get("ScopeType") or "")
         target_id = str(meta.get("ScopeTargetId") or fields.get("ScopeTargetId") or "")
@@ -808,9 +842,9 @@ class GristPartRegistry:
             "variant": meta.get("DesignVariant") or fields.get("DesignVariant") or "", "scope": scope_type, "scopeTargetId": target_id,
             "scopeTarget": target_label, "shortcode": meta.get("Shortcode", ""), "engineeringRevision": fields.get("EngineeringRevision") or "A",
             "revisionRecordId": rev_id, "metadataRecordId": meta_id, "revisionStatus": rev.get("BaselineStatus") or rev.get("Status") or "draft",
-            "manufacturingBaselineStatus": rev.get("ManufacturingBaselineStatus") or "not_established",
-            "manufacturingBaselineKey": rev.get("ManufacturingBaselineKey") or "",
-            "manufacturingBaselineSourceHash": rev.get("ManufacturingBaselineSourceHash") or "",
+            "manufacturingBaselineStatus": baseline_fields.get("Status") or rev.get("ManufacturingBaselineStatus") or "not_established",
+            "manufacturingBaselineKey": baseline_fields.get("BaselineKey") or rev.get("ManufacturingBaselineKey") or "",
+            "manufacturingBaselineSourceHash": baseline_fields.get("SourceHash") or rev.get("ManufacturingBaselineSourceHash") or "",
             "status": fields.get("Status") or "active", "publishStatus": fields.get("PublishStatus") or "", "metadataVersion": meta.get("Version") or fields.get("MetadataVersion") or 1,
             "createdAt": fields.get("CreatedAt"), "actor": fields.get("CreatedActor"), "reason": fields.get("CreatedReason"),
             "aliases": aliases, "legacy": False}
@@ -821,6 +855,7 @@ class GristPartRegistry:
         product_rows = source_rows if source_rows is not None else self._rows("ProductPart")
         metadata_by_id = {int(row["id"]): row.get("fields", {}) for row in self._rows("PartMetadataVersion")}
         revision_by_id = {int(row["id"]): row.get("fields", {}) for row in self._rows("PartRevision")}
+        baseline_by_id = {int(row["id"]): row.get("fields", {}) for row in self._optional_baseline_rows()}
         aliases_by_part: dict[int, list[str]] = {}
         for alias in self._rows("PartNameAlias"):
             fields = alias.get("fields", {})
@@ -842,6 +877,7 @@ class GristPartRegistry:
             revision_id = _ref(fields.get("CurrentPartRevision"))
             meta = metadata_by_id.get(metadata_id, {}) if metadata_id else {}
             revision = revision_by_id.get(revision_id, {}) if revision_id else {}
+            baseline = baseline_by_id.get(_ref(revision.get("ManufacturingBaseline")), {})
             scope = str(meta.get("ScopeType") or fields.get("ScopeType") or "")
             target = str(meta.get("ScopeTargetId") or fields.get("ScopeTargetId") or "")
             name = str(meta.get("DisplayName") or fields.get("DisplayName") or "")
@@ -855,9 +891,9 @@ class GristPartRegistry:
                 "shortcode": meta.get("Shortcode", ""), "engineeringRevision": fields.get("EngineeringRevision") or "A",
                 "revisionRecordId": revision_id, "metadataRecordId": metadata_id,
                 "revisionStatus": revision.get("BaselineStatus") or revision.get("Status") or "draft",
-                "manufacturingBaselineStatus": revision.get("ManufacturingBaselineStatus") or "not_established",
-                "manufacturingBaselineKey": revision.get("ManufacturingBaselineKey") or "",
-                "manufacturingBaselineSourceHash": revision.get("ManufacturingBaselineSourceHash") or "",
+                "manufacturingBaselineStatus": baseline.get("Status") or revision.get("ManufacturingBaselineStatus") or "not_established",
+                "manufacturingBaselineKey": baseline.get("BaselineKey") or revision.get("ManufacturingBaselineKey") or "",
+                "manufacturingBaselineSourceHash": baseline.get("SourceHash") or revision.get("ManufacturingBaselineSourceHash") or "",
                 "status": fields.get("Status") or "active", "publishStatus": fields.get("PublishStatus") or "",
                 "metadataVersion": meta.get("Version") or fields.get("MetadataVersion") or 1,
                 "createdAt": fields.get("CreatedAt"), "actor": fields.get("CreatedActor"),
@@ -1354,7 +1390,7 @@ class GristPartFeatures:
             relationship_status = ("available" if child_revision_id and child_revision and child_part_id and child_fields and child_stable_id
                 else "unavailable_revision" if not child_revision_id or not child_revision
                 else "unavailable_child")
-            result.append({"id": row.get("id"), "componentKey": fields.get("ComponentKey"), "childPartId": child_stable_id or None,
+            result.append({"id": row.get("id"), "componentKey": fields.get("ComponentKey"), "componentIdentity": fields.get("ComponentIdentity"), "childPartId": child_stable_id or None,
                 "childPartNumber": child_fields.get("PartNumber"), "childName": child_metadata.get("DisplayName") or child_fields.get("DisplayName"),
                 "childIdentityKind": str(child_fields.get("IdentityKind") or "part") if child_fields else None,
                 "childRevisionId": child_revision_id, "childRevisionLabel": child_revision.get("RevisionLabel") or child_revision.get("Revision"),
@@ -1402,8 +1438,10 @@ class GristPartFeatures:
             pending.extend(adjacency.get(current, ()))
         key = f"{parent_revision_id}:{child_revision_id}:{request_key}"
         fingerprint = request_fingerprint([parent_part_id, child_part_id, value, uom.strip(), sourcing_route, actor.strip(), reason.strip()])
+        component_identity = f"safari-authored-component:{parent_part_id}:{request_key}"
         saved = self.registry._ensure_keyed("PartComponentRevision", "ComponentKey", key, {
-            "ComponentKey": key, "ParentRevision": parent_revision_id, "ChildRevision": child_revision_id,
+            "ComponentKey": key, "ComponentIdentity": component_identity,
+            "ParentRevision": parent_revision_id, "ChildRevision": child_revision_id,
             "Quantity": value, "QuantityUOM": uom.strip(), "SourcingRoute": sourcing_route, "Status": "active", "ComponentStatus": "active",
             "Actor": actor.strip(), "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()),
             "RequestKey": request_key, "RequestFingerprint": fingerprint})

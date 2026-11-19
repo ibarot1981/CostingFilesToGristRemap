@@ -183,6 +183,8 @@ class GristPartRecoveryTests(unittest.TestCase):
             retry = features.add_component(**args)
             self.assertEqual(first["id"], retry["id"])
             self.assertTrue(retry["component"].get("RequestFingerprint"))
+            self.assertEqual(retry["components"][0]["componentIdentity"], f"safari-authored-component:{root['id']}:root-nested")
+            self.assertEqual(first["component"].get("ComponentIdentity"), retry["component"].get("ComponentIdentity"))
             self.assertEqual(first["components"][0]["childIdentityKind"], "assembly")
             self.assertEqual(first["components"][0]["quantity"], 2)
             self.assertEqual(first["components"][0]["childRevisionLabel"], "A")

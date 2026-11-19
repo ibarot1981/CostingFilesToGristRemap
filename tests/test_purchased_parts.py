@@ -54,6 +54,16 @@ class PurchasedPartRateTests(unittest.TestCase):
         self.assertEqual((historical["status"], historical["purchaseRecordId"], historical["rate"]), ("available", "1", 10))
         self.assertEqual(SPEC["SpecificationKey"], "spec:part-1:purchase")  # rate changes do not change Part/spec identity
 
+    def test_purchase_history_follows_stable_specification_identity_across_accepted_revisions(self):
+        previous = purchase(1, 101, "A-100", "2026-01-01T10:00:00Z", 10,
+            PartPurchaseSpecification=41, PartRevision=8, ProductPart=17, SpecificationIdentity="stable-spec:17:bearing")
+        successor = {**SPEC, "recordId": "42", "PartPurchaseSpecification": 42, "ProductPart": 17,
+            "PartRevision": 9, "SpecificationIdentity": "stable-spec:17:bearing"}
+
+        result = resolve_purchased_part_rate(successor, [previous])
+
+        self.assertEqual((result["status"], result["purchaseRecordId"], result["rate"]), ("available", "1", 10))
+
     def test_recorded_later_but_backdated_purchase_does_not_win(self):
         old_date = purchase(1, 101, "A-100", "2026-01-01T10:00:00Z", 10)
         late_entry = purchase(2, 202, "B-200", "2025-12-01T10:00:00Z", 5, RecordedAt="2026-03-01T00:00:00Z")

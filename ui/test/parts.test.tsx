@@ -5,7 +5,7 @@ import {PartsView} from "../src/PartsView";
 
 const mocks = vi.hoisted(() => ({
   parts: vi.fn(), partScopeTargets: vi.fn(), partDetails: vi.fn(),
-  mappedFiles: vi.fn(),
+  mappedFiles: vi.fn(), mappedPartLines: vi.fn(),
   partNamePreview: vi.fn(), createManagedPart: vi.fn(), createAssembly: vi.fn(), maintainPartShortcode: vi.fn(), savePartIntendedSharing: vi.fn(),
   addPartComponent: vi.fn(), recordPartPurchase: vi.fn(),
 }));
@@ -65,6 +65,7 @@ beforeEach(() => {
   mocks.parts.mockResolvedValue({items:[part],legacyItems:[],storage:"Grist Safari Manufacturing"});
   mocks.partDetails.mockResolvedValue(details);
   mocks.mappedFiles.mockResolvedValue({items:[]});
+  mocks.mappedPartLines.mockResolvedValue({status:"empty",items:[],historical:[]});
 });
 afterEach(() => {cleanup(); vi.unstubAllGlobals();});
 
@@ -94,6 +95,28 @@ it("collapses and expands scope targets, then opens the selected Part details", 
   expect(sessionStorage.getItem("parts:expanded")).toContain("target:product_model:model-1");
 });
 
+it("keeps the ordinary saved Part detail path independent of mapped ODS discovery", async () => {
+  window.history.replaceState(null,"", "#parts/part-uuid");
+  render(<PartsView/>);
+  await screen.findByRole("heading", {name:"S1K — Chassis — Standard"});
+  await waitFor(() => expect(mocks.partDetails).toHaveBeenCalledWith("part-uuid"));
+  expect(mocks.mappedFiles).not.toHaveBeenCalled();
+});
+
+it("shows the current managed revision and established baseline in the Part summary", async () => {
+  const published = {...part, engineeringRevision:"B", manufacturingBaselineStatus:"established"};
+  mocks.parts.mockResolvedValue({items:[published],legacyItems:[],storage:"Grist Safari Manufacturing"});
+  mocks.partDetails.mockResolvedValue({...details,part:{...published,compositionStatus:"draft"},manufacturingBaseline:{status:"established",revisionLabel:"A",revisionLifecycle:"draft",baseline:{WorkbookName:"source.ods",WorkbookPath:"source.ods",SourceHash:"hash"}}});
+  window.history.replaceState(null,"", "#parts/part-uuid");
+
+  render(<PartsView/>);
+
+  await screen.findByRole("heading", {name:"S1K — Chassis — Standard"});
+  expect(await screen.findByText("Engineering revision · Rev B")).toBeTruthy();
+  expect(await screen.findByText((_, element) => element?.tagName === "P" && Boolean(element.textContent?.includes("source baseline Rev A · current Rev B · draft")))).toBeTruthy();
+  expect(screen.getByText("established")).toBeTruthy();
+});
+
 it("shows saved MCL, Tool Shop and CNC mappings separately from baseline and pinned process lines", async () => {
   mocks.partDetails.mockResolvedValue({...details,
     manufacturingBaseline:{status:"not_established",message:"Manufacturing requirements are not yet established."},
@@ -107,6 +130,13 @@ it("shows saved MCL, Tool Shop and CNC mappings separately from baseline and pin
       ],
       historical:[{key:"unavailable",family:"MCL",description:"Saved flange",workbookName:"missing.ods",workbookPath:"old/missing.ods",sheet:"5. Material Cut List Price",row:9,sourceStatus:"unavailable",assignmentStatus:"unverifiable",details:[],provenance:{version:1,actor:"owner",reason:"Initial assignment"},semanticComparison:{status:"source_unavailable",message:"File no longer exists."}}]},
   });
+  mocks.mappedPartLines.mockResolvedValue({status:"partial",readOnly:true,baselineIndependent:true,
+    message:"Current source or mapping evidence is unavailable for one saved source file; retained assignments are historical and unverified.",
+    items:[
+      {key:"mcl",family:"MCL",description:"Plate blank",descriptionStatus:"available",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"5. Material Cut List Price",row:7,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"qty",label:"Quantity",status:"available",value:"2"},{field:"dimension_to_cut_mm",label:"Dimension",status:"blank",value:null}],provenance:{version:3,actor:"owner",reason:"Inline Part mapping",occurredAt:"2026-10-15T07:00:00Z"}},
+      {key:"tool",family:"Tool Shop",description:"Weld fixture",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"Tool Shop Items",row:12,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"toolshop_remarks",label:"Remarks",status:"blank",value:null}]},
+      {key:"cnc",family:"CNC",description:"Frame",workbookName:"pilot.ods",workbookPath:"costing/pilot.ods",sheet:"CNC Cut List",row:4,sourceStatus:"readable",assignmentStatus:"current",details:[{field:"thickness",label:"Thickness",status:"missing",value:null}]},
+    ],historical:[{key:"unavailable",family:"MCL",description:"Saved flange",workbookName:"missing.ods",workbookPath:"old/missing.ods",sheet:"5. Material Cut List Price",row:9,sourceStatus:"unavailable",assignmentStatus:"unverifiable",details:[],provenance:{version:1,actor:"owner",reason:"Initial assignment"},semanticComparison:{status:"source_unavailable",message:"File no longer exists."}}]});
   render(<PartsView/>);
   await screen.findByRole("treeitem", {name:/Product Model/});
   const productParent = screen.getAllByRole("treeitem", {name:/Safari 1000/}).find(item => item.getAttribute("aria-expanded") === "false");
@@ -693,6 +723,10 @@ it("requires an explicit workbook when several associated sources are available 
     {workbookPath:"pilot-a.ods",assignmentStatus:"current",sourceStatus:"readable"},
     {workbookPath:"pilot-b.ods",assignmentStatus:"current",sourceStatus:"readable"},
   ]}});
+  mocks.mappedPartLines.mockResolvedValue({status:"available",historical:[],items:[
+    {workbookPath:"pilot-a.ods",assignmentStatus:"current",sourceStatus:"readable"},
+    {workbookPath:"pilot-b.ods",assignmentStatus:"current",sourceStatus:"readable"},
+  ]});
   const review = vi.fn();
   render(<PartsView onReviewBaseline={review}/>);
   await screen.findByRole("treeitem", {name:/Product Model/});
@@ -701,6 +735,7 @@ it("requires an explicit workbook when several associated sources are available 
   fireEvent.click(screen.getByRole("treeitem", {name:/Safari 1000 HF/}));
   fireEvent.click(await screen.findByRole("treeitem", {name:/SM-P-000001/}));
   fireEvent.click(await screen.findByRole("button", {name:"Manufacturing baseline"}));
+  fireEvent.click(await screen.findByRole("button", {name:"Load comparison sources"}));
   const source = await screen.findByRole("combobox", {name:"Source workbook for Part baseline review"});
   await waitFor(() => expect((source as HTMLSelectElement).options).toHaveLength(3));
   expect((source as HTMLSelectElement).value).toBe("");

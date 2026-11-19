@@ -1,0 +1,1311 @@
+"""Direct, Grist-backed maintenance and controlled publication of Part definitions.
+
+The source workbook is retained as immutable provenance. This service reads and
+writes the accepted Safari definition only; opening the workbook is reserved for
+the explicit comparison workflow.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import timezone
+import json
+import math
+import os
+from typing import Any
+
+from app.exceptions import GristError
+from app.domain import utc_now
+from app.grist_parts import GristPartFeatures, GristPartRegistry, _ref, _serialized
+from app.grist_types import canonical_grist_json_cell, decode_grist_any_object, grist_datetime
+from app.part_identity import PartIdentityError, request_fingerprint
+
+
+FAMILY_PROCESS = {"mcl": "material_cut", "toolshop": "tool_shop", "cnc": "cnc"}
+ACTIVE_STATUSES = {"active", "accepted", "published", "finalized"}
+REMOVED_STATUSES = {"void", "removed", "inactive", "retired"}
+LINE_DETAIL_FIELDS = {
+    "ProcessType", "Material", "PurchaseItem", "ProcessOperation", "WorkCenter", "SourceDepartment",
+    "IssueRoute", "ActivityKind", "Quantity", "QuantityUOM", "DimensionMM", "DimensionInches",
+    "WeightGrams", "WeightKg", "PartWeightKg", "Length", "Width", "Thickness", "IssueSlipNo",
+    "IssueSlipDesc", "InternalMakingCost", "ExternalMachiningCost", "RateCached", "CostCached",
+    "ItemName", "MaterialDisplayName", "OptionGroup", "DimensionText", "DimensionUOM", "PlatePart",
+    "PartCategory", "ItemCode", "ExactQuantityText", "ExactWeightKgText", "WeightUOM",
+    "EngineeringAttributes", "ToolShopRemarks",
+}
+
+
+def _fields(row: dict[str, Any] | None) -> dict[str, Any]:
+    return row.get("fields", row) if row else {}
+
+
+def _int_ref(value: Any) -> int | None:
+    return _ref(value)
+
+
+def _json_cell(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return deepcopy(value)
+    return decode_grist_any_object(value)
+
+
+def _stable(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False)
+
+
+def _num(value: Any, *, allow_blank: bool = False) -> float | None:
+    if value in (None, "") and allow_blank:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _next_revision_label(value: Any) -> str:
+    label = str(value or "A").strip().upper()
+    if not label or not label.isalpha():
+        raise PartIdentityError("PART_REVISION_UNCLASSIFIED", "This legacy revision label is not a managed engineering revision. Review its classification before creating a successor.")
+    ordinal = 0
+    for char in label:
+        ordinal = ordinal * 26 + ord(char) - ord("A") + 1
+    ordinal += 1
+    output = ""
+    while ordinal:
+        ordinal, remainder = divmod(ordinal - 1, 26)
+        output = chr(ord("A") + remainder) + output
+    return output
+
+
+class GristPartDefinitionService:
+    """Read editable definitions, save drafts and publish approved successors."""
+
+    def __init__(self, registry: GristPartRegistry):
+        self.registry = registry
+        self.client = registry.client
+        self.features = GristPartFeatures(registry)
+
+    def _rows(self, table: str) -> list[dict[str, Any]]:
+        return self.registry._rows(table)
+
+    @staticmethod
+    def _missing_table(exc: Exception, table: str) -> bool:
+        message = str(exc).casefold()
+        return isinstance(exc, GristError) and ("404" in message or "not found" in message) and table.casefold() in message
+
+    def _optional_rows(self, table: str) -> list[dict[str, Any]]:
+        try:
+            return self._rows(table)
+        except Exception as exc:
+            if self._missing_table(exc, table):
+                return []
+            raise
+
+    def _require_publication_schema(self) -> None:
+        missing = []
+        for table in ("PartDefinitionDraft", "PartEngineeringChangeRequest", "PartDefinitionVersion", "PartDefinitionPublication"):
+            try:
+                self._rows(table)
+            except Exception as exc:
+                if self._missing_table(exc, table):
+                    missing.append(table)
+                else:
+                    raise
+        if missing:
+            raise PartIdentityError("PART_DEFINITION_SCHEMA_REQUIRED", "Apply the additive Part-definition maintenance schema before editing or publishing: " + ", ".join(missing))
+
+    def _publication_schema_available(self) -> bool:
+        for table in ("PartDefinitionDraft", "PartEngineeringChangeRequest", "PartDefinitionVersion", "PartDefinitionPublication"):
+            try:
+                self._rows(table)
+            except Exception as exc:
+                if self._missing_table(exc, table):
+                    return False
+                raise
+        return True
+
+    def _find(self, table: str, field: str, value: str) -> dict[str, Any] | None:
+        return self.registry._find(self._rows(table), field, value)
+
+    def _part_row(self, part_id: str) -> dict[str, Any]:
+        row = self._find("ProductPart", "StablePartId", str(part_id))
+        if not row:
+            raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
+        return row
+
+    def _current_revision(self, part_id: str) -> dict[str, Any]:
+        part = self.registry.get_part(part_id)
+        if not part:
+            raise PartIdentityError("PART_NOT_FOUND", "The selected Part no longer exists.")
+        row = next((item for item in self._rows("PartRevision") if int(item.get("id", -1)) == int(part["revisionRecordId"])), None)
+        if not row:
+            raise PartIdentityError("PART_REVISION_UNAVAILABLE", "The Part has no readable saved definition revision.")
+        return row
+
+    def _baseline(self, revision: dict[str, Any]) -> dict[str, Any] | None:
+        baseline_id = _int_ref(_fields(revision).get("ManufacturingBaseline"))
+        if not baseline_id:
+            return None
+        return next((row for row in self._rows("PartBaselineProcessing") if int(row.get("id", -1)) == baseline_id), None)
+
+    def _check_established(self, revision: dict[str, Any]) -> None:
+        baseline = self._baseline(revision)
+        if not baseline or str(_fields(baseline).get("Status") or "").casefold() != "established":
+            raise PartIdentityError("PART_BASELINE_REQUIRED", "Direct maintenance is available after the initial manufacturing baseline has been established. Use the existing establishment review for an unestablished Part.")
+
+    def _stored_version(self, revision_id: int) -> dict[str, Any] | None:
+        # Older additive schemas have no P1 tables yet. The accepted Rev A
+        # remains readable through the existing normalized Part tables.
+        rows = self._optional_rows("PartDefinitionVersion")
+        matches = [row for row in rows if _int_ref(_fields(row).get("PartRevision")) == revision_id]
+        if len(matches) > 1:
+            raise PartIdentityError("PART_DEFINITION_DUPLICATE", "More than one accepted definition snapshot points at this engineering revision.")
+        return matches[0] if matches else None
+
+    def _revision_history(self, part_record_id: int, current_id: int) -> list[dict[str, Any]]:
+        revisions = [row for row in self._rows("PartRevision") if _int_ref(_fields(row).get("ProductPart")) == part_record_id]
+        revisions.sort(key=lambda row: (int(_fields(row).get("Revision") or 0), int(row.get("id", 0))))
+        return [{"id": int(row["id"]), "revisionLabel": _fields(row).get("RevisionLabel") or _fields(row).get("Revision"),
+            "status": _fields(row).get("BaselineStatus") or _fields(row).get("Status") or "unclassified",
+            "definitionHash": _fields(row).get("DefinitionHash"), "reason": _fields(row).get("FinalizationReason") or _fields(row).get("Reason"),
+            "actor": _fields(row).get("FinalizedBy") or _fields(row).get("Actor"), "occurredAt": _fields(row).get("FinalizedAt") or _fields(row).get("OccurredAt"),
+            "previousRevisionId": _int_ref(_fields(row).get("PreviousRevision")), "publicationCause": _fields(row).get("PublicationCause"),
+            "current": int(row["id"]) == current_id} for row in revisions]
+
+    def _definition_from_rows(self, part_id: str, revision_id: int) -> dict[str, Any]:
+        part_row = self._part_row(part_id)
+        part_fields = _fields(part_row)
+        revision = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == revision_id), None)
+        if not revision:
+            raise PartIdentityError("PART_REVISION_UNAVAILABLE", "The selected saved Part revision could not be read.")
+        revision_fields = _fields(revision)
+        baseline = self._baseline(revision)
+        baseline_fields = _fields(baseline)
+        baseline_id = int(baseline["id"]) if baseline else None
+        family_rows = [row for row in self._rows("PartBaselineFamily") if _int_ref(_fields(row).get("BaselineProcessing")) == baseline_id] if baseline_id else []
+        applicability = {}
+        for family_row in family_rows:
+            fields = _fields(family_row)
+            family = str(fields.get("Family") or "").casefold()
+            if family in FAMILY_PROCESS:
+                status = str(fields.get("ApplicabilityStatus") or "unknown").casefold()
+                applicability[family] = {"applicable": status not in {"not_applicable", "excluded", "not applicable"},
+                    "status": status, "sourceEvidenceStatus": fields.get("SourceEvidenceStatus"),
+                    "completenessConfirmed": bool(fields.get("CompletenessConfirmed")), "requirementCount": fields.get("RequirementCount") or 0}
+        for family in FAMILY_PROCESS:
+            applicability.setdefault(family, {"applicable": None, "status": "unknown", "sourceEvidenceStatus": "unknown", "completenessConfirmed": False, "requirementCount": 0})
+
+        revisions = {int(row["id"]): _fields(row) for row in self._rows("LineRevision")}
+        masters = {int(row["id"]): _fields(row) for row in self._rows("LineMaster")}
+        details_by_revision: dict[int, list[dict[str, Any]]] = {}
+        for row in self._rows("LineDetail"):
+            fields = _fields(row)
+            line_revision_id = _int_ref(fields.get("LineRevision"))
+            if line_revision_id:
+                details_by_revision.setdefault(line_revision_id, []).append(fields)
+        source_observations = {int(row["id"]): _fields(row) for row in self._rows("SourceLineObservation")}
+        requirement_key_counts: dict[str, int] = {}
+        active_links = []
+        for row in self._rows("PartRevisionLine"):
+            link = _fields(row)
+            if _int_ref(link.get("PartRevision")) != revision_id or str(link.get("Status") or "active").casefold() in REMOVED_STATUSES:
+                continue
+            active_links.append((row, link))
+            raw_key = str(link.get("RequirementKey") or "")
+            if raw_key:
+                requirement_key_counts[raw_key] = requirement_key_counts.get(raw_key, 0) + 1
+        requirements = []
+        for link_row, link in active_links:
+            line_master_id, line_revision_id = _int_ref(link.get("LineMaster")), _int_ref(link.get("LineRevision"))
+            master, line_revision = masters.get(line_master_id or -1, {}), revisions.get(line_revision_id or -1, {})
+            details = details_by_revision.get(line_revision_id or -1, [])
+            detail = deepcopy(details[0]) if len(details) == 1 else {}
+            family = {"material_cut": "mcl", "tool_shop": "toolshop", "cnc": "cnc"}.get(str(link.get("ProcessType") or master.get("ProcessType") or detail.get("ProcessType") or "").casefold(), "other")
+            raw_key = str(link.get("RequirementKey") or "")
+            key = raw_key
+            identity_status = "stable" if raw_key else "legacy_unclassified"
+            legacy_requirement_key = None
+            if raw_key and requirement_key_counts.get(raw_key, 0) > 1:
+                # Keep every ambiguous historical occurrence visible and uniquely
+                # addressable in the draft UI without rewriting its old row.
+                key = f"legacy-duplicate-requirement:{part_id}:{revision_id}:{link_row.get('id')}"
+                identity_status = "legacy_duplicate_unclassified"
+                legacy_requirement_key = raw_key
+            elif not raw_key:
+                key = f"legacy-requirement:{part_id}:{revision_id}:{link.get('RevisionLineKey') or link_row.get('id')}"
+            detail.pop("DetailKey", None)
+            detail.pop("LineRevision", None)
+            detail.pop("RequestKey", None)
+            detail.pop("RequestFingerprint", None)
+            engineering = _json_cell(detail.get("EngineeringAttributes"))
+            detail["EngineeringAttributes"] = engineering or {}
+            for reference_field in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
+                detail[reference_field] = _int_ref(detail.get(reference_field))
+            provenance = {"type": link.get("ProvenanceType") or ("ods_baseline" if _int_ref(link.get("SourceLineObservation")) else "legacy_unclassified"),
+                "sourceObservationId": _int_ref(link.get("SourceLineObservation")), "evidence": _json_cell(link.get("ProvenanceEvidence")) or {}}
+            field_status = deepcopy((engineering or {}).get("fieldStatus", {}))
+            observation = source_observations.get(_int_ref(link.get("SourceLineObservation")) or -1, {})
+            observed = _json_cell(observation.get("ObservedFields")) or {}
+            cells = _json_cell(observation.get("Cells")) or {}
+            source_headers = cells.get("sourceHeaders") if isinstance(cells.get("sourceHeaders"), dict) else {}
+            remarks_key = "toolshop_remarks" if "toolshop_remarks" in observed else "toolshop_part_name"
+            remarks_present = remarks_key in observed and (remarks_key != "toolshop_part_name" or str(source_headers.get(remarks_key) or "").strip().casefold() == "remarks")
+            plate_present = "product_part_name" in observed
+            for field_name, source_present, source_value in (
+                ("ToolShopRemarks", remarks_present, observed.get(remarks_key)),
+                ("PlatePart", plate_present, observed.get("product_part_name")),
+            ):
+                if field_name not in field_status and source_present:
+                    field_status[field_name] = "blank" if source_value is None or not str(source_value).strip() else "value"
+                elif field_name not in field_status:
+                    field_status[field_name] = "missing"
+            requirements.append({"requirementKey": key, "legacyRequirementKey": legacy_requirement_key,
+                "identityStatus": identity_status, "family": family,
+                "lineMasterId": line_master_id, "lineRevisionId": line_revision_id,
+                "lineStatus": line_revision.get("Status") or "unclassified", "processType": link.get("ProcessType") or master.get("ProcessType") or family,
+                "quantity": link.get("QuantityExact") if link.get("QuantityExact") not in (None, "") else link.get("QuantityPerPart"),
+                "uom": link.get("QuantityUOM") or "", "sourcePartName": master.get("SourcePartName") or "",
+                "physicalSignature": line_revision.get("PhysicalSignature") or "", "detail": detail,
+                "fieldStatus": field_status, "provenance": provenance})
+
+        components = []
+        part_by_record = {int(row["id"]): _fields(row) for row in self._rows("ProductPart")}
+        revision_by_id = {int(row["id"]): _fields(row) for row in self._rows("PartRevision")}
+        meta_by_id = {int(row["id"]): _fields(row) for row in self._rows("PartMetadataVersion")}
+        for component_row in self._rows("PartComponentRevision"):
+            component = _fields(component_row)
+            if _int_ref(component.get("ParentRevision")) != revision_id or str(component.get("ComponentStatus") or component.get("Status") or "active").casefold() in REMOVED_STATUSES:
+                continue
+            child_revision_id = _int_ref(component.get("ChildRevision"))
+            child_revision = revision_by_id.get(child_revision_id or -1, {})
+            child_part_record = _int_ref(child_revision.get("ProductPart"))
+            child_part = part_by_record.get(child_part_record or -1, {})
+            child_meta = meta_by_id.get(_int_ref(child_part.get("CurrentMetadataVersion")) or -1, {})
+            identity = str(component.get("ComponentIdentity") or "")
+            components.append({"componentIdentity": identity or f"legacy-component:{part_id}:{revision_id}:{component.get('ComponentKey') or component_row.get('id')}",
+                "identityStatus": "stable" if identity else "legacy_unclassified", "componentRecordId": int(component_row["id"]),
+                "childPartId": child_part.get("StablePartId") or "", "childPartNumber": child_part.get("PartNumber") or "",
+                "childName": child_meta.get("DisplayName") or child_part.get("DisplayName") or "",
+                "childRevisionId": child_revision_id, "childRevisionLabel": child_revision.get("RevisionLabel") or child_revision.get("Revision"),
+                "quantity": component.get("Quantity"), "uom": component.get("QuantityUOM") or "", "sourcingRoute": component.get("SourcingRoute") or "auto",
+                "status": component.get("ComponentStatus") or component.get("Status") or "active", "provenance": component.get("Reason") or ""})
+
+        purchases = []
+        for purchase_row in self._rows("PartPurchaseSpecification"):
+            fields = _fields(purchase_row)
+            if _int_ref(fields.get("PartRevision")) != revision_id or str(fields.get("Status") or "active").casefold() != "active":
+                continue
+            identity = str(fields.get("SpecificationIdentity") or "")
+            purchases.append({"specificationIdentity": identity or f"legacy-specification:{fields.get('SpecificationKey') or purchase_row.get('id')}",
+                "identityStatus": "stable" if identity else "legacy_unclassified", "specificationRecordId": int(purchase_row["id"]),
+                "specificationKey": fields.get("SpecificationKey"), "purchaseItemId": _int_ref(fields.get("PurchaseItem")),
+                "code": fields.get("SpecificationCode") or "", "manufacturer": fields.get("Manufacturer") or "",
+                "manufacturerPartNumber": fields.get("ManufacturerPartNumber") or "", "description": fields.get("Description") or "",
+                "attributes": _json_cell(fields.get("Attributes")) or {}, "costingUOM": fields.get("CostingUOM") or "",
+                "costingCurrency": fields.get("CostingCurrency") or "", "status": fields.get("Status") or "active"})
+
+        saved = self._stored_version(revision_id)
+        if saved:
+            snapshot = _json_cell(_fields(saved).get("Content"))
+            if not snapshot:
+                raise PartIdentityError("PART_DEFINITION_UNREADABLE", "The accepted Part-definition snapshot is not valid canonical JSON.")
+            # The normalized records remain the costing source. This immutable
+            # snapshot supplies complete applicability, identity and provenance.
+            applicability = snapshot.get("applicability", applicability)
+        return {"partId": part_id, "partNumber": part_fields.get("PartNumber"), "partName": part_fields.get("DisplayName") or "",
+            "partRecordId": int(part_row["id"]), "revisionId": revision_id,
+            "revisionLabel": revision_fields.get("RevisionLabel") or revision_fields.get("Revision") or "A",
+            "revisionStatus": revision_fields.get("BaselineStatus") or revision_fields.get("Status") or "draft",
+            "revisionHistory": self._revision_history(int(part_row["id"]), revision_id),
+            "baselineStatus": baseline_fields.get("Status") or "not_established", "source": {"workbookName": baseline_fields.get("WorkbookName"),
+                "workbookPath": baseline_fields.get("WorkbookPath"), "sourceHash": baseline_fields.get("SourceHash"), "readOnly": True},
+            "applicability": applicability, "requirements": requirements, "components": components, "purchases": purchases,
+            "finalizeOnPublication": str(revision_fields.get("BaselineStatus") or "draft").casefold() == "finalized",
+            "contentFingerprint": request_fingerprint({"applicability": applicability, "requirements": requirements, "components": components, "purchases": purchases})}
+
+    def get_definition(self, part_id: str, *, actor: str = "") -> dict[str, Any]:
+        part = self._part_row(part_id)
+        revision = self._current_revision(part_id)
+        self._check_established(revision)
+        definition = self._definition_from_rows(part_id, int(revision["id"]))
+        draft_rows = self._optional_rows("PartDefinitionDraft")
+        cr_rows = self._optional_rows("PartEngineeringChangeRequest")
+        publication_schema_available = self._publication_schema_available()
+        drafts = [row for row in draft_rows if _int_ref(_fields(row).get("ProductPart")) == int(part["id"])
+            and str(_fields(row).get("Status") or "open").casefold() == "open"]
+        draft = max(drafts, key=lambda row: int(_fields(row).get("SaveVersion") or 0)) if drafts else None
+        if draft:
+            content = _json_cell(_fields(draft).get("Content"))
+            definition["draft"] = {"draftKey": _fields(draft).get("DraftKey"), "saveVersion": _fields(draft).get("SaveVersion"),
+                "baseRevisionId": _int_ref(_fields(draft).get("BaseRevision")), "content": content,
+                "reason": _fields(draft).get("Reason") or "", "updatedAt": _fields(draft).get("UpdatedAt"),
+                "stale": _int_ref(_fields(draft).get("BaseRevision")) != int(revision["id"])}
+        part_requests = [row for row in cr_rows
+            if _int_ref(_fields(row).get("ProductPart")) == int(part["id"])
+            and str(_fields(row).get("Status") or "").casefold() in {"pending_approval", "approved", "publishing", "publication_failed"}]
+        definition["pendingChangeRequests"] = [{"key": _fields(row).get("ChangeRequestKey"), "status": _fields(row).get("Status"),
+            "reason": _fields(row).get("Reason"), "createdAt": _fields(row).get("CreatedAt"),
+            "approvedBy": _fields(row).get("ApprovedBy"), "approvedAt": _fields(row).get("ApprovedAt"),
+            "impact": _json_cell(_fields(row).get("ImpactPreview")) or {}}
+            for row in sorted(part_requests, key=lambda item: str(_fields(item).get("CreatedAt") or ""), reverse=True)]
+        definition["canApprove"] = publication_schema_available and str(actor or "").strip().casefold() == os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold()
+        definition["actions"] = {"editPart": publication_schema_available, "revisionHistory": True, "compareWithOds": True,
+            "publicationSchemaAvailable": publication_schema_available,
+            "comparisonSourceAvailable": bool(definition["source"].get("workbookPath"))}
+        return definition
+
+    def options(self, part_id: str) -> dict[str, Any]:
+        self._check_established(self._current_revision(part_id))
+        parts = [{"id": _fields(row).get("StablePartId"), "partNumber": _fields(row).get("PartNumber"), "name": _fields(row).get("DisplayName") or ""}
+            for row in self._rows("ProductPart") if _fields(row).get("StablePartId") and str(_fields(row).get("Status") or "active").casefold() == "active"]
+        materials = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("MaterialDisplayName") or "", "code": _fields(row).get("Code") or ""}
+            for row in self._rows("Material")]
+        purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
+            for row in self._rows("PurchaseItem")]
+        return {"parts": sorted(parts, key=lambda item: str(item["partNumber"])), "materials": sorted(materials, key=lambda item: str(item["name"]).casefold()),
+            "purchaseItems": sorted(purchase_items, key=lambda item: str(item["name"]).casefold()), "families": list(FAMILY_PROCESS)}
+
+    def _normalize_content(self, part_id: str, base_revision_id: int, payload: dict[str, Any], request_key: str) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "A complete Part definition object is required.")
+        base = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == base_revision_id), None)
+        if not base or _int_ref(_fields(base).get("ProductPart")) != int(self._part_row(part_id)["id"]):
+            raise PartIdentityError("PART_REVISION_MISMATCH", "The saved base revision does not belong to this Part.")
+        current = self._definition_from_rows(part_id, base_revision_id)
+        raw_app = payload.get("applicability")
+        if not isinstance(raw_app, dict):
+            raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "Save an explicit applicability choice for MCL, Tool Shop and CNC.")
+        applicability = {}
+        for family in FAMILY_PROCESS:
+            item = raw_app.get(family)
+            if isinstance(item, bool):
+                applicable = item
+                status = "applicable" if item else "not_applicable"
+            elif isinstance(item, dict) and type(item.get("applicable")) is bool:
+                applicable = bool(item["applicable"])
+                status = "applicable" if applicable else "not_applicable"
+            else:
+                raise PartIdentityError("PART_DEFINITION_APPLICABILITY_INVALID", f"Choose whether {family} applies to this Part.")
+            applicability[family] = {"applicable": applicable, "status": status}
+
+        raw_requirements = payload.get("requirements")
+        raw_components = payload.get("components")
+        raw_purchases = payload.get("purchases", [])
+        if not isinstance(raw_requirements, list) or not isinstance(raw_components, list) or not isinstance(raw_purchases, list):
+            raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "Requirements, components and purchase specifications must be lists.")
+        existing_by_key = {str(item.get("requirementKey")): item for item in current["requirements"]}
+        seen_requirements: set[str] = set()
+        requirements = []
+        for index, raw in enumerate(raw_requirements):
+            if not isinstance(raw, dict):
+                raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "Each requirement must be a saved requirement object.")
+            family = str(raw.get("family") or "").strip().casefold()
+            key = str(raw.get("requirementKey") or f"authored-requirement:{request_fingerprint([part_id, base_revision_id, request_key, index])}").strip()
+            existing = existing_by_key.get(key)
+            submitted_identity_status = str(raw.get("identityStatus") or "").casefold()
+            if raw.get("legacyRequirementKey") and not (existing and submitted_identity_status == "legacy_duplicate_unclassified"):
+                if not (submitted_identity_status == "safari_authored" and key.startswith("safari-authored-requirement:") and not existing):
+                    raise PartIdentityError("PART_DEFINITION_LEGACY_IDENTITY_REVIEW_REQUIRED", "Assign a reviewed new requirement identity to this ambiguous legacy occurrence before changing its identity.")
+            if existing and existing.get("identityStatus") == "legacy_duplicate_unclassified" and submitted_identity_status != "legacy_duplicate_unclassified":
+                raise PartIdentityError("PART_DEFINITION_LEGACY_IDENTITY_REVIEW_REQUIRED", "An ambiguous legacy occurrence can only be reclassified with a new Safari-authored requirement identity.")
+            if family not in FAMILY_PROCESS and not (family == "other" and existing and raw.get("lineRevisionId") == existing.get("lineRevisionId")):
+                raise PartIdentityError("PART_DEFINITION_FAMILY_INVALID", "New direct requirements must belong to MCL, Tool Shop or CNC. Existing other-process lines can only be preserved unchanged.")
+            if family in FAMILY_PROCESS and not applicability[family]["applicable"]:
+                raise PartIdentityError("PART_DEFINITION_FAMILY_NOT_APPLICABLE", f"Mark {family} applicable before adding requirements to it.")
+            if key in seen_requirements:
+                raise PartIdentityError("PART_DEFINITION_IDENTITY_DUPLICATE", "Requirement identities must be unique within one Part revision.")
+            seen_requirements.add(key)
+            quantity = _num(raw.get("quantity"), allow_blank=True)
+            uom = str(raw.get("uom") or "").strip()
+            if quantity is None and (not existing or raw.get("lineRevisionId") != existing.get("lineRevisionId")):
+                raise PartIdentityError("PART_DEFINITION_QUANTITY_INVALID", "New or changed requirements need a finite positive quantity.")
+            if quantity is not None and quantity <= 0:
+                raise PartIdentityError("PART_DEFINITION_QUANTITY_INVALID", "Requirement quantities must be finite and greater than zero.")
+            if not uom and not existing:
+                raise PartIdentityError("PART_DEFINITION_UOM_REQUIRED", "New requirements need a quantity unit.")
+            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+            detail = {str(name): deepcopy(value) for name, value in detail.items() if str(name) in LINE_DETAIL_FIELDS}
+            for name in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
+                if name in detail:
+                    detail[name] = _int_ref(detail[name])
+            for name in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
+                ref = _int_ref(detail.get(name))
+                if detail.get(name) not in (None, "") and ref is None:
+                    raise PartIdentityError("PART_DEFINITION_IDENTITY_INVALID", f"{name} must reference an existing Safari identity.")
+                if ref is not None and not any(int(row.get("id", -1)) == ref for row in self._rows(name)):
+                    raise PartIdentityError("PART_DEFINITION_IDENTITY_UNRESOLVED", f"The selected {name} identity is not available in Safari Grist.")
+            dimension_uom = str(detail.get("DimensionUOM") or "").strip().casefold()
+            dimensions = [_num(detail.get(name), allow_blank=True) for name in ("Length", "Width", "Thickness")]
+            unchanged_legacy_line = bool(existing and _int_ref(raw.get("lineRevisionId")) == _int_ref(existing.get("lineRevisionId")))
+            if any(value is not None and value <= 0 for value in dimensions) and not unchanged_legacy_line:
+                raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
+            if any(value is not None for value in dimensions) and (not all(value is not None for value in dimensions) or dimension_uom not in {"mm", "millimeter", "millimeters", "in", "inch", "inches"}) and not unchanged_legacy_line:
+                raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "Length, width and thickness must be supplied together with a supported mm or inch unit.")
+            for name in ("Quantity", "DimensionMM", "DimensionInches", "WeightGrams", "WeightKg", "PartWeightKg",
+                         "Length", "Width", "Thickness", "InternalMakingCost", "ExternalMachiningCost", "RateCached", "CostCached"):
+                if name not in detail or detail[name] in (None, ""):
+                    continue
+                numeric = _num(detail[name])
+                if numeric is None or (name in {"Quantity", "Length", "Width", "Thickness"} and numeric <= 0):
+                    if unchanged_legacy_line:
+                        continue
+                    raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite positive number where supplied.")
+                detail[name] = numeric
+            process_type = FAMILY_PROCESS.get(family) or str(raw.get("processType") or (existing or {}).get("processType") or "")
+            if family in FAMILY_PROCESS:
+                detail["ProcessType"] = process_type
+            field_status = deepcopy(raw.get("fieldStatus") or {})
+            for name in ("ToolShopRemarks", "PlatePart", "DimensionText", "ItemCode", "ItemName", "MaterialDisplayName"):
+                if name in detail:
+                    if detail[name] in (None, ""):
+                        field_status[name] = "missing" if field_status.get(name) == "missing" else "blank"
+                    else:
+                        field_status[name] = "value"
+            engineering = _json_cell(detail.get("EngineeringAttributes")) or {}
+            engineering["fieldStatus"] = field_status
+            detail["EngineeringAttributes"] = canonical_grist_json_cell(engineering)
+            requirements.append({"requirementKey": key, "identityStatus": raw.get("identityStatus") or ("stable" if existing else "safari_authored"),
+                "family": family, "lineMasterId": _int_ref(raw.get("lineMasterId")), "lineRevisionId": _int_ref(raw.get("lineRevisionId")),
+                "processType": process_type, "quantity": quantity, "quantityExact": str(raw.get("quantityExact") or ("" if quantity is None else str(raw.get("quantity")))),
+                "uom": uom, "detail": detail, "provenance": deepcopy(raw.get("provenance") or {"type": "safari_authored", "evidence": {}}),
+                "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status})
+
+        parts_by_stable = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
+        current_parts = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
+        revisions_by_id = {int(row["id"]): _fields(row) for row in self._rows("PartRevision")}
+        existing_components = {str(item.get("componentIdentity")): item for item in current["components"]}
+        component_keys: set[str] = set()
+        components = []
+        seen_child_ids: set[str] = set()
+        for index, raw in enumerate(raw_components):
+            if not isinstance(raw, dict):
+                raise PartIdentityError("PART_COMPONENT_INPUT_INVALID", "Each component must identify a managed child Part.")
+            child_id = str(raw.get("childPartId") or "").strip()
+            child = parts_by_stable.get(child_id)
+            quantity = _num(raw.get("quantity"))
+            uom = str(raw.get("uom") or "").strip()
+            route = str(raw.get("sourcingRoute") or "auto").casefold()
+            identity = str(raw.get("componentIdentity") or f"authored-component:{request_fingerprint([part_id, base_revision_id, request_key, index])}").strip()
+            if not child or child_id == part_id or quantity is None or quantity <= 0 or not uom or route not in {"auto", "make", "buy"} or identity in component_keys:
+                raise PartIdentityError("PART_COMPONENT_INPUT_INVALID", "Components need a unique occurrence identity, other managed Part, positive quantity, unit and auto/make/buy route.")
+            component_keys.add(identity)
+            previous = existing_components.get(identity)
+            if previous and previous.get("childPartId") != child_id:
+                raise PartIdentityError("PART_COMPONENT_IDENTITY_REUSE", "Changing a component identity to a different Part is not allowed; remove the old occurrence and add a distinct reviewed requirement.")
+            current_child_revision_id = int(_int_ref(_fields(child).get("CurrentPartRevision")) or 0)
+            requested_revision = _int_ref(raw.get("childRevisionId"))
+            if previous and requested_revision and requested_revision != _int_ref(previous.get("childRevisionId")):
+                raise PartIdentityError("PART_COMPONENT_REVISION_UNAUTHORIZED", "A dependent child revision pin can change only through the reviewed propagation closure.")
+            if requested_revision and requested_revision != current_child_revision_id and not previous:
+                raise PartIdentityError("PART_COMPONENT_REVISION_STALE", "New component occurrences must pin the current accepted child revision.")
+            child_revision_id = _int_ref(previous.get("childRevisionId")) if previous else current_child_revision_id
+            if not child_revision_id:
+                raise PartIdentityError("PART_COMPONENT_REVISION_UNAVAILABLE", "The selected child Part has no current accepted revision.")
+            if _int_ref(revisions_by_id.get(child_revision_id, {}).get("ProductPart")) != int(child["id"]):
+                raise PartIdentityError("PART_COMPONENT_REVISION_MISMATCH", "The selected child revision does not belong to the chosen canonical Part.")
+            components.append({"componentIdentity": identity, "identityStatus": raw.get("identityStatus") or ("stable" if previous else "safari_authored"),
+                "childPartId": child_id, "childPartRecordId": int(child["id"]), "childRevisionId": child_revision_id,
+                "quantity": quantity, "uom": uom, "sourcingRoute": route, "status": "active", "provenance": str(raw.get("provenance") or "Safari-authored Part requirement")})
+            seen_child_ids.add(child_id)
+        # A Stores issue route is a line-level issue instruction. It never
+        # creates or implies a separately purchased component requirement.
+        adjacency: dict[str, set[str]] = {}
+        for row in self._rows("ProductPart"):
+            parent_id = str(_fields(row).get("StablePartId") or "")
+            if not parent_id:
+                continue
+            current_revision_id = _int_ref(_fields(row).get("CurrentPartRevision"))
+            adjacency[parent_id] = set()
+            for component_row in self._rows("PartComponentRevision"):
+                fields = _fields(component_row)
+                if _int_ref(fields.get("ParentRevision")) != current_revision_id or str(fields.get("ComponentStatus") or fields.get("Status") or "active").casefold() in REMOVED_STATUSES:
+                    continue
+                child_rev = revisions_by_id.get(_int_ref(fields.get("ChildRevision")) or -1, {})
+                child_part_record = _int_ref(child_rev.get("ProductPart"))
+                child_part = next((item for item in self._rows("ProductPart") if int(item.get("id", -1)) == child_part_record), None)
+                child_stable = str(_fields(child_part).get("StablePartId") or "") if child_part else ""
+                if child_stable:
+                    adjacency[parent_id].add(child_stable)
+        adjacency[part_id] = {item["childPartId"] for item in components}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        def visit(node: str) -> None:
+            if node in visiting:
+                raise PartIdentityError("PART_COMPONENT_CYCLE", "These requirements would create a recursive current Part composition cycle.")
+            if node in visited:
+                return
+            visiting.add(node)
+            for child_id in adjacency.get(node, set()):
+                visit(child_id)
+            visiting.remove(node)
+            visited.add(node)
+        for node in adjacency:
+            visit(node)
+
+        existing_purchases = {str(item.get("specificationIdentity")): item for item in current["purchases"]}
+        purchase_items = {int(row["id"]): row for row in self._rows("PurchaseItem")}
+        purchase_ids: set[str] = set()
+        purchases = []
+        for index, raw in enumerate(raw_purchases):
+            if not isinstance(raw, dict):
+                raise PartIdentityError("PART_PURCHASE_SPEC_INPUT_INVALID", "Each purchase specification must be an object.")
+            identity = str(raw.get("specificationIdentity") or f"authored-specification:{request_fingerprint([part_id, base_revision_id, request_key, index])}").strip()
+            item_id = _int_ref(raw.get("purchaseItemId"))
+            if identity in purchase_ids or (item_id is not None and item_id not in purchase_items):
+                raise PartIdentityError("PART_PURCHASE_IDENTITY_INVALID", "Choose unique stable purchase identities and an existing Safari PurchaseItem.")
+            purchase_ids.add(identity)
+            old = existing_purchases.get(identity)
+            if old and old.get("purchaseItemId") != item_id:
+                raise PartIdentityError("PART_PURCHASE_IDENTITY_REUSE", "A purchase specification identity cannot be reassigned to a different canonical PurchaseItem.")
+            code, uom, currency = str(raw.get("code") or "").strip(), str(raw.get("costingUOM") or "").strip(), str(raw.get("costingCurrency") or "INR").strip().upper()
+            if not code or not uom or not currency:
+                raise PartIdentityError("PART_PURCHASE_SPEC_INPUT_INVALID", "Purchase specification code, costing unit and currency are required.")
+            purchases.append({"specificationIdentity": identity, "identityStatus": raw.get("identityStatus") or ("stable" if old else "safari_authored"),
+                "purchaseItemId": item_id, "code": code, "manufacturer": str(raw.get("manufacturer") or "").strip(),
+                "manufacturerPartNumber": str(raw.get("manufacturerPartNumber") or "").strip(), "description": str(raw.get("description") or "").strip(),
+                "attributes": deepcopy(raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}), "costingUOM": uom,
+                "costingCurrency": currency, "status": "active"})
+        return {"applicability": applicability, "requirements": requirements, "components": components, "purchases": purchases,
+            "finalizeOnPublication": bool(payload.get("finalizeOnPublication", current.get("finalizeOnPublication", False))),
+            "baseRevisionId": base_revision_id, "partId": part_id}
+
+    @_serialized
+    def save_draft(self, part_id: str, payload: dict[str, Any], *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
+        self.registry._verify_writer()
+        self._require_publication_schema()
+        part_row = self._part_row(part_id)
+        current = self._current_revision(part_id)
+        self._check_established(current)
+        base_revision_id = _int_ref(payload.get("baseRevisionId"))
+        if base_revision_id != int(current["id"]):
+            raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The Part's accepted revision changed. Reload its current definition before saving a draft.")
+        if not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_DEFINITION_INPUT_REQUIRED", "A reason, trusted actor and idempotency key are required to save a draft.")
+        content = self._normalize_content(part_id, base_revision_id, payload, request_key)
+        content_fingerprint = request_fingerprint(content)
+        operation_fingerprint = request_fingerprint([part_id, base_revision_id, content_fingerprint, actor.strip(), reason.strip()])
+        request = self.registry._begin_request(request_key, "part_definition_draft_save", operation_fingerprint, part_id)
+        old_result = self._request_result(request)
+        if old_result is not None:
+            return old_result
+        draft_key = f"part-definition-draft:{part_id}:{base_revision_id}"
+        for old_draft in self._rows("PartDefinitionDraft"):
+            old_fields = _fields(old_draft)
+            if (_int_ref(old_fields.get("ProductPart")) == int(part_row["id"])
+                    and str(old_fields.get("Status") or "open").casefold() == "open"
+                    and _int_ref(old_fields.get("BaseRevision")) != base_revision_id):
+                self.client.update_table_records("PartDefinitionDraft", [{"id": int(old_draft["id"]), "fields": {
+                    "Status": "stale", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                    "RequestFingerprint": request_fingerprint([old_fields.get("DraftKey"), "stale", base_revision_id])}}])
+        draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+        now = grist_datetime(utc_now())
+        if draft:
+            fields = _fields(draft)
+            if _int_ref(fields.get("BaseRevision")) != base_revision_id:
+                raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The saved draft belongs to another accepted Part revision.")
+            save_version = int(fields.get("SaveVersion") or 0) + 1
+            self.client.update_table_records("PartDefinitionDraft", [{"id": int(draft["id"]), "fields": {
+                "SaveVersion": save_version, "Status": "open", "Content": canonical_grist_json_cell(content),
+                "ContentFingerprint": content_fingerprint, "Actor": actor.strip(), "Reason": reason.strip(),
+                "UpdatedAt": now, "RequestKey": request_key, "RequestFingerprint": operation_fingerprint}}])
+        else:
+            save_version = 1
+            draft = self.registry._ensure_keyed("PartDefinitionDraft", "DraftKey", draft_key, {
+                "DraftKey": draft_key, "ProductPart": int(part_row["id"]), "BaseRevision": base_revision_id,
+                "SaveVersion": save_version, "Status": "open", "Content": canonical_grist_json_cell(content),
+                "ContentFingerprint": content_fingerprint, "Actor": actor.strip(), "Reason": reason.strip(),
+                "CreatedAt": now, "UpdatedAt": now, "RequestKey": request_key, "RequestFingerprint": operation_fingerprint})
+        result = {"draftKey": draft_key, "saveVersion": save_version, "baseRevisionId": base_revision_id,
+            "contentFingerprint": content_fingerprint, "content": content, "status": "saved"}
+        self.registry._complete_request(request, result)
+        return result
+
+    def _request_result(self, request: dict[str, Any]) -> dict[str, Any] | None:
+        fields = _fields(request)
+        if str(fields.get("Status") or "").casefold() != "published":
+            return None
+        value = fields.get("Result")
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _current_graph(self) -> dict[str, Any]:
+        parts = self._rows("ProductPart")
+        revisions = self._rows("PartRevision")
+        current_by_part = {int(row["id"]): _int_ref(_fields(row).get("CurrentPartRevision")) for row in parts}
+        part_by_record = {int(row["id"]): _fields(row) for row in parts}
+        part_by_stable = {str(_fields(row).get("StablePartId") or ""): row for row in parts if _fields(row).get("StablePartId")}
+        revision_by_id = {int(row["id"]): _fields(row) for row in revisions}
+        current_by_stable = {str(_fields(row).get("StablePartId") or ""): current_by_part.get(int(row["id"])) for row in parts if _fields(row).get("StablePartId")}
+        edges = []
+        for row in self._rows("PartComponentRevision"):
+            fields = _fields(row)
+            if str(fields.get("ComponentStatus") or fields.get("Status") or "active").casefold() in REMOVED_STATUSES:
+                continue
+            parent_revision = _int_ref(fields.get("ParentRevision"))
+            child_revision = _int_ref(fields.get("ChildRevision"))
+            parent_fields = revision_by_id.get(parent_revision or -1, {})
+            child_fields = revision_by_id.get(child_revision or -1, {})
+            parent_part_id, child_part_id = _int_ref(parent_fields.get("ProductPart")), _int_ref(child_fields.get("ProductPart"))
+            if not parent_part_id or not child_part_id:
+                continue
+            parent_part, child_part = part_by_record.get(parent_part_id, {}), part_by_record.get(child_part_id, {})
+            edges.append({"rowId": int(row["id"]), "parentPartRecordId": parent_part_id, "parentPartId": str(parent_part.get("StablePartId") or ""),
+                "parentRevisionId": parent_revision, "childPartRecordId": child_part_id, "childPartId": str(child_part.get("StablePartId") or ""),
+                "childRevisionId": child_revision, "quantity": fields.get("Quantity"), "uom": fields.get("QuantityUOM"),
+                "identity": fields.get("ComponentIdentity"), "route": fields.get("SourcingRoute"), "isCurrentParent": current_by_part.get(parent_part_id) == parent_revision,
+                "isCurrentChildPin": current_by_part.get(child_part_id) == child_revision,
+                "parentKind": str(parent_part.get("IdentityKind") or "part").casefold()})
+        configs = self._rows("CostingConfiguration")
+        config_revisions = self._rows("CostingConfigurationRevision")
+        selections = self._rows("ConfigurationPartSelection")
+        codes = {int(row["id"]): _fields(row) for row in self._rows("ProductModelCode")}
+        active_configs_by_code: dict[int, list[dict[str, Any]]] = {}
+        for row in configs:
+            config_fields = _fields(row)
+            code_id = _int_ref(config_fields.get("ProductModelCode"))
+            if code_id and str(config_fields.get("Status") or "active").casefold() == "active":
+                active_configs_by_code.setdefault(code_id, []).append(row)
+        config_by_code = {code_id: rows[0] for code_id, rows in active_configs_by_code.items()}
+        revision_by_config = {int(row["id"]): row for row in config_revisions}
+        current_configs = []
+        for code_id, config in config_by_code.items():
+            if not code_id:
+                continue
+            config_fields = _fields(config)
+            current_revision_id = _int_ref(config_fields.get("CurrentRevision"))
+            revision = revision_by_config.get(current_revision_id or -1)
+            if not revision or str(_fields(revision).get("Status") or "").casefold() != "published":
+                continue
+            for selection in selections:
+                fields = _fields(selection)
+                if _int_ref(fields.get("ConfigurationRevision")) != current_revision_id or str(fields.get("Status") or "active").casefold() in REMOVED_STATUSES:
+                    continue
+                part_record_id = _int_ref(fields.get("ProductPart"))
+                if not part_record_id:
+                    continue
+                part_fields = part_by_record.get(part_record_id, {})
+                current_configs.append({"codeRecordId": code_id, "code": codes.get(code_id, {}).get("Code") or "", "configRecordId": int(config["id"]),
+                    "configRevisionId": current_revision_id, "selectionRecordId": int(selection["id"]),
+                    "selectionIdentity": fields.get("SelectionIdentity") or fields.get("SelectionKey"),
+                    "partRecordId": part_record_id, "partId": str(part_fields.get("StablePartId") or ""),
+                    "partRevisionId": _int_ref(fields.get("PartRevision")) or current_by_part.get(part_record_id),
+                    "quantity": fields.get("Quantity"), "uom": fields.get("QuantityUOM"), "route": fields.get("SourcingRoute"),
+                    "label": fields.get("OccurrenceLabel"), "optionGroup": fields.get("OptionGroup"),
+                    "configurationRevisionNumber": _fields(revision).get("Revision")})
+        generation = request_fingerprint({"parts": [(int(row["id"]), _int_ref(_fields(row).get("CurrentPartRevision"))) for row in parts],
+            "components": [{k: edge[k] for k in ("rowId", "parentRevisionId", "childRevisionId", "quantity", "uom", "identity")} for edge in edges],
+            "configurations": current_configs})
+        return {"parts": parts, "partByRecord": part_by_record, "partByStable": part_by_stable, "currentByPart": current_by_part,
+            "currentByStable": current_by_stable, "revisionById": revision_by_id, "edges": edges,
+            "configs": current_configs, "configRows": configs, "configRevisionRows": config_revisions, "selectionRows": selections,
+            "activeConfigConflicts": {code_id: [int(row["id"]) for row in rows]
+                for code_id, rows in active_configs_by_code.items() if len(rows) > 1}, "generation": generation}
+
+    def impact_preview(self, part_id: str, content: dict[str, Any] | None = None) -> dict[str, Any]:
+        current = self._current_revision(part_id)
+        graph = self._current_graph()
+        target = self._part_row(part_id)
+        target_record = int(target["id"])
+        target_revision = int(current["id"])
+        parent_paths: dict[int, dict[str, tuple[str, ...]]] = {}
+        parent_edge_paths: dict[int, dict[str, tuple[int, ...]]] = {}
+        edges_by_id = {edge["rowId"]: edge for edge in graph["edges"]}
+        parent_order: list[int] = []
+        unknown = []
+        for code_record_id, config_ids in graph.get("activeConfigConflicts", {}).items():
+            unknown.append({"code": "ACTIVE_CONFIGURATION_DUPLICATE", "modelCodeRecordId": code_record_id,
+                "configurationRecordIds": config_ids})
+        path_queue: list[tuple[int, tuple[str, ...], tuple[int, ...]]] = [(target_record, (part_id,), ())]
+        seen_paths: set[tuple[int, tuple[str, ...], tuple[int, ...]]] = set()
+        while path_queue:
+            child_record, path, edge_path = path_queue.pop(0)
+            path_state = (child_record, path, edge_path)
+            if path_state in seen_paths:
+                continue
+            seen_paths.add(path_state)
+            child_current_revision = graph["currentByPart"].get(child_record)
+            for edge in graph["edges"]:
+                if (not edge["isCurrentParent"] or edge["childPartRecordId"] != child_record
+                        or edge["childRevisionId"] != child_current_revision):
+                    continue
+                parent_record = edge["parentPartRecordId"]
+                parent_path = (str(edge["parentPartId"]), *path)
+                next_edge_path = (*edge_path, int(edge["rowId"]))
+                if str(edge["parentPartId"]) in path:
+                    unknown.append({"code": "DEPENDENCY_GRAPH_CYCLE", "partId": edge["parentPartId"], "path": list(parent_path)})
+                    continue
+                if edge["parentKind"] == "assembly":
+                    path_signature = _stable([[(edges_by_id[edge_id].get("parentPartId"), edges_by_id[edge_id].get("identity") or edges_by_id[edge_id].get("rowId"), edges_by_id[edge_id].get("childPartId")) for edge_id in next_edge_path]])
+                    parent_paths.setdefault(parent_record, {})[path_signature] = parent_path
+                    parent_edge_paths.setdefault(parent_record, {})[path_signature] = next_edge_path
+                    if not edge.get("identity"):
+                        unknown.append({"code": "DEPENDENCY_EDGE_IDENTITY_UNCLASSIFIED", "parentPartId": edge["parentPartId"],
+                            "childPartId": edge["childPartId"], "componentRecordId": edge["rowId"], "path": list(parent_path)})
+                    if parent_record not in parent_order:
+                        parent_order.append(parent_record)
+                    path_queue.append((parent_record, parent_path, next_edge_path))
+                else:
+                    unknown.append({"code": "NON_ASSEMBLY_COMPOSITE_COVERAGE_UNSUPPORTED", "parentPartId": edge["parentPartId"], "path": list(parent_path)})
+        affected_parts = []
+        proposed_labels: dict[int, str | None] = {target_record: None}
+        for record_id in parent_order:
+            paths = parent_paths[record_id]
+            row = next((item for item in graph["parts"] if int(item["id"]) == record_id), None)
+            stable_id = str(_fields(row).get("StablePartId") or "") if row else ""
+            revision_id = graph["currentByPart"].get(record_id)
+            revision = graph["revisionById"].get(revision_id or -1, {})
+            label = _fields(revision).get("RevisionLabel") or _fields(revision).get("Revision")
+            try:
+                proposed_label = _next_revision_label(label or "A")
+            except PartIdentityError:
+                proposed_label = None
+                unknown.append({"code": "UNCLASSIFIED_DEPENDENT_REVISION", "partId": stable_id, "revisionLabel": label})
+            proposed_labels[record_id] = proposed_label
+            affected_parts.append({"partRecordId": record_id, "partId": stable_id, "partNumber": _fields(row).get("PartNumber") if row else "",
+                "currentRevisionId": revision_id, "currentRevisionLabel": label, "proposedRevisionLabel": proposed_label,
+                "paths": [list(path) for _, path in sorted(paths.items())], "status": "current_assembly"})
+        target_revision_fields = _fields(current)
+        try:
+            proposed_target_label = _next_revision_label(target_revision_fields.get("RevisionLabel") or target_revision_fields.get("Revision") or "A")
+        except PartIdentityError:
+            proposed_target_label = None
+            unknown.append({"code": "UNCLASSIFIED_TARGET_REVISION", "partId": part_id, "revisionLabel": target_revision_fields.get("RevisionLabel") or target_revision_fields.get("Revision")})
+        proposed_labels[target_record] = proposed_target_label
+        for parent in affected_parts:
+            details = []
+            for signature, edge_ids in sorted(parent_edge_paths.get(parent["partRecordId"], {}).items()):
+                path_details = []
+                for edge_id in reversed(edge_ids):
+                    edge = edges_by_id[edge_id]
+                    parent_revision_fields = graph["revisionById"].get(edge["parentRevisionId"] or -1, {})
+                    child_revision_fields = graph["revisionById"].get(edge["childRevisionId"] or -1, {})
+                    path_details.append({"componentIdentity": edge.get("identity"), "componentRecordId": edge["rowId"],
+                        "parentPartId": edge["parentPartId"], "parentRevisionId": edge["parentRevisionId"],
+                        "parentRevisionLabel": _fields(parent_revision_fields).get("RevisionLabel") or _fields(parent_revision_fields).get("Revision"),
+                        "proposedParentRevisionLabel": proposed_labels.get(edge["parentPartRecordId"]),
+                        "childPartId": edge["childPartId"], "pinnedChildRevisionId": edge["childRevisionId"],
+                        "pinnedChildRevisionLabel": _fields(child_revision_fields).get("RevisionLabel") or _fields(child_revision_fields).get("Revision"),
+                        "proposedChildRevisionLabel": proposed_labels.get(edge["childPartRecordId"]),
+                        "quantity": edge.get("quantity"), "uom": edge.get("uom"), "sourcingRoute": edge.get("route")})
+                details.append({"partPath": parent_paths[parent["partRecordId"]][signature], "edges": path_details})
+            parent["pathDetails"] = details
+        code_uses = []
+        for item in graph["configs"]:
+            if item["partRecordId"] == target_record:
+                if not item.get("selectionIdentity"):
+                    unknown.append({"code": "CONFIGURATION_SELECTION_IDENTITY_UNCLASSIFIED",
+                        "modelCodeRecordId": item["codeRecordId"], "selectionRecordId": item["selectionRecordId"]})
+                current_config_revision = item.get("configurationRevisionNumber")
+                code_uses.append({"modelCodeRecordId": item["codeRecordId"], "modelCode": item["code"], "configurationRecordId": item["configRecordId"],
+                    "configurationRevisionId": item["configRevisionId"], "selectionRecordId": item["selectionRecordId"],
+                    "currentConfigurationRevision": current_config_revision,
+                    "proposedConfigurationRevision": int(current_config_revision or 0) + 1,
+                    "selectionIdentity": item["selectionIdentity"], "partId": item["partId"], "partRevisionId": item["partRevisionId"],
+                    "proposedPartRevisionLabel": proposed_target_label, "quantity": item["quantity"],
+                    "uom": item["uom"], "sourcingRoute": item["route"], "label": item["label"], "optionGroup": item["optionGroup"]})
+        for parent in affected_parts:
+            if parent["status"] != "current_assembly":
+                continue
+            parent_revision_fields = graph["revisionById"].get(parent["currentRevisionId"] or -1, {})
+            if str(parent_revision_fields.get("BaselineStatus") or "").casefold() == "finalized" and content and not content.get("finalizeOnPublication") and str(target_revision_fields.get("BaselineStatus") or "").casefold() != "finalized":
+                unknown.append({"code": "FINALIZED_ASSEMBLY_DEPENDS_ON_UNFINALIZED_PART", "partId": parent["partId"], "message": "Finalize the changed Part in the approved CR before repinning this finalized assembly."})
+        return {"status": "complete_with_gaps" if unknown else "complete", "target": {"partId": part_id, "partRecordId": target_record,
+                "currentRevisionId": target_revision, "currentRevisionLabel": target_revision_fields.get("RevisionLabel") or target_revision_fields.get("Revision"),
+                "proposedRevisionLabel": proposed_target_label},
+            "assemblies": affected_parts, "modelCodeConfigurations": code_uses,
+            "spares": {"status": "unsupported_by_b2_p1", "items": [], "message": "B2 spare-definition composition propagation is reserved for the later B2 composition package."},
+            "unknown": unknown, "dependencyGeneration": graph["generation"],
+            "fingerprint": request_fingerprint({"target": target_revision, "assemblies": affected_parts, "codes": code_uses, "unknown": unknown, "generation": graph["generation"]})}
+
+    @_serialized
+    def submit_change_request(self, part_id: str, payload: dict[str, Any], *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
+        self.registry._verify_writer()
+        self._require_publication_schema()
+        current = self._current_revision(part_id)
+        self._check_established(current)
+        draft_key = str(payload.get("draftKey") or "").strip()
+        draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+        if not draft or _int_ref(_fields(draft).get("ProductPart")) != int(self._part_row(part_id)["id"]):
+            raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "Save this complete Part definition as a Grist draft before requesting approval.")
+        draft_fields = _fields(draft)
+        base_id = _int_ref(draft_fields.get("BaseRevision"))
+        if base_id != int(current["id"]):
+            raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The accepted Part revision changed after this draft was started. Reload and rebase before review.")
+        content = _json_cell(draft_fields.get("Content"))
+        if not content or request_fingerprint(content) != draft_fields.get("ContentFingerprint"):
+            raise PartIdentityError("PART_DEFINITION_DRAFT_INTEGRITY", "The saved draft does not match its recorded content fingerprint.")
+        revalidated_content = self._normalize_content(part_id, int(base_id), content, request_key)
+        if request_fingerprint(revalidated_content) != request_fingerprint(content):
+            raise PartIdentityError("PART_DEFINITION_DRAFT_INVALID", "The saved draft no longer passes current Part-definition validation. Reopen and save a corrected draft.")
+        if not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_CHANGE_REQUEST_INPUT_REQUIRED", "A change reason, trusted actor and idempotency key are required.")
+        before = self._definition_from_rows(part_id, int(current["id"]))
+        impact = self.impact_preview(part_id, content)
+        if any(item.get("code") in {"DEPENDENCY_GRAPH_CYCLE", "FINALIZED_ASSEMBLY_DEPENDS_ON_UNFINALIZED_PART"} for item in impact["unknown"]):
+            raise PartIdentityError("PART_CHANGE_REQUEST_IMPACT_BLOCKED", "The dependency preview has a cycle or a finalized dependent that cannot be safely repinned. Resolve the listed issue before approval.")
+        operation_fingerprint = request_fingerprint([part_id, draft_key, base_id, draft_fields.get("ContentFingerprint"), reason.strip(), impact["fingerprint"], actor.strip()])
+        request = self.registry._begin_request(request_key, "part_definition_change_request", operation_fingerprint, part_id)
+        old_result = self._request_result(request)
+        if old_result is not None:
+            return old_result
+        cr_key = f"part-change-request:{part_id}:{request_key}"
+        cr = self.registry._ensure_keyed("PartEngineeringChangeRequest", "ChangeRequestKey", cr_key, {
+            "ChangeRequestKey": cr_key, "ProductPart": int(self._part_row(part_id)["id"]), "Draft": int(draft["id"]),
+            "BaseRevision": base_id, "Status": "pending_approval", "Reason": reason.strip(),
+            "BeforeDefinition": canonical_grist_json_cell(before), "AfterDefinition": canonical_grist_json_cell(content),
+            "ImpactPreview": canonical_grist_json_cell(impact), "ImpactFingerprint": impact["fingerprint"],
+            "InitiatedBy": actor.strip(), "CreatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
+            "RequestFingerprint": operation_fingerprint})
+        self.client.update_table_records("PartDefinitionDraft", [{"id": int(draft["id"]), "fields": {
+            "Status": "submitted", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
+            "RequestFingerprint": operation_fingerprint}}])
+        result = {"changeRequestKey": cr_key, "status": "pending_approval", "baseRevisionId": base_id,
+            "reason": reason.strip(), "before": before, "after": content, "impact": impact,
+            "requestFingerprint": operation_fingerprint}
+        self.registry._complete_request(request, result)
+        return result
+
+    def _revision_key(self, part_id: str, change_request_key: str) -> str:
+        return f"managed-part-revision:{part_id}:{request_fingerprint(change_request_key)}"
+
+    def _revision_row_for_part(self, part_id: str, revision_key: str, current_revision: dict[str, Any], *, cause: str, change_request_id: int,
+                               actor: str, reason: str, request_key: str, baseline_status: str, label: str) -> dict[str, Any]:
+        part_row = self._part_row(part_id)
+        existing = self._find("PartRevision", "RevisionKey", revision_key)
+        if existing:
+            return existing
+        version = max([int(_fields(row).get("Revision") or 0) for row in self._rows("PartRevision")
+            if _int_ref(_fields(row).get("ProductPart")) == int(part_row["id"])], default=0) + 1
+        current_fields = _fields(current_revision)
+        baseline_id = _int_ref(current_fields.get("ManufacturingBaseline"))
+        baseline = next((row for row in self._rows("PartBaselineProcessing")
+            if baseline_id and int(row.get("id", -1)) == baseline_id), None) if baseline_id else None
+        baseline_fields = _fields(baseline)
+        return self.registry._ensure_keyed("PartRevision", "RevisionKey", revision_key, {
+            "RevisionKey": revision_key, "ProductPart": int(part_row["id"]), "Revision": version,
+            "RevisionLabel": label, "Status": "publishing", "BaselineStatus": "publishing",
+            "ManufacturingBaseline": baseline_id,
+            "ManufacturingBaselineStatus": baseline_fields.get("Status") or current_fields.get("ManufacturingBaselineStatus"),
+            "ManufacturingBaselineSourceHash": baseline_fields.get("SourceHash") or current_fields.get("ManufacturingBaselineSourceHash"),
+            "PreviousRevision": int(current_revision["id"]), "ChangeRequest": int(change_request_id), "PublicationCause": cause,
+            "Actor": actor.strip(), "Reason": reason.strip(), "RequestKey": request_key,
+            "OccurredAt": grist_datetime(utc_now()),
+            "RequestFingerprint": request_fingerprint([part_id, current_revision["id"], label, cause, actor, reason, baseline_status, request_key])})
+
+    def _active_link_rows(self, revision_id: int) -> list[dict[str, Any]]:
+        return [row for row in self._rows("PartRevisionLine") if _int_ref(_fields(row).get("PartRevision")) == revision_id
+            and str(_fields(row).get("Status") or "active").casefold() not in REMOVED_STATUSES]
+
+    def _existing_line_details(self, line_revision_id: int | None) -> dict[str, Any]:
+        rows = [row for row in self._rows("LineDetail") if _int_ref(_fields(row).get("LineRevision")) == line_revision_id]
+        if len(rows) > 1:
+            raise PartIdentityError("PART_LINE_DETAIL_AMBIGUOUS", "This line revision has multiple detail rows; resolve the legacy conflict before publishing a successor.")
+        fields = _fields(rows[0]) if rows else {}
+        return {key: value for key, value in fields.items() if key in LINE_DETAIL_FIELDS}
+
+    def _materialize_line(self, part_id: str, revision_id: int, cr_key: str, item: dict[str, Any], actor: str, reason: str, request_key: str) -> dict[str, Any]:
+        requirement_key = str(item["requirementKey"])
+        existing_master_id, existing_revision_id = _int_ref(item.get("lineMasterId")), _int_ref(item.get("lineRevisionId"))
+        detail = {key: deepcopy(value) for key, value in item.get("detail", {}).items() if key in LINE_DETAIL_FIELDS}
+        existing_detail = self._existing_line_details(existing_revision_id)
+        comparable_detail = deepcopy(existing_detail)
+        comparable_detail["EngineeringAttributes"] = _json_cell(comparable_detail.get("EngineeringAttributes")) or {}
+        detail_for_compare = deepcopy(detail)
+        detail_for_compare["EngineeringAttributes"] = _json_cell(detail_for_compare.get("EngineeringAttributes")) or {}
+        same_detail = existing_revision_id is not None and _stable(detail_for_compare) == _stable(comparable_detail)
+        if existing_revision_id and same_detail:
+            return {"lineMasterId": existing_master_id, "lineRevisionId": existing_revision_id, "changed": False}
+        if not existing_master_id:
+            line_key = f"safari-authored-line:{request_fingerprint([part_id, requirement_key])}"
+            master = self.registry._ensure_keyed("LineMaster", "LineKey", line_key, {"LineKey": line_key,
+                "ProductPart": int(self._part_row(part_id)["id"]), "ProcessType": item["processType"],
+                "Identity": canonical_grist_json_cell({"requirementKey": requirement_key, "family": item["family"]}),
+                "Status": "accepted", "SourcePartName": str(detail.get("ItemName") or detail.get("MaterialDisplayName") or "Safari-authored requirement"),
+                "RequestKey": request_key, "RequestFingerprint": request_fingerprint([line_key, item, actor, reason])})
+            existing_master_id = int(master["id"])
+        if not existing_master_id:
+            raise PartIdentityError("PART_LINE_MASTER_REQUIRED", "The requirement identity cannot be resolved to a saved LineMaster.")
+        previous = next((row for row in self._rows("LineRevision") if int(row.get("id", -1)) == existing_revision_id), None) if existing_revision_id else None
+        signature = request_fingerprint({key: value for key, value in detail.items() if key not in {"EngineeringAttributes", "RequestKey", "RequestFingerprint"}})
+        line_revision_key = f"part-definition-line-revision:{cr_key}:{requirement_key}"
+        line_revision = self.registry._ensure_keyed("LineRevision", "RevisionKey", line_revision_key, {
+            "RevisionKey": line_revision_key, "LineMaster": existing_master_id,
+            "PreviousRevision": int(previous["id"]) if previous else None, "PhysicalSignature": signature,
+            "Status": "accepted", "Snapshot": None, "Actor": actor.strip(), "Reason": reason.strip(),
+            "RequestKey": request_key, "RequestFingerprint": request_fingerprint([line_revision_key, signature, actor, reason])})
+        revision_id_new = int(line_revision["id"])
+        detail_key = f"part-definition-line-detail:{cr_key}:{requirement_key}"
+        detail["LineRevision"] = revision_id_new
+        detail["DetailKey"] = detail_key
+        detail["RequestKey"] = request_key
+        detail["RequestFingerprint"] = request_fingerprint([detail_key, signature, actor, reason])
+        self.registry._ensure_keyed("LineDetail", "DetailKey", detail_key, detail)
+        return {"lineMasterId": existing_master_id, "lineRevisionId": revision_id_new, "changed": True}
+
+    def _write_definition_rows(self, part_id: str, new_revision: dict[str, Any], cr_key: str, content: dict[str, Any], *, actor: str, reason: str, request_key: str,
+                               repin: dict[str, int] | None = None) -> dict[str, Any]:
+        revision_id = int(new_revision["id"])
+        repin = repin or {}
+        lines_written = 0
+        materialized_requirements = []
+        for item in content.get("requirements", []):
+            materialized = self._materialize_line(part_id, revision_id, cr_key, item, actor, reason, request_key)
+            requirement_key = str(item["requirementKey"])
+            provenance = deepcopy(item.get("provenance") or {})
+            if materialized["changed"]:
+                provenance["type"] = "safari_edited" if item.get("identityStatus") in {"stable", "legacy_unclassified"} else "safari_authored"
+                evidence = provenance.get("evidence") if isinstance(provenance.get("evidence"), dict) else {}
+                if _int_ref(provenance.get("sourceObservationId")):
+                    evidence["sourceObservationId"] = _int_ref(provenance.get("sourceObservationId"))
+                provenance["evidence"] = evidence
+            item["lineMasterId"] = materialized["lineMasterId"]
+            item["lineRevisionId"] = materialized["lineRevisionId"]
+            item["provenance"] = provenance
+            materialized_requirements.append(item)
+            link_key = f"part-definition-membership:{cr_key}:{requirement_key}"
+            fields = {"RevisionLineKey": link_key, "RequirementKey": requirement_key, "PartRevision": revision_id,
+                "LineMaster": materialized["lineMasterId"], "LineRevision": materialized["lineRevisionId"],
+                "SourceLineObservation": _int_ref(provenance.get("sourceObservationId")),
+                "ProcessType": item.get("processType"), "QuantityPerPart": item.get("quantity"), "QuantityExact": item.get("quantityExact"),
+                "QuantityUOM": item.get("uom"), "Status": "active", "Actor": actor.strip(), "Reason": reason.strip(),
+                "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": request_fingerprint([cr_key, requirement_key, item]),
+                "ProvenanceType": str(provenance.get("type") or "safari_authored"),
+                "ProvenanceEvidence": canonical_grist_json_cell(provenance.get("evidence") or {})}
+            self.registry._ensure_keyed("PartRevisionLine", "RevisionLineKey", link_key, fields)
+            lines_written += 1
+        for component in content.get("components", []):
+            component_identity = str(component["componentIdentity"])
+            child_part = self._part_row(str(component["childPartId"]))
+            child_revision_id = repin.get(str(component["childPartId"])) or _int_ref(component.get("childRevisionId"))
+            if not child_revision_id:
+                child_revision_id = _int_ref(_fields(child_part).get("CurrentPartRevision"))
+            key = f"part-definition-component:{cr_key}:{component_identity}"
+            component_fields = {"ComponentKey": key, "ComponentIdentity": component_identity, "ParentRevision": revision_id,
+                "ChildRevision": child_revision_id, "Quantity": component.get("quantity"), "QuantityUOM": component.get("uom"),
+                "SourcingRoute": component.get("sourcingRoute") or "auto", "Status": "active", "ComponentStatus": "active",
+                "Actor": actor.strip(), "Reason": reason.strip(), "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": request_fingerprint([cr_key, component])}
+            self.registry._ensure_keyed("PartComponentRevision", "ComponentKey", key, component_fields)
+        for spec in content.get("purchases", []):
+            identity = str(spec["specificationIdentity"])
+            key = f"part-definition-specification:{cr_key}:{identity}"
+            fields = {"SpecificationKey": key, "SpecificationIdentity": identity, "ProductPart": int(self._part_row(part_id)["id"]),
+                "PartRevision": revision_id, "PurchaseItem": spec.get("purchaseItemId"), "SpecificationCode": spec.get("code"),
+                "Manufacturer": spec.get("manufacturer"), "ManufacturerPartNumber": spec.get("manufacturerPartNumber"),
+                "Description": spec.get("description"), "Attributes": canonical_grist_json_cell(spec.get("attributes") or {}),
+                "CostingUOM": spec.get("costingUOM"), "CostingCurrency": spec.get("costingCurrency"), "Status": "active",
+                "Actor": actor.strip(), "Reason": reason.strip(), "CreatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": request_fingerprint([cr_key, spec, actor, reason])}
+            self.registry._ensure_keyed("PartPurchaseSpecification", "SpecificationKey", key, fields)
+        # Drawings are immutable evidence attached to a Part revision. Cloning
+        # keeps the historical links and the accepted successor self-contained.
+        drawings = [row for row in self._rows("PartDrawing") if _int_ref(_fields(row).get("PartRevision")) == int(_int_ref(_fields(new_revision).get("PreviousRevision") or 0) or 0)
+            and str(_fields(row).get("Status") or "active").casefold() not in REMOVED_STATUSES]
+        for drawing_row in drawings:
+            drawing = _fields(drawing_row)
+            identity = str(drawing.get("DrawingIdentity") or drawing_row.get("id"))
+            key = f"part-definition-drawing:{cr_key}:{identity}"
+            copied = {name: drawing.get(name) for name in ("DrawingIdentity", "LinkType", "FilePath", "ExternalURL", "FileVersion", "ContentHash", "Status")}
+            copied.update({"DrawingKey": key, "PartRevision": revision_id, "Actor": actor.strip(), "Reason": reason.strip(),
+                "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key, "RequestFingerprint": request_fingerprint([cr_key, identity, drawing])})
+            self.registry._ensure_keyed("PartDrawing", "DrawingKey", key, copied)
+        return {"requirementsWritten": lines_written, "componentCount": len(content.get("components", [])), "purchaseCount": len(content.get("purchases", [])),
+            "requirements": materialized_requirements}
+
+    def _content_for_assembly(self, part_id: str, revision_id: int, repin: dict[str, int]) -> dict[str, Any]:
+        content = self._definition_from_rows(part_id, revision_id)
+        for component in content.get("components", []):
+            if component.get("childPartId") in repin:
+                component["childRevisionId"] = repin[component["childPartId"]]
+        return {"applicability": content["applicability"], "requirements": content["requirements"], "components": content["components"],
+            "purchases": content["purchases"], "finalizeOnPublication": str(content.get("revisionStatus") or "").casefold() == "finalized",
+            "baseRevisionId": revision_id, "partId": part_id}
+
+    def _make_plan(self, cr: dict[str, Any], approver: str, operation_key: str) -> dict[str, Any]:
+        fields = _fields(cr)
+        part_row = next((row for row in self._rows("ProductPart") if int(row.get("id", -1)) == _int_ref(fields.get("ProductPart"))), None)
+        part_id = str(_fields(part_row).get("StablePartId") or "") if part_row else ""
+        if not part_id:
+            raise PartIdentityError("PART_NOT_FOUND", "The Part referenced by this Change Request no longer exists.")
+        current = self._current_revision(part_id)
+        if int(current["id"]) != _int_ref(fields.get("BaseRevision")):
+            raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The Part's accepted revision changed after the Change Request was submitted.")
+        after = _json_cell(fields.get("AfterDefinition"))
+        impact = _json_cell(fields.get("ImpactPreview"))
+        if not after or not impact or impact.get("fingerprint") != fields.get("ImpactFingerprint"):
+            raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The approved Change Request does not match its saved definition or reviewed impact.")
+        current_impact = self.impact_preview(part_id, after)
+        if current_impact.get("fingerprint") != impact.get("fingerprint"):
+            raise PartIdentityError("PART_DEPENDENCY_CLOSURE_STALE", "Current assemblies or Model Code configurations changed after the dependency preview. Reopen the definition, review the new impact and submit a new Change Request.")
+        blocking_unknown = [item for item in current_impact.get("unknown", [])
+            if item.get("code") != "NON_ASSEMBLY_COMPOSITE_COVERAGE_UNSUPPORTED"]
+        if blocking_unknown:
+            raise PartIdentityError("PART_DEPENDENCY_CLOSURE_INCOMPLETE", "The reviewed dependency closure has unresolved or unsupported paths; publication is blocked until coverage is explicit.")
+        if not current_impact.get("target", {}).get("proposedRevisionLabel") or any(not item.get("proposedRevisionLabel") for item in current_impact.get("assemblies", [])):
+            raise PartIdentityError("PART_REVISION_UNCLASSIFIED", "A current Part or assembly has an unclassified legacy revision label; no managed engineering revision will be invented.")
+        repin: dict[str, int] = {part_id: 0}
+        parts = [{"partId": part_id, "partRecordId": int(part_row["id"]), "currentRevisionId": int(current["id"]),
+            "revisionLabel": current_impact["target"]["proposedRevisionLabel"], "kind": str(_fields(part_row).get("IdentityKind") or "part"),
+            "content": after, "finalize": bool(after.get("finalizeOnPublication") or str(_fields(current).get("BaselineStatus") or "").casefold() == "finalized")}]
+        for dependent in impact.get("assemblies", []):
+            dep_id = dependent["partId"]
+            dep_revision_id = int(dependent["currentRevisionId"])
+            dep_content = self._content_for_assembly(dep_id, dep_revision_id, {})
+            dep_content["finalizeOnPublication"] = str(self._revision_by_id(dep_revision_id).get("BaselineStatus") or "").casefold() == "finalized"
+            parts.append({"partId": dep_id, "partRecordId": int(dependent["partRecordId"]), "currentRevisionId": dep_revision_id,
+                "revisionLabel": dependent["proposedRevisionLabel"], "kind": "assembly", "content": dep_content,
+                "finalize": bool(dep_content["finalizeOnPublication"])})
+        target_finalize = parts[0]["finalize"]
+        if any(item["kind"] == "assembly" and item["finalize"] and not target_finalize for item in parts):
+            raise PartIdentityError("PART_DEPENDENT_FINALIZATION_REQUIRED", "A finalized current assembly cannot be repinned to a Part that remains unfinalized. Mark the Part revision for finalization in this approved Change Request.")
+        config_groups: dict[int, list[dict[str, Any]]] = {}
+        target_record_id = int(part_row["id"])
+        for use in impact.get("modelCodeConfigurations", []):
+            config_groups.setdefault(int(use["modelCodeRecordId"]), []).append(use)
+        config_plans = []
+        graph = self._current_graph()
+        for code_record_id, affected in sorted(config_groups.items()):
+            current_config = next((row for row in graph["configRows"] if _int_ref(_fields(row).get("ProductModelCode")) == code_record_id), None)
+            if not current_config:
+                raise PartIdentityError("PART_CONFIGURATION_IMPACT_STALE", "An impacted Model Code configuration no longer exists.")
+            revision_id = _int_ref(_fields(current_config).get("CurrentRevision"))
+            revision = next((row for row in graph["configRevisionRows"] if int(row.get("id", -1)) == revision_id), None)
+            if not revision or str(_fields(revision).get("Status") or "").casefold() != "published":
+                raise PartIdentityError("PART_CONFIGURATION_IMPACT_INCOMPLETE", "An impacted Model Code has no verified current configuration revision.")
+            version = int(_fields(current_config).get("Version") or _fields(revision).get("Revision") or 0) + 1
+            config_plans.append({"codeRecordId": code_record_id, "configurationRecordId": int(current_config["id"]),
+                "currentRevisionId": int(revision_id), "revision": version, "currency": _fields(revision).get("Currency") or "INR",
+                "selections": [dict(item) for item in graph["configs"] if item["codeRecordId"] == code_record_id]})
+        return {"changeRequestKey": fields.get("ChangeRequestKey"), "partId": part_id, "baseRevisionId": int(current["id"]),
+            "approver": approver, "reason": fields.get("Reason"), "operationKey": operation_key, "parts": parts,
+            "configurations": config_plans, "impactFingerprint": impact["fingerprint"],
+            "dependencyGeneration": impact.get("dependencyGeneration"), "affectedPartRecordIds": [item["partRecordId"] for item in parts],
+            "affectedCodeRecordIds": [item["codeRecordId"] for item in config_plans]}
+
+    def _revision_by_id(self, revision_id: int) -> dict[str, Any]:
+        row = next((item for item in self._rows("PartRevision") if int(item.get("id", -1)) == int(revision_id)), None)
+        return _fields(row)
+
+    def _assert_no_pending_publication(self, publication: dict[str, Any], record_id: int) -> None:
+        return None
+
+    @_serialized
+    def approve_and_publish(self, change_request_key: str, *, actor: str, request_key: str) -> dict[str, Any]:
+        self.registry._verify_writer()
+        self._require_publication_schema()
+        cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key)
+        if not cr:
+            raise PartIdentityError("PART_CHANGE_REQUEST_NOT_FOUND", "The submitted Part Change Request no longer exists.")
+        if not actor.strip() or not request_key.strip():
+            raise PartIdentityError("PART_APPROVAL_INPUT_REQUIRED", "A trusted approver and idempotency key are required.")
+        required_approver = os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold()
+        if actor.strip().casefold() != required_approver:
+            raise PartIdentityError("PART_CHANGE_REQUEST_APPROVER_REQUIRED", "Only the currently designated Irshad engineering approver can approve Part-definition publication.")
+        fields = _fields(cr)
+        operation_fingerprint = request_fingerprint([change_request_key, actor.strip(), request_key])
+        request = self.registry._begin_request(request_key, "part_definition_approval_publication", operation_fingerprint, change_request_key)
+        old_result = self._request_result(request)
+        if old_result is not None:
+            return old_result
+        if str(fields.get("Status") or "").casefold() not in {"pending_approval", "approved", "publishing", "publication_failed", "published"}:
+            raise PartIdentityError("PART_CHANGE_REQUEST_STATE_INVALID", "Only a submitted pending Change Request can be approved and published.")
+        approved_at = _fields(cr).get("ApprovedAt") or grist_datetime(utc_now())
+        if not _fields(cr).get("ApprovedBy"):
+            self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {
+                "Status": "approved", "ApprovedBy": actor.strip(), "ApprovedAt": approved_at, "RequestKey": request_key,
+                "RequestFingerprint": operation_fingerprint}}])
+            cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key) or cr
+            fields = _fields(cr)
+        publication_key = str(fields.get("PublicationKey") or f"part-definition-publication:{request_fingerprint(change_request_key)}")
+        journal = self._find("PartDefinitionPublication", "PublicationKey", publication_key)
+        if journal:
+            journal_fields = _fields(journal)
+            saved_plan = _json_cell(journal_fields.get("Plan"))
+            plan_fingerprint = request_fingerprint(saved_plan) if saved_plan else ""
+            if (_int_ref(journal_fields.get("ChangeRequest")) != int(cr["id"])
+                    or journal_fields.get("PlanFingerprint") != plan_fingerprint or not saved_plan
+                    or saved_plan.get("changeRequestKey") != change_request_key):
+                raise PartIdentityError("PART_PUBLICATION_PLAN_CONFLICT", "The saved publication plan differs from the approved dependency closure.")
+            plan = saved_plan
+        else:
+            if str(fields.get("Status") or "").casefold() == "published":
+                result = {"changeRequestKey": change_request_key, "status": "published",
+                    "publishedRevisionId": _int_ref(fields.get("PublishedRevision")), "idempotent": True}
+                self.registry._complete_request(request, result)
+                return result
+            plan = self._make_plan(cr, actor.strip(), request_key)
+            plan_fingerprint = request_fingerprint(plan)
+            journal = self.registry._ensure_keyed("PartDefinitionPublication", "PublicationKey", publication_key, {
+                "PublicationKey": publication_key, "ChangeRequest": int(cr["id"]), "Status": "publishing",
+                "Plan": canonical_grist_json_cell(plan), "PlanFingerprint": plan_fingerprint,
+                "AffectedParts": canonical_grist_json_cell({"recordIds": plan["affectedPartRecordIds"]}),
+                "AffectedCodes": canonical_grist_json_cell({"recordIds": plan["affectedCodeRecordIds"]}),
+                "CompletedStages": canonical_grist_json_cell({"stages": []}), "LastError": "",
+                "CreatedAt": grist_datetime(utc_now()), "UpdatedAt": grist_datetime(utc_now()),
+                "RequestKey": request_key, "RequestFingerprint": operation_fingerprint})
+            self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {"Status": "publishing", "PublicationKey": publication_key}}])
+        try:
+            result = self._apply_plan(journal, cr, plan, request_key=request_key, actor=actor.strip())
+            self.registry._complete_request(request, result)
+            return result
+        except Exception as exc:
+            current_journal = self._find("PartDefinitionPublication", "PublicationKey", publication_key) or journal
+            if str(_fields(current_journal).get("Status") or "").casefold() != "published":
+                self.client.update_table_records("PartDefinitionPublication", [{"id": int(current_journal["id"]), "fields": {
+                    "Status": "publication_failed", "LastError": str(exc)[:1000], "UpdatedAt": grist_datetime(utc_now())}}])
+            raise
+
+    def _apply_plan(self, journal: dict[str, Any], cr: dict[str, Any], plan: dict[str, Any], *, request_key: str, actor: str) -> dict[str, Any]:
+        cr_key = str(plan["changeRequestKey"])
+        current_journal = self._find("PartDefinitionPublication", "PublicationKey", str(_fields(journal).get("PublicationKey"))) or journal
+        plan_fields = _json_cell(_fields(current_journal).get("Plan")) or plan
+        if request_fingerprint(plan_fields) != _fields(current_journal).get("PlanFingerprint"):
+            raise PartIdentityError("PART_PUBLICATION_PLAN_INTEGRITY", "The durable publication plan failed its fingerprint check.")
+        rows_by_part: dict[str, dict[str, Any]] = {}
+        for item in plan_fields["parts"]:
+            current_revision = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == int(item["currentRevisionId"])), None)
+            if not current_revision:
+                raise PartIdentityError("PART_REVISION_UNAVAILABLE", "A current revision required by the approved publication plan is unavailable.")
+            key = self._revision_key(str(item["partId"]), cr_key)
+            row = self._revision_row_for_part(str(item["partId"]), key, current_revision, cause=cr_key, change_request_id=int(cr["id"]), actor=actor,
+                reason=str(plan_fields.get("reason") or ""), request_key=request_key,
+                baseline_status="finalized" if item["finalize"] else "draft", label=str(item["revisionLabel"]))
+            rows_by_part[str(item["partId"])] = row
+        repin = {part_id: int(row["id"]) for part_id, row in rows_by_part.items()}
+        # Stage 1: persist every immutable definition row while all current
+        # pointers still reference the previously accepted coherent generation.
+        for item in plan_fields["parts"]:
+            part_id = str(item["partId"])
+            content = item["content"]
+            written = self._write_definition_rows(part_id, rows_by_part[part_id], cr_key, content, actor=actor,
+                reason=str(plan_fields.get("reason") or ""), request_key=request_key, repin=repin)
+            content["requirements"] = written["requirements"]
+            for component in content.get("components", []):
+                if component.get("childPartId") in repin:
+                    component["childRevisionId"] = repin[component["childPartId"]]
+            snapshot_key = f"part-definition-version:{request_fingerprint(cr_key + ':' + part_id)}"
+            previous_version = next((row for row in self._rows("PartDefinitionVersion") if _int_ref(_fields(row).get("PartRevision")) == int(item["currentRevisionId"])), None)
+            part_row = self._part_row(part_id)
+            snapshot = {"applicability": content.get("applicability", {}), "requirements": content.get("requirements", []),
+                "components": content.get("components", []), "purchases": content.get("purchases", []),
+                "finalizeOnPublication": item["finalize"], "publicationCause": cr_key,
+                "provenance": {"type": "safari_change_request", "changeRequestKey": cr_key}}
+            self.registry._ensure_keyed("PartDefinitionVersion", "DefinitionKey", snapshot_key, {
+                "DefinitionKey": snapshot_key, "ProductPart": int(part_row["id"]), "PartRevision": int(rows_by_part[part_id]["id"]),
+                "ChangeRequest": int(cr["id"]), "PreviousDefinition": int(previous_version["id"]) if previous_version else None,
+                "Content": canonical_grist_json_cell(snapshot), "ContentFingerprint": request_fingerprint(snapshot),
+                "PublicationCause": cr_key, "Actor": actor, "Reason": str(plan_fields.get("reason") or ""),
+                "OccurredAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": request_fingerprint([cr_key, part_id, snapshot])})
+        self._update_stage(current_journal, "definition_rows_written")
+
+        # Stage 2: create immutable successor configuration versions with all
+        # current selection identities/overrides retained and the changed Part
+        # pinned to its new accepted engineering revision.
+        config_rows_by_code: dict[int, dict[str, Any]] = {}
+        for config in plan_fields.get("configurations", []):
+            config_row = next((row for row in self._rows("CostingConfiguration") if int(row.get("id", -1)) == int(config["configurationRecordId"])), None)
+            if not config_row or _int_ref(_fields(config_row).get("CurrentRevision")) != int(config["currentRevisionId"]):
+                raise PartIdentityError("PART_CONFIGURATION_STALE_BASE", "An impacted Model Code configuration changed after review; its current successor was not published.")
+            revision_key = f"configuration-part-change:{cr_key}:{config['codeRecordId']}"
+            revision_row = self.registry._ensure_keyed("CostingConfigurationRevision", "ConfigurationRevisionKey", revision_key, {
+                "ConfigurationRevisionKey": revision_key, "Configuration": int(config_row["id"]), "Revision": int(config["revision"]),
+                "Status": "publishing", "Currency": config.get("currency") or "INR", "Actor": actor,
+                "ChangeRequest": int(cr["id"]), "PublicationCause": cr_key,
+                "Reason": str(plan_fields.get("reason") or ""), "CreatedAt": grist_datetime(utc_now()),
+                "RequestKey": request_key, "RequestFingerprint": request_fingerprint([cr_key, config])})
+            for selection in config["selections"]:
+                part_revision = repin.get(selection["partId"]) or selection.get("partRevisionId")
+                if not part_revision:
+                    part_revision = _int_ref(_fields(self._part_row(selection["partId"])).get("CurrentPartRevision"))
+                selection_key = f"{revision_key}:{selection['selectionIdentity']}"
+                selection_fields = {"SelectionKey": selection_key, "SelectionIdentity": selection["selectionIdentity"],
+                    "ConfigurationRevision": int(revision_row["id"]), "ProductPart": int(selection["partRecordId"]),
+                    "StablePartId": selection["partId"], "PartRevision": part_revision, "Quantity": selection["quantity"],
+                    "QuantityUOM": selection["uom"], "SourcingRoute": selection["route"], "OccurrenceLabel": selection["label"],
+                    "OptionGroup": selection["optionGroup"], "Status": "active", "Actor": actor,
+                    "Reason": str(plan_fields.get("reason") or ""), "RequestKey": request_key,
+                    "RequestFingerprint": request_fingerprint([cr_key, config["codeRecordId"], selection])}
+                self.registry._ensure_keyed("ConfigurationPartSelection", "SelectionKey", selection_key, selection_fields)
+            config_rows_by_code[int(config["codeRecordId"])] = {"config": config_row, "revision": revision_row}
+        self._update_stage(current_journal, "configuration_rows_written")
+
+        # Stage 3: validate physical closures before moving any current pointer.
+        for item in plan_fields["parts"]:
+            row = rows_by_part[str(item["partId"])]
+            if item["finalize"]:
+                closure = self.features._physical_closure(int(row["id"]), set())
+                self.client.update_table_records("PartRevision", [{"id": int(row["id"]), "fields": {
+                    "Status": "finalized", "BaselineStatus": "finalized", "DefinitionHash": closure["definitionHash"],
+                    "FinalizedAt": grist_datetime(utc_now()), "FinalizedBy": actor,
+                    "FinalizationReason": str(plan_fields.get("reason") or "")}}])
+            else:
+                row = rows_by_part[str(item["partId"])]
+                self.client.update_table_records("PartRevision", [{"id": int(row["id"]), "fields": {"Status": "accepted", "BaselineStatus": "draft"}}])
+        for item in config_rows_by_code.values():
+            self.client.update_table_records("CostingConfigurationRevision", [{"id": int(item["revision"]["id"]), "fields": {"Status": "published"}}])
+        self._update_stage(current_journal, "successor_content_verified")
+
+        # The journal blocks reads for this reviewed closure while multiple
+        # current pointers are updated. Readers resume only after every pointer
+        # is confirmed and the journal is marked published.
+        for item in plan_fields["parts"]:
+            part_row = self._part_row(str(item["partId"]))
+            current_pointer = _int_ref(_fields(part_row).get("CurrentPartRevision"))
+            successor_id = int(rows_by_part[str(item["partId"])]["id"])
+            if current_pointer not in {int(item["currentRevisionId"]), successor_id}:
+                raise PartIdentityError("PART_DEFINITION_STALE_BASE", "A current Part/assembly pointer changed during publication; the approved generation was not partially advanced.")
+        for config in plan_fields.get("configurations", []):
+            config_row = next((row for row in self._rows("CostingConfiguration") if int(row.get("id", -1)) == int(config["configurationRecordId"])), None)
+            current_pointer = _int_ref(_fields(config_row).get("CurrentRevision")) if config_row else None
+            successor = config_rows_by_code.get(int(config["codeRecordId"]))
+            successor_id = int(successor["revision"]["id"]) if successor else None
+            if not config_row or current_pointer not in {int(config["currentRevisionId"]), successor_id}:
+                raise PartIdentityError("PART_CONFIGURATION_STALE_BASE", "A current configuration pointer changed during publication; the approved generation was not partially advanced.")
+        for item in plan_fields["parts"]:
+            part_row = self._part_row(str(item["partId"]))
+            revision_row = rows_by_part[str(item["partId"])]
+            if _int_ref(_fields(part_row).get("CurrentPartRevision")) != int(revision_row["id"]):
+                self.client.update_table_records("ProductPart", [{"id": int(part_row["id"]), "fields": {
+                    "CurrentPartRevision": int(revision_row["id"]), "EngineeringRevision": str(item["revisionLabel"]),
+                }}])
+        for code_id, item in config_rows_by_code.items():
+            config = item["config"]
+            revision = item["revision"]
+            if _int_ref(_fields(config).get("CurrentRevision")) != int(revision["id"]):
+                self.client.update_table_records("CostingConfiguration", [{"id": int(config["id"]), "fields": {
+                    "CurrentRevision": int(revision["id"]), "Version": int(_fields(revision).get("Revision") or 0),
+                    "Currency": _fields(revision).get("Currency") or "INR", "UpdatedAt": grist_datetime(utc_now()),
+                    "Actor": actor, "Reason": str(plan_fields.get("reason") or ""), "RequestKey": request_key,
+                    "RequestFingerprint": request_fingerprint([cr_key, code_id, revision["id"]])}}])
+        self._update_stage(current_journal, "current_pointers_moved")
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", f"{request_key}:approved-publication", {
+            "EventType": "part_definition_change_request_published", "Actor": actor, "OccurredAt": grist_datetime(utc_now()),
+            "EntityType": "ProductPart", "EntityId": plan_fields["partId"], "Reason": str(plan_fields.get("reason") or ""),
+            "Payload": canonical_grist_json_cell({"changeRequestKey": cr_key, "publishedRevisionId": int(rows_by_part[plan_fields["partId"]]["id"]),
+                "dependentParts": plan_fields["affectedPartRecordIds"], "modelCodes": plan_fields["affectedCodeRecordIds"]}),
+            "RequestKey": f"{request_key}:approved-publication", "RequestFingerprint": request_fingerprint([cr_key, plan_fields])})
+        self.client.update_table_records("PartDefinitionPublication", [{"id": int(current_journal["id"]), "fields": {
+            "Status": "published", "CompletedAt": grist_datetime(utc_now()), "UpdatedAt": grist_datetime(utc_now()), "LastError": ""}}])
+        self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {
+            "Status": "published", "PublishedRevision": int(rows_by_part[plan_fields["partId"]]["id"]), "PublicationKey": _fields(current_journal).get("PublicationKey")}}])
+        if _int_ref(_fields(cr).get("Draft")):
+            self.client.update_table_records("PartDefinitionDraft", [{"id": int(_int_ref(_fields(cr).get("Draft"))), "fields": {
+                "Status": "published", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
+                "RequestFingerprint": request_fingerprint([cr_key, "draft_published"])}}])
+        return {"changeRequestKey": cr_key, "status": "published", "publishedRevisionId": int(rows_by_part[plan_fields["partId"]]["id"]),
+            "publishedRevisionLabel": next(item["revisionLabel"] for item in plan_fields["parts"] if item["partId"] == plan_fields["partId"]),
+            "dependentPartCount": len(plan_fields["parts"]) - 1, "configurationCount": len(config_rows_by_code), "idempotent": False}
+
+    def _update_stage(self, journal: dict[str, Any], stage: str) -> None:
+        current = self._find("PartDefinitionPublication", "PublicationKey", str(_fields(journal).get("PublicationKey"))) or journal
+        stages = _json_cell(_fields(current).get("CompletedStages")) or {"stages": []}
+        values = list(stages.get("stages") or [])
+        if stage not in values:
+            values.append(stage)
+        self.client.update_table_records("PartDefinitionPublication", [{"id": int(current["id"]), "fields": {
+            "CompletedStages": canonical_grist_json_cell({"stages": values}), "UpdatedAt": grist_datetime(utc_now()), "LastError": ""}}])
