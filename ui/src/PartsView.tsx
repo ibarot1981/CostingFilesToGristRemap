@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { Archive, ArrowLeft, Check, ChevronDown, ChevronRight, FileText, History, LoaderCircle, PackagePlus, Plus, Search, ShoppingCart, Tags, Wrench } from "lucide-react";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import { CascadeCodePicker, PartCreationForm } from "./PartCreationForm";
 import { PartDefinitionMaintenance } from "./PartDefinitionMaintenance";
 import "./parts.css";
@@ -85,6 +85,8 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const [retireReason, setRetireReason] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [publicationRecovery, setPublicationRecovery] = useState<any>(null);
+  const [publicationRecoveryBusy, setPublicationRecoveryBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [registerRefreshing, setRegisterRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -151,8 +153,20 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     if (!selectedId || mode !== "selected") { setDetails(null); return; }
     if (!active) return;
     const generation = ++detailsGeneration.current;
+    setPublicationRecovery(null);
     api.partDetails(selectedId).then(value => { if (generation === detailsGeneration.current) { setDetails(value); setRegister(old => ({ ...old, items: old.items.map(part => part.id === selectedId ? { ...part, ...value.part } : part) })); } })
-      .catch(cause => { if (generation === detailsGeneration.current) setError(String(cause)); });
+      .catch(async cause => {
+        if (generation !== detailsGeneration.current) return;
+        setError(String(cause));
+        if (cause instanceof ApiError && cause.code === "PART_DEFINITION_PUBLICATION_PENDING") {
+          try {
+            const recovery = await api.partDefinitionRecovery(selectedId);
+            if (generation === detailsGeneration.current) setPublicationRecovery(recovery);
+          } catch (recoveryCause) {
+            if (generation === detailsGeneration.current) setError(`${String(cause)} Recovery status could not be read: ${String(recoveryCause)}`);
+          }
+        }
+      });
     return () => { ++detailsGeneration.current; };
   }, [active, selectedId, mode]);
 
@@ -227,6 +241,21 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     setDetails(value);
     setRegister(old => ({ ...old, items: old.items.map(part => part.id === selectedId ? { ...part, ...value.part } : part) }));
     await refresh();
+  }
+
+  async function retryDefinitionPublication(item: any) {
+    if (!selectedId || !item?.changeRequestKey || !item?.requestKey || !item?.canRetry) return;
+    setPublicationRecoveryBusy(true); setError(""); setNotice("");
+    try {
+      const result = await api.approveAndPublishPartDefinition(item.changeRequestKey, item.requestKey);
+      setPublicationRecovery(null);
+      await reloadSelectedDetails();
+      setNotice(`Approved revision ${result.publishedRevisionLabel || "successor"} was recovered and published. ${result.dependentPartCount || 0} dependent Part/assembly successor(s) and ${result.configurationCount || 0} configuration successor(s) were confirmed.`);
+    } catch (cause) {
+      setError(String(cause));
+      try { setPublicationRecovery(await api.partDefinitionRecovery(selectedId)); }
+      catch (recoveryCause) { setError(`${String(cause)} Recovery status could not be read: ${String(recoveryCause)}`); }
+    } finally { setPublicationRecoveryBusy(false); }
   }
 
   function startCreate(kind: "part" | "assembly" = "part") {
@@ -462,6 +491,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
         <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : selected.identityKind === "assembly" ? `Assembly · ${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}` : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>Engineering revision · {selected.legacy ? "unverified" : engineeringRevisionLabel(selected)}</span></div></div>
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>
           <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full {selected.identityKind === "assembly" ? "Assembly" : "Part"} details</button>{selected.identityKind === "assembly" ? <button className="button" onClick={openComposition}><PackagePlus size={14}/> Open composition</button> : <><button className="button" onClick={openManufacturingBaseline}><Wrench size={14}/> Manufacturing baseline</button><button className="button" onClick={openMappedWorkbookLines}><FileText size={14}/> Mapped workbook lines</button></>}<button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
+          {publicationRecovery?.items?.map((item: any) => <section className="parts-section-card parts-publication-recovery" key={item.changeRequestKey} aria-label="Approved publication recovery"><strong>Approved Part publication is recovering</strong><p>The reviewed Grist publication is incomplete, so Part and configuration reads remain blocked until the same successor plan finishes.</p><span>Change Request · {item.changeRequestStatus.replaceAll("_", " ")} · {item.status.replaceAll("_", " ")}</span><p>{item.reason || "No engineering reason recorded"} · {item.dependentPartCount} dependent Part/assembly successor(s) · {item.configurationCount} configuration successor(s)</p><button className="button primary" disabled={publicationRecoveryBusy || !item.canRetry} onClick={() => void retryDefinitionPublication(item)}>{publicationRecoveryBusy ? "Recovering…" : item.canRetry ? "Retry approved publication" : "Waiting for designated approver"}</button></section>)}
           {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>{engineeringRevisionLabel(selected)} · changes use the approved CR process</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
           {fullDetails && details?.part?.id === selectedId ? <>
             <div className="parts-detail-tabs" aria-label={`${selected.identityKind === "assembly" ? "Assembly" : "Part"} detail sections`}>{(selected.identityKind === "assembly" ? ["Overview", "Components", "Drawings", "Used in configurations", "History"] : ["Overview", "Manufacturing baseline", "Intended sharing", "Mapped workbook lines", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"]).map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" aria-controls={id} onClick={() => openPartDetailSection(id)}>{label}</button>; })}</div>

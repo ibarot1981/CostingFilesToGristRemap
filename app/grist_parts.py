@@ -1367,7 +1367,19 @@ class GristPartFeatures:
         fields = revision_row.get("fields", {})
         if str(fields.get("RevisionLabel") or "A") != "A":
             raise PartIdentityError("PART_REVISION_LOCKED", "Engineering changes beyond Rev A require the approved CR workflow.")
-        if str(fields.get("BaselineStatus") or fields.get("Status") or "draft").casefold() != "draft":
+        part_record_id = _ref(fields.get("ProductPart"))
+        part_row = next((row for row in self.registry._rows("ProductPart")
+            if part_record_id and int(row.get("id", -1)) == part_record_id), None)
+        part_fields = part_row.get("fields", {}) if part_row else {}
+        baseline_id = _ref(fields.get("ManufacturingBaseline"))
+        baseline = next((row for row in self.registry._optional_baseline_rows()
+            if baseline_id and int(row.get("id", -1)) == baseline_id), None)
+        baseline_status = str((baseline or {}).get("fields", {}).get("Status")
+            or part_fields.get("ManufacturingBaselineStatus") or fields.get("ManufacturingBaselineStatus") or "").casefold()
+        if baseline_status == "established":
+            raise PartIdentityError("PART_REVISION_LOCKED", "An established manufacturing baseline is immutable through legacy Part writers; use an approved CR to change its physical definition.")
+        revision_status = str(fields.get("BaselineStatus") or fields.get("Status") or "draft").casefold()
+        if revision_status != "draft":
             raise PartIdentityError("PART_REVISION_LOCKED", "The Part definition is finalized and physically locked until approved CR control exists.")
 
     def components(self, part_id: str) -> list[dict[str, Any]]:

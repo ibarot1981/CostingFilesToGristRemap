@@ -6,7 +6,12 @@ const apiMocks = vi.hoisted(() => ({
   partDefinition: vi.fn(), partDefinitionOptions: vi.fn(), savePartDefinitionDraft: vi.fn(),
   submitPartDefinitionChangeRequest: vi.fn(), approveAndPublishPartDefinition: vi.fn(),
 }));
-vi.mock("../src/api", () => ({api: apiMocks}));
+vi.mock("../src/api", () => ({api: apiMocks, ApiError: class ApiError extends Error {
+  status: number; code: string; retryDisposition: string;
+  constructor(message: string, status = 500, code = "", retryDisposition = "retry_same_request") {
+    super(message); this.status = status; this.code = code; this.retryDisposition = retryDisposition;
+  }
+}}));
 
 const accepted = {
   partId: "part-1", partNumber: "SM-P-000001", partName: "Bracket", partRecordId: 10, revisionId: 20,
@@ -39,7 +44,7 @@ it("saves a direct edit as a Grist draft and reloads the persisted reason before
     baseRevisionId:20,applicability:accepted.applicability,requirements:accepted.requirements,components:[],purchases:[],finalizeOnPublication:false,
   }}};
   apiMocks.partDefinition.mockResolvedValueOnce(withDraft).mockResolvedValue({...withDraft,draft:{...withDraft.draft,reason:"Increase blank allowance"}});
-  const savedContent = {baseRevisionId:20,applicability:accepted.applicability,requirements:accepted.requirements,components:[],purchases:[],finalizeOnPublication:false};
+  const savedContent = {baseRevisionId:20,expectedSaveVersion:1,applicability:accepted.applicability,requirements:accepted.requirements,components:[],purchases:[],finalizeOnPublication:false};
   apiMocks.savePartDefinitionDraft.mockResolvedValue({draftKey:"draft-1",saveVersion:2,contentFingerprint:"fp2",content:savedContent});
   const onSaved = vi.fn();
   render(<PartDefinitionMaintenance partId="part-1" onSaved={onSaved} onCompare={vi.fn()}/>);
@@ -52,10 +57,53 @@ it("saves a direct edit as a Grist draft and reloads the persisted reason before
   await screen.findByText(/Draft saved in Safari Grist/);
   expect(apiMocks.savePartDefinitionDraft).toHaveBeenCalledTimes(1);
   expect(apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements[0]).toMatchObject({requirementKey:"req-1",quantity:"2"});
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[0][1].expectedSaveVersion).toBe(1);
   fireEvent.click(screen.getByRole("button",{name:"Request approval"}));
   await screen.findByText(/Change Request submitted for review/);
   expect(apiMocks.submitPartDefinitionChangeRequest).toHaveBeenCalledWith("part-1",{draftKey:"draft-1",reason:"Increase blank allowance"},expect.any(String));
   expect(onSaved).not.toHaveBeenCalled();
+});
+
+it("locks an uncertain draft save across reload and retries the original key and payload", async () => {
+  apiMocks.savePartDefinitionDraft.mockRejectedValueOnce(new Error("connection lost after save"));
+  const props = {partId:"part-1",onSaved:vi.fn(),onCompare:vi.fn()};
+  const first = render(<PartDefinitionMaintenance {...props}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Add measured requirement"}});
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText(/connection lost after save/);
+  const stored = JSON.parse(localStorage.getItem("safari.part-definition:part-1:draft-save") || "null");
+  expect(stored?.status).toBe("pending");
+  const originalPayload = JSON.parse(stored.payload);
+  expect(originalPayload.expectedSaveVersion).toBe(0);
+  expect(screen.getByRole("button",{name:"Retry original draft save"})).toBeTruthy();
+  first.unmount();
+
+  apiMocks.savePartDefinitionDraft.mockResolvedValue({draftKey:"draft-1",saveVersion:1,contentFingerprint:"fp",content:originalPayload});
+  render(<PartDefinitionMaintenance {...props}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Retry original draft save"}));
+  await screen.findByText(/original draft save was confirmed/);
+  expect(apiMocks.savePartDefinitionDraft).toHaveBeenCalledTimes(2);
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[0][2]).toBe(stored.key);
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[1][2]).toBe(stored.key);
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[1][1]).toEqual(originalPayload);
+  expect(localStorage.getItem("safari.part-definition:part-1:draft-save")).toBeNull();
+});
+
+it("collects an explicit MCL rate quantity and unit for a newly authored requirement", async () => {
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Add requirement"}));
+  const quantities = screen.getAllByLabelText("Rate-basis quantity") as HTMLInputElement[];
+  const units = screen.getAllByLabelText("Rate-basis unit") as HTMLInputElement[];
+  fireEvent.change(quantities[quantities.length - 1],{target:{value:"2"}});
+  fireEvent.change(units[units.length - 1],{target:{value:"kg"}});
+  fireEvent.change(screen.getAllByLabelText("Material identity")[1],{target:{value:"5"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Add measured MCL"}});
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText(/Draft saved in Safari Grist/);
+  const authored = apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements.at(-1);
+  expect(authored.detail).toMatchObject({Material:"5",Quantity:"2",QuantityUOM:"kg"});
 });
 
 it("retries an uncertain approved publication with the same durable request key", async () => {

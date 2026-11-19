@@ -23,3 +23,13 @@ class InterimRatesTests(unittest.TestCase):
         self.assertEqual(result['status'], 'rate_unavailable')
         self.assertIsNone(result['costingNewRate'])
         self.assertEqual(compare_interim_rates(rates, mappings, [master, master], [])[0]['status'], 'ambiguous_master')
+
+    def test_selected_rate_log_exposes_effective_entry_and_update_dates(self):
+        masters = [{"id": 1, "fields": {"MasterMaterial": "Steel", "MaterialLatestRate": 55, "Default_MaterialRate": 40}}]
+        logs = [{"id": 7, "fields": {"MasterMaterial": 1, "RatePerKG": 52, "EffectiveAt": "2026-11-10T00:00:00Z",
+            "RecordedAt": "2026-11-09T12:00:00Z", "UpdatedAt": "2026-11-11T09:00:00Z"}}]
+
+        row = compare_interim_rates({"Plate": "50"}, {"Plate": "Steel"}, masters, logs)[0]
+
+        self.assertEqual((row["selectedRateLogId"], row["effectiveAt"], row["rateSourceDate"]), (7, "2026-11-10T00:00:00+00:00", "2026-11-10T00:00:00+00:00"))
+        self.assertEqual((row["sourceRecordedAt"], row["sourceUpdatedAt"]), ("2026-11-09T12:00:00+00:00", "2026-11-11T09:00:00+00:00"))

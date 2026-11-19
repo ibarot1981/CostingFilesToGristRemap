@@ -1,6 +1,7 @@
 """Read-only live Model Code costing and explicit normalized Grist snapshots."""
 from __future__ import annotations
 
+from copy import deepcopy
 from calendar import monthrange
 from datetime import datetime, timedelta, timezone
 import json
@@ -50,6 +51,40 @@ def _date(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _rate_age(value: Any, *, as_of: datetime) -> dict[str, Any]:
+    """Age a rate by Asia/Kolkata calendar date while retaining unknown/future states."""
+    local_as_of = as_of.astimezone(ZoneInfo("Asia/Kolkata")).date()
+    source_date = None
+    if value not in (None, ""):
+        normalized = datetime_text(value)
+        parsed = _date(value)
+        if parsed:
+            source_date = parsed.astimezone(ZoneInfo("Asia/Kolkata")).date()
+        else:
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y"):
+                try:
+                    source_date = datetime.strptime(normalized[:10] if fmt == "%Y-%m-%d" else normalized, fmt).date()
+                    break
+                except ValueError:
+                    continue
+    base = {"rateSourceDate": source_date.isoformat() if source_date else None, "rateAgeAsOfDate": local_as_of.isoformat()}
+    if source_date is None:
+        return {**base, "rateAgeStatus": "unknown", "rateAgeDays": None, "rateAgeDaysUntil": None}
+    days = (local_as_of - source_date).days
+    if days < 0:
+        return {**base, "rateAgeStatus": "future_date", "rateAgeDays": None, "rateAgeDaysUntil": abs(days)}
+    return {**base, "rateAgeStatus": "dated", "rateAgeDays": days, "rateAgeDaysUntil": None}
+
+
+def _cost_date_summary(evidence: list[dict[str, Any]], *, as_of: datetime) -> dict[str, Any]:
+    ages = [item for item in evidence]
+    known = [int(item["rateAgeDays"]) for item in ages if item.get("rateAgeStatus") == "dated" and item.get("rateAgeDays") is not None]
+    return {"asOfDate": as_of.astimezone(ZoneInfo("Asia/Kolkata")).date().isoformat(),
+        "datedInputCount": len(known), "unknownInputCount": sum(item.get("rateAgeStatus") == "unknown" for item in ages),
+        "futureInputCount": sum(item.get("rateAgeStatus") == "future_date" for item in ages),
+        "oldestKnownAgeDays": max(known) if known else None}
 
 
 def _num(value: Any) -> float | None:
@@ -330,7 +365,7 @@ class GristLiveCostService:
         if not config or not config["selections"]:
             return {"status": "incomplete", "generation": request_fingerprint([int(code["id"]), utc_now()]),
                 "modelCode": _public(code), "configuration": None, "currency": None, "totalCost": None,
-                "parts": [], "lines": [], "rateEvidence": [], "warnings": [{"code": "COST_CONFIGURATION_REQUIRED",
+                "parts": [], "lines": [], "rateEvidence": [], "costDateSummary": _cost_date_summary([], as_of=datetime.now(timezone.utc)), "warnings": [{"code": "COST_CONFIGURATION_REQUIRED",
                 "message": "An explicit current Model Code configuration is required. Source mappings and shared workbook rows do not create one."}],
                 "inputFingerprint": start_fingerprint, "inputManifest": {"configuration": None, "tableFingerprint": start_fingerprint}}
 
@@ -435,7 +470,7 @@ class GristLiveCostService:
                         warn("LINE_QUANTITY_INVALID", "A normalized line has missing or invalid quantity evidence.", path)
                         continue
                     total_quantity = effective_quantity * link_quantity * amount_per_line
-                    detail_candidates.append({"kind": "material" if process.casefold() in {"mcl", "material", "material cut list"} else "process",
+                    detail_candidates.append({"kind": "material" if process.casefold() in {"mcl", "material", "material cut list", "material_cut"} else "process",
                         "lineKey": f"{path}|{link_fields.get('RevisionLineKey') or link['id']}|{_fields(detail).get('DetailKey') or detail['id']}",
                         "occurrencePath": path, "partRecordId": part_id, "partRevisionId": revision_id, "selectionRow": selection_row,
                         "lineLink": link, "lineMasterId": master_id, "lineRevisionId": line_revision_id,
@@ -445,7 +480,7 @@ class GristLiveCostService:
                         "description": str(detail_fields.get("ItemName") or detail_fields.get("MaterialDisplayName") or master.get("SourcePartName") or process).strip(),
                         "currency": str(_fields(config["revision"]).get("Currency") or "").upper(),
                         "physicalSignature": str(line_revision.get("PhysicalSignature") or "")})
-                    if material_name and process.casefold() in {"mcl", "material", "material cut list"}:
+                    if material_name and process.casefold() in {"mcl", "material", "material cut list", "material_cut"}:
                         direct_material_names.append(material_name)
             route = forced_route.casefold()
             if route == "auto":
@@ -563,6 +598,9 @@ class GristLiveCostService:
                     warn("CURRENCY_BASIS_MISMATCH", f"Purchased Part rate is {rate.get('currency')} while this configuration uses {code_currency}; add an explicit reviewed configuration conversion.", candidate["occurrencePath"])
                     lines_out.append(self._unpriced_line(candidate, "Currency conversion to configuration basis is unavailable.", "purchased_part"))
                     continue
+                purchase_source = next((row for row in purchase_rows if str(row.get("id")) == str(rate.get("purchaseRecordId"))), {})
+                purchase_fields = _fields(purchase_source)
+                age = _rate_age(rate.get("transactionAt"), as_of=current_time)
                 amount = candidate["quantity"] * float(rate["rate"])
                 line = {"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                     "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
@@ -571,11 +609,13 @@ class GristLiveCostService:
                     "quantity": candidate["quantity"], "quantityUOM": candidate["uom"], "rate": rate["rate"], "rateUOM": rate["uom"],
                     "currency": rate["currency"], "grossCost": amount, "recoveryCost": 0, "adjustmentCost": 0, "netCost": amount,
                     "calculationBasis": "effective_part_quantity × latest eligible actual purchase rate", "costPolicy": RATE_POLICY,
-                    "status": "available", "linear": True, "purchaseItemId": ref_id(sf.get("PurchaseItem"))}
+                    "status": "available", "linear": True, "purchaseItemId": ref_id(sf.get("PurchaseItem")), "rateAge": age}
                 lines_out.append(line)
                 evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "purchased_part", "sourceTable": "PartPurchaseRecord",
                     "sourceDocumentId": getattr(self.client, "doc_id", ""), "sourceRecordId": str(rate.get("purchaseRecordId") or ""),
                     "sourceVersion": str(rate.get("transactionAt") or ""), "transactionAt": rate.get("transactionAt"),
+                    "effectiveAt": rate.get("transactionAt"), "sourceRecordedAt": datetime_text(purchase_fields.get("RecordedAt")) if purchase_fields.get("RecordedAt") else None,
+                    "sourceUpdatedAt": datetime_text(purchase_fields.get("UpdatedAt")) if purchase_fields.get("UpdatedAt") else None, **age,
                     "vendorId": ref_id(rate.get("vendorId")), "purchaseRecordId": ref_id(rate.get("purchaseRecordId")),
                     "rawUnitRate": rate.get("rate"), "normalizedUnitRate": rate.get("rate"), "sourceCurrency": rate.get("sourceCurrency"),
                     "sourceUOM": rate.get("purchaseUOM"), "normalizedCurrency": rate.get("currency"), "normalizedUOM": rate.get("uom"),
@@ -593,6 +633,9 @@ class GristLiveCostService:
                     continue
                 unit_rate = float(rate["costingNewRate"])
                 amount = candidate["quantity"] * unit_rate
+                material_date = rate.get("rateSourceDate") or rate.get("effectiveAt")
+                age = _rate_age(material_date, as_of=current_time)
+                effective_at = rate.get("effectiveAt")
                 lines_out.append({"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                     "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
                     "sourceType": "material", "sourceKey": str(candidate["lineKey"].split("|", 1)[-1]), "sourceRecordId": str(rate.get("masterRecordId") or ""),
@@ -601,11 +644,15 @@ class GristLiveCostService:
                     "quantityUOM": candidate["uom"], "rate": unit_rate, "rateUOM": candidate["uom"], "currency": code_currency,
                     "grossCost": amount, "recoveryCost": 0, "adjustmentCost": 0, "netCost": amount,
                     "calculationBasis": "effective Part quantity × normalized material quantity × current Costing-New rate",
-                    "costPolicy": str(rate.get("basis") or "MaterialLatestRate / Default_MaterialRate"), "status": "available", "linear": True})
+                    "costPolicy": str(rate.get("basis") or "MaterialLatestRate / Default_MaterialRate"), "status": "available", "linear": True,
+                    "rateAge": age})
                 evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "material", "sourceTable": str(rate.get("basis") or "MasterMaterial"),
                     "sourceDocumentId": str(material_response.get("sourceDocumentId") or ""),
-                    "sourceRecordId": ",".join(str(value) for value in rate.get("rateLogRecordIds", [])) or str(rate.get("masterRecordId") or ""),
-                    "sourceVersion": str(rate.get("basis") or ""), "effectiveAt": None,
+                    "sourceRecordId": str(rate.get("selectedRateLogId") or rate.get("masterRecordId") or ""),
+                    "sourceVersion": str(rate.get("selectedRateLogId") or rate.get("basis") or ""),
+                    "effectiveAt": datetime_text(effective_at) if _date(effective_at) else None,
+                    "sourceRecordedAt": datetime_text(rate.get("sourceRecordedAt")) if rate.get("sourceRecordedAt") else None,
+                    "sourceUpdatedAt": datetime_text(rate.get("sourceUpdatedAt")) if rate.get("sourceUpdatedAt") else None, **age,
                     "rawUnitRate": unit_rate, "normalizedUnitRate": unit_rate, "sourceCurrency": code_currency, "sourceUOM": candidate["uom"],
                     "normalizedCurrency": code_currency, "normalizedUOM": candidate["uom"], "conversionFactor": 1,
                     "ratePolicy": str(rate.get("basis") or "MaterialLatestRate / Default_MaterialRate"),
@@ -634,6 +681,8 @@ class GristLiveCostService:
                 lines_out.append(self._unpriced_line(candidate, "Process-rate basis does not match this line/configuration.", "process"))
                 continue
             amount = candidate["quantity"] * unit_rate
+            rate_fields = _fields(row)
+            age = _rate_age(rate_fields.get("EffectiveAt"), as_of=current_time)
             lines_out.append({"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                 "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
                 "sourceType": "process", "sourceKey": str(candidate["lineKey"].split("|", 1)[-1]), "sourceRecordId": str(row["id"]),
@@ -641,10 +690,12 @@ class GristLiveCostService:
                 "costCategory": str(candidate.get("process") or "process"), "quantity": candidate["quantity"], "quantityUOM": candidate["uom"],
                 "rate": unit_rate, "rateUOM": rate_uom, "currency": currency, "grossCost": amount, "recoveryCost": 0,
                 "adjustmentCost": 0, "netCost": amount, "calculationBasis": "effective Part quantity × normalized process line quantity × approved process rate",
-                "costPolicy": "latest effective approved CostingProcessRate", "status": "available", "linear": True})
+                "costPolicy": "latest effective approved CostingProcessRate", "status": "available", "linear": True, "rateAge": age})
             evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "process", "sourceTable": "CostingProcessRate",
                 "sourceDocumentId": str(getattr(self.client, "doc_id", "")), "sourceRecordId": str(row["id"]),
                 "sourceVersion": str(_fields(row).get("EffectiveAt") or ""), "effectiveAt": datetime_text(_fields(row).get("EffectiveAt")),
+                "sourceRecordedAt": datetime_text(rate_fields.get("RecordedAt")) if rate_fields.get("RecordedAt") else None,
+                "sourceUpdatedAt": datetime_text(rate_fields.get("UpdatedAt")) if rate_fields.get("UpdatedAt") else None, **age,
                 "rawUnitRate": unit_rate, "normalizedUnitRate": unit_rate, "sourceCurrency": currency, "sourceUOM": rate_uom,
                 "normalizedCurrency": currency, "normalizedUOM": rate_uom, "conversionFactor": 1,
                 "ratePolicy": "latest effective approved CostingProcessRate", "evidenceReference": _fields(row).get("SourceReference"),
@@ -667,12 +718,13 @@ class GristLiveCostService:
             "materialRateSource": material_response.get("source"), "policyVersion": POLICY_VERSION}
         input_fingerprint = request_fingerprint({"manifest": manifest, "parts": parts_out, "lines": lines_out, "rateEvidence": evidence_rows,
             "currency": code_currency, "configurationSelections": [row.get("SelectionIdentity") for row in selections]})
+        date_summary = _cost_date_summary(evidence_rows, as_of=current_time)
         return {"status": "complete" if not blockers and bool(lines_out) else "incomplete", "generation": request_fingerprint([int(code["id"]), utc_now(), input_fingerprint]),
             "modelCode": _public(code), "configuration": {"id": int(config["record"]["id"]), "revisionId": int(config["revision"]["id"]),
                 "revisionKey": _fields(config["revision"]).get("ConfigurationRevisionKey"), "version": _fields(config["revision"]).get("Revision")},
             "currency": code_currency, "costBasis": "current per-code configured physical occurrences and current eligible rates",
             "totalCost": round(subtotal, 6) if not blockers else None, "knownSubtotal": round(subtotal, 6),
-            "parts": parts_out, "lines": lines_out, "rateEvidence": evidence_rows, "warnings": warnings,
+            "parts": parts_out, "lines": lines_out, "rateEvidence": evidence_rows, "costDateSummary": date_summary, "warnings": warnings,
             "inputFingerprint": input_fingerprint, "inputManifest": manifest,
             "lineCount": len(lines_out), "availableLineCount": len(available_lines)}
 
@@ -735,10 +787,22 @@ class GristLiveCostService:
                     raise PartIdentityError("COST_LIVE_STALE", "Costing inputs changed after this Live Cost was displayed. Refresh, review the new result and save again.")
                 if self._result_content_fingerprint(current) != content_fingerprint:
                     raise PartIdentityError("COST_LIVE_CONTENT_MISMATCH", "The displayed Live Cost facts do not match the current Grist calculation. Refresh before saving.")
-            frozen = live
+            frozen = deepcopy(live)
             expected_parts, expected_lines, expected_evidence = (len(frozen.get("parts", [])), len(frozen.get("lines", [])), len(frozen.get("rateEvidence", [])))
             snapshot_key = str(uuid5(NAMESPACE_URL, "safari-cost-snapshot:" + request_key))
             captured_at = _fields(publication).get("CreatedAt") if publication else grist_datetime(utc_now())
+            captured_time = _date(captured_at) or datetime.now(timezone.utc)
+            age_by_line: dict[str, dict[str, Any]] = {}
+            for evidence in frozen.get("rateEvidence", []):
+                source_date = evidence.get("rateSourceDate") or evidence.get("effectiveAt") or evidence.get("transactionAt")
+                age = _rate_age(source_date, as_of=captured_time)
+                evidence.update(age)
+                age_by_line[str(evidence.get("lineKey") or "")] = age
+            for line in frozen.get("lines", []):
+                age = age_by_line.get(str(line.get("lineKey") or ""))
+                if age:
+                    line["rateAge"] = age
+            frozen["costDateSummary"] = _cost_date_summary(frozen.get("rateEvidence", []), as_of=captured_time)
             header = {"SnapshotKey": snapshot_key, "ProductModelCode": int(code_id),
                 "Configuration": int(frozen["configuration"]["id"]), "ConfigurationRevision": int(frozen["configuration"]["revisionId"]),
                 "CapturedAt": captured_at, "CostingAsOf": captured_at, "CreatedBy": actor.strip(), "Label": label, "Notes": reason,
@@ -853,6 +917,10 @@ class GristLiveCostService:
                 "SourceTable": item.get("sourceTable"), "SourceRecordId": item.get("sourceRecordId"),
                 "SourceVersion": item.get("sourceVersion"), "EffectiveAt": grist_datetime(item.get("effectiveAt")) if item.get("effectiveAt") else None,
                 "TransactionAt": grist_datetime(item.get("transactionAt")) if item.get("transactionAt") else None,
+                "RateSourceDate": item.get("rateSourceDate"), "SourceRecordedAt": str(item.get("sourceRecordedAt") or ""),
+                "SourceUpdatedAt": str(item.get("sourceUpdatedAt") or ""), "RateAgeStatus": item.get("rateAgeStatus"),
+                "RateAgeDays": item.get("rateAgeDays"), "RateAgeDaysUntil": item.get("rateAgeDaysUntil"),
+                "RateAgeAsOfDate": item.get("rateAgeAsOfDate"),
                 "Vendor": item.get("vendorId"), "PurchaseRecord": item.get("purchaseRecordId"),
                 "RawUnitRate": item.get("rawUnitRate"), "NormalizedUnitRate": item.get("normalizedUnitRate"),
                 "SourceCurrency": item.get("sourceCurrency"), "SourceUOM": item.get("sourceUOM"),

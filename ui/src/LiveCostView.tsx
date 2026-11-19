@@ -5,9 +5,26 @@ import type { ModelCode, Product, ProductModel } from "./types";
 type Selection = { selectionIdentity: string; partId: string; partName: string; quantity: string; uom: string; sourcingRoute: string; label: string; optionGroup: string };
 
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function canonicalValue(value: any): any {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]));
+  return value;
+}
+function costResultSignature(value: any) {
+  const fields = ["modelCode", "configuration", "currency", "costBasis", "totalCost", "knownSubtotal", "parts", "lines", "rateEvidence", "inputFingerprint"];
+  return JSON.stringify(canonicalValue(Object.fromEntries(fields.map(key => [key, value?.[key]]))));
+}
 function money(value: unknown, currency: string) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "Unavailable";
   return `${currency} ${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 4 })}`;
+}
+function rateAgeText(value: any) {
+  const age = value?.rateAge || value;
+  if (age?.rateAgeStatus === "dated") return `${age.rateSourceDate} · ${age.rateAgeDays} day(s) old`;
+  if (age?.RateAgeStatus === "dated") return `${age.RateSourceDate} · ${age.RateAgeDays} day(s) old`;
+  if (age?.rateAgeStatus === "future_date") return `${age.rateSourceDate} · future date`;
+  if (age?.RateAgeStatus === "future_date") return `${age.RateSourceDate} · future date`;
+  return "Date unknown";
 }
 function newSelection(): Selection { return { selectionIdentity: crypto.randomUUID(), partId: "", partName: "", quantity: "1", uom: "each", sourcingRoute: "auto", label: "", optionGroup: "" }; }
 
@@ -106,17 +123,36 @@ export function LiveCostView({ products }: { products: Product[] }) {
   };
 
   const saveSnapshot = async (attempt = saveAttempt) => {
-    if (!live || live.status !== "complete") return;
-    const next = attempt || { key: crypto.randomUUID(), payload: { liveResult: live, label: snapshotLabel, reason: snapshotReason } };
-    setSaveAttempt(next); setSnapshotPending(next); window.localStorage.setItem(`safari-cost-snapshot-pending:${codeId}`, JSON.stringify(next));
+    if (!codeId || !live || live.status !== "complete") return;
     setBusy(true); setError(""); setNotice("");
     try {
+      let next = attempt;
+      if (!next) {
+        const current = await api.liveCost(codeId);
+        if (current.status !== "complete") {
+          setLive(current); setError("Live Cost is no longer complete. Review the refreshed result before saving a snapshot."); return;
+        }
+        if (costResultSignature(current) !== costResultSignature(live)) {
+          setLive(current); setError("Live Cost changed since review. Review the refreshed result before saving a snapshot."); return;
+        }
+        next = { key: crypto.randomUUID(), payload: { liveResult: current, label: snapshotLabel, reason: snapshotReason } };
+      }
+      setSaveAttempt(next); setSnapshotPending(next); window.localStorage.setItem(`safari-cost-snapshot-pending:${codeId}`, JSON.stringify(next));
       const result = await api.saveCostSnapshot(codeId, next.payload, next.key);
       window.localStorage.removeItem(`safari-cost-snapshot-pending:${codeId}`); setSaveAttempt(null); setSnapshotPending(null);
       setSnapshotLabel(""); setSnapshotReason(""); setNotice("Cost Snapshot is complete and its normalized Grist rows have been verified.");
       await refreshCode(codeId);
       setSnapshotDetail(result);
-    } catch (cause) { setError(message(cause)); }
+    } catch (cause) {
+      const code = (cause as { code?: string })?.code;
+      if (code === "COST_LIVE_STALE" || code === "COST_LIVE_CONTENT_MISMATCH") {
+        window.localStorage.removeItem(`safari-cost-snapshot-pending:${codeId}`); setSaveAttempt(null); setSnapshotPending(null);
+        try {
+          setLive(await api.liveCost(codeId));
+          setError("Live Cost changed before the snapshot was saved. Review the refreshed calculation and save again.");
+        } catch (refreshCause) { setError(`${message(cause)}; refreshing Live Cost also failed: ${message(refreshCause)}`); }
+      } else setError(message(cause));
+    }
     finally { setBusy(false); }
   };
 
@@ -195,10 +231,11 @@ export function LiveCostView({ products }: { products: Product[] }) {
           <strong className={live?.status === "complete" ? "live-total" : "live-total incomplete"}>{money(live?.totalCost, live?.currency || currency)}</strong></div>
         {live?.status === "complete" ? <p className="live-complete">Complete current calculation · {live.lineCount} cost lines · {live.availableLineCount} rate-backed</p>
           : live && <p className="live-incomplete">Incomplete: known subtotal {money(live.knownSubtotal, live.currency || currency)} is not a final total.</p>}
+        {live?.costDateSummary && <p className="live-readonly-note">Rate dates as of {live.costDateSummary.asOfDate} (Asia/Kolkata) · oldest known {live.costDateSummary.oldestKnownAgeDays === null ? "unknown" : `${live.costDateSummary.oldestKnownAgeDays} day(s)`} · {live.costDateSummary.unknownInputCount} unknown · {live.costDateSummary.futureInputCount} future-dated.</p>}
         {live?.warnings?.length > 0 && <div className="live-warning-list">{live.warnings.map((item: any, index: number) => <div key={`${item.code}:${index}`}><strong>{item.code.replaceAll("_", " ")}</strong><span>{item.message}</span></div>)}</div>}
-        {live?.lines?.length > 0 && <div className="live-table-wrap"><table><thead><tr><th>Occurrence / Part</th><th>Line</th><th>Quantity</th><th>Rate</th><th>Cost</th><th>Evidence</th></tr></thead><tbody>{live.lines.map((line: any) => {
+        {live?.lines?.length > 0 && <div className="live-table-wrap"><table><thead><tr><th>Occurrence / Part</th><th>Line</th><th>Quantity</th><th>Rate</th><th>Rate date</th><th>Cost</th><th>Evidence</th></tr></thead><tbody>{live.lines.map((line: any) => {
           const part = live.parts.find((item: any) => item.occurrencePath === line.partOccurrencePath);
-          return <tr key={line.lineKey}><td>{part?.partNumber} · {part?.name}<small>{line.stableOccurrencePath}</small></td><td>{line.description}<small>{line.costCategory} · {line.sourceKey}</small></td><td>{line.quantity} {line.quantityUOM}</td><td>{line.status === "available" ? `${money(line.rate, line.currency)} / ${line.rateUOM}` : line.reason || "Unavailable"}</td><td>{money(line.netCost, line.currency || currency)}</td><td>{live.rateEvidence.find((item: any) => item.lineKey === line.lineKey)?.evidenceReference || line.costPolicy || "—"}</td></tr>;
+          return <tr key={line.lineKey}><td>{part?.partNumber} · {part?.name}<small>{line.stableOccurrencePath}</small></td><td>{line.description}<small>{line.costCategory} · {line.sourceKey}</small></td><td>{line.quantity} {line.quantityUOM}</td><td>{line.status === "available" ? `${money(line.rate, line.currency)} / ${line.rateUOM}` : line.reason || "Unavailable"}</td><td>{line.status === "available" ? rateAgeText(line) : "Unavailable"}</td><td>{money(line.netCost, line.currency || currency)}</td><td>{live.rateEvidence.find((item: any) => item.lineKey === line.lineKey)?.evidenceReference || line.costPolicy || "—"}</td></tr>;
         })}</tbody></table></div>}
         {live?.lines?.filter((line: any) => line.sourceType === "process" && line.status !== "available").map((line: any) => <ProcessRateCapture key={line.lineKey} line={line} currency={live.currency || currency} onSaved={() => refreshCode()}/>)}
         <div className="live-snapshot-form"><label>Snapshot label<input value={snapshotLabel} onChange={event => setSnapshotLabel(event.target.value)} placeholder="Optional review label"/></label>
@@ -247,7 +284,7 @@ export function LiveCostView({ products }: { products: Product[] }) {
       {snapshotDetail?.snapshot?.PublicationStatus === "complete" && <section className="live-panel live-frozen-detail"><div className="live-section-title"><div><h2>Frozen snapshot detail</h2><p>{snapshotDetail.snapshot.SnapshotKey} · {snapshotDetail.snapshot.CreatedBy} · {snapshotDetail.snapshot.Notes}</p></div><strong>{money(snapshotDetail.snapshot.TotalCost, snapshotDetail.snapshot.Currency)}</strong></div>
         <p>This view uses only the saved Part, line and rate-evidence records. It does not look up current rates.</p>
         <div className="live-table-wrap"><table><thead><tr><th>Frozen Part occurrence</th><th>Quantity</th><th>Revision / metadata</th></tr></thead><tbody>{snapshotDetail.parts.map((part: any) => <tr key={part.PartOccurrenceKey}><td>{part.PartNumber} · {part.FrozenName}<small>{part.StableOccurrencePath}</small></td><td>{part.EffectiveQuantity} {part.QuantityUOM}</td><td>Rev {part.EngineeringRevision} · metadata v{part.MetadataVersionNumber}</td></tr>)}</tbody></table></div>
-        <div className="live-table-wrap"><table><thead><tr><th>Frozen line</th><th>Quantity</th><th>Rate</th><th>Cost</th><th>Frozen source evidence</th></tr></thead><tbody>{snapshotDetail.lines.map((line: any) => <tr key={line.SnapshotLineKey}><td>{line.Description}<small>{line.SourceType} · {line.SourceKey}</small></td><td>{line.Quantity} {line.QuantityUOM}</td><td>{money(line.Rate, line.Currency)} / {line.RateUOM}</td><td>{money(line.NetCost, line.Currency)}</td><td>{snapshotDetail.rateEvidence.filter((item: any) => item.SnapshotLine === line.id).map((item: any) => `${item.SourceTable}/${item.SourceRecordId} · ${item.EvidenceReference}`).join("; ") || "No rate evidence"}</td></tr>)}</tbody></table></div>
+        <div className="live-table-wrap"><table><thead><tr><th>Frozen line</th><th>Quantity</th><th>Rate</th><th>Cost</th><th>Frozen source evidence and age</th></tr></thead><tbody>{snapshotDetail.lines.map((line: any) => <tr key={line.SnapshotLineKey}><td>{line.Description}<small>{line.SourceType} · {line.SourceKey}</small></td><td>{line.Quantity} {line.QuantityUOM}</td><td>{money(line.Rate, line.Currency)} / {line.RateUOM}</td><td>{money(line.NetCost, line.Currency)}</td><td>{snapshotDetail.rateEvidence.filter((item: any) => item.SnapshotLine === line.id).map((item: any) => `${item.SourceTable}/${item.SourceRecordId} · ${item.EvidenceReference} · ${rateAgeText(item)}`).join("; ") || "No rate evidence"}</td></tr>)}</tbody></table></div>
         {snapshotDetail.lineCount > snapshotDetail.lineOffset + snapshotDetail.lineLimit && <button className="button" onClick={() => void openSnapshot(snapshotDetail.snapshot.SnapshotKey, snapshotDetail.lineOffset + snapshotDetail.lineLimit)}>More lines</button>}
       </section>}
     </>}

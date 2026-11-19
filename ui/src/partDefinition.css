@@ -15,7 +15,7 @@
 .parts-definition-items strong,.parts-definition-history strong{font-size:10px;color:#34435a}
 .parts-definition-items span,.parts-definition-history span{font-size:10px;color:#536176}
 .parts-definition-items small,.parts-definition-history p{font-size:9px;color:#7b8796;margin:0}
-.parts-definition-editor{display:grid;gap:10px;margin-top:12px;padding-top:10px;border-top:1px solid #e7eaee}
+.parts-definition-editor{display:grid;gap:10px;min-width:0;margin-top:12px;padding:10px 0 0;border:0;border-top:1px solid #e7eaee}
 .parts-definition-row{min-width:0;margin:0;padding:10px;border:1px solid #dfe4e9;border-radius:8px;background:#fff}
 .parts-definition-row legend{padding:0 5px;color:#647286;font-size:9px;font-weight:700;overflow-wrap:anywhere}
 .parts-definition-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}

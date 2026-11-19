@@ -172,6 +172,40 @@ class GristPartDefinitionService:
             "previousRevisionId": _int_ref(_fields(row).get("PreviousRevision")), "publicationCause": _fields(row).get("PublicationCause"),
             "current": int(row["id"]) == current_id} for row in revisions]
 
+    def publication_recovery(self, part_id: str, *, actor: str = "") -> dict[str, Any]:
+        """Expose only durable retry identity while normal reads are generation-blocked."""
+        part = self._part_row(part_id)
+        part_record_id = int(part["id"])
+        change_requests = self._optional_rows("PartEngineeringChangeRequest")
+        journals = self._optional_rows("PartDefinitionPublication")
+        can_recover = str(actor or "").strip().casefold() == os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold()
+        items = []
+        for journal in journals:
+            fields = _fields(journal)
+            status = str(fields.get("Status") or "").casefold()
+            if status == "published":
+                continue
+            plan = _json_cell(fields.get("Plan")) or {}
+            affected = [int(value) for value in plan.get("affectedPartRecordIds", []) if str(value).isdigit()]
+            if part_record_id not in affected:
+                continue
+            change_request_key = str(plan.get("changeRequestKey") or "")
+            cr = next((row for row in change_requests if str(_fields(row).get("ChangeRequestKey") or "") == change_request_key), None)
+            if not cr:
+                change_request_id = _int_ref(fields.get("ChangeRequest"))
+                cr = next((row for row in change_requests if int(row.get("id", -1)) == change_request_id), None) if change_request_id else None
+            cr_fields = _fields(cr)
+            change_request_key = change_request_key or str(cr_fields.get("ChangeRequestKey") or "")
+            request_key = str(fields.get("RequestKey") or cr_fields.get("RequestKey") or "")
+            items.append({"changeRequestKey": change_request_key, "requestKey": request_key,
+                "status": status or "unknown", "changeRequestStatus": str(cr_fields.get("Status") or "unknown").casefold(),
+                "reason": str(cr_fields.get("Reason") or plan.get("reason") or ""),
+                "completedStages": (_json_cell(fields.get("CompletedStages")) or {}).get("stages", []),
+                "dependentPartCount": len(plan.get("affectedPartRecordIds") or []) - 1,
+                "configurationCount": len(plan.get("affectedCodeRecordIds") or []),
+                "canRetry": bool(can_recover and change_request_key and request_key)})
+        return {"status": "recovering" if items else "clear", "items": items}
+
     def _definition_from_rows(self, part_id: str, revision_id: int) -> dict[str, Any]:
         part_row = self._part_row(part_id)
         part_fields = _fields(part_row)
@@ -415,28 +449,34 @@ class GristPartDefinitionService:
             if key in seen_requirements:
                 raise PartIdentityError("PART_DEFINITION_IDENTITY_DUPLICATE", "Requirement identities must be unique within one Part revision.")
             seen_requirements.add(key)
+            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+            detail = {str(name): deepcopy(value) for name, value in detail.items() if str(name) in LINE_DETAIL_FIELDS}
+            unchanged_legacy_line = bool(existing and self._same_requirement_physical_content(raw, existing, detail))
             quantity = _num(raw.get("quantity"), allow_blank=True)
             uom = str(raw.get("uom") or "").strip()
-            if quantity is None and (not existing or raw.get("lineRevisionId") != existing.get("lineRevisionId")):
+            if quantity is None and not unchanged_legacy_line:
                 raise PartIdentityError("PART_DEFINITION_QUANTITY_INVALID", "New or changed requirements need a finite positive quantity.")
             if quantity is not None and quantity <= 0:
                 raise PartIdentityError("PART_DEFINITION_QUANTITY_INVALID", "Requirement quantities must be finite and greater than zero.")
             if not uom and not existing:
                 raise PartIdentityError("PART_DEFINITION_UOM_REQUIRED", "New requirements need a quantity unit.")
-            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
-            detail = {str(name): deepcopy(value) for name, value in detail.items() if str(name) in LINE_DETAIL_FIELDS}
             for name in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
-                if name in detail:
-                    detail[name] = _int_ref(detail[name])
-            for name in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
-                ref = _int_ref(detail.get(name))
-                if detail.get(name) not in (None, "") and ref is None:
+                submitted_ref = detail.get(name)
+                if submitted_ref in (None, ""):
+                    detail[name] = None if name in detail else detail.get(name)
+                    continue
+                ref = _int_ref(submitted_ref)
+                if ref is None:
+                    if unchanged_legacy_line and submitted_ref == (existing.get("detail") or {}).get(name):
+                        continue
                     raise PartIdentityError("PART_DEFINITION_IDENTITY_INVALID", f"{name} must reference an existing Safari identity.")
                 if ref is not None and not any(int(row.get("id", -1)) == ref for row in self._rows(name)):
+                    if unchanged_legacy_line and ref == _int_ref((existing.get("detail") or {}).get(name)):
+                        continue
                     raise PartIdentityError("PART_DEFINITION_IDENTITY_UNRESOLVED", f"The selected {name} identity is not available in Safari Grist.")
+                detail[name] = ref
             dimension_uom = str(detail.get("DimensionUOM") or "").strip().casefold()
             dimensions = [_num(detail.get(name), allow_blank=True) for name in ("Length", "Width", "Thickness")]
-            unchanged_legacy_line = bool(existing and _int_ref(raw.get("lineRevisionId")) == _int_ref(existing.get("lineRevisionId")))
             if any(value is not None and value <= 0 for value in dimensions) and not unchanged_legacy_line:
                 raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
             if any(value is not None for value in dimensions) and (not all(value is not None for value in dimensions) or dimension_uom not in {"mm", "millimeter", "millimeters", "in", "inch", "inches"}) and not unchanged_legacy_line:
@@ -454,6 +494,12 @@ class GristPartDefinitionService:
             process_type = FAMILY_PROCESS.get(family) or str(raw.get("processType") or (existing or {}).get("processType") or "")
             if family in FAMILY_PROCESS:
                 detail["ProcessType"] = process_type
+                rate_quantity = _num(detail.get("Quantity"), allow_blank=True)
+                rate_uom = str(detail.get("QuantityUOM") or "").strip()
+                if not unchanged_legacy_line and (rate_quantity is None or rate_quantity <= 0 or not rate_uom):
+                    raise PartIdentityError("PART_DEFINITION_RATE_BASIS_INVALID", "New or changed manufacturing requirements need a finite positive rate quantity and its unit.")
+                if family == "mcl" and not unchanged_legacy_line and not (_int_ref(detail.get("Material")) or str(detail.get("MaterialDisplayName") or "").strip()):
+                    raise PartIdentityError("PART_DEFINITION_MATERIAL_REQUIRED", "A new or changed MCL requirement needs a canonical Material or an exact material display name.")
             field_status = deepcopy(raw.get("fieldStatus") or {})
             for name in ("ToolShopRemarks", "PlatePart", "DimensionText", "ItemCode", "ItemName", "MaterialDisplayName"):
                 if name in detail:
@@ -569,13 +615,59 @@ class GristPartDefinitionService:
             "finalizeOnPublication": bool(payload.get("finalizeOnPublication", current.get("finalizeOnPublication", False))),
             "baseRevisionId": base_revision_id, "partId": part_id}
 
+    @staticmethod
+    def _same_requirement_physical_content(raw: dict[str, Any], existing: dict[str, Any], detail: dict[str, Any]) -> bool:
+        """Allow malformed legacy evidence only when the whole physical line is unchanged."""
+        if _int_ref(raw.get("lineRevisionId")) != _int_ref(existing.get("lineRevisionId")):
+            return False
+        if str(raw.get("family") or "").strip().casefold() != str(existing.get("family") or "").strip().casefold():
+            return False
+        if str(raw.get("processType") or existing.get("processType") or "") != str(existing.get("processType") or ""):
+            return False
+        raw_quantity, old_quantity = _num(raw.get("quantity"), allow_blank=True), _num(existing.get("quantity"), allow_blank=True)
+        if raw_quantity != old_quantity or str(raw.get("uom") or "").strip() != str(existing.get("uom") or "").strip():
+            return False
+        old_detail = existing.get("detail") if isinstance(existing.get("detail"), dict) else {}
+        numeric_fields = {"Quantity", "DimensionMM", "DimensionInches", "WeightGrams", "WeightKg", "PartWeightKg",
+            "Length", "Width", "Thickness", "InternalMakingCost", "ExternalMachiningCost", "RateCached", "CostCached"}
+        reference_fields = {"Material", "PurchaseItem", "ProcessOperation", "WorkCenter"}
+        for name in LINE_DETAIL_FIELDS:
+            new_value, old_value = detail.get(name), old_detail.get(name)
+            if new_value in (None, "") and old_value in (None, ""):
+                continue
+            if name in numeric_fields:
+                new_number, old_number = _num(new_value), _num(old_value)
+                if new_number is None or old_number is None:
+                    if new_value != old_value:
+                        return False
+                elif new_number != old_number:
+                    return False
+            elif name in reference_fields:
+                new_ref, old_ref = _int_ref(new_value), _int_ref(old_value)
+                if new_ref is None or old_ref is None:
+                    if new_value != old_value:
+                        return False
+                elif new_ref != old_ref:
+                    return False
+            elif name == "EngineeringAttributes":
+                if _stable(_json_cell(new_value) or {}) != _stable(_json_cell(old_value) or {}):
+                    return False
+            elif new_value != old_value:
+                return False
+        return True
+
     @_serialized
     def save_draft(self, part_id: str, payload: dict[str, Any], *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
         self.registry._verify_writer()
         self._require_publication_schema()
+        if not isinstance(payload, dict):
+            raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "A complete Part definition object is required.")
         part_row = self._part_row(part_id)
         current = self._current_revision(part_id)
         self._check_established(current)
+        expected_save_version = payload.get("expectedSaveVersion")
+        if isinstance(expected_save_version, bool) or not isinstance(expected_save_version, int) or expected_save_version < 0:
+            raise PartIdentityError("PART_DEFINITION_SAVE_VERSION_REQUIRED", "Include the saved draft version you reviewed; use 0 when no draft exists.")
         base_revision_id = _int_ref(payload.get("baseRevisionId"))
         if base_revision_id != int(current["id"]):
             raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The Part's accepted revision changed. Reload its current definition before saving a draft.")
@@ -583,12 +675,41 @@ class GristPartDefinitionService:
             raise PartIdentityError("PART_DEFINITION_INPUT_REQUIRED", "A reason, trusted actor and idempotency key are required to save a draft.")
         content = self._normalize_content(part_id, base_revision_id, payload, request_key)
         content_fingerprint = request_fingerprint(content)
-        operation_fingerprint = request_fingerprint([part_id, base_revision_id, content_fingerprint, actor.strip(), reason.strip()])
-        request = self.registry._begin_request(request_key, "part_definition_draft_save", operation_fingerprint, part_id)
-        old_result = self._request_result(request)
-        if old_result is not None:
-            return old_result
+        operation_fingerprint = request_fingerprint([part_id, base_revision_id, expected_save_version, content_fingerprint, actor.strip(), reason.strip()])
         draft_key = f"part-definition-draft:{part_id}:{base_revision_id}"
+        draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+        prior_request = self._find("PartRegistryRequest", "RequestKey", request_key)
+        if prior_request:
+            request_fields = _fields(prior_request)
+            if (request_fields.get("RequestFingerprint") != operation_fingerprint
+                    or request_fields.get("RequestType") != "part_definition_draft_save"):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different draft content or generation.")
+            old_result = self._request_result(prior_request)
+            if old_result is not None:
+                current_version = int(_fields(draft).get("SaveVersion") or 0) if draft else 0
+                if current_version > int(old_result.get("saveVersion") or 0):
+                    raise PartIdentityError("PART_DEFINITION_DRAFT_REPLAY_SUPERSEDED", "This completed draft save was superseded by a newer draft. Reload the current version before continuing.")
+                return {**old_result, "idempotent": True}
+            draft_fields = _fields(draft)
+            if (draft and draft_fields.get("RequestKey") == request_key
+                    and draft_fields.get("RequestFingerprint") == operation_fingerprint
+                    and int(draft_fields.get("SaveVersion") or 0) == expected_save_version + 1
+                    and draft_fields.get("ContentFingerprint") == content_fingerprint):
+                recovered = {"draftKey": draft_key, "saveVersion": expected_save_version + 1, "baseRevisionId": base_revision_id,
+                    "contentFingerprint": content_fingerprint, "content": content, "status": "saved", "idempotent": True}
+                self.registry._complete_request(prior_request, recovered)
+                return recovered
+        if draft:
+            fields = _fields(draft)
+            status = str(fields.get("Status") or "open").casefold()
+            if status != "open":
+                raise PartIdentityError("PART_DEFINITION_DRAFT_IMMUTABLE", "A submitted or published draft is immutable; create a new reviewed draft after its Change Request is resolved.")
+            current_save_version = int(fields.get("SaveVersion") or 0)
+        else:
+            current_save_version = 0
+        if expected_save_version != current_save_version:
+            raise PartIdentityError("PART_DEFINITION_DRAFT_STALE", f"This draft is version {current_save_version}; reload before saving against the current version.")
+        request = prior_request or self.registry._begin_request(request_key, "part_definition_draft_save", operation_fingerprint, part_id)
         for old_draft in self._rows("PartDefinitionDraft"):
             old_fields = _fields(old_draft)
             if (_int_ref(old_fields.get("ProductPart")) == int(part_row["id"])
@@ -597,13 +718,12 @@ class GristPartDefinitionService:
                 self.client.update_table_records("PartDefinitionDraft", [{"id": int(old_draft["id"]), "fields": {
                     "Status": "stale", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
                     "RequestFingerprint": request_fingerprint([old_fields.get("DraftKey"), "stale", base_revision_id])}}])
-        draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
         now = grist_datetime(utc_now())
         if draft:
             fields = _fields(draft)
             if _int_ref(fields.get("BaseRevision")) != base_revision_id:
                 raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The saved draft belongs to another accepted Part revision.")
-            save_version = int(fields.get("SaveVersion") or 0) + 1
+            save_version = current_save_version + 1
             self.client.update_table_records("PartDefinitionDraft", [{"id": int(draft["id"]), "fields": {
                 "SaveVersion": save_version, "Status": "open", "Content": canonical_grist_json_cell(content),
                 "ContentFingerprint": content_fingerprint, "Actor": actor.strip(), "Reason": reason.strip(),
@@ -616,7 +736,7 @@ class GristPartDefinitionService:
                 "ContentFingerprint": content_fingerprint, "Actor": actor.strip(), "Reason": reason.strip(),
                 "CreatedAt": now, "UpdatedAt": now, "RequestKey": request_key, "RequestFingerprint": operation_fingerprint})
         result = {"draftKey": draft_key, "saveVersion": save_version, "baseRevisionId": base_revision_id,
-            "contentFingerprint": content_fingerprint, "content": content, "status": "saved"}
+            "contentFingerprint": content_fingerprint, "content": content, "status": "saved", "idempotent": False}
         self.registry._complete_request(request, result)
         return result
 
@@ -737,7 +857,7 @@ class GristPartDefinitionService:
                 if str(edge["parentPartId"]) in path:
                     unknown.append({"code": "DEPENDENCY_GRAPH_CYCLE", "partId": edge["parentPartId"], "path": list(parent_path)})
                     continue
-                if edge["parentKind"] == "assembly":
+                if edge["parentKind"] in {"part", "assembly"}:
                     path_signature = _stable([[(edges_by_id[edge_id].get("parentPartId"), edges_by_id[edge_id].get("identity") or edges_by_id[edge_id].get("rowId"), edges_by_id[edge_id].get("childPartId")) for edge_id in next_edge_path]])
                     parent_paths.setdefault(parent_record, {})[path_signature] = parent_path
                     parent_edge_paths.setdefault(parent_record, {})[path_signature] = next_edge_path
@@ -748,7 +868,8 @@ class GristPartDefinitionService:
                         parent_order.append(parent_record)
                     path_queue.append((parent_record, parent_path, next_edge_path))
                 else:
-                    unknown.append({"code": "NON_ASSEMBLY_COMPOSITE_COVERAGE_UNSUPPORTED", "parentPartId": edge["parentPartId"], "path": list(parent_path)})
+                    unknown.append({"code": "NON_ASSEMBLY_COMPOSITE_COVERAGE_UNSUPPORTED", "parentPartId": edge["parentPartId"],
+                        "parentKind": edge["parentKind"], "path": list(parent_path)})
         affected_parts = []
         proposed_labels: dict[int, str | None] = {target_record: None}
         for record_id in parent_order:
@@ -758,6 +879,7 @@ class GristPartDefinitionService:
             revision_id = graph["currentByPart"].get(record_id)
             revision = graph["revisionById"].get(revision_id or -1, {})
             label = _fields(revision).get("RevisionLabel") or _fields(revision).get("Revision")
+            parent_kind = str(_fields(row).get("IdentityKind") or "part").casefold() if row else "part"
             try:
                 proposed_label = _next_revision_label(label or "A")
             except PartIdentityError:
@@ -766,7 +888,7 @@ class GristPartDefinitionService:
             proposed_labels[record_id] = proposed_label
             affected_parts.append({"partRecordId": record_id, "partId": stable_id, "partNumber": _fields(row).get("PartNumber") if row else "",
                 "currentRevisionId": revision_id, "currentRevisionLabel": label, "proposedRevisionLabel": proposed_label,
-                "paths": [list(path) for _, path in sorted(paths.items())], "status": "current_assembly"})
+                "kind": parent_kind, "paths": [list(path) for _, path in sorted(paths.items())], "status": f"current_{parent_kind}"})
         target_revision_fields = _fields(current)
         try:
             proposed_target_label = _next_revision_label(target_revision_fields.get("RevisionLabel") or target_revision_fields.get("Revision") or "A")
@@ -792,9 +914,13 @@ class GristPartDefinitionService:
                         "quantity": edge.get("quantity"), "uom": edge.get("uom"), "sourcingRoute": edge.get("route")})
                 details.append({"partPath": parent_paths[parent["partRecordId"]][signature], "edges": path_details})
             parent["pathDetails"] = details
+        changed_part_records = {target_record, *parent_paths.keys()}
         code_uses = []
         for item in graph["configs"]:
-            if item["partRecordId"] == target_record:
+            if item["partRecordId"] in changed_part_records:
+                proposed_label = proposed_labels.get(item["partRecordId"])
+                dependency_paths = ([list(path) for _, path in sorted(parent_paths.get(item["partRecordId"], {}).items())]
+                    if item["partRecordId"] != target_record else [[part_id]])
                 if not item.get("selectionIdentity"):
                     unknown.append({"code": "CONFIGURATION_SELECTION_IDENTITY_UNCLASSIFIED",
                         "modelCodeRecordId": item["codeRecordId"], "selectionRecordId": item["selectionRecordId"]})
@@ -804,21 +930,25 @@ class GristPartDefinitionService:
                     "currentConfigurationRevision": current_config_revision,
                     "proposedConfigurationRevision": int(current_config_revision or 0) + 1,
                     "selectionIdentity": item["selectionIdentity"], "partId": item["partId"], "partRevisionId": item["partRevisionId"],
-                    "proposedPartRevisionLabel": proposed_target_label, "quantity": item["quantity"],
-                    "uom": item["uom"], "sourcingRoute": item["route"], "label": item["label"], "optionGroup": item["optionGroup"]})
+                    "proposedPartRevisionLabel": proposed_label, "quantity": item["quantity"],
+                    "uom": item["uom"], "sourcingRoute": item["route"], "label": item["label"], "optionGroup": item["optionGroup"],
+                    "dependencyPaths": dependency_paths})
         for parent in affected_parts:
-            if parent["status"] != "current_assembly":
+            if parent["status"] not in {"current_part", "current_assembly"}:
                 continue
             parent_revision_fields = graph["revisionById"].get(parent["currentRevisionId"] or -1, {})
             if str(parent_revision_fields.get("BaselineStatus") or "").casefold() == "finalized" and content and not content.get("finalizeOnPublication") and str(target_revision_fields.get("BaselineStatus") or "").casefold() != "finalized":
-                unknown.append({"code": "FINALIZED_ASSEMBLY_DEPENDS_ON_UNFINALIZED_PART", "partId": parent["partId"], "message": "Finalize the changed Part in the approved CR before repinning this finalized assembly."})
+                unknown.append({"code": "FINALIZED_DEPENDENT_DEPENDS_ON_UNFINALIZED_PART", "partId": parent["partId"],
+                    "kind": parent["kind"], "message": "Finalize the changed Part in the approved CR before repinning this finalized dependent definition."})
+        assemblies = [item for item in affected_parts if item["kind"] == "assembly"]
         return {"status": "complete_with_gaps" if unknown else "complete", "target": {"partId": part_id, "partRecordId": target_record,
                 "currentRevisionId": target_revision, "currentRevisionLabel": target_revision_fields.get("RevisionLabel") or target_revision_fields.get("Revision"),
                 "proposedRevisionLabel": proposed_target_label},
-            "assemblies": affected_parts, "modelCodeConfigurations": code_uses,
+            "assemblies": assemblies, "dependents": affected_parts, "modelCodeConfigurations": code_uses,
             "spares": {"status": "unsupported_by_b2_p1", "items": [], "message": "B2 spare-definition composition propagation is reserved for the later B2 composition package."},
             "unknown": unknown, "dependencyGeneration": graph["generation"],
-            "fingerprint": request_fingerprint({"target": target_revision, "assemblies": affected_parts, "codes": code_uses, "unknown": unknown, "generation": graph["generation"]})}
+            "fingerprint": request_fingerprint({"target": target_revision, "assemblies": assemblies, "dependents": affected_parts,
+                "codes": code_uses, "unknown": unknown, "generation": graph["generation"]})}
 
     @_serialized
     def submit_change_request(self, part_id: str, payload: dict[str, Any], *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
@@ -844,8 +974,8 @@ class GristPartDefinitionService:
             raise PartIdentityError("PART_CHANGE_REQUEST_INPUT_REQUIRED", "A change reason, trusted actor and idempotency key are required.")
         before = self._definition_from_rows(part_id, int(current["id"]))
         impact = self.impact_preview(part_id, content)
-        if any(item.get("code") in {"DEPENDENCY_GRAPH_CYCLE", "FINALIZED_ASSEMBLY_DEPENDS_ON_UNFINALIZED_PART"} for item in impact["unknown"]):
-            raise PartIdentityError("PART_CHANGE_REQUEST_IMPACT_BLOCKED", "The dependency preview has a cycle or a finalized dependent that cannot be safely repinned. Resolve the listed issue before approval.")
+        if impact["unknown"]:
+            raise PartIdentityError("PART_CHANGE_REQUEST_IMPACT_BLOCKED", "The dependency preview is incomplete or has an unsupported path. Resolve every listed issue before submitting this Change Request.")
         operation_fingerprint = request_fingerprint([part_id, draft_key, base_id, draft_fields.get("ContentFingerprint"), reason.strip(), impact["fingerprint"], actor.strip()])
         request = self.registry._begin_request(request_key, "part_definition_change_request", operation_fingerprint, part_id)
         old_result = self._request_result(request)
@@ -910,6 +1040,9 @@ class GristPartDefinitionService:
         requirement_key = str(item["requirementKey"])
         existing_master_id, existing_revision_id = _int_ref(item.get("lineMasterId")), _int_ref(item.get("lineRevisionId"))
         detail = {key: deepcopy(value) for key, value in item.get("detail", {}).items() if key in LINE_DETAIL_FIELDS}
+        engineering_attributes = _json_cell(detail.get("EngineeringAttributes"))
+        if engineering_attributes is not None:
+            detail["EngineeringAttributes"] = canonical_grist_json_cell(engineering_attributes)
         existing_detail = self._existing_line_details(existing_revision_id)
         comparable_detail = deepcopy(existing_detail)
         comparable_detail["EngineeringAttributes"] = _json_cell(comparable_detail.get("EngineeringAttributes")) or {}
@@ -1041,27 +1174,27 @@ class GristPartDefinitionService:
         current_impact = self.impact_preview(part_id, after)
         if current_impact.get("fingerprint") != impact.get("fingerprint"):
             raise PartIdentityError("PART_DEPENDENCY_CLOSURE_STALE", "Current assemblies or Model Code configurations changed after the dependency preview. Reopen the definition, review the new impact and submit a new Change Request.")
-        blocking_unknown = [item for item in current_impact.get("unknown", [])
-            if item.get("code") != "NON_ASSEMBLY_COMPOSITE_COVERAGE_UNSUPPORTED"]
+        blocking_unknown = list(current_impact.get("unknown", []))
         if blocking_unknown:
             raise PartIdentityError("PART_DEPENDENCY_CLOSURE_INCOMPLETE", "The reviewed dependency closure has unresolved or unsupported paths; publication is blocked until coverage is explicit.")
-        if not current_impact.get("target", {}).get("proposedRevisionLabel") or any(not item.get("proposedRevisionLabel") for item in current_impact.get("assemblies", [])):
+        dependents = current_impact.get("dependents", current_impact.get("assemblies", []))
+        if not current_impact.get("target", {}).get("proposedRevisionLabel") or any(not item.get("proposedRevisionLabel") for item in dependents):
             raise PartIdentityError("PART_REVISION_UNCLASSIFIED", "A current Part or assembly has an unclassified legacy revision label; no managed engineering revision will be invented.")
         repin: dict[str, int] = {part_id: 0}
         parts = [{"partId": part_id, "partRecordId": int(part_row["id"]), "currentRevisionId": int(current["id"]),
             "revisionLabel": current_impact["target"]["proposedRevisionLabel"], "kind": str(_fields(part_row).get("IdentityKind") or "part"),
             "content": after, "finalize": bool(after.get("finalizeOnPublication") or str(_fields(current).get("BaselineStatus") or "").casefold() == "finalized")}]
-        for dependent in impact.get("assemblies", []):
+        for dependent in impact.get("dependents", impact.get("assemblies", [])):
             dep_id = dependent["partId"]
             dep_revision_id = int(dependent["currentRevisionId"])
             dep_content = self._content_for_assembly(dep_id, dep_revision_id, {})
             dep_content["finalizeOnPublication"] = str(self._revision_by_id(dep_revision_id).get("BaselineStatus") or "").casefold() == "finalized"
             parts.append({"partId": dep_id, "partRecordId": int(dependent["partRecordId"]), "currentRevisionId": dep_revision_id,
-                "revisionLabel": dependent["proposedRevisionLabel"], "kind": "assembly", "content": dep_content,
+                "revisionLabel": dependent["proposedRevisionLabel"], "kind": dependent.get("kind") or "assembly", "content": dep_content,
                 "finalize": bool(dep_content["finalizeOnPublication"])})
         target_finalize = parts[0]["finalize"]
-        if any(item["kind"] == "assembly" and item["finalize"] and not target_finalize for item in parts):
-            raise PartIdentityError("PART_DEPENDENT_FINALIZATION_REQUIRED", "A finalized current assembly cannot be repinned to a Part that remains unfinalized. Mark the Part revision for finalization in this approved Change Request.")
+        if any(item["finalize"] for item in parts[1:]) and not target_finalize:
+            raise PartIdentityError("PART_DEPENDENT_FINALIZATION_REQUIRED", "A finalized current dependent Part or assembly cannot be repinned to a Part that remains unfinalized. Mark the Part revision for finalization in this approved Change Request.")
         config_groups: dict[int, list[dict[str, Any]]] = {}
         target_record_id = int(part_row["id"])
         for use in impact.get("modelCodeConfigurations", []):
@@ -1209,7 +1342,7 @@ class GristPartDefinitionService:
         config_rows_by_code: dict[int, dict[str, Any]] = {}
         for config in plan_fields.get("configurations", []):
             config_row = next((row for row in self._rows("CostingConfiguration") if int(row.get("id", -1)) == int(config["configurationRecordId"])), None)
-            if not config_row or _int_ref(_fields(config_row).get("CurrentRevision")) != int(config["currentRevisionId"]):
+            if not config_row:
                 raise PartIdentityError("PART_CONFIGURATION_STALE_BASE", "An impacted Model Code configuration changed after review; its current successor was not published.")
             revision_key = f"configuration-part-change:{cr_key}:{config['codeRecordId']}"
             revision_row = self.registry._ensure_keyed("CostingConfigurationRevision", "ConfigurationRevisionKey", revision_key, {
@@ -1218,6 +1351,15 @@ class GristPartDefinitionService:
                 "ChangeRequest": int(cr["id"]), "PublicationCause": cr_key,
                 "Reason": str(plan_fields.get("reason") or ""), "CreatedAt": grist_datetime(utc_now()),
                 "RequestKey": request_key, "RequestFingerprint": request_fingerprint([cr_key, config])})
+            current_pointer = _int_ref(_fields(config_row).get("CurrentRevision"))
+            successor_id = int(revision_row["id"])
+            if current_pointer not in {int(config["currentRevisionId"]), successor_id}:
+                raise PartIdentityError("PART_CONFIGURATION_STALE_BASE", "An impacted Model Code configuration changed to a foreign generation after review; the approved successor was not published.")
+            revision_fields = _fields(revision_row)
+            if (_int_ref(revision_fields.get("Configuration")) != int(config_row["id"])
+                    or str(revision_fields.get("PublicationCause") or "") != cr_key
+                    or int(revision_fields.get("Revision") or 0) != int(config["revision"])):
+                raise PartIdentityError("PART_CONFIGURATION_STALE_BASE", "The current configuration successor does not match this verified publication plan.")
             for selection in config["selections"]:
                 part_revision = repin.get(selection["partId"]) or selection.get("partRevisionId")
                 if not part_revision:

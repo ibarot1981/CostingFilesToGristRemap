@@ -60,6 +60,7 @@ export const api = {
   maintainPartShortcode: (payload: unknown, key: string) => send<any>("/api/parts/shortcodes", payload, { "Idempotency-Key": key }),
   partDetails: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}`),
   partDefinition: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition`),
+  partDefinitionRecovery: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/recovery`),
   partDefinitionOptions: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/options`),
   savePartDefinitionDraft: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/draft`, payload, { "Idempotency-Key": key }, "PUT", PART_DEFINITION_WRITE_TIMEOUT_MS),
   submitPartDefinitionChangeRequest: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/change-requests`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),

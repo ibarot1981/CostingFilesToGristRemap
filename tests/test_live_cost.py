@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
 from app.grist_types import grist_datetime
-from app.live_cost import GristLiveCostService
+from app.live_cost import GristLiveCostService, _cost_date_summary, _rate_age
 from app.part_identity import PartIdentityError
 
 
@@ -73,6 +73,7 @@ class LiveCostTests(unittest.TestCase):
         self.registry._verify_writer = lambda: None
         self.features = GristPartFeatures(self.registry)
         self.rate = {"Bolt": "5"}
+        self.rate_metadata = {}
         self.service = GristLiveCostService(self.registry, material_rate_loader=self.load_rates)
         self._make_model()
 
@@ -82,7 +83,7 @@ class LiveCostTests(unittest.TestCase):
     def load_rates(self, names):
         return {"status": "available", "source": "Costing-New", "sourceDocumentId": "costing-new-test",
             "rows": [{"material": name, "status": "available", "costingNewRate": self.rate.get(name),
-                "basis": "Default_MaterialRate", "masterRecordId": 700, "rateLogRecordIds": []} for name in names]}
+                "basis": "Default_MaterialRate", "masterRecordId": 700, "rateLogRecordIds": [], **self.rate_metadata.get(name, {})} for name in names]}
 
     def create_part(self, key, name, variant=""):
         return self.registry.create_part(scope_type="product", target_id="5", target_label="Safari 1000",
@@ -164,6 +165,11 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(saved["snapshot"]["PublicationStatus"], "complete")
         self.assertEqual(saved["snapshot"]["TotalCost"], 670)
         self.assertEqual((len(saved["parts"]), len(saved["lines"]), len(saved["rateEvidence"])), (3, 4, 4))
+        self.assertEqual((live["costDateSummary"]["datedInputCount"], live["costDateSummary"]["unknownInputCount"], live["costDateSummary"]["futureInputCount"]), (3, 1, 0))
+        self.assertEqual(sum(item["RateAgeStatus"] == "unknown" for item in saved["rateEvidence"]), 1)
+        self.assertTrue(all(item["RateAgeAsOfDate"] for item in saved["rateEvidence"]))
+        frozen_rate_ages = {item["EvidenceKey"]: (item["RateAgeStatus"], item["RateAgeDays"], item["RateAgeAsOfDate"], item["RateSourceDate"])
+            for item in saved["rateEvidence"]}
         self.assertEqual(len(self.client.tables["CostSnapshot"]), 1)
         self.assertEqual(len(self.client.tables.get("PurchasedPartCostEvidence", [])), 0)
 
@@ -184,6 +190,8 @@ class LiveCostTests(unittest.TestCase):
         historical = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertEqual(historical["snapshot"]["TotalCost"], 670)
         self.assertEqual(sorted(line["Rate"] for line in historical["lines"]), [5.0, 20.0, 100.0, 100.0])
+        self.assertEqual({item["EvidenceKey"]: (item["RateAgeStatus"], item["RateAgeDays"], item["RateAgeAsOfDate"], item["RateSourceDate"])
+            for item in historical["rateEvidence"]}, frozen_rate_ages)
         self.client.reads.clear()
         self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertFalse({"PartPurchaseRecord", "CostingProcessRate"} & set(self.client.reads))
@@ -327,6 +335,61 @@ class LiveCostTests(unittest.TestCase):
             actor="owner", request_key="policy-inherit")
         inherited = self.service.policy_state(100)
         self.assertEqual((inherited["policy"], inherited["source"]), ("monthly", "system"))
+
+    def test_material_cut_process_type_uses_material_rate_with_explicit_consumption_basis(self):
+        material = next(row for row in self.client.tables["Material"] if row["fields"].get("CanonicalName") == "Bolt")
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:authored-material-cut", "ProcessType": "material_cut", "SourcePartName": "Authored steel"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:authored-material-cut", "LineMaster": master["id"],
+            "ProcessType": "material_cut", "PhysicalSignature": "authored-material-v1", "Status": "active"}}])["records"][0]
+        self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:authored-material-cut", "LineRevision": revision["id"],
+            "ProcessType": "material_cut", "Material": material["id"], "MaterialDisplayName": "Bolt", "ItemName": "Authored steel", "Quantity": 2, "QuantityUOM": "kg"}}])
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:authored-material-cut", "RequirementKey": "authored-material-cut",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 1, "QuantityUOM": "each", "Status": "active"}}])
+
+        live = self.service.live_cost(100)
+
+        authored = next(item for item in live["lines"] if item["description"] == "Authored steel")
+        self.assertEqual((authored["sourceType"], authored["quantity"], authored["quantityUOM"], authored["rate"], authored["netCost"]), ("material", 4, "kg", 5.0, 20.0))
+        self.assertNotIn("PROCESS_RATE_UNAVAILABLE", {warning["code"] for warning in live["warnings"]})
+
+    def test_new_toolshop_and_cnc_requirements_cost_from_eligible_dated_rates(self):
+        created = {}
+        for process, quantity, rate in (("tool_shop", 3, 2), ("cnc", 4, 3)):
+            key = process.replace("_", "-")
+            master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": f"line:authored-{key}", "ProcessType": process, "SourcePartName": f"Authored {process}"}}])["records"][0]
+            revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": f"revision:authored-{key}", "LineMaster": master["id"],
+                "ProcessType": process, "PhysicalSignature": f"authored-{key}-v1", "Status": "active"}}])["records"][0]
+            self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": f"detail:authored-{key}", "LineRevision": revision["id"],
+                "ProcessType": process, "ItemName": f"Authored {process}", "Quantity": quantity, "QuantityUOM": "each"}}])
+            self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": f"membership:authored-{key}", "RequirementKey": f"authored-{key}",
+                "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": process,
+                "QuantityPerPart": 1, "QuantityUOM": "Nos", "Status": "active"}}])
+            self.service.record_process_rate(master["id"], {"rate": rate, "uom": "each", "currency": "INR",
+                "effectiveAt": "2026-11-18T00:00:00Z", "sourceReference": f"approved {process} card", "reason": "dated QA rate"},
+                actor="reviewer", request_key=f"rate-{key}")
+            created[process] = quantity * rate * 2
+
+        live = self.service.live_cost(100)
+
+        authored = [line for line in live["lines"] if line["description"].startswith("Authored ")]
+        by_description = {line["description"]: line for line in authored}
+        self.assertEqual(live["status"], "complete")
+        self.assertEqual(by_description["Authored tool_shop"]["netCost"], created["tool_shop"])
+        self.assertEqual(by_description["Authored cnc"]["netCost"], created["cnc"])
+        self.assertTrue(all(item["rateAge"]["rateAgeStatus"] == "dated" for item in authored))
+
+    def test_rate_age_uses_kolkata_calendar_and_aggregates_unknown_and_future_inputs(self):
+        now = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
+        same_india_day = _rate_age("2026-11-18T20:00:00Z", as_of=now)
+        future = _rate_age("2026-11-20", as_of=now)
+        unknown = _rate_age(None, as_of=now)
+        old = _rate_age("2026-11-09", as_of=now)
+        summary = _cost_date_summary([same_india_day, future, unknown, old], as_of=now)
+        self.assertEqual((same_india_day["rateAgeStatus"], same_india_day["rateAgeDays"], same_india_day["rateAgeAsOfDate"]), ("dated", 0, "2026-11-19"))
+        self.assertEqual((future["rateAgeStatus"], future["rateAgeDaysUntil"]), ("future_date", 1))
+        self.assertEqual(unknown["rateAgeStatus"], "unknown")
+        self.assertEqual((summary["oldestKnownAgeDays"], summary["unknownInputCount"], summary["futureInputCount"]), (10, 1, 1))
 
 
 if __name__ == "__main__":

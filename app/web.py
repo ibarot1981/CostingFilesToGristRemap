@@ -1395,6 +1395,12 @@ def get_part_definition(part_id: str, request: Request):
     return _part_definition_service().get_definition(part_id, actor=_request_actor(request))
 
 
+@app.get("/api/parts/{part_id}/definition/recovery")
+@_part_registry_read_scope
+def get_part_definition_publication_recovery(part_id: str, request: Request):
+    return _part_definition_service().publication_recovery(part_id, actor=_request_actor(request))
+
+
 @app.get("/api/parts/{part_id}/definition/options")
 @_part_registry_read_scope
 def get_part_definition_options(part_id: str):
