@@ -296,6 +296,7 @@ class GristPartDefinitionService:
             requirements.append({"requirementKey": key, "legacyRequirementKey": legacy_requirement_key,
                 "identityStatus": identity_status, "family": family,
                 "lineMasterId": line_master_id, "lineRevisionId": line_revision_id,
+                "lineIdentityStatus": "resolved" if master and line_revision and _int_ref(line_revision.get("LineMaster")) == line_master_id else "unresolved",
                 "lineStatus": line_revision.get("Status") or "unclassified", "processType": link.get("ProcessType") or master.get("ProcessType") or family,
                 "quantity": link.get("QuantityExact") if link.get("QuantityExact") not in (None, "") else link.get("QuantityPerPart"),
                 "uom": link.get("QuantityUOM") or "", "sourcePartName": master.get("SourcePartName") or "",
@@ -413,6 +414,62 @@ class GristPartDefinitionService:
         return {"parts": sorted(parts, key=lambda item: str(item["partNumber"])), "materials": sorted(materials, key=lambda item: str(item["name"]).casefold()),
             "purchaseItems": sorted(purchase_items, key=lambda item: str(item["name"]).casefold()), "families": list(FAMILY_PROCESS)}
 
+    def _requirement_line_identity(self, raw: dict[str, Any], existing: dict[str, Any] | None,
+                                   base_requirements: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+        """Resolve retained line identity from the immutable base membership."""
+        supplied = []
+        for name in ("lineMasterId", "lineRevisionId"):
+            value = raw.get(name)
+            invalid_scalar = (not isinstance(value, (int, float, str, type(None))) or isinstance(value, bool)
+                or isinstance(value, float) and (not math.isfinite(value) or not value.is_integer())
+                or isinstance(value, str) and bool(value.strip()) and not value.strip().isdigit())
+            ref = None if invalid_scalar else _int_ref(value)
+            if value not in (None, "") and (invalid_scalar or ref is None or ref <= 0):
+                raise PartIdentityError("PART_REQUIREMENT_LINE_IDENTITY_INVALID", "A physical line reference is invalid.")
+            supplied.append(ref)
+        if not existing:
+            # A reviewed duplicate occurrence is reclassified as a genuinely new
+            # identity; its old physical references are evidence, not a binding.
+            legacy_key = str(raw.get("legacyRequirementKey") or "")
+            candidates = [item for item in base_requirements if legacy_key and item.get("legacyRequirementKey") == legacy_key
+                and item.get("identityStatus") == "legacy_duplicate_unclassified"]
+            reviewed = (str(raw.get("identityStatus") or "").casefold() == "safari_authored"
+                and str(raw.get("requirementKey") or "").startswith("safari-authored-requirement:")
+                and any(tuple(supplied) == (_int_ref(item.get("lineMasterId")), _int_ref(item.get("lineRevisionId"))) for item in candidates))
+            if any(supplied) and not reviewed:
+                raise PartIdentityError("PART_REQUIREMENT_LINE_IDENTITY_INVALID", "A new requirement cannot select an arbitrary physical line identity.")
+            return None, None
+        master_id, revision_id = _int_ref(existing.get("lineMasterId")), _int_ref(existing.get("lineRevisionId"))
+        if any(value is not None and value != expected for value, expected in zip(supplied, (master_id, revision_id))):
+            raise PartIdentityError("PART_REQUIREMENT_LINE_IDENTITY_INVALID", "A retained requirement must use its saved physical line and revision.")
+        master = next((row for row in self._rows("LineMaster") if int(row.get("id", -1)) == master_id), None)
+        revision = next((row for row in self._rows("LineRevision") if int(row.get("id", -1)) == revision_id), None)
+        if not master_id or not revision_id or not master or not revision or _int_ref(_fields(revision).get("LineMaster")) != master_id:
+            raise PartIdentityError("PART_REQUIREMENT_LINE_IDENTITY_UNRESOLVED", "The saved requirement has an unresolved physical line or revision; review is required before publication.")
+        return master_id, revision_id
+
+    def _validate_plan_line_identities(self, parts: list[dict[str, Any]]) -> None:
+        """Validate every frozen Part against its historical base before writes."""
+        with self.registry.read_scope():
+            self._validate_plan_line_identities_in_scope(parts)
+
+    def _validate_plan_line_identities_in_scope(self, parts: list[dict[str, Any]]) -> None:
+        for part in parts:
+            part_id, revision_id = str(part["partId"]), int(part["currentRevisionId"])
+            revision = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == revision_id), None)
+            if not revision or _int_ref(_fields(revision).get("ProductPart")) != int(self._part_row(part_id)["id"]):
+                raise PartIdentityError("PART_REVISION_MISMATCH", "The saved base revision does not belong to this Part.")
+            base = self._definition_from_rows(part_id, revision_id)
+            existing = {str(item.get("requirementKey")): item for item in base["requirements"]}
+            seen: set[str] = set()
+            for item in part["content"].get("requirements", []):
+                key = str(item.get("requirementKey") or "")
+                if not key or key in seen:
+                    raise PartIdentityError("PART_DEFINITION_IDENTITY_DUPLICATE", "Each published requirement must have a unique saved identity.")
+                seen.add(key)
+                master, revision = self._requirement_line_identity(item, existing.get(key), base["requirements"])
+                item["lineMasterId"], item["lineRevisionId"] = master, revision
+
     def _normalize_content(self, part_id: str, base_revision_id: int, payload: dict[str, Any], request_key: str) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "A complete Part definition object is required.")
@@ -456,6 +513,8 @@ class GristPartDefinitionService:
                     raise PartIdentityError("PART_DEFINITION_LEGACY_IDENTITY_REVIEW_REQUIRED", "Assign a reviewed new requirement identity to this ambiguous legacy occurrence before changing its identity.")
             if existing and existing.get("identityStatus") == "legacy_duplicate_unclassified" and submitted_identity_status != "legacy_duplicate_unclassified":
                 raise PartIdentityError("PART_DEFINITION_LEGACY_IDENTITY_REVIEW_REQUIRED", "An ambiguous legacy occurrence can only be reclassified with a new Safari-authored requirement identity.")
+            line_master_id, line_revision_id = self._requirement_line_identity(raw, existing, current["requirements"])
+            raw = {**raw, "lineMasterId": line_master_id, "lineRevisionId": line_revision_id}
             if family not in FAMILY_PROCESS and not (family == "other" and existing and raw.get("lineRevisionId") == existing.get("lineRevisionId")):
                 raise PartIdentityError("PART_DEFINITION_FAMILY_INVALID", "New direct requirements must belong to MCL, Tool Shop or CNC. Existing other-process lines can only be preserved unchanged.")
             if family in FAMILY_PROCESS and not applicability[family]["applicable"]:
@@ -491,16 +550,25 @@ class GristPartDefinitionService:
                 detail[name] = ref
             dimension_uom = str(detail.get("DimensionUOM") or "").strip().casefold()
             dimensions = [_num(detail.get(name), allow_blank=True) for name in ("Length", "Width", "Thickness")]
-            if any(value is not None and value <= 0 for value in dimensions) and not unchanged_legacy_line:
+            # Numeric Grist columns can read back an omitted value as zero. Preserve
+            # an existing zero, but never allow a new zero to be introduced.
+            old_detail = (existing or {}).get("detail") or {}
+            preserved_zero_dimensions = {
+                name for name, value in zip(("Length", "Width", "Thickness"), dimensions)
+                if existing and value == 0 and _num(old_detail.get(name), allow_blank=True) == 0
+            }
+            effective_dimensions = [None if name in preserved_zero_dimensions else value
+                                    for name, value in zip(("Length", "Width", "Thickness"), dimensions)]
+            if any(value is not None and value <= 0 for value in effective_dimensions) and not unchanged_legacy_line:
                 raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
-            if any(value is not None for value in dimensions) and (not all(value is not None for value in dimensions) or dimension_uom not in {"mm", "millimeter", "millimeters", "in", "inch", "inches"}) and not unchanged_legacy_line:
+            if any(value is not None for value in effective_dimensions) and (not all(value is not None for value in effective_dimensions) or dimension_uom not in {"mm", "millimeter", "millimeters", "in", "inch", "inches"}) and not unchanged_legacy_line:
                 raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "Length, width and thickness must be supplied together with a supported mm or inch unit.")
             for name in ("Quantity", "DimensionMM", "DimensionInches", "WeightGrams", "WeightKg", "PartWeightKg",
                          "Length", "Width", "Thickness", "InternalMakingCost", "ExternalMachiningCost", "RateCached", "CostCached"):
                 if name not in detail or detail[name] in (None, ""):
                     continue
                 numeric = _num(detail[name])
-                if numeric is None or (name in {"Quantity", "Length", "Width", "Thickness"} and numeric <= 0):
+                if numeric is None or (name in {"Quantity", "Length", "Width", "Thickness"} and numeric <= 0 and name not in preserved_zero_dimensions):
                     if unchanged_legacy_line:
                         continue
                     raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite positive number where supplied.")
@@ -525,7 +593,7 @@ class GristPartDefinitionService:
             engineering["fieldStatus"] = field_status
             detail["EngineeringAttributes"] = canonical_grist_json_cell(engineering)
             requirements.append({"requirementKey": key, "identityStatus": raw.get("identityStatus") or ("stable" if existing else "safari_authored"),
-                "family": family, "lineMasterId": _int_ref(raw.get("lineMasterId")), "lineRevisionId": _int_ref(raw.get("lineRevisionId")),
+                "family": family, "lineMasterId": line_master_id, "lineRevisionId": line_revision_id,
                 "processType": process_type, "quantity": quantity, "quantityExact": str(raw.get("quantityExact") or ("" if quantity is None else str(raw.get("quantity")))),
                 "uom": uom, "detail": detail, "provenance": deepcopy(raw.get("provenance") or {"type": "safari_authored", "evidence": {}}),
                 "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status})
@@ -1139,7 +1207,14 @@ class GristPartDefinitionService:
         if not content or request_fingerprint(content) != draft_fields.get("ContentFingerprint"):
             raise PartIdentityError("PART_DEFINITION_DRAFT_INTEGRITY", "The saved draft does not match its recorded content fingerprint.")
         revalidated_content = self._normalize_content(part_id, int(base_id), content, request_key)
-        if request_fingerprint(revalidated_content) != request_fingerprint(content):
+        comparable_content = deepcopy(content)
+        normalized_by_key = {str(item.get("requirementKey")): item for item in revalidated_content["requirements"]}
+        for item in comparable_content.get("requirements", []):
+            normalized = normalized_by_key.get(str(item.get("requirementKey"))) or {}
+            for field in ("lineMasterId", "lineRevisionId"):
+                if item.get(field) in (None, "") and normalized.get(field) is not None:
+                    item[field] = normalized[field]
+        if request_fingerprint(revalidated_content) != request_fingerprint(comparable_content):
             raise PartIdentityError("PART_DEFINITION_DRAFT_INVALID", "The saved draft no longer passes current Part-definition validation. Reopen and save a corrected draft.")
         if not actor.strip() or not reason.strip() or not request_key.strip():
             raise PartIdentityError("PART_CHANGE_REQUEST_INPUT_REQUIRED", "A change reason, trusted actor and idempotency key are required.")
@@ -1433,6 +1508,19 @@ class GristPartDefinitionService:
             raise PartIdentityError("PART_CHANGE_REQUEST_APPROVER_REQUIRED", "Only the currently designated Irshad engineering approver can approve Part-definition publication.")
         fields = _fields(cr)
         operation_fingerprint = request_fingerprint([change_request_key, actor.strip(), request_key])
+        prior = self._find("PartRegistryRequest", "RequestKey", request_key)
+        if prior:
+            prior = self.registry._begin_request(request_key, "part_definition_approval_publication", operation_fingerprint, change_request_key)
+            old_result = self._request_result(prior)
+            if old_result is not None:
+                return old_result
+        if str(fields.get("Status") or "").casefold() not in {"published", "stale"}:
+            part_row = next((row for row in self._rows("ProductPart") if int(row.get("id", -1)) == _int_ref(fields.get("ProductPart"))), None)
+            after = _json_cell(fields.get("AfterDefinition"))
+            part_id = str(_fields(part_row).get("StablePartId") or "")
+            if not part_id or not after or not _int_ref(fields.get("BaseRevision")):
+                raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The submitted definition has no valid Part or base revision.")
+            self._validate_plan_line_identities([{"partId": part_id, "currentRevisionId": _int_ref(fields.get("BaseRevision")), "content": after}])
         request = self.registry._begin_request(request_key, "part_definition_approval_publication", operation_fingerprint, change_request_key)
         old_result = self._request_result(request)
         if old_result is not None:
@@ -1501,6 +1589,7 @@ class GristPartDefinitionService:
         plan_fields = _json_cell(_fields(current_journal).get("Plan")) or plan
         if request_fingerprint(plan_fields) != _fields(current_journal).get("PlanFingerprint"):
             raise PartIdentityError("PART_PUBLICATION_PLAN_INTEGRITY", "The durable publication plan failed its fingerprint check.")
+        self._validate_plan_line_identities(plan_fields["parts"])
         rows_by_part: dict[str, dict[str, Any]] = {}
         for item in plan_fields["parts"]:
             current_revision = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == int(item["currentRevisionId"])), None)

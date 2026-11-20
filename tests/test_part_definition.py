@@ -102,6 +102,129 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             reason="Increase blank allowance", request_key=f"cr-{request_suffix}")
         return definition, request
 
+    def test_physical_identity_claims_are_checked_against_base_before_any_write(self):
+        cases = ("missing-master", "foreign-master", "missing-revision", "mismatched-revision", "new-forged", "fractional-master", "boolean-master")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                client = DefinitionMemoryGrist()
+                client.tables["LineMaster"].append({"id": 41, "fields": {"LineKey": "foreign", "ProductPart": 10, "ProcessType": "cnc"}})
+                client.tables["LineRevision"].append({"id": 51, "fields": {"RevisionKey": "foreign-rev", "LineMaster": 41, "Status": "accepted"}})
+                service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+                definition = service.get_definition("p-1")
+                content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                    "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False}
+                item = content["requirements"][0]
+                if case == "missing-master": item["lineMasterId"] = 99999
+                elif case == "foreign-master": item["lineMasterId"] = 41
+                elif case == "missing-revision": item["lineRevisionId"] = 99999
+                elif case == "mismatched-revision": item["lineRevisionId"] = 51
+                elif case == "fractional-master": item["lineMasterId"] = 40.5
+                elif case == "boolean-master": item["lineMasterId"] = True
+                else: item["requirementKey"] = "authored-forged"
+                before = deepcopy(client.tables)
+                with self.assertRaises(PartIdentityError) as error:
+                    service.save_draft("p-1", content, actor="operator", reason="identity validation", request_key="invalid-" + case)
+                self.assertEqual(error.exception.code, "PART_REQUIREMENT_LINE_IDENTITY_INVALID")
+                self.assertEqual(client.tables, before)
+
+    def test_omitted_references_derive_saved_pair_and_shared_line_keeps_lineage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["LineMaster"][0]["fields"]["ProductPart"] = 999  # Shared physical line, owned elsewhere.
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False}
+            item = content["requirements"][0]
+            item.pop("lineMasterId"); item.pop("lineRevisionId")
+            item["detail"]["ItemName"] = "Edited shared line"
+            saved = service.save_draft("p-1", content, actor="operator", reason="shared edit", request_key="shared-draft")
+            self.assertEqual((saved["content"]["requirements"][0]["lineMasterId"], saved["content"]["requirements"][0]["lineRevisionId"]), (40, 50))
+            cr = service.submit_change_request("p-1", {"draftKey": saved["draftKey"]}, actor="operator", reason="shared edit", request_key="shared-cr")
+            published = service.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="shared-publish")
+            link = next(row["fields"] for row in client.tables["PartRevisionLine"] if row["fields"]["PartRevision"] == published["publishedRevisionId"])
+            line = next(row["fields"] for row in client.tables["LineRevision"] if row["id"] == link["LineRevision"])
+            self.assertEqual((link["RequirementKey"], link["LineMaster"], line["PreviousRevision"]), ("requirement:p-1:1", 40, 50))
+            self.assertEqual(client.tables["LineDetail"][0]["fields"]["ItemName"], "Bracket blank")
+            self.assertEqual(client.tables["PartRevisionLine"][0]["fields"]["LineRevision"], 50)
+
+    def test_malformed_pending_cr_is_rejected_before_approval_journal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            _, cr = self.draft_and_submit(service, request_suffix="forged-pending")
+            fields = client.tables["PartEngineeringChangeRequest"][0]["fields"]
+            after = json.loads(fields["AfterDefinition"])
+            after["requirements"][0]["lineMasterId"] = 99999
+            fields["AfterDefinition"] = json.dumps(after)
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="forged-approval")
+            self.assertEqual(error.exception.code, "PART_REQUIREMENT_LINE_IDENTITY_INVALID")
+            self.assertEqual(client.tables, before)
+
+    def test_unresolved_legacy_line_remains_readable_but_cannot_be_published(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["PartRevisionLine"][0]["fields"]["LineRevision"] = 99999
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            self.assertEqual(definition["requirements"][0]["lineIdentityStatus"], "unresolved")
+            content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False}
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", content, actor="operator", reason="review", request_key="unresolved")
+            self.assertEqual(error.exception.code, "PART_REQUIREMENT_LINE_IDENTITY_UNRESOLVED")
+            self.assertEqual(before, client.tables)
+
+    def test_new_requirement_materialization_recovers_without_duplicate_line_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            path = Path(temp) / "coordinator.sqlite3"
+            service = self.make_service(client, path)
+            definition = service.get_definition("p-1")
+            new = deepcopy(definition["requirements"][0])
+            new.update({"requirementKey": "authored-new-line", "identityStatus": "safari_authored", "lineMasterId": None, "lineRevisionId": None})
+            new["detail"]["ItemName"] = "New independent blank"
+            content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": [deepcopy(definition["requirements"][0]), new], "components": [], "purchases": [], "finalizeOnPublication": False}
+            saved = service.save_draft("p-1", content, actor="operator", reason="new line", request_key="new-line-draft")
+            cr = service.submit_change_request("p-1", {"draftKey": saved["draftKey"]}, actor="operator", reason="new line", request_key="new-line-cr")
+            client.lose_after_create_table = "LineRevision"
+            with self.assertRaises(TimeoutError):
+                service.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="new-line-publish")
+            restarted = self.make_service(client, path)
+            result = restarted.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="new-line-publish")
+            accepted = restarted.get_definition("p-1")
+            new_item = next(item for item in accepted["requirements"] if item["requirementKey"] == "authored-new-line")
+            self.assertNotEqual(new_item["lineMasterId"], 40)
+            masters = [row for row in client.tables["LineMaster"] if row["id"] == new_item["lineMasterId"]]
+            line_revisions = [row for row in client.tables["LineRevision"] if row["fields"].get("LineMaster") == new_item["lineMasterId"]]
+            self.assertEqual((len(masters), len(line_revisions)), (1, 1))
+            self.assertEqual(result["publishedRevisionId"], accepted["revisionId"])
+
+    def test_legacy_saved_draft_with_omitted_line_references_remains_approvable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            from app.part_identity import request_fingerprint
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False}
+            saved = service.save_draft("p-1", content, actor="operator", reason="legacy draft", request_key="legacy-draft")
+            fields = client.tables["PartDefinitionDraft"][0]["fields"]
+            old_content = json.loads(fields["Content"])
+            old_content["requirements"][0].pop("lineMasterId"); old_content["requirements"][0].pop("lineRevisionId")
+            fields["Content"] = json.dumps(old_content); fields["ContentFingerprint"] = request_fingerprint(old_content)
+            cr = service.submit_change_request("p-1", {"draftKey": saved["draftKey"]}, actor="operator", reason="legacy draft", request_key="legacy-cr")
+            result = service.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="legacy-approval")
+            link = next(row["fields"] for row in client.tables["PartRevisionLine"] if row["fields"]["PartRevision"] == result["publishedRevisionId"])
+            self.assertEqual(link["LineMaster"], 40)
+            if link["LineRevision"] != 50:
+                line = next(row["fields"] for row in client.tables["LineRevision"] if row["id"] == link["LineRevision"])
+                self.assertEqual(line["PreviousRevision"], 50)
+
     def test_reviewed_publication_preserves_history_and_versions_current_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
             client = DefinitionMemoryGrist()
@@ -473,6 +596,23 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                 with self.assertRaises(PartIdentityError):
                     service.save_draft("p-1", content, actor="operator", reason="invalid physical edit", request_key=f"invalid-{label}")
                 self.assertEqual(client.tables, before)
+
+    def test_existing_grist_zero_dimensions_can_be_preserved_but_not_introduced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["LineDetail"][0]["fields"].update({"Length": 0, "Width": 0, "Thickness": 0})
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": definition["applicability"], "requirements": deepcopy(definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            content["requirements"][0]["detail"].update({"ItemName": "Changed item", "Quantity": 1, "QuantityUOM": "kg"})
+            saved = service.save_draft("p-1", content, actor="operator", reason="edit", request_key="preserve-zero")
+            self.assertEqual(saved["content"]["requirements"][0]["detail"]["Length"], 0)
+            content["expectedSaveVersion"] = 1
+            content["requirements"][0]["detail"]["Length"] = -1
+            with self.assertRaises(PartIdentityError):
+                service.save_draft("p-1", content, actor="operator", reason="edit", request_key="negative-dimension")
 
     def test_new_and_changed_process_requirements_need_real_rate_basis(self):
         with tempfile.TemporaryDirectory() as temp:
