@@ -20,11 +20,15 @@ function money(value: unknown, currency: string) {
 }
 function rateAgeText(value: any) {
   const age = value?.rateAge || value;
-  if (age?.rateAgeStatus === "dated") return `${age.rateSourceDate} · ${age.rateAgeDays} day(s) old`;
-  if (age?.RateAgeStatus === "dated") return `${age.RateSourceDate} · ${age.RateAgeDays} day(s) old`;
-  if (age?.rateAgeStatus === "future_date") return `${age.rateSourceDate} · future date`;
-  if (age?.RateAgeStatus === "future_date") return `${age.RateSourceDate} · future date`;
-  return "Date unknown";
+  const status = age?.rateAgeStatus || age?.RateAgeStatus;
+  const sourceDate = age?.rateSourceDate || age?.RateSourceDate;
+  const days = age?.rateAgeDays ?? age?.RateAgeDays;
+  const basis = age?.rateDateBasis || age?.RateDateBasis || "unknown";
+  const basisLabel: Record<string, string> = { entry: "entry date", update: "rate update date", effective: "effective date", transaction: "purchase date", unknown: "basis unknown" };
+  const label = basisLabel[basis] || "basis unknown";
+  if (status === "dated") return `${sourceDate} · ${days} day(s) old · ${label}`;
+  if (status === "future_date") return `${sourceDate} · future date · ${label}`;
+  return `Date unknown · ${label}`;
 }
 function newSelection(): Selection { return { selectionIdentity: crypto.randomUUID(), partId: "", partName: "", quantity: "1", uom: "each", sourcingRoute: "auto", label: "", optionGroup: "" }; }
 

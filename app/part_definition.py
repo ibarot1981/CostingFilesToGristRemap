@@ -373,6 +373,7 @@ class GristPartDefinitionService:
             definition["draft"] = {"draftKey": _fields(draft).get("DraftKey"), "saveVersion": _fields(draft).get("SaveVersion"),
                 "baseRevisionId": _int_ref(_fields(draft).get("BaseRevision")), "content": content,
                 "reason": _fields(draft).get("Reason") or "", "updatedAt": _fields(draft).get("UpdatedAt"),
+                "reopenedFromChangeRequest": _int_ref(_fields(draft).get("ReopenedFromChangeRequest")),
                 "stale": _int_ref(_fields(draft).get("BaseRevision")) != int(revision["id"])}
         part_requests = [row for row in cr_rows
             if _int_ref(_fields(row).get("ProductPart")) == int(part["id"])
@@ -380,8 +381,21 @@ class GristPartDefinitionService:
         definition["pendingChangeRequests"] = [{"key": _fields(row).get("ChangeRequestKey"), "status": _fields(row).get("Status"),
             "reason": _fields(row).get("Reason"), "createdAt": _fields(row).get("CreatedAt"),
             "approvedBy": _fields(row).get("ApprovedBy"), "approvedAt": _fields(row).get("ApprovedAt"),
+            "before": _json_cell(_fields(row).get("BeforeDefinition")) or {},
+            "after": _json_cell(_fields(row).get("AfterDefinition")) or {},
             "impact": _json_cell(_fields(row).get("ImpactPreview")) or {}}
             for row in sorted(part_requests, key=lambda item: str(_fields(item).get("CreatedAt") or ""), reverse=True)]
+        stale_requests = [row for row in cr_rows
+            if _int_ref(_fields(row).get("ProductPart")) == int(part["id"])
+            and str(_fields(row).get("Status") or "").casefold() == "stale"]
+        definition["staleChangeRequests"] = [{"key": _fields(row).get("ChangeRequestKey"), "status": "stale",
+            "reason": _fields(row).get("Reason"), "staleAt": _fields(row).get("StaleAt"),
+            "staleCode": _fields(row).get("StaleCode"), "staleReason": _fields(row).get("StaleReason"),
+            "before": _json_cell(_fields(row).get("BeforeDefinition")) or {},
+            "after": _json_cell(_fields(row).get("AfterDefinition")) or {},
+            "impact": _json_cell(_fields(row).get("ImpactPreview")) or {},
+            "canReopen": not _int_ref(_fields(row).get("ReopenedDraft"))}
+            for row in sorted(stale_requests, key=lambda item: str(_fields(item).get("StaleAt") or ""), reverse=True)]
         definition["canApprove"] = publication_schema_available and str(actor or "").strip().casefold() == os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold()
         definition["actions"] = {"editPart": publication_schema_available, "revisionHistory": True, "compareWithOds": True,
             "publicationSchemaAvailable": publication_schema_available,
@@ -675,9 +689,21 @@ class GristPartDefinitionService:
             raise PartIdentityError("PART_DEFINITION_INPUT_REQUIRED", "A reason, trusted actor and idempotency key are required to save a draft.")
         content = self._normalize_content(part_id, base_revision_id, payload, request_key)
         content_fingerprint = request_fingerprint(content)
-        operation_fingerprint = request_fingerprint([part_id, base_revision_id, expected_save_version, content_fingerprint, actor.strip(), reason.strip()])
-        draft_key = f"part-definition-draft:{part_id}:{base_revision_id}"
+        canonical_draft_key = f"part-definition-draft:{part_id}:{base_revision_id}"
+        requested_draft_key = str(payload.get("draftKey") or "").strip()
+        draft_key = requested_draft_key or canonical_draft_key
+        reopened_prefix = canonical_draft_key + ":reopened:"
+        if draft_key != canonical_draft_key and not draft_key.startswith(reopened_prefix):
+            raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "The selected saved draft does not belong to this Part and accepted revision.")
+        operation_fingerprint = request_fingerprint([part_id, base_revision_id, expected_save_version,
+            content_fingerprint, actor.strip(), reason.strip()]) if draft_key == canonical_draft_key else request_fingerprint(
+                [part_id, draft_key, base_revision_id, expected_save_version, content_fingerprint, actor.strip(), reason.strip()])
         draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+        if draft and (_int_ref(_fields(draft).get("ProductPart")) != int(part_row["id"])
+                or _int_ref(_fields(draft).get("BaseRevision")) != base_revision_id):
+            raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "The selected saved draft does not belong to this Part and accepted revision.")
+        if requested_draft_key and draft is None and draft_key != canonical_draft_key:
+            raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "Reopen the stale Change Request before saving its retained content.")
         prior_request = self._find("PartRegistryRequest", "RequestKey", request_key)
         if prior_request:
             request_fields = _fields(prior_request)
@@ -737,6 +763,92 @@ class GristPartDefinitionService:
                 "CreatedAt": now, "UpdatedAt": now, "RequestKey": request_key, "RequestFingerprint": operation_fingerprint})
         result = {"draftKey": draft_key, "saveVersion": save_version, "baseRevisionId": base_revision_id,
             "contentFingerprint": content_fingerprint, "content": content, "status": "saved", "idempotent": False}
+        self.registry._complete_request(request, result)
+        return result
+
+    @_serialized
+    def reopen_stale_change_request(self, part_id: str, change_request_key: str, *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
+        self.registry._verify_writer()
+        self._require_publication_schema()
+        if not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_CHANGE_REQUEST_REOPEN_INPUT_REQUIRED", "A reopen reason, trusted actor and idempotency key are required.")
+        cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key)
+        if not cr or _int_ref(_fields(cr).get("ProductPart")) != int(self._part_row(part_id)["id"]):
+            raise PartIdentityError("PART_CHANGE_REQUEST_NOT_FOUND", "The stale Change Request does not belong to this Part.")
+        fields = _fields(cr)
+        if str(fields.get("Status") or "").casefold() != "stale":
+            raise PartIdentityError("PART_CHANGE_REQUEST_STATE_INVALID", "Only a stale Change Request can be reopened as a new draft.")
+        reopened_ref = _int_ref(fields.get("ReopenedDraft"))
+        linked_draft = next((row for row in self._rows("PartDefinitionDraft")
+            if reopened_ref and int(row.get("id", -1)) == reopened_ref), None)
+        reopened_drafts = [row for row in self._rows("PartDefinitionDraft")
+            if _int_ref(_fields(row).get("ReopenedFromChangeRequest")) == int(cr["id"])]
+        if reopened_ref and not linked_draft:
+            raise PartIdentityError("PART_CHANGE_REQUEST_REOPEN_INTEGRITY", "The stale Change Request's recorded reopened draft is missing.")
+        existing_reopened = linked_draft or (reopened_drafts[0] if reopened_drafts else None)
+        if existing_reopened and str(_fields(existing_reopened).get("RequestKey") or "") != request_key:
+            raise PartIdentityError("PART_CHANGE_REQUEST_ALREADY_REOPENED", "This stale Change Request already has a reopened draft; reload it before continuing.")
+        operation_fingerprint = request_fingerprint([part_id, change_request_key, actor.strip(), reason.strip()])
+        request = self.registry._begin_request(request_key, "part_definition_change_request_reopen", operation_fingerprint, change_request_key)
+        old_result = self._request_result(request)
+        if old_result is not None:
+            return {**old_result, "idempotent": True}
+        old_draft_id = _int_ref(fields.get("Draft"))
+        old_draft = next((row for row in self._rows("PartDefinitionDraft") if int(row.get("id", -1)) == old_draft_id), None)
+        after = _json_cell(fields.get("AfterDefinition"))
+        if not old_draft or not after:
+            raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The stale Change Request is missing its immutable submitted draft evidence.")
+        old_fields = _fields(old_draft)
+        submitted_content = _json_cell(old_fields.get("Content"))
+        submitted_fingerprint = str(old_fields.get("ContentFingerprint") or "")
+        if (not submitted_content or not submitted_fingerprint
+                or request_fingerprint(submitted_content) != submitted_fingerprint
+                or request_fingerprint(after) != submitted_fingerprint):
+            raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The immutable submitted definition no longer matches its saved draft fingerprint.")
+
+        current = self._current_revision(part_id)
+        base_revision_id = int(current["id"])
+        retained = deepcopy(after)
+        retained["baseRevisionId"] = base_revision_id
+        content = self._normalize_content(part_id, base_revision_id, retained, request_key)
+        content_fingerprint = request_fingerprint(content)
+        draft_key = f"part-definition-draft:{part_id}:{base_revision_id}:reopened:{request_fingerprint(change_request_key)}"
+        reopened = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+        if reopened:
+            reopened_fields = _fields(reopened)
+            if (_int_ref(reopened_fields.get("ProductPart")) != int(self._part_row(part_id)["id"])
+                    or _int_ref(reopened_fields.get("BaseRevision")) != base_revision_id
+                    or _int_ref(reopened_fields.get("SupersedesDraft")) != old_draft_id
+                    or _int_ref(reopened_fields.get("ReopenedFromChangeRequest")) != int(cr["id"])
+                    or request_fingerprint(_json_cell(reopened_fields.get("Content")) or {}) != str(reopened_fields.get("ContentFingerprint") or "")):
+                raise PartIdentityError("PART_DEFINITION_DRAFT_INTEGRITY", "The reopened draft does not match its stale Change Request lineage.")
+            if not _int_ref(fields.get("ReopenedDraft")) and str(reopened_fields.get("RequestKey") or "") != request_key:
+                raise PartIdentityError("PART_CHANGE_REQUEST_ALREADY_REOPENED", "This stale Change Request already has a reopened draft; reload it before continuing.")
+        else:
+            if _int_ref(fields.get("ReopenedDraft")):
+                raise PartIdentityError("PART_CHANGE_REQUEST_REOPEN_INTEGRITY", "The stale Change Request's recorded reopened draft is missing.")
+            reopened = self.registry._ensure_keyed("PartDefinitionDraft", "DraftKey", draft_key, {
+                "DraftKey": draft_key, "ProductPart": int(self._part_row(part_id)["id"]), "BaseRevision": base_revision_id,
+                "SupersedesDraft": old_draft_id, "ReopenedFromChangeRequest": int(cr["id"]),
+                "SaveVersion": 1, "Status": "open", "Content": canonical_grist_json_cell(content),
+                "ContentFingerprint": content_fingerprint, "Actor": actor.strip(), "Reason": reason.strip(),
+                "CreatedAt": grist_datetime(utc_now()), "UpdatedAt": grist_datetime(utc_now()),
+                "RequestKey": request_key, "RequestFingerprint": operation_fingerprint})
+        if not _int_ref(fields.get("ReopenedDraft")):
+            self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {"ReopenedDraft": int(reopened["id"])}}])
+        audit_key = f"part-change-request-reopen:{request_fingerprint(change_request_key)}"
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", audit_key, {
+            "EventType": "part_definition_change_request_reopened", "Actor": actor.strip(), "OccurredAt": grist_datetime(utc_now()),
+            "EntityType": "PartEngineeringChangeRequest", "EntityId": str(cr["id"]), "Reason": reason.strip(),
+            "Payload": canonical_grist_json_cell({"changeRequestKey": change_request_key, "submittedDraftId": old_draft_id,
+                "reopenedDraftKey": draft_key, "submittedContentFingerprint": submitted_fingerprint,
+                "reopenedContentFingerprint": request_fingerprint(_json_cell(_fields(reopened).get("Content")) or {})}),
+            "RequestKey": audit_key, "RequestFingerprint": request_fingerprint([change_request_key, draft_key, reason.strip()])})
+        reopened_fields = _fields(reopened)
+        result = {"changeRequestKey": change_request_key, "draftKey": draft_key,
+            "saveVersion": int(reopened_fields.get("SaveVersion") or 1), "baseRevisionId": base_revision_id,
+            "content": _json_cell(reopened_fields.get("Content")) or content, "status": str(reopened_fields.get("Status") or "open"),
+            "idempotent": bool(_int_ref(fields.get("ReopenedDraft")))}
         self.registry._complete_request(request, result)
         return result
 
@@ -961,6 +1073,8 @@ class GristPartDefinitionService:
         if not draft or _int_ref(_fields(draft).get("ProductPart")) != int(self._part_row(part_id)["id"]):
             raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "Save this complete Part definition as a Grist draft before requesting approval.")
         draft_fields = _fields(draft)
+        if str(draft_fields.get("Status") or "open").casefold() != "open":
+            raise PartIdentityError("PART_DEFINITION_DRAFT_IMMUTABLE", "Only an open saved draft can be submitted; reopen a stale Change Request to review a new draft.")
         base_id = _int_ref(draft_fields.get("BaseRevision"))
         if base_id != int(current["id"]):
             raise PartIdentityError("PART_DEFINITION_STALE_BASE", "The accepted Part revision changed after this draft was started. Reload and rebase before review.")
@@ -1226,6 +1340,19 @@ class GristPartDefinitionService:
     def _assert_no_pending_publication(self, publication: dict[str, Any], record_id: int) -> None:
         return None
 
+    def _mark_change_request_stale(self, cr: dict[str, Any], *, code: str, reason: str, request_key: str) -> None:
+        fields = _fields(cr)
+        stale_at = fields.get("StaleAt") or grist_datetime(utc_now())
+        self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {
+            "Status": "stale", "StaleAt": stale_at, "StaleCode": code, "StaleReason": reason}}])
+        event_key = f"part-change-request-stale:{request_fingerprint(fields.get('ChangeRequestKey'))}"
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", event_key, {
+            "EventType": "part_definition_change_request_stale", "Actor": str(fields.get("ApprovedBy") or fields.get("InitiatedBy") or ""),
+            "OccurredAt": stale_at, "EntityType": "PartEngineeringChangeRequest", "EntityId": str(cr["id"]),
+            "Reason": reason, "Payload": canonical_grist_json_cell({"changeRequestKey": fields.get("ChangeRequestKey"),
+                "staleCode": code, "reviewedImpactFingerprint": fields.get("ImpactFingerprint"), "approvalRequestKey": request_key}),
+            "RequestKey": event_key, "RequestFingerprint": request_fingerprint([fields.get("ChangeRequestKey"), code, reason])})
+
     @_serialized
     def approve_and_publish(self, change_request_key: str, *, actor: str, request_key: str) -> dict[str, Any]:
         self.registry._verify_writer()
@@ -1244,15 +1371,14 @@ class GristPartDefinitionService:
         old_result = self._request_result(request)
         if old_result is not None:
             return old_result
-        if str(fields.get("Status") or "").casefold() not in {"pending_approval", "approved", "publishing", "publication_failed", "published"}:
+        status = str(fields.get("Status") or "").casefold()
+        if status == "stale":
+            self._mark_change_request_stale(cr, code=str(fields.get("StaleCode") or "PART_DEPENDENCY_CLOSURE_STALE"),
+                reason=str(fields.get("StaleReason") or "The saved dependency review is stale. Reopen it as a new draft and request fresh approval."),
+                request_key=request_key)
+            raise PartIdentityError("PART_CHANGE_REQUEST_STALE", "This Change Request is stale and cannot be approved. Reopen its saved content, review the current dependency closure and submit a new request.")
+        if status not in {"pending_approval", "approved", "publishing", "publication_failed", "published"}:
             raise PartIdentityError("PART_CHANGE_REQUEST_STATE_INVALID", "Only a submitted pending Change Request can be approved and published.")
-        approved_at = _fields(cr).get("ApprovedAt") or grist_datetime(utc_now())
-        if not _fields(cr).get("ApprovedBy"):
-            self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {
-                "Status": "approved", "ApprovedBy": actor.strip(), "ApprovedAt": approved_at, "RequestKey": request_key,
-                "RequestFingerprint": operation_fingerprint}}])
-            cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key) or cr
-            fields = _fields(cr)
         publication_key = str(fields.get("PublicationKey") or f"part-definition-publication:{request_fingerprint(change_request_key)}")
         journal = self._find("PartDefinitionPublication", "PublicationKey", publication_key)
         if journal:
@@ -1270,7 +1396,18 @@ class GristPartDefinitionService:
                     "publishedRevisionId": _int_ref(fields.get("PublishedRevision")), "idempotent": True}
                 self.registry._complete_request(request, result)
                 return result
-            plan = self._make_plan(cr, actor.strip(), request_key)
+            try:
+                plan = self._make_plan(cr, actor.strip(), request_key)
+            except PartIdentityError as exc:
+                if exc.code in {"PART_DEFINITION_STALE_BASE", "PART_DEPENDENCY_CLOSURE_STALE"}:
+                    self._mark_change_request_stale(cr, code=exc.code, reason=str(exc), request_key=request_key)
+                raise
+            approved_at = fields.get("ApprovedAt") or grist_datetime(utc_now())
+            if not fields.get("ApprovedBy"):
+                self.client.update_table_records("PartEngineeringChangeRequest", [{"id": int(cr["id"]), "fields": {
+                    "Status": "approved", "ApprovedBy": actor.strip(), "ApprovedAt": approved_at, "RequestKey": request_key,
+                    "RequestFingerprint": operation_fingerprint}}])
+                cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key) or cr
             plan_fingerprint = request_fingerprint(plan)
             journal = self.registry._ensure_keyed("PartDefinitionPublication", "PublicationKey", publication_key, {
                 "PublicationKey": publication_key, "ChangeRequest": int(cr["id"]), "Status": "publishing",
@@ -1377,7 +1514,10 @@ class GristPartDefinitionService:
         self._update_stage(current_journal, "configuration_rows_written")
 
         # Stage 3: validate physical closures before moving any current pointer.
-        for item in plan_fields["parts"]:
+        # A dependent parent may also reference the target directly while its
+        # child assembly references that same target. Finalize every planned
+        # child before its consumers, independent of preview/table row order.
+        for item in self._child_first_part_order(plan_fields["parts"]):
             row = rows_by_part[str(item["partId"])]
             if item["finalize"]:
                 closure = self.features._physical_closure(int(row["id"]), set())
@@ -1442,6 +1582,35 @@ class GristPartDefinitionService:
         return {"changeRequestKey": cr_key, "status": "published", "publishedRevisionId": int(rows_by_part[plan_fields["partId"]]["id"]),
             "publishedRevisionLabel": next(item["revisionLabel"] for item in plan_fields["parts"] if item["partId"] == plan_fields["partId"]),
             "dependentPartCount": len(plan_fields["parts"]) - 1, "configurationCount": len(config_rows_by_code), "idempotent": False}
+
+    @staticmethod
+    def _child_first_part_order(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_id = {str(item["partId"]): item for item in parts}
+        original_order = {str(item["partId"]): index for index, item in enumerate(parts)}
+        parents_by_child: dict[str, set[str]] = {part_id: set() for part_id in by_id}
+        children_by_parent: dict[str, set[str]] = {part_id: set() for part_id in by_id}
+        for parent_id, item in by_id.items():
+            for component in (item.get("content") or {}).get("components", []):
+                child_id = str(component.get("childPartId") or "")
+                if child_id in by_id:
+                    children_by_parent[parent_id].add(child_id)
+                    parents_by_child[child_id].add(parent_id)
+        ready = sorted((part_id for part_id, children in children_by_parent.items() if not children),
+            key=original_order.__getitem__)
+        result: list[dict[str, Any]] = []
+        emitted: set[str] = set()
+        while ready:
+            child_id = ready.pop(0)
+            emitted.add(child_id)
+            result.append(by_id[child_id])
+            for parent_id in sorted(parents_by_child[child_id], key=original_order.__getitem__):
+                children_by_parent[parent_id].discard(child_id)
+                if not children_by_parent[parent_id] and parent_id not in emitted and parent_id not in ready:
+                    ready.append(parent_id)
+                    ready.sort(key=original_order.__getitem__)
+        if len(result) != len(parts):
+            raise PartIdentityError("PART_COMPONENT_CYCLE", "The reviewed successor definitions contain a cycle; no dependent revision was finalized.")
+        return result
 
     def _update_stage(self, journal: dict[str, Any], stage: str) -> None:
         current = self._find("PartDefinitionPublication", "PublicationKey", str(_fields(journal).get("PublicationKey"))) or journal

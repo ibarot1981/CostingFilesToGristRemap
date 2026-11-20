@@ -1419,6 +1419,12 @@ def submit_part_definition_change_request(part_id: str, request: Request, payloa
         reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
 
 
+@app.post("/api/parts/{part_id}/definition/change-requests/{change_request_key}/reopen")
+def reopen_stale_part_definition_change_request(part_id: str, change_request_key: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_definition_service().reopen_stale_change_request(part_id, change_request_key,
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
 @app.post("/api/part-definition/change-requests/{change_request_key}/approve-and-publish")
 def approve_and_publish_part_definition(change_request_key: str, request: Request, payload: dict[str, Any] = Body(default={}), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     return _part_definition_service().approve_and_publish(change_request_key, actor=_request_actor(request), request_key=idempotency_key or "")

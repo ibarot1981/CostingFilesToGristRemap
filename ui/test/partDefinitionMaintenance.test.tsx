@@ -4,7 +4,7 @@ import {PartDefinitionMaintenance} from "../src/PartDefinitionMaintenance";
 
 const apiMocks = vi.hoisted(() => ({
   partDefinition: vi.fn(), partDefinitionOptions: vi.fn(), savePartDefinitionDraft: vi.fn(),
-  submitPartDefinitionChangeRequest: vi.fn(), approveAndPublishPartDefinition: vi.fn(),
+  submitPartDefinitionChangeRequest: vi.fn(), reopenPartDefinitionChangeRequest: vi.fn(), approveAndPublishPartDefinition: vi.fn(),
 }));
 vi.mock("../src/api", () => ({api: apiMocks, ApiError: class ApiError extends Error {
   status: number; code: string; retryDisposition: string;
@@ -166,4 +166,42 @@ it("shows the stable assembly path and configuration before and proposed pins fo
   expect(screen.getByText(/pinned Rev A → proposed Rev B/)).toBeTruthy();
   expect(screen.getByText(/Configuration record 100 Rev 4 → proposed Rev 5/)).toBeTruthy();
   expect(screen.getByText(/B2 spare-definition composition propagation/)).toBeTruthy();
+});
+
+it("shows the immutable submitted definition diff in a fresh approver session", async () => {
+  const before = {...accepted, components:[{componentIdentity:"component-1",childPartId:"child-1",quantity:1,uom:"each"}], purchases:[]};
+  const after = {...accepted, requirements:[{...accepted.requirements[0],quantity:2}], components:[], purchases:[]};
+  apiMocks.partDefinition.mockResolvedValue({...accepted,canApprove:true,pendingChangeRequests:[{
+    key:"cr-fresh-review",status:"pending_approval",reason:"Reviewed change",before,after,
+    impact:{fingerprint:"impact-1",assemblies:[],modelCodeConfigurations:[]},
+  }]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+
+  expect(await screen.findByText("requirements[req-1].quantity")).toBeTruthy();
+  expect(screen.getByText("components[component-1]")).toBeTruthy();
+  expect(screen.getByText("removed")).toBeTruthy();
+  expect(screen.getByText("1")).toBeTruthy();
+  expect(screen.getByText("2")).toBeTruthy();
+});
+
+it("reopens preserved stale changes through a new saved draft", async () => {
+  const before = {...accepted,requirements:[{...accepted.requirements[0],quantity:1}]};
+  const after = {...accepted,requirements:[{...accepted.requirements[0],quantity:2}]};
+  const stale = {...accepted,staleChangeRequests:[{key:"cr-stale",status:"stale",reason:"Reviewed change",
+    staleCode:"PART_DEPENDENCY_CLOSURE_STALE",staleReason:"The configuration changed.",before,after,canReopen:true}]};
+  const reopenedDraft = {draftKey:"draft-reopened",saveVersion:1,baseRevisionId:20,reason:"Review closure",
+    content:{baseRevisionId:20,applicability:accepted.applicability,requirements:after.requirements,components:[],purchases:[],finalizeOnPublication:false}};
+  apiMocks.partDefinition.mockResolvedValueOnce(stale).mockResolvedValue({...accepted,draft:reopenedDraft});
+  apiMocks.reopenPartDefinitionChangeRequest.mockResolvedValue({draftKey:"draft-reopened",saveVersion:1,status:"open"});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+
+  fireEvent.click(await screen.findByText("Review the preserved submitted definition"));
+  expect(screen.getByText("requirements[req-1].quantity")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Reason for reopening this saved change"),{target:{value:"Review closure"}});
+  fireEvent.click(screen.getByRole("button",{name:"Reopen saved changes as a new draft"}));
+
+  await screen.findByText(/Saved changes reopened as draft v1/);
+  expect(apiMocks.reopenPartDefinitionChangeRequest).toHaveBeenCalledWith("part-1","cr-stale",{reason:"Review closure"},expect.any(String));
+  expect((screen.getByLabelText("Quantity") as HTMLInputElement).value).toBe("2");
+  expect(screen.getByLabelText("Engineering change reason")).toBeTruthy();
 });

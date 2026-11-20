@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
 from app.grist_types import grist_datetime
-from app.live_cost import GristLiveCostService, _cost_date_summary, _rate_age
+from app.live_cost import GristLiveCostService, SNAPSHOT_CHECKSUM_V1_COLUMNS, _cost_date_summary, _rate_age
 from app.part_identity import PartIdentityError
 
 
@@ -147,6 +147,19 @@ class LiveCostTests(unittest.TestCase):
             expected_name=preview["name"], expected_usage_fingerprint=self.registry.usage_evidence(part_id)["fingerprint"],
             actor="reviewer", reason="metadata-only rename", request_key=key)["part"]
 
+    def save_test_snapshot(self, request_key):
+        live = self.service.live_cost(100)
+        return self.service.save_snapshot(100, {"liveResult": live, "reason": "snapshot checksum compatibility"},
+            actor="cost engineer", request_key=request_key)
+
+    def snapshot_rows(self, snapshot_key):
+        header = next(row for row in self.client.tables["CostSnapshot"] if row["fields"].get("SnapshotKey") == snapshot_key)
+        snapshot_id = header["id"]
+        parts = [row for row in self.client.tables["CostSnapshotPart"] if row["fields"].get("Snapshot") == snapshot_id]
+        lines = [row for row in self.client.tables["CostSnapshotLine"] if row["fields"].get("Snapshot") == snapshot_id]
+        evidence = [row for row in self.client.tables["CostSnapshotRateEvidence"] if row["fields"].get("Snapshot") == snapshot_id]
+        return header, parts, lines, evidence
+
     def test_live_is_read_only_explicit_snapshot_freezes_mixed_configuration_and_all_rates(self):
         before = {table: len(rows) for table, rows in self.client.tables.items() if table.startswith("CostSnapshot") or table == "PurchasedPartCostEvidence"}
         live = self.service.live_cost(100)
@@ -168,6 +181,13 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual((live["costDateSummary"]["datedInputCount"], live["costDateSummary"]["unknownInputCount"], live["costDateSummary"]["futureInputCount"]), (3, 1, 0))
         self.assertEqual(sum(item["RateAgeStatus"] == "unknown" for item in saved["rateEvidence"]), 1)
         self.assertTrue(all(item["RateAgeAsOfDate"] for item in saved["rateEvidence"]))
+        purchase_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "purchased_part")
+        process_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "process")
+        material_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "material")
+        self.assertEqual(purchase_evidence["RateDateBasis"], "entry")
+        self.assertNotEqual(purchase_evidence["TransactionAt"], purchase_evidence["RateSourceDate"])
+        self.assertEqual(process_evidence["RateDateBasis"], "entry")
+        self.assertEqual(material_evidence["RateDateBasis"], "unknown")
         frozen_rate_ages = {item["EvidenceKey"]: (item["RateAgeStatus"], item["RateAgeDays"], item["RateAgeAsOfDate"], item["RateSourceDate"])
             for item in saved["rateEvidence"]}
         self.assertEqual(len(self.client.tables["CostSnapshot"]), 1)
@@ -270,6 +290,53 @@ class LiveCostTests(unittest.TestCase):
         with self.assertRaises(PartIdentityError) as error:
             self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertEqual(error.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
+    def test_v1_snapshot_keeps_legacy_age_unknown_after_additive_columns_appear(self):
+        saved = self.save_test_snapshot("snapshot-v1-upgrade")
+        header, parts, lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        for row in evidence:
+            for column in SNAPSHOT_CHECKSUM_V1_COLUMNS:
+                row["fields"][column] = None if column in {"RateAgeDays", "RateAgeDaysUntil"} else ""
+        old_checksum = self.service._snapshot_content_checksum(parts, lines, evidence, version=1)
+        header["fields"].update({"ContentChecksum": old_checksum, "ContentChecksumVersion": 0})
+
+        recovered = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+
+        self.assertEqual(recovered["snapshot"]["ContentChecksumVersion"], 1)
+        self.assertTrue(all(item["RateAgeStatus"] == "unknown" and item["RateDateBasis"] == "unknown"
+            and item["RateAgeDays"] is None for item in recovered["rateEvidence"]))
+        lines[0]["fields"]["NetCost"] = 999
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
+    def test_v2_snapshot_preserves_captured_age_and_checks_it_after_basis_column_addition(self):
+        saved = self.save_test_snapshot("snapshot-v2-upgrade")
+        header, parts, lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        for row in evidence:
+            row["fields"]["RateDateBasis"] = ""
+        old_checksum = self.service._snapshot_content_checksum(parts, lines, evidence, version=2)
+        header["fields"].update({"ContentChecksum": old_checksum, "ContentChecksumVersion": 0})
+
+        recovered = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+
+        self.assertEqual(recovered["snapshot"]["ContentChecksumVersion"], 2)
+        self.assertTrue(any(item["RateAgeStatus"] != "unknown" for item in recovered["rateEvidence"]))
+        self.assertTrue(all(item["RateDateBasis"] == "unknown" for item in recovered["rateEvidence"]))
+        evidence[0]["fields"]["RateAgeStatus"] = "tampered"
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
+    def test_v3_snapshot_checksum_covers_rate_date_basis(self):
+        saved = self.save_test_snapshot("snapshot-v3-basis-integrity")
+        self.assertEqual(saved["snapshot"]["ContentChecksumVersion"], 3)
+        _header, _parts, _lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        evidence[0]["fields"]["RateDateBasis"] = "tampered"
+
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
 
     def test_configuration_publication_resumes_and_old_retry_does_not_roll_back_current_revision(self):
         next_payload = {"currency": "INR", "reason": "reviewed quantity correction", "selections": [

@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.domain import utc_now
+from app.cost_dates import cost_date_evidence
 from app.grist_types import datetime_text, grist_datetime
 from app.part_identity import PartIdentityError, request_fingerprint
 
@@ -24,6 +25,9 @@ INPUT_TABLES = (
     "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate",
 )
 POLICY_VERSION = "live-cost-v1"
+SNAPSHOT_CHECKSUM_V1_COLUMNS = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus",
+    "RateAgeDays", "RateAgeDaysUntil", "RateAgeAsOfDate", "RateDateBasis"}
+SNAPSHOT_CHECKSUM_V2_COLUMNS = {"RateDateBasis"}
 RATE_POLICY = "net merchandise less explicit discount; tax, freight and other charges excluded"
 WRITE_BATCH_SIZE = 400
 
@@ -600,7 +604,8 @@ class GristLiveCostService:
                     continue
                 purchase_source = next((row for row in purchase_rows if str(row.get("id")) == str(rate.get("purchaseRecordId"))), {})
                 purchase_fields = _fields(purchase_source)
-                age = _rate_age(rate.get("transactionAt"), as_of=current_time)
+                date_evidence = cost_date_evidence(purchase_fields, source_kind="purchase_record")
+                age = _rate_age(date_evidence.get("rateSourceDate"), as_of=current_time)
                 amount = candidate["quantity"] * float(rate["rate"])
                 line = {"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                     "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
@@ -609,13 +614,12 @@ class GristLiveCostService:
                     "quantity": candidate["quantity"], "quantityUOM": candidate["uom"], "rate": rate["rate"], "rateUOM": rate["uom"],
                     "currency": rate["currency"], "grossCost": amount, "recoveryCost": 0, "adjustmentCost": 0, "netCost": amount,
                     "calculationBasis": "effective_part_quantity × latest eligible actual purchase rate", "costPolicy": RATE_POLICY,
-                    "status": "available", "linear": True, "purchaseItemId": ref_id(sf.get("PurchaseItem")), "rateAge": age}
+                    "status": "available", "linear": True, "purchaseItemId": ref_id(sf.get("PurchaseItem")),
+                    "rateAge": {**age, "rateDateBasis": date_evidence.get("rateDateBasis") or "unknown"}}
                 lines_out.append(line)
                 evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "purchased_part", "sourceTable": "PartPurchaseRecord",
                     "sourceDocumentId": getattr(self.client, "doc_id", ""), "sourceRecordId": str(rate.get("purchaseRecordId") or ""),
-                    "sourceVersion": str(rate.get("transactionAt") or ""), "transactionAt": rate.get("transactionAt"),
-                    "effectiveAt": rate.get("transactionAt"), "sourceRecordedAt": datetime_text(purchase_fields.get("RecordedAt")) if purchase_fields.get("RecordedAt") else None,
-                    "sourceUpdatedAt": datetime_text(purchase_fields.get("UpdatedAt")) if purchase_fields.get("UpdatedAt") else None, **age,
+                    "sourceVersion": str(rate.get("transactionAt") or ""), **date_evidence, **age,
                     "vendorId": ref_id(rate.get("vendorId")), "purchaseRecordId": ref_id(rate.get("purchaseRecordId")),
                     "rawUnitRate": rate.get("rate"), "normalizedUnitRate": rate.get("rate"), "sourceCurrency": rate.get("sourceCurrency"),
                     "sourceUOM": rate.get("purchaseUOM"), "normalizedCurrency": rate.get("currency"), "normalizedUOM": rate.get("uom"),
@@ -633,8 +637,9 @@ class GristLiveCostService:
                     continue
                 unit_rate = float(rate["costingNewRate"])
                 amount = candidate["quantity"] * unit_rate
-                material_date = rate.get("rateSourceDate") or rate.get("effectiveAt")
-                age = _rate_age(material_date, as_of=current_time)
+                date_basis = str(rate.get("rateDateBasis") or ("effective" if rate.get("effectiveAt") else "unknown"))
+                material_date = rate.get("rateSourceDate") or (rate.get("effectiveAt") if date_basis == "effective" else None)
+                age = _rate_age(material_date if date_basis != "unknown" else None, as_of=current_time)
                 effective_at = rate.get("effectiveAt")
                 lines_out.append({"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                     "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
@@ -645,12 +650,14 @@ class GristLiveCostService:
                     "grossCost": amount, "recoveryCost": 0, "adjustmentCost": 0, "netCost": amount,
                     "calculationBasis": "effective Part quantity × normalized material quantity × current Costing-New rate",
                     "costPolicy": str(rate.get("basis") or "MaterialLatestRate / Default_MaterialRate"), "status": "available", "linear": True,
-                    "rateAge": age})
+                    "rateAge": {**age, "rateDateBasis": date_basis}})
                 evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "material", "sourceTable": str(rate.get("basis") or "MasterMaterial"),
                     "sourceDocumentId": str(material_response.get("sourceDocumentId") or ""),
                     "sourceRecordId": str(rate.get("selectedRateLogId") or rate.get("masterRecordId") or ""),
                     "sourceVersion": str(rate.get("selectedRateLogId") or rate.get("basis") or ""),
                     "effectiveAt": datetime_text(effective_at) if _date(effective_at) else None,
+                    "transactionAt": datetime_text(rate.get("transactionAt")) if _date(rate.get("transactionAt")) else None,
+                    "rateDateBasis": date_basis,
                     "sourceRecordedAt": datetime_text(rate.get("sourceRecordedAt")) if rate.get("sourceRecordedAt") else None,
                     "sourceUpdatedAt": datetime_text(rate.get("sourceUpdatedAt")) if rate.get("sourceUpdatedAt") else None, **age,
                     "rawUnitRate": unit_rate, "normalizedUnitRate": unit_rate, "sourceCurrency": code_currency, "sourceUOM": candidate["uom"],
@@ -682,7 +689,8 @@ class GristLiveCostService:
                 continue
             amount = candidate["quantity"] * unit_rate
             rate_fields = _fields(row)
-            age = _rate_age(rate_fields.get("EffectiveAt"), as_of=current_time)
+            date_evidence = cost_date_evidence(rate_fields, source_kind="process_rate")
+            age = _rate_age(date_evidence.get("rateSourceDate"), as_of=current_time)
             lines_out.append({"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
                 "partOccurrencePath": candidate["occurrencePath"], "configurationSelectionIdentity": _fields(candidate["selectionRow"]).get("SelectionIdentity"),
                 "sourceType": "process", "sourceKey": str(candidate["lineKey"].split("|", 1)[-1]), "sourceRecordId": str(row["id"]),
@@ -690,12 +698,11 @@ class GristLiveCostService:
                 "costCategory": str(candidate.get("process") or "process"), "quantity": candidate["quantity"], "quantityUOM": candidate["uom"],
                 "rate": unit_rate, "rateUOM": rate_uom, "currency": currency, "grossCost": amount, "recoveryCost": 0,
                 "adjustmentCost": 0, "netCost": amount, "calculationBasis": "effective Part quantity × normalized process line quantity × approved process rate",
-                "costPolicy": "latest effective approved CostingProcessRate", "status": "available", "linear": True, "rateAge": age})
+                "costPolicy": "latest effective approved CostingProcessRate", "status": "available", "linear": True,
+                "rateAge": {**age, "rateDateBasis": date_evidence.get("rateDateBasis") or "unknown"}})
             evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "process", "sourceTable": "CostingProcessRate",
                 "sourceDocumentId": str(getattr(self.client, "doc_id", "")), "sourceRecordId": str(row["id"]),
-                "sourceVersion": str(_fields(row).get("EffectiveAt") or ""), "effectiveAt": datetime_text(_fields(row).get("EffectiveAt")),
-                "sourceRecordedAt": datetime_text(rate_fields.get("RecordedAt")) if rate_fields.get("RecordedAt") else None,
-                "sourceUpdatedAt": datetime_text(rate_fields.get("UpdatedAt")) if rate_fields.get("UpdatedAt") else None, **age,
+                "sourceVersion": str(_fields(row).get("EffectiveAt") or ""), **date_evidence, **age,
                 "rawUnitRate": unit_rate, "normalizedUnitRate": unit_rate, "sourceCurrency": currency, "sourceUOM": rate_uom,
                 "normalizedCurrency": currency, "normalizedUOM": rate_uom, "conversionFactor": 1,
                 "ratePolicy": "latest effective approved CostingProcessRate", "evidenceReference": _fields(row).get("SourceReference"),
@@ -788,21 +795,26 @@ class GristLiveCostService:
                 if self._result_content_fingerprint(current) != content_fingerprint:
                     raise PartIdentityError("COST_LIVE_CONTENT_MISMATCH", "The displayed Live Cost facts do not match the current Grist calculation. Refresh before saving.")
             frozen = deepcopy(live)
-            expected_parts, expected_lines, expected_evidence = (len(frozen.get("parts", [])), len(frozen.get("lines", [])), len(frozen.get("rateEvidence", [])))
             snapshot_key = str(uuid5(NAMESPACE_URL, "safari-cost-snapshot:" + request_key))
+            existing_header = next((row for row in self._rows("CostSnapshot") if _fields(row).get("SnapshotKey") == snapshot_key), None)
+            existing_evidence = ([row for row in self._rows("CostSnapshotRateEvidence")
+                if existing_header and ref_id(_fields(row).get("Snapshot")) == int(existing_header["id"])])
+            snapshot_version = self._snapshot_checksum_version(existing_header, existing_evidence, frozen.get("rateEvidence", [])) if publication else 3
+            expected_parts, expected_lines, expected_evidence = (len(frozen.get("parts", [])), len(frozen.get("lines", [])), len(frozen.get("rateEvidence", [])))
             captured_at = _fields(publication).get("CreatedAt") if publication else grist_datetime(utc_now())
             captured_time = _date(captured_at) or datetime.now(timezone.utc)
             age_by_line: dict[str, dict[str, Any]] = {}
-            for evidence in frozen.get("rateEvidence", []):
-                source_date = evidence.get("rateSourceDate") or evidence.get("effectiveAt") or evidence.get("transactionAt")
-                age = _rate_age(source_date, as_of=captured_time)
-                evidence.update(age)
-                age_by_line[str(evidence.get("lineKey") or "")] = age
-            for line in frozen.get("lines", []):
-                age = age_by_line.get(str(line.get("lineKey") or ""))
-                if age:
-                    line["rateAge"] = age
-            frozen["costDateSummary"] = _cost_date_summary(frozen.get("rateEvidence", []), as_of=captured_time)
+            if snapshot_version >= 3:
+                for evidence in frozen.get("rateEvidence", []):
+                    age = _rate_age(evidence.get("rateSourceDate"), as_of=captured_time)
+                    evidence.update(age)
+                    evidence["rateDateBasis"] = str(evidence.get("rateDateBasis") or "unknown")
+                    age_by_line[str(evidence.get("lineKey") or "")] = {**age, "rateDateBasis": evidence["rateDateBasis"]}
+                for line in frozen.get("lines", []):
+                    age = age_by_line.get(str(line.get("lineKey") or ""))
+                    if age:
+                        line["rateAge"] = age
+                frozen["costDateSummary"] = _cost_date_summary(frozen.get("rateEvidence", []), as_of=captured_time)
             header = {"SnapshotKey": snapshot_key, "ProductModelCode": int(code_id),
                 "Configuration": int(frozen["configuration"]["id"]), "ConfigurationRevision": int(frozen["configuration"]["revisionId"]),
                 "CapturedAt": captured_at, "CostingAsOf": captured_at, "CreatedBy": actor.strip(), "Label": label, "Notes": reason,
@@ -824,7 +836,8 @@ class GristLiveCostService:
 
             part_key_ids = self._publish_snapshot_parts(snapshot_key, request_key, request_fp, frozen.get("parts", []))
             line_key_ids = self._publish_snapshot_lines(snapshot_key, request_key, request_fp, frozen.get("lines", []), part_key_ids, frozen.get("rateEvidence", []))
-            self._publish_snapshot_evidence(snapshot_key, request_key, request_fp, frozen.get("rateEvidence", []), line_key_ids)
+            self._publish_snapshot_evidence(snapshot_key, request_key, request_fp, frozen.get("rateEvidence", []), line_key_ids,
+                checksum_version=snapshot_version)
             header_row = next(row for row in self._rows("CostSnapshot") if _fields(row).get("SnapshotKey") == snapshot_key)
             actual_parts = [row for row in self._rows("CostSnapshotPart") if ref_id(_fields(row).get("Snapshot")) == int(header_row["id"])]
             actual_lines = [row for row in self._rows("CostSnapshotLine") if ref_id(_fields(row).get("Snapshot")) == int(header_row["id"])]
@@ -833,8 +846,9 @@ class GristLiveCostService:
                     or any(ref_id(_fields(row).get("PartOccurrence")) not in {int(item["id"]) for item in actual_parts} for row in actual_lines)
                     or any(ref_id(_fields(row).get("SnapshotLine")) not in {int(item["id"]) for item in actual_lines} for row in actual_evidence)):
                 raise PartIdentityError("COST_SNAPSHOT_PUBLICATION_INCOMPLETE", "Grist has not confirmed every normalized snapshot row and relationship; retry this same request key to resume publication.")
-            checksum = self._snapshot_content_checksum(actual_parts, actual_lines, actual_evidence)
-            self.client.update_table_records("CostSnapshot", [{"id": int(header_row["id"]), "fields": {"PublicationStatus": "complete", "ContentChecksum": checksum}}])
+            checksum = self._snapshot_content_checksum(actual_parts, actual_lines, actual_evidence, version=snapshot_version)
+            self.client.update_table_records("CostSnapshot", [{"id": int(header_row["id"]), "fields": {
+                "PublicationStatus": "complete", "ContentChecksum": checksum, "ContentChecksumVersion": snapshot_version}}])
             publication_row = next(row for row in self._rows("CostSnapshotPublication") if _fields(row).get("PublicationKey") == request_key)
             self.client.update_table_records("CostSnapshotPublication", [{"id": int(publication_row["id"]), "fields": {"Status": "complete", "CompletedAt": grist_datetime(utc_now()), "UpdatedAt": grist_datetime(utc_now())}}])
             result = self.get_snapshot(snapshot_key)
@@ -906,7 +920,8 @@ class GristLiveCostService:
         return {_fields(row).get("SnapshotLineKey")[len(snapshot_key) + 1:]: int(row["id"])
                 for row in self._rows("CostSnapshotLine") if ref_id(_fields(row).get("Snapshot")) == int(header["id"])}
 
-    def _publish_snapshot_evidence(self, snapshot_key: str, request_key: str, request_fp: str, evidence: list[dict[str, Any]], line_ids: dict[str, int]) -> None:
+    def _publish_snapshot_evidence(self, snapshot_key: str, request_key: str, request_fp: str, evidence: list[dict[str, Any]],
+                                   line_ids: dict[str, int], *, checksum_version: int) -> None:
         header = next(row for row in self._rows("CostSnapshot") if _fields(row).get("SnapshotKey") == snapshot_key)
         pending = []
         for item in evidence:
@@ -917,10 +932,6 @@ class GristLiveCostService:
                 "SourceTable": item.get("sourceTable"), "SourceRecordId": item.get("sourceRecordId"),
                 "SourceVersion": item.get("sourceVersion"), "EffectiveAt": grist_datetime(item.get("effectiveAt")) if item.get("effectiveAt") else None,
                 "TransactionAt": grist_datetime(item.get("transactionAt")) if item.get("transactionAt") else None,
-                "RateSourceDate": item.get("rateSourceDate"), "SourceRecordedAt": str(item.get("sourceRecordedAt") or ""),
-                "SourceUpdatedAt": str(item.get("sourceUpdatedAt") or ""), "RateAgeStatus": item.get("rateAgeStatus"),
-                "RateAgeDays": item.get("rateAgeDays"), "RateAgeDaysUntil": item.get("rateAgeDaysUntil"),
-                "RateAgeAsOfDate": item.get("rateAgeAsOfDate"),
                 "Vendor": item.get("vendorId"), "PurchaseRecord": item.get("purchaseRecordId"),
                 "RawUnitRate": item.get("rawUnitRate"), "NormalizedUnitRate": item.get("normalizedUnitRate"),
                 "SourceCurrency": item.get("sourceCurrency"), "SourceUOM": item.get("sourceUOM"),
@@ -931,6 +942,13 @@ class GristLiveCostService:
                 "RatePolicy": item.get("ratePolicy"), "EvidenceReference": item.get("evidenceReference"),
                 "ResolutionStatus": item.get("resolutionStatus"), "Reason": item.get("reason"),
                 "RequestKey": request_key, "RequestFingerprint": request_fingerprint([request_fp, item])}
+            if checksum_version >= 2:
+                fields.update({"RateSourceDate": item.get("rateSourceDate"), "SourceRecordedAt": str(item.get("sourceRecordedAt") or ""),
+                    "SourceUpdatedAt": str(item.get("sourceUpdatedAt") or ""), "RateAgeStatus": item.get("rateAgeStatus"),
+                    "RateAgeDays": item.get("rateAgeDays"), "RateAgeDaysUntil": item.get("rateAgeDaysUntil"),
+                    "RateAgeAsOfDate": item.get("rateAgeAsOfDate")})
+            if checksum_version >= 3:
+                fields["RateDateBasis"] = item.get("rateDateBasis") or "unknown"
             pending.append(("EvidenceKey", key, fields))
         self._upsert_rows("CostSnapshotRateEvidence", pending)
 
@@ -1112,23 +1130,58 @@ class GristLiveCostService:
         line_rows = [row for row in self._rows("CostSnapshotLine") if ref_id(_fields(row).get("Snapshot")) == hid]
         evidence_rows = [row for row in self._rows("CostSnapshotRateEvidence") if ref_id(_fields(row).get("Snapshot")) == hid]
         expected_checksum = str(_fields(header).get("ContentChecksum") or "")
-        if not expected_checksum or self._snapshot_content_checksum(part_rows, line_rows, evidence_rows) != expected_checksum:
+        checksum_version = self._snapshot_checksum_version(header, evidence_rows, [])
+        if not expected_checksum or self._snapshot_content_checksum(part_rows, line_rows, evidence_rows, version=checksum_version) != expected_checksum:
             raise PartIdentityError("COST_SNAPSHOT_INTEGRITY_FAILED", "Frozen snapshot rows no longer match their publication checksum; review the Grist records before using this history.")
         parts = [_public(row) for row in part_rows]
         all_lines = [_public(row) for row in line_rows]
         evidence = [_public(row) for row in evidence_rows]
+        if checksum_version == 1:
+            for item in evidence:
+                item.update({"RateSourceDate": None, "RateDateBasis": "unknown", "SourceRecordedAt": None,
+                    "SourceUpdatedAt": None, "RateAgeStatus": "unknown", "RateAgeDays": None,
+                    "RateAgeDaysUntil": None, "RateAgeAsOfDate": None})
+        elif checksum_version == 2:
+            for item in evidence:
+                if item.get("RateDateBasis") in (None, ""):
+                    item["RateDateBasis"] = "unknown"
         limit, offset = min(max(int(limit), 1), 10000), max(int(offset), 0)
         lines = all_lines[offset:offset + limit]
         line_ids = {int(row["id"]) for row in lines}
-        return {"snapshot": _public(header), "parts": parts, "lines": lines,
+        return {"snapshot": {**_public(header), "ContentChecksumVersion": checksum_version}, "parts": parts, "lines": lines,
             "rateEvidence": [row for row in evidence if ref_id(_fields(row).get("SnapshotLine")) in line_ids],
             "lineCount": len(all_lines), "lineOffset": offset, "lineLimit": limit,
             "evidenceCount": len(evidence), "historicalSource": "frozen CostSnapshot records"}
 
     @staticmethod
-    def _snapshot_content_checksum(parts: list[dict[str, Any]], lines: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> str:
+    def _snapshot_checksum_version(header: dict[str, Any] | None, evidence_rows: list[dict[str, Any]],
+                                   live_evidence: list[dict[str, Any]]) -> int:
+        declared = _num(_fields(header).get("ContentChecksumVersion")) if header else None
+        if declared in {1, 2, 3}:
+            return int(declared)
+        stored_has_basis = any(_fields(row).get("RateDateBasis") not in (None, "") for row in evidence_rows)
+        payload_has_basis = any(item.get("rateDateBasis") not in (None, "") for item in live_evidence)
+        if stored_has_basis or payload_has_basis:
+            return 3
+        age_columns = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus", "RateAgeAsOfDate"}
+        stored_has_age = any(any(_fields(row).get(column) not in (None, "") for column in age_columns) for row in evidence_rows)
+        payload_has_age = any(any(item.get(name) not in (None, "") for name in
+            ("rateSourceDate", "sourceRecordedAt", "sourceUpdatedAt", "rateAgeStatus", "rateAgeDays", "rateAgeDaysUntil", "rateAgeAsOfDate"))
+            for item in live_evidence)
+        return 2 if stored_has_age or payload_has_age else 1
+
+    @staticmethod
+    def _snapshot_content_checksum(parts: list[dict[str, Any]], lines: list[dict[str, Any]],
+                                   evidence: list[dict[str, Any]], *, version: int = 3) -> str:
         def ordered(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
-            return sorted((_fields(row) for row in rows), key=lambda fields: str(fields.get(key) or ""))
+            excluded = SNAPSHOT_CHECKSUM_V1_COLUMNS if version == 1 else SNAPSHOT_CHECKSUM_V2_COLUMNS if version == 2 else set()
+            projected = []
+            for row in rows:
+                fields = _fields(row)
+                projected.append({name: value for name, value in fields.items() if name not in excluded})
+            return sorted(projected, key=lambda fields: str(fields.get(key) or ""))
+        if version not in {1, 2, 3}:
+            raise PartIdentityError("COST_SNAPSHOT_CHECKSUM_VERSION_UNSUPPORTED", "This Cost Snapshot uses an unsupported integrity-check version.")
         return request_fingerprint({"parts": ordered(parts, "PartOccurrenceKey"),
             "lines": ordered(lines, "SnapshotLineKey"), "evidence": ordered(evidence, "EvidenceKey")})
 

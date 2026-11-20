@@ -105,6 +105,11 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             original_selection = deepcopy(client.tables["ConfigurationPartSelection"][0])
             _definition, request = self.draft_and_submit(service)
             self.assertEqual(request["impact"]["modelCodeConfigurations"][0]["modelCode"], "M-1")
+            approver_view = service.get_definition("p-1", actor="Irshad")
+            pending = approver_view["pendingChangeRequests"][0]
+            self.assertEqual(str(pending["before"]["requirements"][0]["quantity"]), "1")
+            self.assertEqual(pending["after"]["requirements"][0]["quantity"], 2)
+            self.assertNotEqual(pending["before"], pending["after"])
             self.assertEqual(client.tables["ProductPart"][0]["fields"]["CurrentPartRevision"], 20)
             with self.assertRaises(PartIdentityError):
                 service.approve_and_publish(request["changeRequestKey"], actor="not Irshad", request_key="approval-normal")
@@ -212,6 +217,64 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                 service.submit_change_request("p-1", {"draftKey": saved["draftKey"]}, actor="operator", reason="hold", request_key="cr-stale")
 
             self.assertEqual(conflict.exception.code, "PART_DEFINITION_STALE_BASE")
+
+    def test_stale_change_request_reopens_as_new_draft_and_requires_fresh_approval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            _definition, stale_request = self.draft_and_submit(service, request_suffix="reopen")
+            original_after = deepcopy(stale_request["after"])
+            client.update_table_records("ConfigurationPartSelection", [{"id": 102, "fields": {"Quantity": 3}}])
+
+            with self.assertRaises(PartIdentityError) as stale:
+                service.approve_and_publish(stale_request["changeRequestKey"], actor="Irshad", request_key="approval-stale-reopen")
+
+            self.assertEqual(stale.exception.code, "PART_DEPENDENCY_CLOSURE_STALE")
+            old_cr = next(row["fields"] for row in client.tables["PartEngineeringChangeRequest"]
+                if row["fields"]["ChangeRequestKey"] == stale_request["changeRequestKey"])
+            self.assertEqual(old_cr["Status"], "stale")
+            self.assertNotEqual(old_cr.get("ApprovedBy"), "Irshad")
+            stale_view = service.get_definition("p-1", actor="Irshad")["staleChangeRequests"][0]
+            self.assertEqual(stale_view["after"], original_after)
+            self.assertEqual(str(stale_view["before"]["requirements"][0]["quantity"]), "1")
+
+            reopened = service.reopen_stale_change_request("p-1", stale_request["changeRequestKey"], actor="operator",
+                reason="Review current configuration closure", request_key="reopen-stale")
+            self.assertEqual(reopened["content"]["requirements"][0]["quantity"], 2)
+            reopened_retry = service.reopen_stale_change_request("p-1", stale_request["changeRequestKey"], actor="operator",
+                reason="Review current configuration closure", request_key="reopen-stale")
+            self.assertTrue(reopened_retry["idempotent"])
+            self.assertNotEqual(reopened["draftKey"], next(row["fields"]["DraftKey"] for row in client.tables["PartDefinitionDraft"]
+                if row["fields"].get("Status") == "submitted"))
+            corrected = deepcopy(reopened["content"])
+            corrected["draftKey"] = reopened["draftKey"]
+            corrected["expectedSaveVersion"] = reopened["saveVersion"]
+            corrected["requirements"][0]["quantity"] = 3
+            saved = service.save_draft("p-1", corrected, actor="operator", reason="Corrected after closure review", request_key="save-reopened")
+            fresh_request = service.submit_change_request("p-1", {"draftKey": saved["draftKey"]}, actor="operator",
+                reason="Corrected definition with refreshed impact", request_key="cr-reopened")
+            self.assertEqual(fresh_request["after"]["requirements"][0]["quantity"], 3)
+            self.assertEqual(fresh_request["impact"]["modelCodeConfigurations"][0]["quantity"], 3)
+            published = service.approve_and_publish(fresh_request["changeRequestKey"], actor="Irshad", request_key="approval-reopened")
+
+            self.assertEqual(published["status"], "published")
+            self.assertEqual(old_cr["AfterDefinition"], next(row["fields"]["AfterDefinition"] for row in client.tables["PartEngineeringChangeRequest"]
+                if row["fields"]["ChangeRequestKey"] == stale_request["changeRequestKey"]))
+            with self.assertRaises(PartIdentityError) as second_reopen:
+                service.reopen_stale_change_request("p-1", stale_request["changeRequestKey"], actor="operator",
+                    reason="Second reopen", request_key="reopen-stale-again")
+            self.assertEqual(second_reopen.exception.code, "PART_CHANGE_REQUEST_ALREADY_REOPENED")
+
+    def test_publication_parts_are_ordered_child_first_for_shared_diamond(self):
+        parts = [
+            {"partId": "top", "content": {"components": [{"childPartId": "target"}, {"childPartId": "sub"}]}},
+            {"partId": "target", "content": {"components": []}},
+            {"partId": "sub", "content": {"components": [{"childPartId": "target"}]}},
+        ]
+
+        ordered = GristPartDefinitionService._child_first_part_order(parts)
+
+        self.assertEqual([item["partId"] for item in ordered], ["target", "sub", "top"])
 
     def test_impact_preview_exposes_stable_component_paths_and_proposed_revisions(self):
         with tempfile.TemporaryDirectory() as temp:

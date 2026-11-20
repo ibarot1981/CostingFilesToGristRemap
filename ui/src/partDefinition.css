@@ -39,3 +39,11 @@
 .parts-definition-impact > article, .parts-definition-impact-path { display: grid; gap: 0.3rem; padding: 0.65rem; border: 1px solid var(--parts-border, #d8dde5); border-radius: 0.4rem; }
 .parts-definition-impact-path { margin-top: 0.45rem; background: var(--parts-muted, #f6f7f9); }
 .parts-definition-field-status { display: block; }
+.parts-definition-diff { display: grid; gap: 0.4rem; margin-block: 0.75rem; padding: 0.7rem; border: 1px solid var(--parts-border, #d8dde5); border-radius: 0.45rem; background: #fff; }
+.parts-definition-diff h4, .parts-definition-diff p { margin: 0; }
+.parts-definition-diff-scroll { overflow-x: auto; }
+.parts-definition-diff table { width: 100%; min-width: 660px; border-collapse: collapse; font-size: 0.85em; }
+.parts-definition-diff th, .parts-definition-diff td { padding: 0.45rem; border: 1px solid var(--parts-border, #d8dde5); text-align: left; vertical-align: top; }
+.parts-definition-diff td { max-width: 420px; overflow-wrap: anywhere; }
+.parts-definition-diff code { white-space: normal; }
+.parts-definition-stale-requests article { display: grid; gap: 0.45rem; padding-top: 0.65rem; border-top: 1px solid #e2d5b8; }

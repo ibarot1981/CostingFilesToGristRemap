@@ -1479,7 +1479,20 @@ class GristPartFeatures:
                 "Payload": json.dumps({"revisionLabel": "A", "definitionHash": definition_hash}, sort_keys=True),
                 "RequestKey": request_key, "RequestFingerprint": definition_hash})
             return {"part": part, "revision": fields, "idempotent": True}
-        self._revision_is_draft(revision)
+        revision_label = str(fields.get("RevisionLabel") or fields.get("Revision") or "A")
+        baseline_id = _ref(fields.get("ManufacturingBaseline"))
+        baseline = next((row for row in self.registry._optional_baseline_rows()
+            if baseline_id and int(row.get("id", -1)) == baseline_id), None)
+        part_record_id = _ref(fields.get("ProductPart"))
+        part_row = next((row for row in self.registry._rows("ProductPart")
+            if part_record_id and int(row.get("id", -1)) == part_record_id), None)
+        part_fields = part_row.get("fields", {}) if part_row else {}
+        baseline_status = str((baseline or {}).get("fields", {}).get("Status")
+            or part_fields.get("ManufacturingBaselineStatus") or fields.get("ManufacturingBaselineStatus") or "").casefold()
+        revision_status = str(fields.get("BaselineStatus") or fields.get("Status") or "draft").casefold()
+        initial_established_rev_a = baseline_status == "established" and revision_label == "A" and revision_status == "draft"
+        if not initial_established_rev_a:
+            self._revision_is_draft(revision)
         physical = self._physical_closure(int(revision["id"]), set())
         definition_hash = str(physical["definitionHash"])
         occurred = grist_datetime(utc_now())

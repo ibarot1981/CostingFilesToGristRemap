@@ -5,7 +5,7 @@ import "./partDefinition.css";
 type Definition = {
   partId: string; partNumber: string; revisionId: number; revisionLabel: string; revisionStatus: string;
   applicability: Record<string, any>; requirements: any[]; components: any[]; purchases: any[];
-  revisionHistory: any[]; draft?: any; canApprove?: boolean; pendingChangeRequests?: any[]; source?: any; actions?: any;
+  revisionHistory: any[]; draft?: any; canApprove?: boolean; pendingChangeRequests?: any[]; staleChangeRequests?: any[]; source?: any; actions?: any;
 };
 
 const FAMILY_LABEL: Record<string, string> = { mcl: "Material Cut List", toolshop: "Tool Shop", cnc: "CNC" };
@@ -31,6 +31,66 @@ function operationKey(partId: string, action: string, payload: unknown) {
   }
 }
 function clearOperationKey(storageKey: string) { try { localStorage.removeItem(storageKey); } catch { /* storage can be disabled */ } }
+const stableValue = (value: any): any => Array.isArray(value) ? value.map(stableValue) : value && typeof value === "object"
+  ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stableValue(value[key])])) : value;
+const sameValue = (left: any, right: any) => JSON.stringify(stableValue(left)) === JSON.stringify(stableValue(right));
+function changeRequestDiff(before: any, after: any) {
+  const changes: Array<{ path: string; kind: string; before: any; after: any }> = [];
+  const identityFor = (value: any) => value?.requirementKey || value?.componentIdentity || value?.specificationIdentity || value?.identity;
+  function visit(oldValue: any, newValue: any, path: string) {
+    if (sameValue(oldValue, newValue)) return;
+    if (Array.isArray(oldValue) && Array.isArray(newValue)) {
+      const oldIds = oldValue.map(identityFor), newIds = newValue.map(identityFor);
+      if (oldIds.every(Boolean) && newIds.every(Boolean)) {
+        const oldById = new Map(oldValue.map((item: any) => [identityFor(item), item]));
+        const newById = new Map(newValue.map((item: any) => [identityFor(item), item]));
+        for (const id of [...new Set([...oldById.keys(), ...newById.keys()])].sort()) {
+          const itemPath = `${path}[${String(id)}]`;
+          if (!oldById.has(id)) changes.push({ path: itemPath, kind: "added", before: null, after: newById.get(id) });
+          else if (!newById.has(id)) changes.push({ path: itemPath, kind: "removed", before: oldById.get(id), after: null });
+          else visit(oldById.get(id), newById.get(id), itemPath);
+        }
+        return;
+      }
+      const length = Math.max(oldValue.length, newValue.length);
+      for (let index = 0; index < length; index += 1) {
+        const itemPath = `${path}[${index + 1}]`;
+        if (index >= oldValue.length) changes.push({ path: itemPath, kind: "added", before: null, after: newValue[index] });
+        else if (index >= newValue.length) changes.push({ path: itemPath, kind: "removed", before: oldValue[index], after: null });
+        else visit(oldValue[index], newValue[index], itemPath);
+      }
+      return;
+    }
+    if (oldValue && newValue && typeof oldValue === "object" && typeof newValue === "object" && !Array.isArray(oldValue) && !Array.isArray(newValue)) {
+      for (const key of [...new Set([...Object.keys(oldValue), ...Object.keys(newValue)])].sort()) {
+        const fieldPath = path ? `${path}.${key}` : key;
+        if (!(key in oldValue)) changes.push({ path: fieldPath, kind: "added", before: null, after: newValue[key] });
+        else if (!(key in newValue)) changes.push({ path: fieldPath, kind: "removed", before: oldValue[key], after: null });
+        else visit(oldValue[key], newValue[key], fieldPath);
+      }
+      return;
+    }
+    changes.push({ path, kind: "changed", before: oldValue, after: newValue });
+  }
+  visit(before || {}, after || {}, "");
+  return changes;
+}
+const reviewValue = (value: any) => value === null || value === undefined ? "—"
+  : typeof value === "object" ? JSON.stringify(value) : String(value);
+function ChangeReview({ before, after, title }: { before: any; after: any; title: string }) {
+  const changes = changeRequestDiff(before, after);
+  return <section className="parts-definition-diff" aria-label={title}>
+    <h4>{title}</h4>
+    <p>Saved before/after values from this Change Request. The table includes additions, field changes and removals.</p>
+    {changes.length === 0 ? <p>No definition differences were recorded.</p> : <div className="parts-definition-diff-scroll"><table>
+      <thead><tr><th>Change</th><th>Requirement or field</th><th>Before</th><th>After</th></tr></thead>
+      <tbody>{changes.map((change, index) => <tr key={`${change.path}:${index}`}>
+        <td>{change.kind}</td><td><code>{change.path || "definition"}</code></td>
+        <td>{reviewValue(change.before)}</td><td>{reviewValue(change.after)}</td>
+      </tr>)}</tbody>
+    </table></div>}
+  </section>;
+}
 function savedDraftAttempt(partId: string) {
   const storageKey = `safari.part-definition:${partId}:draft-save`;
   try {
@@ -46,6 +106,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   const [content, setContent] = useState<any>(null);
   const [attributeText, setAttributeText] = useState<Record<string, string>>({});
   const [reason, setReason] = useState("");
+  const [reopenReason, setReopenReason] = useState("");
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -115,7 +176,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       setError("Finish each attributes field with a valid JSON object before saving the draft."); return;
     }
     setBusy(true); setError(""); setNotice("");
-    const payload = { ...content, baseRevisionId: definition.revisionId, expectedSaveVersion: definition.draft?.saveVersion || 0, reason };
+    const payload = { ...content, baseRevisionId: definition.revisionId, draftKey: definition.draft?.draftKey,
+      expectedSaveVersion: definition.draft?.saveVersion || 0, reason };
     const attempt = operationKey(partId, "draft-save", payload);
     if ("conflict" in attempt && attempt.conflict) { setPendingSave(savedDraftAttempt(partId)); setError("A previous draft save is still unresolved. Retry its original saved request first."); setBusy(false); return; }
     const savedAttempt = { key: attempt.key, storageKey: attempt.storageKey, payload: JSON.stringify(payload) };
@@ -170,6 +232,21 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     finally { setBusy(false); }
   }
 
+  async function reopenStaleChangeRequest(changeRequest: any) {
+    if (!reopenReason.trim()) { setError("Enter a reason before reopening the stale Change Request as a new draft."); return; }
+    setBusy(true); setError(""); setNotice("");
+    const payload = { reason: reopenReason.trim() };
+    const attempt = operationKey(partId, `reopen-${changeRequest.key}`, payload);
+    try {
+      const result = await api.reopenPartDefinitionChangeRequest(partId, changeRequest.key, payload, attempt.key);
+      clearOperationKey(attempt.storageKey);
+      await reload(); setEditing(true); setNotice(`Saved changes reopened as draft v${result.saveVersion}. Review the current accepted definition and update the draft before requesting fresh approval.`);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status < 500) { clearOperationKey(attempt.storageKey); await reload(); }
+      setError(cause instanceof Error ? cause.message : "The stale Change Request could not be reopened.");
+    } finally { setBusy(false); }
+  }
+
   async function approveAndPublish() {
     if (!pending?.key) return;
     setBusy(true); setError(""); setNotice("");
@@ -179,7 +256,10 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       clearOperationKey(attempt.storageKey);
       await reload(); onSaved(); setEditing(false);
       setNotice(`Accepted revision ${result.publishedRevisionLabel} is published. ${result.dependentPartCount} current dependent Part/assembly successor(s) and ${result.configurationCount} current configuration successor(s) were versioned.`);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "The approved Change Request could not be published. Retry the same request if Grist reports an uncertain result."); }
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status < 500) { clearOperationKey(attempt.storageKey); await reload(); }
+      setError(cause instanceof Error ? cause.message : "The approved Change Request could not be published. Retry the same request if Grist reports an uncertain result.");
+    }
     finally { setBusy(false); }
   }
 
@@ -265,7 +345,9 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       {definition.components.length > 0 && <><h4>Components</h4><div className="parts-definition-items">{definition.components.map((item: any) => <article key={item.componentIdentity}><strong>{item.childPartNumber} · {item.childName}</strong><span>{item.quantity} {item.uom} · {item.sourcingRoute || "auto"} · pinned Rev {item.childRevisionLabel || "unknown"}</span><small>{item.componentIdentity} · {item.identityStatus || "stable"}</small></article>)}</div></>}
       {definition.purchases.length > 0 && <><h4>Purchase specifications</h4><div className="parts-definition-items">{definition.purchases.map((item: any) => <article key={item.specificationIdentity}><strong>{item.code} · {item.description || item.manufacturerPartNumber}</strong><span>{item.manufacturer} · {item.costingUOM} · {item.costingCurrency}</span><small>{item.specificationIdentity} · {item.identityStatus || "stable"}</small></article>)}</div></>}
       {definition.draft && <p className={definition.draft.stale ? "parts-definition-error" : "parts-definition-notice"} role="status">{definition.draft.stale ? `Draft v${definition.draft.saveVersion} is based on an older accepted revision. Its saved content is retained; review the current accepted definition, reconcile changes, then save a new draft.` : `Saved draft v${definition.draft.saveVersion} · ${definition.draft.updatedAt}. Accepted Rev ${definition.revisionLabel} is unchanged.`}</p>}
-      {pending && <div className="parts-definition-pending"><strong>Change Request · {pending.status.replaceAll("_", " ")}</strong><p>{pending.reason}</p><span>{pendingDependents.length} current dependent Part/assembly successor(s) · {pending.impact?.modelCodeConfigurations?.length || 0} Model Code configuration successor(s)</span>
+     {pending && <div className="parts-definition-pending"><strong>Change Request · {pending.status.replaceAll("_", " ")}</strong><p>{pending.reason}</p>
+       <ChangeReview before={pending.before} after={pending.after} title="Submitted definition before and after"/>
+       <span>{pendingDependents.length} current dependent Part/assembly successor(s) · {pending.impact?.modelCodeConfigurations?.length || 0} Model Code configuration successor(s)</span>
         {pending.impact?.target && <p>Part {pending.impact.target.partId} · record {pending.impact.target.partRecordId}: Rev {pending.impact.target.currentRevisionLabel} → proposed Rev {pending.impact.target.proposedRevisionLabel || "unclassified"}</p>}
         {pendingDependents.length > 0 && <div className="parts-definition-impact"><h4>Current dependent Part/assembly closure</h4>{pendingDependents.map((dependent: any) => <article key={dependent.partId}><strong>{dependent.kind === "part" ? "Part" : "Assembly"} · {dependent.partNumber || dependent.partId} · {dependent.partId} (record {dependent.partRecordId})</strong><span>Current Rev {dependent.currentRevisionLabel} → proposed Rev {dependent.proposedRevisionLabel || "unclassified"}</span>
           {(dependent.pathDetails || []).map((path: any, pathIndex: number) => <div className="parts-definition-impact-path" key={`${dependent.partId}:${pathIndex}`}><small>Path: {path.partPath.join(" → ")}</small>{path.edges.map((edge: any, edgeIndex: number) => <small key={`${edge.componentIdentity || edge.componentRecordId}:${edgeIndex}`}>{edge.componentIdentity || `unclassified component record ${edge.componentRecordId}`} · {edge.parentPartId} Rev {edge.parentRevisionLabel} → {edge.proposedParentRevisionLabel} contains {edge.childPartId} pinned Rev {edge.pinnedChildRevisionLabel} → proposed Rev {edge.proposedChildRevisionLabel} · {edge.quantity ?? "—"} {edge.uom || ""} · {edge.sourcingRoute || "auto"}</small>)}</div>)}</article>)}</div>}
@@ -274,6 +356,18 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
         {pending.impact?.unknown?.length > 0 && <p className="parts-definition-error">Impact has gaps: {pending.impact.unknown.map((item: any) => item.code).join(", ")}</p>}
         {definition.canApprove && <button type="button" className="button primary" onClick={() => void approveAndPublish()} disabled={busy || pending.status === "pending_approval" && !pending.impact?.fingerprint}>{busy ? "Publishing…" : "Approve and publish as Irshad"}</button>}
       </div>}
+     {(definition.staleChangeRequests || []).length > 0 && <div className="parts-definition-pending parts-definition-stale-requests">
+       <h4>Change Requests returned for review</h4>
+       {(definition.staleChangeRequests || []).map((stale: any) => <article key={stale.key}>
+         <strong>Stale Change Request · {stale.key}</strong><p>{stale.reason}</p>
+         <p className="parts-definition-error">{stale.staleReason || "The accepted base or reviewed dependency closure changed."}</p>
+         <small>{stale.staleCode || "Stale review"} · detected {stale.staleAt || "date not recorded"}</small>
+         <details><summary>Review the preserved submitted definition</summary><ChangeReview before={stale.before} after={stale.after} title="Stale request before and after"/></details>
+         {stale.canReopen ? <><label className="parts-definition-reason">Reason for reopening this saved change<input value={reopenReason} onChange={event => setReopenReason(event.target.value)}/></label>
+           <button type="button" className="button primary" onClick={() => void reopenStaleChangeRequest(stale)} disabled={busy || !reopenReason.trim()}>Reopen saved changes as a new draft</button></>
+           : <p className="parts-definition-notice" role="status">This stale request already has a linked reopened draft. Edit that saved draft and request fresh approval.</p>}
+       </article>)}
+     </div>}
       <details id="part-definition-history" className="parts-definition-history"><summary>Engineering revision history</summary>{definition.revisionHistory.map((revision: any) => <article key={revision.id}><strong>Rev {revision.revisionLabel} · {revision.status.replaceAll("_", " ")}{revision.current ? " · current" : ""}</strong><span>{revision.actor || "Actor not recorded"} · {revision.occurredAt || "Date not recorded"}</span><p>{revision.reason || "No reason recorded"}{revision.publicationCause ? ` · cause ${revision.publicationCause}` : ""}</p></article>)}</details>
     </>}
   </section>;

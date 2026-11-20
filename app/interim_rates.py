@@ -1,26 +1,9 @@
 """Read-only Costing-New rate display through reviewed material aliases."""
 from __future__ import annotations
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
 from typing import Any
 from app.material_resolution import resolve_material
-from app.grist_types import datetime_text
-
-
-def _first_value(fields: dict[str, Any], names: tuple[str, ...]) -> Any:
-    return next((fields.get(name) for name in names if fields.get(name) not in (None, "")), None)
-
-
-def _rate_date_evidence(fields: dict[str, Any]) -> tuple[str | None, str | None]:
-    raw = _first_value(fields, ("EffectiveAt", "RateDate", "DateOfEntry", "EntryDate", "Date", "CreatedAt", "RecordedAt", "UpdatedAt", "Timestamp"))
-    if raw in (None, ""):
-        return None, None
-    text = datetime_text(raw)
-    try:
-        datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return text, text
-    except ValueError:
-        return None, text
+from app.cost_dates import cost_date_evidence
 
 
 def _number(value: Any) -> Decimal | None:
@@ -55,13 +38,9 @@ def compare_interim_rates(ods_rates: dict[str, Any], mappings: dict[str, str],
             row.update({"basis": field, "masterRecordId": record['id'], "status": 'available' if rate is not None else 'rate_unavailable',
                         "costingNewRate": str(rate) if rate is not None else None})
             date_fields = selected_entry.get("fields", {}) if selected_entry else record['fields']
-            effective_at, rate_source_date = _rate_date_evidence(date_fields)
-            recorded = _first_value(date_fields, ("RecordedAt", "CreatedAt", "EntryAt"))
-            updated = _first_value(date_fields, ("UpdatedAt", "LastUpdatedAt"))
+            date_evidence = cost_date_evidence(date_fields, source_kind="rate_log" if selected_entry else "rate_master")
             row.update({"selectedRateLogId": selected_entry.get("id") if selected_entry else None,
-                "effectiveAt": effective_at, "rateSourceDate": rate_source_date,
-                "sourceRecordedAt": datetime_text(recorded) if recorded not in (None, "") else None,
-                "sourceUpdatedAt": datetime_text(updated) if updated not in (None, "") else None})
+                **date_evidence})
             old = _number(ods_rate)
             if old is not None and rate is not None:
                 row['difference'] = str(rate-old)

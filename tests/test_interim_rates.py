@@ -24,12 +24,36 @@ class InterimRatesTests(unittest.TestCase):
         self.assertIsNone(result['costingNewRate'])
         self.assertEqual(compare_interim_rates(rates, mappings, [master, master], [])[0]['status'], 'ambiguous_master')
 
-    def test_selected_rate_log_exposes_effective_entry_and_update_dates(self):
+    def test_selected_rate_log_ages_from_update_and_exposes_distinct_dates(self):
         masters = [{"id": 1, "fields": {"MasterMaterial": "Steel", "MaterialLatestRate": 55, "Default_MaterialRate": 40}}]
         logs = [{"id": 7, "fields": {"MasterMaterial": 1, "RatePerKG": 52, "EffectiveAt": "2026-11-10T00:00:00Z",
             "RecordedAt": "2026-11-09T12:00:00Z", "UpdatedAt": "2026-11-11T09:00:00Z"}}]
 
         row = compare_interim_rates({"Plate": "50"}, {"Plate": "Steel"}, masters, logs)[0]
 
-        self.assertEqual((row["selectedRateLogId"], row["effectiveAt"], row["rateSourceDate"]), (7, "2026-11-10T00:00:00+00:00", "2026-11-10T00:00:00+00:00"))
+        self.assertEqual((row["selectedRateLogId"], row["effectiveAt"], row["rateSourceDate"], row["rateDateBasis"]),
+            (7, "2026-11-10T00:00:00+00:00", "2026-11-11T09:00:00+00:00", "update"))
         self.assertEqual((row["sourceRecordedAt"], row["sourceUpdatedAt"]), ("2026-11-09T12:00:00+00:00", "2026-11-11T09:00:00+00:00"))
+
+    def test_master_metadata_update_does_not_become_a_rate_age_event(self):
+        masters = [{"id": 1, "fields": {"MasterMaterial": "Steel", "MaterialLatestRate": 55,
+            "EffectiveAt": "2026-11-10T00:00:00Z", "UpdatedAt": "2026-11-18T00:00:00Z"}}]
+
+        row = compare_interim_rates({"Plate": "50"}, {"Plate": "Steel"}, masters, [])[0]
+
+        self.assertEqual(row["effectiveAt"], "2026-11-10T00:00:00+00:00")
+        self.assertEqual(row["rateSourceDate"], "2026-11-10T00:00:00+00:00")
+        self.assertEqual(row["rateDateBasis"], "effective")
+        self.assertIsNone(row["sourceUpdatedAt"])
+
+    def test_legacy_date_text_is_retained_as_explicit_entry_and_update_basis(self):
+        masters = [{"id": 1, "fields": {"MasterMaterial": "Steel", "MaterialLatestRate": 55}}]
+        logs = [{"id": 7, "fields": {"MasterMaterial": 1, "RatePerKG": 52, "EffectiveAt": "2026-10-01T00:00:00Z",
+            "RecordedAt": "17/11/2026", "UpdatedAt": "18/11/2026"}}]
+
+        row = compare_interim_rates({"Plate": "50"}, {"Plate": "Steel"}, masters, logs)[0]
+
+        self.assertEqual(row["rateDateBasis"], "update")
+        self.assertEqual(row["rateSourceDate"], "2026-11-18")
+        self.assertEqual(row["sourceRecordedAt"], "2026-11-17")
+        self.assertEqual(row["effectiveAt"], "2026-10-01T00:00:00+00:00")
