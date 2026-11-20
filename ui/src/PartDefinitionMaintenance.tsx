@@ -91,14 +91,15 @@ function ChangeReview({ before, after, title }: { before: any; after: any; title
     </table></div>}
   </section>;
 }
-function savedDraftAttempt(partId: string) {
-  const storageKey = `safari.part-definition:${partId}:draft-save`;
+function savedAttempt(partId: string, action: string) {
+  const storageKey = `safari.part-definition:${partId}:${action}`;
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
     return saved?.status === "pending" && saved?.key && typeof saved?.payload === "string"
       ? { key: saved.key as string, storageKey, payload: saved.payload as string } : null;
   } catch { return null; }
 }
+const savedDraftAttempt = (partId: string) => savedAttempt(partId, "draft-save");
 
 export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { partId: string; onSaved: () => void; onCompare: () => void }) {
   const [definition, setDefinition] = useState<Definition | null>(null);
@@ -111,6 +112,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [pendingSave, setPendingSave] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
+  const [pendingSubmit, setPendingSubmit] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -118,6 +120,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   async function reload() {
     setLoading(true);
     setPendingSave(savedDraftAttempt(partId));
+    setPendingSubmit(savedAttempt(partId, "change-request"));
     try {
       const [next, nextOptions] = await Promise.all([api.partDefinition(partId), api.partDefinitionOptions(partId)]);
       setDefinition(next);
@@ -167,7 +170,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   }
 
   async function saveDraft() {
-    if (!definition || !reason.trim() || pendingSave) { setError(pendingSave ? "Resolve the saved request before editing or saving another draft." : "Enter the engineering reason before saving a draft."); return; }
+    if (!definition || !reason.trim() || pendingSave || pendingSubmit) { setError(pendingSave || pendingSubmit ? "Resolve the saved request before editing or saving another draft." : "Enter the engineering reason before saving a draft."); return; }
     const activeAttributeTexts = [
       ...(content?.requirements || []).map((item: any) => attributeText[`requirement:${item.requirementKey}`]),
       ...(content?.purchases || []).map((item: any) => attributeText[`purchase:${item.specificationIdentity}`]),
@@ -219,20 +222,37 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   }
 
   async function submitForApproval() {
+    if (pendingSubmit) { setError("Confirm the original submission before requesting another approval."); return; }
     if (!definition?.draft || dirty || !reason.trim()) { setError("Save the current draft and reason before requesting approval."); return; }
     setBusy(true); setError(""); setNotice("");
     const payload = { draftKey: definition.draft.draftKey, reason };
     const attempt = operationKey(partId, "change-request", payload);
+    if ("conflict" in attempt && attempt.conflict) { setPendingSubmit(savedAttempt(partId, "change-request")); setError("Confirm the original submission before requesting another approval."); setBusy(false); return; }
+    const saved = { key: attempt.key, storageKey: attempt.storageKey, payload: JSON.stringify(payload) };
+    setPendingSubmit(saved);
+    await confirmSubmission(saved);
+  }
+
+  async function confirmSubmission(attempt: { key: string; storageKey: string; payload: string }) {
+    setBusy(true); setError(""); setNotice("");
     try {
-      const result = await api.submitPartDefinitionChangeRequest(partId, payload, attempt.key);
+      const result = await api.submitPartDefinitionChangeRequest(partId, JSON.parse(attempt.payload), attempt.key);
       clearOperationKey(attempt.storageKey);
+      setPendingSubmit(null);
       await reload(); setNotice(`Change Request submitted for review. ${result.impact?.dependents?.length ?? result.impact?.assemblies?.length ?? 0} current dependent Part/assembly successor(s) and ${result.impact?.modelCodeConfigurations?.length || 0} configuration successor(s) are in the reviewed closure.`);
       setEditing(false);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "The Change Request could not be submitted."); }
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.retryDisposition === "safe_to_edit" && ["PART_CHANGE_REQUEST_INPUT_REQUIRED", "PART_DEFINITION_DRAFT_REQUIRED", "PART_DEFINITION_DRAFT_IMMUTABLE", "PART_DEFINITION_STALE_BASE", "PART_DEFINITION_DRAFT_INVALID", "PART_CHANGE_REQUEST_IMPACT_BLOCKED"].includes(cause.code)) {
+        clearOperationKey(attempt.storageKey); setPendingSubmit(null);
+        await reload();
+      }
+      setError(cause instanceof Error ? cause.message : "The Change Request could not be submitted.");
+    }
     finally { setBusy(false); }
   }
 
   async function reopenStaleChangeRequest(changeRequest: any) {
+    if (pendingSubmit) { setError("Confirm the original submission before reopening another change."); return; }
     if (!reopenReason.trim()) { setError("Enter a reason before reopening the stale Change Request as a new draft."); return; }
     setBusy(true); setError(""); setNotice("");
     const payload = { reason: reopenReason.trim() };
@@ -269,7 +289,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
 
   return <section className="parts-section-card parts-definition-card" aria-label="Saved Part definition">
     <header className="parts-definition-heading"><div><h3>Saved Part definition</h3><p>{definition.partNumber} · accepted Rev {definition.revisionLabel} · {definition.revisionStatus.replaceAll("_", " ")}</p></div>
-      <div className="parts-definition-actions"><button type="button" className="button" onClick={() => { setEditing(true); setNotice(""); }} disabled={busy || Boolean(pending) || Boolean(pendingSave) || !definition.actions?.editPart}>Edit Part</button>
+      <div className="parts-definition-actions"><button type="button" className="button" onClick={() => { setEditing(true); setNotice(""); }} disabled={busy || Boolean(pending) || Boolean(pendingSave) || Boolean(pendingSubmit) || !definition.actions?.editPart}>Edit Part</button>
         <button type="button" className="button" onClick={() => document.getElementById("part-definition-history")?.scrollIntoView({ behavior: "smooth", block: "center" })}>Revision history</button>
         <button type="button" className="button" onClick={onCompare}>Compare with ODS</button></div></header>
     {error && <p className="parts-definition-error" role="alert">{error}</p>}{notice && <p className="parts-definition-notice" role="status">{notice}</p>}
@@ -278,7 +298,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     {definition.source?.workbookName && <p className="parts-definition-source">Origin provenance: {definition.source.workbookName} · {definition.source.sourceHash || "source hash unavailable"} · read only</p>}
 
     {pendingSave && <p className="parts-definition-error" role="alert">A draft save has an uncertain result. Editing is locked until its original payload is retried with the same request key. <button type="button" className="button" onClick={() => void retryPendingSave()} disabled={busy}>{busy ? "Retrying…" : "Retry original draft save"}</button></p>}
-    {editing && <fieldset className="parts-definition-editor" aria-label="Edit saved Part definition" disabled={busy || Boolean(pendingSave)}>
+    {pendingSubmit && <p className="parts-definition-error" role="alert">A Change Request submission has an uncertain result. Confirm the original request before continuing. <button type="button" className="button" onClick={() => void confirmSubmission(pendingSubmit)} disabled={busy}>{busy ? "Confirming…" : "Confirm original submission"}</button></p>}
+    {editing && <fieldset className="parts-definition-editor" aria-label="Edit saved Part definition" disabled={busy || Boolean(pendingSave) || Boolean(pendingSubmit)}>
       {definition.draft?.stale && <p className="parts-definition-error" role="status">The saved draft uses an older accepted base. It is retained. Review the current values here and reconcile them manually before saving a new draft on Rev {definition.revisionLabel}.</p>}
       <div className="parts-definition-applicability"><strong>Family applicability</strong>{Object.entries(FAMILY_LABEL).map(([family, label]) => <label key={family}><input type="checkbox" checked={Boolean(content?.applicability?.[family]?.applicable)} onChange={event => patchContent({ applicability: { ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: event.target.checked } } })}/>{label}</label>)}</div>
       <div className="parts-definition-list-heading"><h4>Manufacturing requirements</h4><button type="button" className="button" disabled={busy || !content?.applicability?.mcl?.applicable && !content?.applicability?.toolshop?.applicable && !content?.applicability?.cnc?.applicable} onClick={() => patchContent({ requirements: [...(content.requirements || []), { requirementKey: `ui-authored:${crypto.randomUUID()}`, identityStatus: "safari_authored", family: content.applicability?.mcl?.applicable ? "mcl" : content.applicability?.toolshop?.applicable ? "toolshop" : "cnc", quantity: "1", uom: "Nos", processType: "", detail: { Quantity: "", QuantityUOM: "" }, provenance: { type: "safari_authored", evidence: {} } }] })}>Add requirement</button></div>
@@ -333,7 +354,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
 
       {!isFinalized && <label className="parts-definition-finalize"><input type="checkbox" checked={Boolean(content?.finalizeOnPublication)} onChange={event => patchContent({ finalizeOnPublication: event.target.checked })}/> Finalize this successor definition through the approved Change Request</label>}
       <label className="parts-definition-reason">Engineering change reason<input value={reason} onChange={event => { setReason(event.target.value); setDirty(true); }}/></label>
-      <div className="parts-definition-actions"><button type="button" className="button primary" onClick={() => void saveDraft()} disabled={busy || !reason.trim()}>{busy ? "Saving…" : "Save draft"}</button>
+      <div className="parts-definition-actions"><button type="button" className="button primary" onClick={() => void saveDraft()} disabled={busy || Boolean(pendingSubmit) || !reason.trim()}>{busy ? "Saving…" : "Save draft"}</button>
         <button type="button" className="button" onClick={() => { setEditing(false); setDirty(false); if (definition) setContent(definition.draft && !definition.draft.stale ? definition.draft.content : emptyContent(definition)); }} disabled={busy}>Close editor</button>
         {definition.draft && !definition.draft.stale && <button type="button" className="button primary" onClick={() => void submitForApproval()} disabled={busy || dirty || !reason.trim()}>Request approval</button>}</div>
     </fieldset>}
@@ -354,7 +375,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
         {pending.impact?.modelCodeConfigurations?.length > 0 && <div className="parts-definition-impact"><h4>Current Model Code configuration closure</h4>{pending.impact.modelCodeConfigurations.map((use: any) => <article key={`${use.modelCodeRecordId}:${use.selectionIdentity || use.selectionRecordId}`}><strong>{use.modelCode || "Model Code"} · record {use.modelCodeRecordId} · selection {use.selectionIdentity || `unclassified record ${use.selectionRecordId}`}</strong><span>Configuration record {use.configurationRecordId} Rev {use.currentConfigurationRevision} → proposed Rev {use.proposedConfigurationRevision} · Part {use.partId} pinned Rev {use.partRevisionId} → proposed Rev {use.proposedPartRevisionLabel} · {use.quantity ?? "—"} {use.uom || ""} · {use.sourcingRoute || "auto"} · {use.label || "unlabeled occurrence"}{use.optionGroup ? ` · option ${use.optionGroup}` : ""}</span>{(use.dependencyPaths || []).filter((path: string[]) => path.length > 1).map((path: string[], index: number) => <small key={`${use.selectionIdentity}:${index}`}>Affected through: {path.join(" → ")}</small>)}</article>)}</div>}
         {pending.impact?.spares?.message && <p>{pending.impact.spares.message}</p>}
         {pending.impact?.unknown?.length > 0 && <p className="parts-definition-error">Impact has gaps: {pending.impact.unknown.map((item: any) => item.code).join(", ")}</p>}
-        {definition.canApprove && <button type="button" className="button primary" onClick={() => void approveAndPublish()} disabled={busy || pending.status === "pending_approval" && !pending.impact?.fingerprint}>{busy ? "Publishing…" : "Approve and publish as Irshad"}</button>}
+        {definition.canApprove && <button type="button" className="button primary" onClick={() => void approveAndPublish()} disabled={busy || Boolean(pendingSubmit) || pending.status === "pending_approval" && !pending.impact?.fingerprint}>{busy ? "Publishing…" : "Approve and publish as Irshad"}</button>}
       </div>}
      {(definition.staleChangeRequests || []).length > 0 && <div className="parts-definition-pending parts-definition-stale-requests">
        <h4>Change Requests returned for review</h4>
@@ -364,7 +385,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
          <small>{stale.staleCode || "Stale review"} · detected {stale.staleAt || "date not recorded"}</small>
          <details><summary>Review the preserved submitted definition</summary><ChangeReview before={stale.before} after={stale.after} title="Stale request before and after"/></details>
          {stale.canReopen ? <><label className="parts-definition-reason">Reason for reopening this saved change<input value={reopenReason} onChange={event => setReopenReason(event.target.value)}/></label>
-           <button type="button" className="button primary" onClick={() => void reopenStaleChangeRequest(stale)} disabled={busy || !reopenReason.trim()}>Reopen saved changes as a new draft</button></>
+           <button type="button" className="button primary" onClick={() => void reopenStaleChangeRequest(stale)} disabled={busy || Boolean(pendingSubmit) || !reopenReason.trim()}>Reopen saved changes as a new draft</button></>
            : <p className="parts-definition-notice" role="status">This stale request already has a linked reopened draft. Edit that saved draft and request fresh approval.</p>}
        </article>)}
      </div>}

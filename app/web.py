@@ -1415,8 +1415,18 @@ def save_part_definition_draft(part_id: str, request: Request, payload: dict[str
 
 @app.post("/api/parts/{part_id}/definition/change-requests")
 def submit_part_definition_change_request(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
-    return _part_definition_service().submit_change_request(part_id, payload, actor=_request_actor(request),
-        reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    service = _part_definition_service()
+    try:
+        return service.submit_change_request(part_id, payload, actor=_request_actor(request),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        safe_codes = {"PART_CHANGE_REQUEST_INPUT_REQUIRED", "PART_DEFINITION_DRAFT_REQUIRED", "PART_DEFINITION_DRAFT_IMMUTABLE", "PART_DEFINITION_STALE_BASE",
+            "PART_DEFINITION_DRAFT_INVALID", "PART_CHANGE_REQUEST_IMPACT_BLOCKED"}
+        if exc.code in safe_codes and not service._find("PartRegistryRequest", "RequestKey", idempotency_key or ""):
+            error = _part_http_error(exc)
+            error.detail["retryDisposition"] = "safe_to_edit"
+            raise error
+        raise
 
 
 @app.post("/api/parts/{part_id}/definition/change-requests/{change_request_key}/reopen")

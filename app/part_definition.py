@@ -1066,9 +1066,66 @@ class GristPartDefinitionService:
     def submit_change_request(self, part_id: str, payload: dict[str, Any], *, actor: str, reason: str, request_key: str) -> dict[str, Any]:
         self.registry._verify_writer()
         self._require_publication_schema()
+        if not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_CHANGE_REQUEST_INPUT_REQUIRED", "A change reason, trusted actor and idempotency key are required.")
+        draft_key = str(payload.get("draftKey") or "").strip()
+        prior = self._find("PartRegistryRequest", "RequestKey", request_key)
+        cr_key = f"part-change-request:{part_id}:{request_key}"
+        cr = self._find("PartEngineeringChangeRequest", "ChangeRequestKey", cr_key)
+        if prior and (_fields(prior).get("RequestType") != "part_definition_change_request" or _fields(prior).get("EntityUUID") != part_id):
+            raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different data.")
+        frozen = _json_cell(_fields(prior).get("Payload")) if prior else None
+        if prior and not cr and isinstance(frozen, dict) and frozen.get("kind") == "part-definition-submission-v1":
+            draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+            saved = frozen.get("result") or {}
+            expected = request_fingerprint([part_id, draft_key, saved.get("baseRevisionId"), request_fingerprint(saved.get("after")), reason.strip(), (saved.get("impact") or {}).get("fingerprint"), actor.strip()])
+            if (frozen.get("partId") != part_id or frozen.get("draftKey") != draft_key
+                    or frozen.get("actor") != actor.strip() or frozen.get("reason") != reason.strip()
+                    or not draft or _int_ref(frozen.get("draftId")) != int(draft["id"])
+                    or _int_ref(_fields(draft).get("ProductPart")) != int(self._part_row(part_id)["id"])
+                    or str(_fields(draft).get("Status") or "open").casefold() != "open"
+                    or not saved.get("before") or not saved.get("after") or not saved.get("impact")
+                    or request_fingerprint(_json_cell(_fields(draft).get("Content"))) != request_fingerprint(saved.get("after"))
+                    or saved.get("requestFingerprint") != expected or expected != _fields(prior).get("RequestFingerprint")):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different data.")
+            cr = self.registry._ensure_keyed("PartEngineeringChangeRequest", "ChangeRequestKey", cr_key, {
+                "ChangeRequestKey": cr_key, "ProductPart": int(self._part_row(part_id)["id"]), "Draft": int(draft["id"]),
+                "BaseRevision": saved["baseRevisionId"], "Status": "pending_approval", "Reason": reason.strip(),
+                "BeforeDefinition": canonical_grist_json_cell(saved["before"]), "AfterDefinition": canonical_grist_json_cell(saved["after"]),
+                "ImpactPreview": canonical_grist_json_cell(saved["impact"]), "ImpactFingerprint": saved["impact"]["fingerprint"],
+                "InitiatedBy": actor.strip(), "CreatedAt": frozen["createdAt"], "RequestKey": request_key,
+                "RequestFingerprint": saved["requestFingerprint"]})
+        if cr:
+            f = _fields(cr)
+            draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
+            content = _json_cell(_fields(draft).get("Content")) if draft else None
+            after = _json_cell(f.get("AfterDefinition"))
+            before = _json_cell(f.get("BeforeDefinition"))
+            impact = _json_cell(f.get("ImpactPreview"))
+            fingerprint = request_fingerprint([part_id, draft_key, _int_ref(f.get("BaseRevision")), request_fingerprint(after), reason.strip(), (impact or {}).get("fingerprint"), actor.strip()])
+            if (not prior or not draft or _int_ref(f.get("Draft")) != int(draft["id"])
+                    or _int_ref(f.get("ProductPart")) != int(self._part_row(part_id)["id"])
+                    or f.get("Reason") != reason.strip() or f.get("InitiatedBy") != actor.strip()
+                    or not after or not before or not impact or request_fingerprint(content) != request_fingerprint(after)
+                    or _fields(prior).get("RequestFingerprint") != fingerprint):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different data.")
+            result = self._request_result(prior)
+            captured = {"changeRequestKey": cr_key, "status": "pending_approval", "baseRevisionId": _int_ref(f.get("BaseRevision")), "reason": reason.strip(), "before": before, "after": after, "impact": impact, "requestFingerprint": fingerprint}
+            if isinstance(frozen, dict) and frozen.get("kind") == "part-definition-submission-v1" and request_fingerprint(frozen.get("result")) != request_fingerprint(captured):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "The submitted Change Request differs from its frozen journal.")
+            if result is not None:
+                if request_fingerprint(result) != request_fingerprint(captured):
+                    raise PartIdentityError("PART_REQUEST_CONFLICT", "The submitted Change Request differs from its recorded result.")
+                return result
+            if str(_fields(draft).get("Status") or "open").casefold() == "open":
+                self.client.update_table_records("PartDefinitionDraft", [{"id": int(draft["id"]), "fields": {"Status": "submitted", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key, "RequestFingerprint": fingerprint}}])
+            elif _fields(draft).get("RequestKey") != request_key or _fields(draft).get("RequestFingerprint") != fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "The submitted draft belongs to another request.")
+            result = captured
+            self.registry._complete_request(prior, result)
+            return result
         current = self._current_revision(part_id)
         self._check_established(current)
-        draft_key = str(payload.get("draftKey") or "").strip()
         draft = self._find("PartDefinitionDraft", "DraftKey", draft_key)
         if not draft or _int_ref(_fields(draft).get("ProductPart")) != int(self._part_row(part_id)["id"]):
             raise PartIdentityError("PART_DEFINITION_DRAFT_REQUIRED", "Save this complete Part definition as a Grist draft before requesting approval.")
@@ -1091,6 +1148,18 @@ class GristPartDefinitionService:
         if impact["unknown"]:
             raise PartIdentityError("PART_CHANGE_REQUEST_IMPACT_BLOCKED", "The dependency preview is incomplete or has an unsupported path. Resolve every listed issue before submitting this Change Request.")
         operation_fingerprint = request_fingerprint([part_id, draft_key, base_id, draft_fields.get("ContentFingerprint"), reason.strip(), impact["fingerprint"], actor.strip()])
+        result = {"changeRequestKey": cr_key, "status": "pending_approval", "baseRevisionId": base_id,
+            "reason": reason.strip(), "before": before, "after": content, "impact": impact,
+            "requestFingerprint": operation_fingerprint}
+        if not prior:
+            now = grist_datetime(utc_now())
+            frozen = {"kind": "part-definition-submission-v1", "partId": part_id, "draftKey": draft_key,
+                "draftId": int(draft["id"]), "actor": actor.strip(), "reason": reason.strip(), "createdAt": now, "result": result}
+            self.client.create_table_records("PartRegistryRequest", [{"fields": {"RequestKey": request_key,
+                "RequestType": "part_definition_change_request", "RequestFingerprint": operation_fingerprint,
+                "EntityUUID": part_id, "Status": "publishing", "StartedAt": now, "UpdatedAt": now,
+                "WriterHostId": self.registry.host_id, "CoordinatorId": self.registry.coordinator_id,
+                "Payload": json.dumps(frozen, sort_keys=True)}}])
         request = self.registry._begin_request(request_key, "part_definition_change_request", operation_fingerprint, part_id)
         old_result = self._request_result(request)
         if old_result is not None:
@@ -1106,9 +1175,6 @@ class GristPartDefinitionService:
         self.client.update_table_records("PartDefinitionDraft", [{"id": int(draft["id"]), "fields": {
             "Status": "submitted", "UpdatedAt": grist_datetime(utc_now()), "RequestKey": request_key,
             "RequestFingerprint": operation_fingerprint}}])
-        result = {"changeRequestKey": cr_key, "status": "pending_approval", "baseRevisionId": base_id,
-            "reason": reason.strip(), "before": before, "after": content, "impact": impact,
-            "requestFingerprint": operation_fingerprint}
         self.registry._complete_request(request, result)
         return result
 

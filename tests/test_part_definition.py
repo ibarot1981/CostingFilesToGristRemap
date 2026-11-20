@@ -40,6 +40,7 @@ class DefinitionMemoryGrist:
         self.next_id = 200
         self.lock = threading.Lock()
         self.lose_after_update_table = ""
+        self.lose_after_create_table = ""
 
     def validate_safari_write_target(self):
         return None
@@ -57,7 +58,12 @@ class DefinitionMemoryGrist:
                 self.next_id += 1
                 rows.append(row)
                 created.append(deepcopy(row))
-            return {"records": created}
+            lose = table == self.lose_after_create_table
+            if lose:
+                self.lose_after_create_table = ""
+        if lose:
+            raise TimeoutError(f"simulated lost response after Grist created {table}")
+        return {"records": created}
 
     def update_table_records(self, table, updates):
         lose = False
@@ -578,6 +584,79 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             with self.assertRaises(PartIdentityError) as error:
                 service.save_draft("p-1", content, actor="operator", reason="change after submit", request_key="draft-after-submit")
             self.assertEqual(error.exception.code, "PART_DEFINITION_DRAFT_IMMUTABLE")
+
+    def test_submission_replay_and_partial_writes_preserve_original_review(self):
+        for interruption in ("completed", "journal-create", "PartEngineeringChangeRequest", "PartDefinitionDraft", "PartRegistryRequest"):
+            with self.subTest(interruption=interruption), tempfile.TemporaryDirectory() as temp:
+                client = DefinitionMemoryGrist()
+                path = Path(temp) / "coordinator.sqlite3"
+                service = self.make_service(client, path)
+                definition = service.get_definition("p-1")
+                content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                    "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False}
+                saved = service.save_draft("p-1", content, actor="operator", reason="review", request_key="draft")
+                payload = {"draftKey": saved["draftKey"]}
+                if interruption in ("journal-create", "PartEngineeringChangeRequest"):
+                    client.lose_after_create_table = "PartRegistryRequest" if interruption == "journal-create" else interruption
+                elif interruption != "completed":
+                    client.lose_after_update_table = interruption
+                if interruption == "completed":
+                    original = service.submit_change_request("p-1", payload, actor="operator", reason="review", request_key="submit")
+                else:
+                    with self.assertRaises(TimeoutError):
+                        service.submit_change_request("p-1", payload, actor="operator", reason="review", request_key="submit")
+                    if interruption == "PartEngineeringChangeRequest":
+                        request = next(row for row in client.tables["PartRegistryRequest"] if row["fields"].get("RequestKey") == "submit")
+                        request["fields"].pop("Payload", None)  # Pre-fix pending journal compatibility.
+                restarted = self.make_service(client, path)
+                # A later configuration change must not alter the already captured review.
+                client.tables["ConfigurationPartSelection"][0]["fields"]["Quantity"] = 7
+                result = restarted.submit_change_request("p-1", payload, actor="operator", reason="review", request_key="submit")
+                self.assertEqual(result["impact"]["modelCodeConfigurations"][0]["quantity"], 2)
+                if interruption == "completed":
+                    self.assertEqual(original, result)
+                self.assertEqual(len(client.tables["PartEngineeringChangeRequest"]), 1)
+                self.assertEqual(client.tables["PartDefinitionDraft"][0]["fields"]["Status"], "submitted")
+                for actor, reason, draft in (("other", "review", payload["draftKey"]), ("operator", "other", payload["draftKey"]), ("operator", "review", "other")):
+                    with self.assertRaises(PartIdentityError) as error:
+                        restarted.submit_change_request("p-1", {"draftKey": draft}, actor=actor, reason=reason, request_key="submit")
+                    self.assertEqual(error.exception.code, "PART_REQUEST_CONFLICT")
+                with self.assertRaises(PartIdentityError) as error:
+                    restarted.submit_change_request("other-part", payload, actor="operator", reason="review", request_key="submit")
+                self.assertEqual(error.exception.code, "PART_REQUEST_CONFLICT")
+                draft_fields = client.tables["PartDefinitionDraft"][0]["fields"]
+                old_content = draft_fields["Content"]
+                draft_fields["Content"] = json.dumps({"changed": True})
+                with self.assertRaises(PartIdentityError) as error:
+                    restarted.submit_change_request("p-1", payload, actor="operator", reason="review", request_key="submit")
+                self.assertEqual(error.exception.code, "PART_REQUEST_CONFLICT")
+                draft_fields["Content"] = old_content
+                with self.assertRaises(PartIdentityError) as error:
+                    restarted.submit_change_request("p-1", payload, actor="operator", reason="review", request_key="new-key")
+                self.assertEqual(error.exception.code, "PART_DEFINITION_DRAFT_IMMUTABLE")
+
+    def test_completed_submission_replays_after_publication_reuses_cr_journal_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            _, original = self.draft_and_submit(service, request_suffix="published-replay")
+            draft = client.tables["PartDefinitionDraft"][0]["fields"]["DraftKey"]
+            # A request recorded before the journal payload was introduced must remain replayable.
+            request = next(row for row in client.tables["PartRegistryRequest"] if row["fields"].get("RequestKey") == "cr-published-replay")
+            request["fields"].pop("Payload", None)
+            service.approve_and_publish(original["changeRequestKey"], actor="Irshad", request_key="approve-published-replay")
+            replay = service.submit_change_request("p-1", {"draftKey": draft}, actor="operator",
+                reason="Increase blank allowance", request_key="cr-published-replay")
+            self.assertEqual(original, replay)
+            self.assertEqual(len(client.tables["PartEngineeringChangeRequest"]), 1)
+            cr_fields = client.tables["PartEngineeringChangeRequest"][0]["fields"]
+            before = json.loads(cr_fields["BeforeDefinition"])
+            before["partName"] = "altered history"
+            cr_fields["BeforeDefinition"] = json.dumps(before)
+            with self.assertRaises(PartIdentityError) as error:
+                service.submit_change_request("p-1", {"draftKey": draft}, actor="operator",
+                    reason="Increase blank allowance", request_key="cr-published-replay")
+            self.assertEqual(error.exception.code, "PART_REQUEST_CONFLICT")
 
     def test_configuration_impact_includes_assemblies_selected_indirectly_and_preserves_other_configs(self):
         with tempfile.TemporaryDirectory() as temp:

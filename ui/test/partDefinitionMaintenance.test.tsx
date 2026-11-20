@@ -1,6 +1,7 @@
 import {afterEach, beforeEach, expect, it, vi} from "vitest";
 import {cleanup, fireEvent, render, screen} from "@testing-library/react";
 import {PartDefinitionMaintenance} from "../src/PartDefinitionMaintenance";
+import {ApiError} from "../src/api";
 
 const apiMocks = vi.hoisted(() => ({
   partDefinition: vi.fn(), partDefinitionOptions: vi.fn(), savePartDefinitionDraft: vi.fn(),
@@ -38,6 +39,57 @@ beforeEach(() => {
   apiMocks.approveAndPublishPartDefinition.mockResolvedValue({status:"published",publishedRevisionLabel:"B",dependentPartCount:0,configurationCount:0});
 });
 afterEach(() => {cleanup(); vi.unstubAllGlobals(); localStorage.clear();});
+
+it("recovers an uncertain submission after reload with the exact saved key and payload", async () => {
+  const draft = {draftKey:"draft-1",saveVersion:1,baseRevisionId:20,reason:"Review change",content:{
+    baseRevisionId:20,applicability:accepted.applicability,requirements:accepted.requirements,components:[],purchases:[],finalizeOnPublication:false}};
+  apiMocks.partDefinition.mockResolvedValue({...accepted,draft});
+  apiMocks.submitPartDefinitionChangeRequest.mockRejectedValueOnce(new Error("response lost"));
+  const props = {partId:"part-1",onSaved:vi.fn(),onCompare:vi.fn()};
+  const first = render(<PartDefinitionMaintenance {...props}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Request approval"}));
+  await screen.findByText("response lost");
+  const saved = JSON.parse(localStorage.getItem("safari.part-definition:part-1:change-request") || "null");
+  first.unmount();
+  apiMocks.partDefinition.mockResolvedValue(accepted);
+  render(<PartDefinitionMaintenance {...props}/>);
+  expect((await screen.findByRole("button",{name:"Edit Part"}) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button",{name:"Confirm original submission"}));
+  await screen.findByText(/Change Request submitted for review/);
+  expect(apiMocks.submitPartDefinitionChangeRequest.mock.calls[1]).toEqual(["part-1",JSON.parse(saved.payload),saved.key]);
+  expect(localStorage.getItem("safari.part-definition:part-1:change-request")).toBeNull();
+});
+
+it("allows correction after a confirmed pre-write rejection", async () => {
+  const draft = {draftKey:"draft-1",saveVersion:1,baseRevisionId:20,reason:"Review change",content:{
+    baseRevisionId:20,applicability:accepted.applicability,requirements:accepted.requirements,components:[],purchases:[],finalizeOnPublication:false}};
+  apiMocks.partDefinition.mockResolvedValue({...accepted,draft});
+  apiMocks.submitPartDefinitionChangeRequest.mockRejectedValueOnce(new ApiError("Draft already submitted",409,"PART_DEFINITION_DRAFT_IMMUTABLE","safe_to_edit"));
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Request approval"}));
+  await screen.findByText("Draft already submitted");
+  expect(localStorage.getItem("safari.part-definition:part-1:change-request")).toBeNull();
+  fireEvent.click(screen.getByRole("button",{name:"Request approval"}));
+  await screen.findByText(/Change Request submitted for review/);
+  expect(apiMocks.submitPartDefinitionChangeRequest.mock.calls[0][2]).not.toBe(apiMocks.submitPartDefinitionChangeRequest.mock.calls[1][2]);
+});
+
+it("keeps an uncertain submission locked after a request conflict", async () => {
+  const storageKey = "safari.part-definition:part-1:change-request";
+  const saved = {key:"original-key",payload:JSON.stringify({draftKey:"draft-1",reason:"original"}),status:"pending"};
+  localStorage.setItem(storageKey,JSON.stringify(saved));
+  apiMocks.partDefinition.mockResolvedValue({...accepted,canApprove:true,pendingChangeRequests:[{key:"cr-1",status:"pending_approval",impact:{fingerprint:"fp"}}]});
+  apiMocks.submitPartDefinitionChangeRequest.mockRejectedValue(new ApiError("Key conflict",409,"PART_REQUEST_CONFLICT","retry_same_request"));
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  const retry = await screen.findByRole("button",{name:"Confirm original submission"});
+  expect((screen.getByRole("button",{name:"Approve and publish as Irshad"}) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(retry);
+  await screen.findByText("Key conflict");
+  expect(JSON.parse(localStorage.getItem(storageKey) || "null")).toEqual(saved);
+  expect((screen.getByRole("button",{name:"Edit Part"}) as HTMLButtonElement).disabled).toBe(true);
+});
 
 it("saves a direct edit as a Grist draft and reloads the persisted reason before CR submission", async () => {
   const withDraft = {...accepted,draft:{draftKey:"draft-1",saveVersion:1,baseRevisionId:20,reason:"Initial test edit",content:{
