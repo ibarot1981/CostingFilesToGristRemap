@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
 from app.grist_types import grist_datetime
-from app.live_cost import GristLiveCostService
+from app.live_cost import GristLiveCostService, SNAPSHOT_CHECKSUM_V1_COLUMNS, _cost_date_summary, _rate_age
 from app.part_identity import PartIdentityError
 
 
@@ -73,6 +73,7 @@ class LiveCostTests(unittest.TestCase):
         self.registry._verify_writer = lambda: None
         self.features = GristPartFeatures(self.registry)
         self.rate = {"Bolt": "5"}
+        self.rate_metadata = {}
         self.service = GristLiveCostService(self.registry, material_rate_loader=self.load_rates)
         self._make_model()
 
@@ -82,7 +83,7 @@ class LiveCostTests(unittest.TestCase):
     def load_rates(self, names):
         return {"status": "available", "source": "Costing-New", "sourceDocumentId": "costing-new-test",
             "rows": [{"material": name, "status": "available", "costingNewRate": self.rate.get(name),
-                "basis": "Default_MaterialRate", "masterRecordId": 700, "rateLogRecordIds": []} for name in names]}
+                "basis": "Default_MaterialRate", "masterRecordId": 700, "rateLogRecordIds": [], **self.rate_metadata.get(name, {})} for name in names]}
 
     def create_part(self, key, name, variant=""):
         return self.registry.create_part(scope_type="product", target_id="5", target_label="Safari 1000",
@@ -146,6 +147,19 @@ class LiveCostTests(unittest.TestCase):
             expected_name=preview["name"], expected_usage_fingerprint=self.registry.usage_evidence(part_id)["fingerprint"],
             actor="reviewer", reason="metadata-only rename", request_key=key)["part"]
 
+    def save_test_snapshot(self, request_key):
+        live = self.service.live_cost(100)
+        return self.service.save_snapshot(100, {"liveResult": live, "reason": "snapshot checksum compatibility"},
+            actor="cost engineer", request_key=request_key)
+
+    def snapshot_rows(self, snapshot_key):
+        header = next(row for row in self.client.tables["CostSnapshot"] if row["fields"].get("SnapshotKey") == snapshot_key)
+        snapshot_id = header["id"]
+        parts = [row for row in self.client.tables["CostSnapshotPart"] if row["fields"].get("Snapshot") == snapshot_id]
+        lines = [row for row in self.client.tables["CostSnapshotLine"] if row["fields"].get("Snapshot") == snapshot_id]
+        evidence = [row for row in self.client.tables["CostSnapshotRateEvidence"] if row["fields"].get("Snapshot") == snapshot_id]
+        return header, parts, lines, evidence
+
     def test_live_is_read_only_explicit_snapshot_freezes_mixed_configuration_and_all_rates(self):
         before = {table: len(rows) for table, rows in self.client.tables.items() if table.startswith("CostSnapshot") or table == "PurchasedPartCostEvidence"}
         live = self.service.live_cost(100)
@@ -164,6 +178,18 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(saved["snapshot"]["PublicationStatus"], "complete")
         self.assertEqual(saved["snapshot"]["TotalCost"], 670)
         self.assertEqual((len(saved["parts"]), len(saved["lines"]), len(saved["rateEvidence"])), (3, 4, 4))
+        self.assertEqual((live["costDateSummary"]["datedInputCount"], live["costDateSummary"]["unknownInputCount"], live["costDateSummary"]["futureInputCount"]), (3, 1, 0))
+        self.assertEqual(sum(item["RateAgeStatus"] == "unknown" for item in saved["rateEvidence"]), 1)
+        self.assertTrue(all(item["RateAgeAsOfDate"] for item in saved["rateEvidence"]))
+        purchase_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "purchased_part")
+        process_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "process")
+        material_evidence = next(item for item in saved["rateEvidence"] if item["SourceType"] == "material")
+        self.assertEqual(purchase_evidence["RateDateBasis"], "entry")
+        self.assertNotEqual(purchase_evidence["TransactionAt"], purchase_evidence["RateSourceDate"])
+        self.assertEqual(process_evidence["RateDateBasis"], "entry")
+        self.assertEqual(material_evidence["RateDateBasis"], "unknown")
+        frozen_rate_ages = {item["EvidenceKey"]: (item["RateAgeStatus"], item["RateAgeDays"], item["RateAgeAsOfDate"], item["RateSourceDate"])
+            for item in saved["rateEvidence"]}
         self.assertEqual(len(self.client.tables["CostSnapshot"]), 1)
         self.assertEqual(len(self.client.tables.get("PurchasedPartCostEvidence", [])), 0)
 
@@ -184,6 +210,8 @@ class LiveCostTests(unittest.TestCase):
         historical = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertEqual(historical["snapshot"]["TotalCost"], 670)
         self.assertEqual(sorted(line["Rate"] for line in historical["lines"]), [5.0, 20.0, 100.0, 100.0])
+        self.assertEqual({item["EvidenceKey"]: (item["RateAgeStatus"], item["RateAgeDays"], item["RateAgeAsOfDate"], item["RateSourceDate"])
+            for item in historical["rateEvidence"]}, frozen_rate_ages)
         self.client.reads.clear()
         self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertFalse({"PartPurchaseRecord", "CostingProcessRate"} & set(self.client.reads))
@@ -263,6 +291,53 @@ class LiveCostTests(unittest.TestCase):
             self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
         self.assertEqual(error.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
 
+    def test_v1_snapshot_keeps_legacy_age_unknown_after_additive_columns_appear(self):
+        saved = self.save_test_snapshot("snapshot-v1-upgrade")
+        header, parts, lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        for row in evidence:
+            for column in SNAPSHOT_CHECKSUM_V1_COLUMNS:
+                row["fields"][column] = None if column in {"RateAgeDays", "RateAgeDaysUntil"} else ""
+        old_checksum = self.service._snapshot_content_checksum(parts, lines, evidence, version=1)
+        header["fields"].update({"ContentChecksum": old_checksum, "ContentChecksumVersion": 0})
+
+        recovered = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+
+        self.assertEqual(recovered["snapshot"]["ContentChecksumVersion"], 1)
+        self.assertTrue(all(item["RateAgeStatus"] == "unknown" and item["RateDateBasis"] == "unknown"
+            and item["RateAgeDays"] is None for item in recovered["rateEvidence"]))
+        lines[0]["fields"]["NetCost"] = 999
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
+    def test_v2_snapshot_preserves_captured_age_and_checks_it_after_basis_column_addition(self):
+        saved = self.save_test_snapshot("snapshot-v2-upgrade")
+        header, parts, lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        for row in evidence:
+            row["fields"]["RateDateBasis"] = ""
+        old_checksum = self.service._snapshot_content_checksum(parts, lines, evidence, version=2)
+        header["fields"].update({"ContentChecksum": old_checksum, "ContentChecksumVersion": 0})
+
+        recovered = self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+
+        self.assertEqual(recovered["snapshot"]["ContentChecksumVersion"], 2)
+        self.assertTrue(any(item["RateAgeStatus"] != "unknown" for item in recovered["rateEvidence"]))
+        self.assertTrue(all(item["RateDateBasis"] == "unknown" for item in recovered["rateEvidence"]))
+        evidence[0]["fields"]["RateAgeStatus"] = "tampered"
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
+    def test_v3_snapshot_checksum_covers_rate_date_basis(self):
+        saved = self.save_test_snapshot("snapshot-v3-basis-integrity")
+        self.assertEqual(saved["snapshot"]["ContentChecksumVersion"], 3)
+        _header, _parts, _lines, evidence = self.snapshot_rows(saved["snapshot"]["SnapshotKey"])
+        evidence[0]["fields"]["RateDateBasis"] = "tampered"
+
+        with self.assertRaises(PartIdentityError) as tampered:
+            self.service.get_snapshot(saved["snapshot"]["SnapshotKey"])
+        self.assertEqual(tampered.exception.code, "COST_SNAPSHOT_INTEGRITY_FAILED")
+
     def test_configuration_publication_resumes_and_old_retry_does_not_roll_back_current_revision(self):
         next_payload = {"currency": "INR", "reason": "reviewed quantity correction", "selections": [
             {"selectionIdentity": "main-actuator", "partId": self.parent["id"], "quantity": 3, "uom": "each", "sourcingRoute": "make"}]}
@@ -327,6 +402,61 @@ class LiveCostTests(unittest.TestCase):
             actor="owner", request_key="policy-inherit")
         inherited = self.service.policy_state(100)
         self.assertEqual((inherited["policy"], inherited["source"]), ("monthly", "system"))
+
+    def test_material_cut_process_type_uses_material_rate_with_explicit_consumption_basis(self):
+        material = next(row for row in self.client.tables["Material"] if row["fields"].get("CanonicalName") == "Bolt")
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:authored-material-cut", "ProcessType": "material_cut", "SourcePartName": "Authored steel"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:authored-material-cut", "LineMaster": master["id"],
+            "ProcessType": "material_cut", "PhysicalSignature": "authored-material-v1", "Status": "active"}}])["records"][0]
+        self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:authored-material-cut", "LineRevision": revision["id"],
+            "ProcessType": "material_cut", "Material": material["id"], "MaterialDisplayName": "Bolt", "ItemName": "Authored steel", "Quantity": 2, "QuantityUOM": "kg"}}])
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:authored-material-cut", "RequirementKey": "authored-material-cut",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 1, "QuantityUOM": "each", "Status": "active"}}])
+
+        live = self.service.live_cost(100)
+
+        authored = next(item for item in live["lines"] if item["description"] == "Authored steel")
+        self.assertEqual((authored["sourceType"], authored["quantity"], authored["quantityUOM"], authored["rate"], authored["netCost"]), ("material", 4, "kg", 5.0, 20.0))
+        self.assertNotIn("PROCESS_RATE_UNAVAILABLE", {warning["code"] for warning in live["warnings"]})
+
+    def test_new_toolshop_and_cnc_requirements_cost_from_eligible_dated_rates(self):
+        created = {}
+        for process, quantity, rate in (("tool_shop", 3, 2), ("cnc", 4, 3)):
+            key = process.replace("_", "-")
+            master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": f"line:authored-{key}", "ProcessType": process, "SourcePartName": f"Authored {process}"}}])["records"][0]
+            revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": f"revision:authored-{key}", "LineMaster": master["id"],
+                "ProcessType": process, "PhysicalSignature": f"authored-{key}-v1", "Status": "active"}}])["records"][0]
+            self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": f"detail:authored-{key}", "LineRevision": revision["id"],
+                "ProcessType": process, "ItemName": f"Authored {process}", "Quantity": quantity, "QuantityUOM": "each"}}])
+            self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": f"membership:authored-{key}", "RequirementKey": f"authored-{key}",
+                "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": process,
+                "QuantityPerPart": 1, "QuantityUOM": "Nos", "Status": "active"}}])
+            self.service.record_process_rate(master["id"], {"rate": rate, "uom": "each", "currency": "INR",
+                "effectiveAt": "2026-11-18T00:00:00Z", "sourceReference": f"approved {process} card", "reason": "dated QA rate"},
+                actor="reviewer", request_key=f"rate-{key}")
+            created[process] = quantity * rate * 2
+
+        live = self.service.live_cost(100)
+
+        authored = [line for line in live["lines"] if line["description"].startswith("Authored ")]
+        by_description = {line["description"]: line for line in authored}
+        self.assertEqual(live["status"], "complete")
+        self.assertEqual(by_description["Authored tool_shop"]["netCost"], created["tool_shop"])
+        self.assertEqual(by_description["Authored cnc"]["netCost"], created["cnc"])
+        self.assertTrue(all(item["rateAge"]["rateAgeStatus"] == "dated" for item in authored))
+
+    def test_rate_age_uses_kolkata_calendar_and_aggregates_unknown_and_future_inputs(self):
+        now = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
+        same_india_day = _rate_age("2026-11-18T20:00:00Z", as_of=now)
+        future = _rate_age("2026-11-20", as_of=now)
+        unknown = _rate_age(None, as_of=now)
+        old = _rate_age("2026-11-09", as_of=now)
+        summary = _cost_date_summary([same_india_day, future, unknown, old], as_of=now)
+        self.assertEqual((same_india_day["rateAgeStatus"], same_india_day["rateAgeDays"], same_india_day["rateAgeAsOfDate"]), ("dated", 0, "2026-11-19"))
+        self.assertEqual((future["rateAgeStatus"], future["rateAgeDaysUntil"]), ("future_date", 1))
+        self.assertEqual(unknown["rateAgeStatus"], "unknown")
+        self.assertEqual((summary["oldestKnownAgeDays"], summary["unknownInputCount"], summary["futureInputCount"]), (10, 1, 1))
 
 
 if __name__ == "__main__":

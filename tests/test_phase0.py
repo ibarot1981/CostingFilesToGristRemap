@@ -322,7 +322,7 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
-    def test_schema_v16_plans_only_additive_identity_kind_and_mapping_evidence_columns(self) -> None:
+    def test_schema_v17_plans_only_additive_identity_and_mapping_evidence_columns(self) -> None:
         client = _SchemaClient()
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
@@ -333,6 +333,12 @@ class Phase0Tests(unittest.TestCase):
                         "SemanticPolicyVersion", "SemanticFingerprint", "SemanticEvidence"
                     }
                     or table["id"] in {"ProductPart", "PartRegistryRequest"} and column["id"] == "IdentityKind"
+                    or table["id"] == "PartRevision" and column["id"] in {"PreviousRevision", "ChangeRequest", "PublicationCause", "Actor", "Reason", "OccurredAt"}
+                    or table["id"] == "PartRevisionLine" and column["id"] in {"ProvenanceType", "ProvenanceEvidence"}
+                    or table["id"] == "PartComponentRevision" and column["id"] == "ComponentIdentity"
+                    or table["id"] == "PartPurchaseSpecification" and column["id"] == "SpecificationIdentity"
+                    or table["id"] == "ConfigurationPartSelection" and column["id"] == "PartRevision"
+                    or table["id"] == "CostingConfigurationRevision" and column["id"] in {"ChangeRequest", "PublicationCause"}
                 )
             ]}
             for table in FOUNDATION_TABLES
@@ -340,7 +346,7 @@ class Phase0Tests(unittest.TestCase):
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-spares-foundation-grist-2026-11-17.v16")
+        self.assertEqual(SCHEMA_VERSION, "safari-part-definition-maintenance-grist-2026-11-19.v17")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
         additions = {item["tableId"]: item["columns"] for item in plan.add_columns}
@@ -352,7 +358,37 @@ class Phase0Tests(unittest.TestCase):
             ],
             "ProductPart": [{"id": "IdentityKind", "type": "Text"}],
             "PartRegistryRequest": [{"id": "IdentityKind", "type": "Text"}],
+            "PartRevision": [{"id": key, "type": value} for key, value in (
+                ("PreviousRevision", "Ref:PartRevision"), ("ChangeRequest", "Ref:PartEngineeringChangeRequest"),
+                ("PublicationCause", "Text"), ("Actor", "Text"), ("Reason", "Text"), ("OccurredAt", "DateTime"))],
+            "PartRevisionLine": [{"id": "ProvenanceType", "type": "Text"}, {"id": "ProvenanceEvidence", "type": "Any"}],
+            "PartComponentRevision": [{"id": "ComponentIdentity", "type": "Text"}],
+            "PartPurchaseSpecification": [{"id": "SpecificationIdentity", "type": "Text"}],
+            "ConfigurationPartSelection": [{"id": "PartRevision", "type": "Ref:PartRevision"}],
+            "CostingConfigurationRevision": [{"id": "ChangeRequest", "type": "Ref:PartEngineeringChangeRequest"}, {"id": "PublicationCause", "type": "Text"}],
         })
+        self.assertEqual(client.writes, [])
+
+    def test_part_definition_v17_migration_from_v16_adds_only_p1_tables_and_columns(self) -> None:
+        client = _SchemaClient()
+        new_tables = {"PartDefinitionDraft", "PartEngineeringChangeRequest", "PartDefinitionVersion", "PartDefinitionPublication"}
+        new_columns = {"PartRevision": {"PreviousRevision", "ChangeRequest", "PublicationCause", "Actor", "Reason", "OccurredAt"},
+            "PartRevisionLine": {"ProvenanceType", "ProvenanceEvidence"}, "PartComponentRevision": {"ComponentIdentity"},
+            "PartPurchaseSpecification": {"SpecificationIdentity"}, "ConfigurationPartSelection": {"PartRevision"},
+            "CostingConfigurationRevision": {"ChangeRequest", "PublicationCause"}}
+        client.list_tables = lambda document_id: [
+            {"id": table["id"], "columns": [
+                {"id": column["id"], "fields": {"type": column["type"]}}
+                for column in table["columns"] if column["id"] not in new_columns.get(table["id"], set())
+            ]} for table in FOUNDATION_TABLES if table["id"] not in new_tables
+        ]
+
+        plan = plan_schema(client, "safari-doc", workspace_id="ws1")
+
+        self.assertEqual({table["id"] for table in plan.create_tables}, new_tables)
+        additions = {item["tableId"]: {column["id"] for column in item["columns"]} for item in plan.add_columns}
+        self.assertEqual(additions, new_columns)
+        self.assertEqual(plan.update_columns, ())
         self.assertEqual(client.writes, [])
 
     def test_spares_v16_migration_from_v15_only_creates_additive_spare_tables(self) -> None:

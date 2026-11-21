@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from app.material_resolution import resolve_material
+from app.cost_dates import cost_date_evidence
 
 
 def _number(value: Any) -> Decimal | None:
@@ -31,10 +32,15 @@ def compare_interim_rates(ods_rates: dict[str, Any], mappings: dict[str, str],
             record = candidates[0]
             entries = [log for log in logs if log['fields'].get('MasterMaterial') == record['id']]
             row['rateLogRecordIds'] = [entry['id'] for entry in entries]
+            selected_entry = entries[-1] if entries else None
             field = 'MaterialLatestRate' if entries else 'Default_MaterialRate'
             rate = _number(record['fields'].get(field))
             row.update({"basis": field, "masterRecordId": record['id'], "status": 'available' if rate is not None else 'rate_unavailable',
                         "costingNewRate": str(rate) if rate is not None else None})
+            date_fields = selected_entry.get("fields", {}) if selected_entry else record['fields']
+            date_evidence = cost_date_evidence(date_fields, source_kind="rate_log" if selected_entry else "rate_master")
+            row.update({"selectedRateLogId": selected_entry.get("id") if selected_entry else None,
+                **date_evidence})
             old = _number(ods_rate)
             if old is not None and rate is not None:
                 row['difference'] = str(rate-old)

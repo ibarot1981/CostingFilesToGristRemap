@@ -28,7 +28,7 @@ from app.repository import AssociationConflict, AssociationProposal, GovernanceC
 from app.workbook import OdsWorkbook
 from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
 from app.libreoffice_refresh import LibreOfficeRefreshError, linked_ods_sources, refreshed_ods_copy
-from app.part_identity import PartIdentityError
+from app.part_identity import PartIdentityError, request_fingerprint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -340,6 +340,15 @@ def _part_features():
     if not isinstance(registry, GristPartRegistry):
         raise _error(503, "PART_GRIST_REQUIRED", "Composition and purchased-Part records require the configured Safari Manufacturing Grist adapter.")
     return GristPartFeatures(registry)
+
+
+def _part_definition_service():
+    from app.grist_parts import GristPartRegistry
+    from app.part_definition import GristPartDefinitionService
+    registry = _part_registry()
+    if not isinstance(registry, GristPartRegistry):
+        raise _error(503, "PART_GRIST_REQUIRED", "Direct Part-definition maintenance requires the configured Safari Manufacturing Grist adapter.")
+    return GristPartDefinitionService(registry)
 
 
 def _part_baseline_service():
@@ -1138,10 +1147,9 @@ def part_details(part_id: str) -> dict[str, Any]:
         else:
             history = {}
         part.setdefault("mappingHistory", [])
-        mapped_lines = _part_mapped_lines(repository, part_id) if part.get("identityKind", "part") == "part" else {
-            "status": "deferred", "items": [], "historical": [],
-            "message": "Workbook assignment to assemblies is deferred.", "readOnly": True,
-            "baselineIndependent": True}
+        mapped_lines = {"status": "deferred", "items": [], "historical": [],
+            "message": "Workbook assignment evidence is loaded only when you explicitly open Mapped workbook lines.",
+            "readOnly": True, "baselineIndependent": True}
         if registry.__class__.__name__ == "GristPartRegistry":
             features = _part_features()
             process_lines = features.process_lines(part_id)
@@ -1182,6 +1190,19 @@ def part_details(part_id: str) -> dict[str, Any]:
                     "drawings": {"status": "unavailable", "items": [], "message": "Legacy drawing references have not been reconciled."},
                     "usedIn": {"status": "unavailable", "items": [], "message": "Legacy configurations have not been reconciled."}}
     raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+
+
+@app.get("/api/parts/{part_id}/mapped-lines")
+@_part_registry_read_scope
+def part_mapped_lines(part_id: str) -> dict[str, Any]:
+    repository = _get_repository()
+    part = _part_registry().get_part(part_id)
+    if not part:
+        raise _error(404, "PART_NOT_FOUND", "The selected Part identity was not found.")
+    if part.get("identityKind", "part") != "part":
+        return {"status": "deferred", "items": [], "historical": [],
+            "message": "Workbook assignment to assemblies is deferred.", "readOnly": True, "baselineIndependent": True}
+    return _part_mapped_lines(repository, part_id)
 
 
 @app.get("/api/parts/{part_id}/manufacturing-baseline/review")
@@ -1366,6 +1387,75 @@ def decide_part_manufacturing_comparison(comparison_key: str, request: Request, 
 @app.get("/api/parts/{part_id}/composition")
 def part_composition(part_id: str):
     return {"items": _part_features().components(part_id)}
+
+
+@app.get("/api/parts/{part_id}/definition")
+@_part_registry_read_scope
+def get_part_definition(part_id: str, request: Request):
+    return _part_definition_service().get_definition(part_id, actor=_request_actor(request))
+
+
+@app.get("/api/parts/{part_id}/definition/recovery")
+@_part_registry_read_scope
+def get_part_definition_publication_recovery(part_id: str, request: Request):
+    return _part_definition_service().publication_recovery(part_id, actor=_request_actor(request))
+
+
+@app.get("/api/parts/{part_id}/definition/options")
+@_part_registry_read_scope
+def get_part_definition_options(part_id: str):
+    return _part_definition_service().options(part_id)
+
+
+@app.put("/api/parts/{part_id}/definition/draft")
+def save_part_definition_draft(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_definition_service().save_draft(part_id, payload, actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/parts/{part_id}/definition/change-requests")
+def submit_part_definition_change_request(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    service = _part_definition_service()
+    try:
+        return service.submit_change_request(part_id, payload, actor=_request_actor(request),
+            reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        safe_codes = {"PART_CHANGE_REQUEST_INPUT_REQUIRED", "PART_DEFINITION_DRAFT_REQUIRED", "PART_DEFINITION_DRAFT_IMMUTABLE", "PART_DEFINITION_STALE_BASE",
+            "PART_DEFINITION_DRAFT_INVALID", "PART_CHANGE_REQUEST_IMPACT_BLOCKED"}
+        if exc.code in safe_codes and not service._find("PartRegistryRequest", "RequestKey", idempotency_key or ""):
+            error = _part_http_error(exc)
+            error.detail["retryDisposition"] = "safe_to_edit"
+            raise error
+        raise
+
+
+@app.post("/api/parts/{part_id}/definition/change-requests/{change_request_key}/reopen")
+def reopen_stale_part_definition_change_request(part_id: str, change_request_key: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_definition_service().reopen_stale_change_request(part_id, change_request_key,
+        actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+
+
+@app.post("/api/part-definition/change-requests/{change_request_key}/approve-and-publish")
+def approve_and_publish_part_definition(change_request_key: str, request: Request, payload: dict[str, Any] = Body(default={}), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    service = _part_definition_service()
+    try:
+        if payload:
+            raise PartIdentityError("PART_APPROVAL_INPUT_INVALID", "Approval does not accept a replacement publication payload.")
+        return service.approve_and_publish(change_request_key, actor=_request_actor(request), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        error = _part_http_error(exc)
+        # A generic 4xx is not proof that no publication rows were written.
+        error.detail["retryDisposition"] = "retry_same_request"
+        if exc.code in {"PART_APPROVAL_INPUT_REQUIRED", "PART_CHANGE_REQUEST_APPROVER_REQUIRED", "PART_CHANGE_REQUEST_NOT_FOUND",
+                "PART_DEFINITION_STALE_BASE", "PART_DEPENDENCY_CLOSURE_STALE", "PART_DEPENDENCY_CLOSURE_INCOMPLETE",
+                "PART_CHANGE_REQUEST_STALE", "PART_REQUIREMENT_LINE_IDENTITY_INVALID", "PART_REQUIREMENT_LINE_IDENTITY_UNRESOLVED"}:
+            journal_key = f"part-definition-publication:{request_fingerprint(change_request_key)}"
+            journal = service._find("PartDefinitionPublication", "PublicationKey", journal_key)
+            cr = service._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key)
+            fields = (cr or {}).get("fields", {})
+            if not journal and not fields.get("ApprovedBy") and str(fields.get("Status") or "").casefold() not in {"approved", "publishing", "publication_failed", "published"}:
+                error.detail["retryDisposition"] = "safe_to_edit"
+        raise error
 
 
 @app.put("/api/parts/{part_id}/intended-sharing")

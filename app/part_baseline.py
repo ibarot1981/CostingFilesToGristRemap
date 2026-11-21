@@ -559,11 +559,16 @@ class PartBaselineService:
         if baseline_id:
             families = [{"id": int(row["id"]), **_row_fields(row)} for row in self.registry._rows("PartBaselineFamily")
                 if _ref_id(_row_fields(row).get("BaselineProcessing")) == baseline_id]
-        return {"status": str(revision_fields.get("ManufacturingBaselineStatus") or "not_established"),
-            "sourceHash": revision_fields.get("ManufacturingBaselineSourceHash") or "",
+        baseline_fields = _row_fields(baseline) if baseline else {}
+        baseline_revision_id = _ref_id(baseline_fields.get("PartRevision"))
+        baseline_revision = next((row for row in self.registry._rows("PartRevision")
+            if baseline_revision_id and int(row.get("id", -1)) == baseline_revision_id), None) if baseline_revision_id else None
+        baseline_revision_fields = _row_fields(baseline_revision)
+        return {"status": str(baseline_fields.get("Status") or revision_fields.get("ManufacturingBaselineStatus") or "not_established"),
+            "sourceHash": baseline_fields.get("SourceHash") or revision_fields.get("ManufacturingBaselineSourceHash") or "",
             "baseline": ({"id": int(baseline["id"]), **_row_fields(baseline)} if baseline else None),
             "families": families, "requirements": self._baseline_requirements(part, revision, baseline) if baseline else [],
-            "revisionLabel": _row_fields(revision).get("RevisionLabel") or "A",
+            "revisionLabel": baseline_revision_fields.get("RevisionLabel") or baseline_revision_fields.get("Revision") or "unclassified",
             "revisionLifecycle": _row_fields(revision).get("BaselineStatus") or _row_fields(revision).get("Status") or "draft"}
 
     def _table_available(self, table: str) -> bool:

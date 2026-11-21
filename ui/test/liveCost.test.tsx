@@ -89,6 +89,33 @@ it("keeps viewing read-only, saves a deliberate snapshot, then opens only frozen
   expect(mocks.liveCost.mock.calls.length).toBe(afterSavedRefresh);
 });
 
+it("refreshes and requires review when the current costing result changed before snapshot save", async () => {
+  mocks.liveCost.mockResolvedValueOnce(live).mockResolvedValueOnce({ ...live, generation: "live-generation-2", inputFingerprint: "input-fingerprint-2", totalCost: 125, knownSubtotal: 125 });
+  render(<LiveCostView products={products}/>);
+  await selectCode();
+  await screen.findByText(/Complete current calculation/);
+  fireEvent.change(screen.getByLabelText("Save reason"), { target: { value: "Reviewed estimate" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save Cost Snapshot Now" }));
+  await screen.findByText("Live Cost changed since review. Review the refreshed result before saving a snapshot.");
+  expect(mocks.saveCostSnapshot).not.toHaveBeenCalled();
+  expect(mocks.liveCost).toHaveBeenCalledTimes(2);
+  expect(localStorage.getItem("safari-cost-snapshot-pending:c")).toBeNull();
+});
+
+it("clears an impossible stale-snapshot retry and refreshes the displayed calculation", async () => {
+  mocks.saveCostSnapshot.mockRejectedValueOnce({ code: "COST_LIVE_CONTENT_MISMATCH", message: "Displayed result differs" });
+  render(<LiveCostView products={products}/>);
+  await selectCode();
+  await screen.findByText(/Complete current calculation/);
+  fireEvent.change(screen.getByLabelText("Save reason"), { target: { value: "Reviewed estimate" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save Cost Snapshot Now" }));
+  await screen.findByText("Live Cost changed before the snapshot was saved. Review the refreshed calculation and save again.");
+  expect(mocks.saveCostSnapshot).toHaveBeenCalledTimes(1);
+  expect(mocks.liveCost).toHaveBeenCalledTimes(3);
+  expect(localStorage.getItem("safari-cost-snapshot-pending:c")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Resume pending snapshot" })).toBeNull();
+});
+
 it("creates an explicit configuration revision before a current cost becomes saveable", async () => {
   mocks.costingConfiguration.mockResolvedValueOnce({ status: "missing", configuration: null });
   mocks.liveCost.mockResolvedValueOnce({ status: "incomplete", generation: "missing", inputFingerprint: "empty", totalCost: null,

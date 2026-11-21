@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { Archive, ArrowLeft, Check, ChevronDown, ChevronRight, FileText, History, LoaderCircle, PackagePlus, Plus, Search, ShoppingCart, Tags, Wrench } from "lucide-react";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import { CascadeCodePicker, PartCreationForm } from "./PartCreationForm";
+import { PartDefinitionMaintenance } from "./PartDefinitionMaintenance";
 import "./parts.css";
 
 type Scope = "global" | "product" | "product_model" | "model_code";
@@ -15,6 +16,11 @@ type TreeEntry = { id: string; parentId?: string; label: string; depth: number; 
 
 const scopeLabels: Record<Scope, string> = { global: "Global", product: "Product", product_model: "Product Model", model_code: "Model Code" };
 const emptyRegister: Register = { items: [], legacyItems: [] };
+
+function engineeringRevisionLabel(part?: Pick<Part, "engineeringRevision"> | null): string {
+  const revision = String(part?.engineeringRevision || "").trim();
+  return revision ? `Rev ${revision}` : "revision unverified";
+}
 
 function PartDetailSection({ id, title, children, initiallyOpen = false }: { id?: string; title: ReactNode; children: ReactNode; initiallyOpen?: boolean }) {
   return <details id={id} className="parts-section-card" open={initiallyOpen || undefined}>
@@ -68,6 +74,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const [baselineWorkbookOptions, setBaselineWorkbookOptions] = useState<{ path: string; label: string }[]>([]);
   const [baselineWorkbookPath, setBaselineWorkbookPath] = useState("");
   const [baselineWorkbookLoading, setBaselineWorkbookLoading] = useState(false);
+  const [mappedLinesLoading, setMappedLinesLoading] = useState(false);
   const [requestedDetailSection, setRequestedDetailSection] = useState<{ partId: string; sectionId: string } | null>(null);
   const [scope, setScope] = useState<Scope>("global");
   const [targetId, setTargetId] = useState("global");
@@ -78,6 +85,8 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
   const [retireReason, setRetireReason] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [publicationRecovery, setPublicationRecovery] = useState<any>(null);
+  const [publicationRecoveryBusy, setPublicationRecoveryBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [registerRefreshing, setRegisterRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -144,52 +153,35 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     if (!selectedId || mode !== "selected") { setDetails(null); return; }
     if (!active) return;
     const generation = ++detailsGeneration.current;
+    setPublicationRecovery(null);
     api.partDetails(selectedId).then(value => { if (generation === detailsGeneration.current) { setDetails(value); setRegister(old => ({ ...old, items: old.items.map(part => part.id === selectedId ? { ...part, ...value.part } : part) })); } })
-      .catch(cause => { if (generation === detailsGeneration.current) setError(String(cause)); });
+      .catch(async cause => {
+        if (generation !== detailsGeneration.current) return;
+        setError(String(cause));
+        if (cause instanceof ApiError && cause.code === "PART_DEFINITION_PUBLICATION_PENDING") {
+          try {
+            const recovery = await api.partDefinitionRecovery(selectedId);
+            if (generation === detailsGeneration.current) setPublicationRecovery(recovery);
+          } catch (recoveryCause) {
+            if (generation === detailsGeneration.current) setError(`${String(cause)} Recovery status could not be read: ${String(recoveryCause)}`);
+          }
+        }
+      });
     return () => { ++detailsGeneration.current; };
   }, [active, selectedId, mode]);
 
   useEffect(() => {
-    setBaselineWorkbookOptions([]);
-    setBaselineWorkbookPath("");
+    const isMappedPartView = mappingReturn?.partId === selectedId && mappingReturn.mode === "view";
+    const recordedBaselinePath = isMappedPartView
+      ? String(details?.manufacturingBaseline?.baseline?.WorkbookPath || "").trim()
+      : "";
+    const mappedContextPath = isMappedPartView
+      ? recordedBaselinePath || String(mappingReturn.path || "").trim()
+      : "";
+    setBaselineWorkbookOptions(mappedContextPath ? [{ path: mappedContextPath, label: mappedContextPath }] : []);
+    setBaselineWorkbookPath(mappedContextPath);
     setBaselineWorkbookLoading(false);
-  }, [selectedId]);
-
-  useEffect(() => {
-    if (!selectedId || !fullDetails || details?.part?.id !== selectedId || details?.part?.identityKind === "assembly") return;
-    const normalizePath = (value: unknown) => String(value || "").trim().replaceAll("\\", "/").toLocaleLowerCase();
-    const mappedPaths = new Set((details.mappedLines?.items || [])
-      .filter((line: any) => line.assignmentStatus === "current" && line.sourceStatus === "readable")
-      .map((line: any) => normalizePath(line.workbookPath))
-      .filter(Boolean));
-    if (!mappedPaths.size) {
-      setBaselineWorkbookOptions([]);
-      setBaselineWorkbookPath("");
-      setBaselineWorkbookLoading(false);
-      return;
-    }
-    let active = true;
-    setBaselineWorkbookLoading(true);
-    api.mappedFiles().then(result => {
-      if (!active) return;
-      const byPath = new Map<string, { path: string; label: string }>();
-      for (const item of result.items || []) {
-        const path = String(item.file?.relative_path || "").trim();
-        if (!path || !mappedPaths.has(normalizePath(path)) || !item.association) continue;
-        const blockers = new Set(["missing_file", "parse_error", "catalog_mismatch", "duplicate_code_ownership"]);
-        if ((item.issues || []).some((issue: string) => blockers.has(issue))) continue;
-        const association = item.association || {};
-        const product = String(association.product_name || item.product?.name || "");
-        const model = String(association.model_name || item.model?.name || "");
-        byPath.set(path.toLocaleLowerCase(), { path, label: [product, model, path].filter(Boolean).join(" · ") });
-      }
-      const options = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
-      setBaselineWorkbookOptions(options);
-      setBaselineWorkbookPath(current => options.some(option => option.path === current) ? current : options.length === 1 ? options[0].path : "");
-    }).catch(cause => { if (active) setError(String(cause)); })
-      .finally(() => { if (active) setBaselineWorkbookLoading(false); });
-    return () => { active = false; };
-  }, [selectedId, fullDetails, details, details?.part?.identityKind]);
+  }, [selectedId, details?.part?.id, details?.manufacturingBaseline?.baseline?.WorkbookPath, mappingReturn?.partId, mappingReturn?.path, mappingReturn?.mode]);
 
   useEffect(() => {
     if (!requestedDetailSection) return;
@@ -251,6 +243,29 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     await refresh();
   }
 
+  async function retryDefinitionPublication(item: any) {
+    if (!selectedId || !item?.changeRequestKey || !item?.requestKey || !item?.canRetry) return;
+    setPublicationRecoveryBusy(true); setError(""); setNotice("");
+    try {
+      const result = await api.approveAndPublishPartDefinition(item.changeRequestKey, item.requestKey);
+      try {
+        const storageKey = `safari.part-definition:${item.rootPartId || selectedId}:approve-publish`;
+        const attempt = JSON.parse(localStorage.getItem(storageKey) || "null");
+        const payload = JSON.parse(attempt?.payload || "null");
+        // The confirmed journal may have repaired a pre-fix client attempt that
+        // had already saved a conflicting key for this same Change Request.
+        if (payload?.changeRequestKey === item.changeRequestKey) localStorage.removeItem(storageKey);
+      } catch { /* local storage may be unavailable */ }
+      setPublicationRecovery(null);
+      await reloadSelectedDetails();
+      setNotice(`Approved revision ${result.publishedRevisionLabel || "successor"} was recovered and published. ${result.dependentPartCount || 0} dependent Part/assembly successor(s) and ${result.configurationCount || 0} configuration successor(s) were confirmed.`);
+    } catch (cause) {
+      setError(String(cause));
+      try { setPublicationRecovery(await api.partDefinitionRecovery(selectedId)); }
+      catch (recoveryCause) { setError(`${String(cause)} Recovery status could not be read: ${String(recoveryCause)}`); }
+    } finally { setPublicationRecoveryBusy(false); }
+  }
+
   function startCreate(kind: "part" | "assembly" = "part") {
     creationFormGeneration.current += 1;
     setCreationFormInstance(creationFormGeneration.current);
@@ -280,6 +295,59 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     setRequestedDetailSection({ partId: selectedId, sectionId: "mapped-workbook-lines" });
     history.pushState(null, "", `#parts/${encodeURIComponent(selectedId)}`);
     setFullDetails(true);
+    setMappedLinesLoading(true);
+    api.mappedPartLines(selectedId).then(value => {
+      setDetails((current: any) => current?.part?.id === selectedId ? { ...current, mappedLines: value } : current);
+    }).catch(cause => setError(String(cause))).finally(() => setMappedLinesLoading(false));
+  }
+
+  async function loadBaselineWorkbookOptions(): Promise<{ path: string; label: string }[]> {
+    if (!selectedId) return [];
+    if (baselineWorkbookOptions.length) return baselineWorkbookOptions;
+    if (baselineWorkbookLoading) return [];
+    setBaselineWorkbookLoading(true);
+    try {
+      const [mappedLines, result] = await Promise.all([api.mappedPartLines(selectedId), api.mappedFiles()]);
+      setDetails((current: any) => current?.part?.id === selectedId ? { ...current, mappedLines } : current);
+      const normalizePath = (value: unknown) => String(value || "").trim().replaceAll("\\", "/").toLocaleLowerCase();
+      const mappedPaths = new Set((mappedLines.items || [])
+        .filter((line: any) => line.assignmentStatus === "current" && line.sourceStatus === "readable")
+        .map((line: any) => normalizePath(line.workbookPath)).filter(Boolean));
+      const byPath = new Map<string, { path: string; label: string }>();
+      for (const item of result.items || []) {
+        const path = String(item.file?.relative_path || "").trim();
+        if (!path || !mappedPaths.has(normalizePath(path)) || !item.association) continue;
+        const blockers = new Set(["missing_file", "parse_error", "catalog_mismatch", "duplicate_code_ownership"]);
+        if ((item.issues || []).some((issue: string) => blockers.has(issue))) continue;
+        const association = item.association || {};
+        const product = String(association.product_name || item.product?.name || "");
+        const model = String(association.model_name || item.model?.name || "");
+        byPath.set(path.toLocaleLowerCase(), { path, label: [product, model, path].filter(Boolean).join(" · ") });
+      }
+      const options = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+      setBaselineWorkbookOptions(options);
+      const recordedPath = String(details?.manufacturingBaseline?.baseline?.WorkbookPath || "");
+      setBaselineWorkbookPath(current => options.some(option => option.path === current) ? current
+        : options.some(option => option.path === recordedPath) ? recordedPath : options.length === 1 ? options[0].path : "");
+      return options;
+    } catch (cause) { setError(String(cause)); return []; }
+    finally { setBaselineWorkbookLoading(false); }
+  }
+
+  async function compareWithOds() {
+    const options = await loadBaselineWorkbookOptions();
+    const current = details?.manufacturingBaseline?.baseline?.WorkbookPath || "";
+    const registered = options.find(option => option.path === current)?.path;
+    if (selected && registered) {
+      onReviewBaseline?.(selected.id, { id: selected.id, name: selected.name, description: selected.description,
+        partNumber: selected.partNumber, engineeringRevision: selected.engineeringRevision, status: selected.status,
+        selectable: !selected.legacy && selected.status !== "retired", duplicateName: Boolean(selected.ambiguousName),
+        manufacturingBaselineStatus: details?.manufacturingBaseline?.status || selected.manufacturingBaselineStatus,
+        legacy: selected.legacy }, registered);
+      return;
+    }
+    openManufacturingBaseline();
+    setError("No registered, readable ODS source is available for comparison. The accepted Safari definition remains available.");
   }
 
   function backToSummary() {
@@ -351,7 +419,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     setMetadataAttempt(attempt); setBusy(true); setError("");
     try {
       const result = await api.updatePartMetadata(selected.id, attempt.payload, attempt.key);
-      setMetadataAttempt(null); setMode("selected"); setSelectedId(result.part.id); setNotice("Part name/scope metadata saved. Part number and Rev A were preserved.");
+      setMetadataAttempt(null); setMode("selected"); setSelectedId(result.part.id); setNotice(`Part name/scope metadata saved. Part number and ${engineeringRevisionLabel(selected)} were preserved.`);
       await refresh();
     } catch (cause) {
       const message = String(cause); setError(message);
@@ -387,7 +455,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     <label>What is the Part called?<input name="part-metadata-description" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={description} maxLength={120} onChange={event => setDescription(event.target.value)} placeholder="For example, Chassis" disabled={formLocked}/></label>
     <label>Design variant<input name="part-metadata-variant" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={variant} maxLength={120} onChange={event => setVariant(event.target.value)} disabled={formLocked}/><small>Design variants are fixed for this Part. Create a new Part for a distinct physical design.</small></label>
     {namePreview && <div className={`parts-name-preview ${namePreview.available ? "available" : "collision"}`} role="status"><span>Before / after · server validated</span>{namePreview.before && <small>{namePreview.before.name} →</small>}<strong>{namePreview.name}</strong><p>{namePreview.affectedSourceAssignments?.length || 0} saved source assignment row(s) reference this Part; they retain the same Part identity and are included in the stale-preview check. Per-code BOM uses are not available in this source-mapping history.</p>{!namePreview.available && <><p>{namePreview.collision.some(item => item.source === "legacy") ? "A legacy Part already uses this name. Review its identity or add a meaningful distinction." : "A current or historical Part name already uses this name. Select the existing Part or add a meaningful distinction."}</p><div className="parts-collision-list">{namePreview.collision.map((collision, index) => <button type="button" key={`${collision.source}:${collision.id}:${index}`} className="button" onClick={() => void openCollision(collision)}>Open {collision.number ? `${collision.number} · ` : "legacy · "}{collision.source === "legacy" ? "existing Part" : "matching Part"}</button>)}</div></>}</div>}
-    {selected && <div className="parts-readonly-facts"><span>Permanent number <strong>{selected.partNumber}</strong></span><span>Engineering revision <strong>Rev A · fixed until CR flow</strong></span></div>}
+    {selected && <div className="parts-readonly-facts"><span>Permanent number <strong>{selected.partNumber}</strong></span><span>Engineering revision <strong>{engineeringRevisionLabel(selected)} · fixed until CR flow</strong></span></div>}
     <label>Why is this metadata change needed?<textarea name="part-metadata-reason" autoComplete="off" spellCheck={false} autoCapitalize="sentences" value={reason} onChange={event => setReason(event.target.value)} rows={3} maxLength={2000} disabled={formLocked}/></label>
     <div className="parts-form-actions"><button type="button" className="button" disabled={busy || Boolean(metadataAttempt)} onClick={() => { setMode("selected"); setMetadataAttempt(null); setError(""); }}>Cancel</button><button type="button" className="button primary" disabled={busy || (!metadataAttempt && (!namePreview?.available || !reason.trim()))} onClick={() => void saveMetadata()}>{metadataAttempt ? "Retry same request" : "Save metadata version"}</button></div>
   </section>;
@@ -405,7 +473,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
           style={{ "--tree-depth": entry.depth } as CSSProperties} onKeyDown={event => treeKeyDown(event, index, entry)}
           onClick={() => entry.part ? selectPart(entry.part) : toggleTree(entry)}>
           {entry.hasChildren ? (entry.expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>) : <span className="parts-tree-spacer"/>}
-          {entry.part ? <span className="parts-tree-part"><span className="parts-row-number">{entry.part.partNumber || "Legacy · unallocated"}</span><strong>{entry.part.name}</strong><small>{entry.part.legacy ? "Legacy · revision unverified" : entry.part.identityKind === "assembly" ? `Assembly · Rev A · ${entry.part.status}` : `Part · Rev A · ${entry.part.status}`}</small></span>
+          {entry.part ? <span className="parts-tree-part"><span className="parts-row-number">{entry.part.partNumber || "Legacy · unallocated"}</span><strong>{entry.part.name}</strong><small>{entry.part.legacy ? "Legacy · revision unverified" : entry.part.identityKind === "assembly" ? `Assembly · ${engineeringRevisionLabel(entry.part)} · ${entry.part.status}` : `Part · ${engineeringRevisionLabel(entry.part)} · ${entry.part.status}`}</small></span>
             : <><strong>{entry.label}</strong><small>{entry.count ?? 0}</small></>}
         </button>)}
         {!loading && !allParts.length && <div className="empty"><strong>No Parts or assemblies found</strong><span>Try another search or create a managed identity.</span></div>}
@@ -428,16 +496,18 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
         void refresh("", true);
       }} onUseExisting={part => { if (creationFormGeneration.current === creationFormInstance) selectPart(part as unknown as Part); }} onCancel={() => { setMode("selected"); setError(""); }} cancelLabel="Back to Parts"/> : mode === "edit" ? editForm : selected ? <>
         {fullDetails && <button className="parts-back-link" onClick={navigationPath.length ? backToParent : backToSummary}><ArrowLeft size={15}/>{navigationPath.length ? `Back to ${navigationPath[navigationPath.length - 1].name}` : "Back to Parts"}</button>}
-        <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : selected.identityKind === "assembly" ? `Assembly · ${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}` : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>{selected.legacy ? "Engineering revision unverified" : "Engineering revision · A"}</span></div></div>
+        <div className="parts-selected-card"><div><span className="eyebrow">{selected.legacy ? "Legacy Part record" : selected.identityKind === "assembly" ? `Assembly · ${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}` : `${scopeLabels[selected.scope as Scope] || selected.scope} · ${selected.scopeTarget}`}</span><h2>{selected.name}</h2><p>{selected.legacy ? "This name-derived identity has not been migrated or allocated a permanent number." : `${selected.description}${selected.variant ? ` · ${selected.variant}` : ""}`}</p></div><div className="parts-identifiers"><strong>{selected.partNumber || "Unallocated"}</strong><span>Engineering revision · {selected.legacy ? "unverified" : engineeringRevisionLabel(selected)}</span></div></div>
         {selected.legacy ? <div className="parts-legacy-callout"><strong>Legacy identity retained</strong><p>Existing Grist references and history remain unchanged. A numeric value in the legacy PartRevision table is not treated as evidence of CR approval. Migration requires a separately reviewed plan.</p>{selected.legacyRevisionValues?.length ? <small>Recorded numeric values: {selected.legacyRevisionValues.join(", ")} · unverified</small> : null}</div> : <>
           <div className="parts-summary-actions"><button className="button" onClick={openFullDetails}><FileText size={14}/> Open full {selected.identityKind === "assembly" ? "Assembly" : "Part"} details</button>{selected.identityKind === "assembly" ? <button className="button" onClick={openComposition}><PackagePlus size={14}/> Open composition</button> : <><button className="button" onClick={openManufacturingBaseline}><Wrench size={14}/> Manufacturing baseline</button><button className="button" onClick={openMappedWorkbookLines}><FileText size={14}/> Mapped workbook lines</button></>}<button className="button" onClick={beginEdit} disabled={selected.status === "retired"}>Review name/scope change</button></div>
-          {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>Rev A · changes require the approved CR process</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
+          {publicationRecovery?.items?.map((item: any) => <section className="parts-section-card parts-publication-recovery" key={item.changeRequestKey} aria-label="Approved publication recovery"><strong>Approved Part publication is recovering</strong><p>The reviewed Grist publication is incomplete, so Part and configuration reads remain blocked until the same successor plan finishes.</p><span>Change Request · {item.changeRequestStatus.replaceAll("_", " ")} · {item.status.replaceAll("_", " ")}</span><p>{item.reason || "No engineering reason recorded"} · {item.dependentPartCount} dependent Part/assembly successor(s) · {item.configurationCount} configuration successor(s)</p><button className="button primary" disabled={publicationRecoveryBusy || !item.canRetry} onClick={() => void retryDefinitionPublication(item)}>{publicationRecoveryBusy ? "Recovering…" : item.canRetry ? "Retry approved publication" : "Waiting for designated approver"}</button></section>)}
+          {!fullDetails && <PartDetailSection id="part-overview-summary" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Current name</dt><dd>{selected.name}</dd></div><div><dt>Sharing scope</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Design variant</dt><dd>{selected.variant || "Not supplied"}</dd></div><div><dt>Engineering revision</dt><dd>{engineeringRevisionLabel(selected)} · changes use the approved CR process</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{(selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Status</dt><dd>{selected.status}</dd></div></dl></PartDetailSection>}
           {fullDetails && details?.part?.id === selectedId ? <>
             <div className="parts-detail-tabs" aria-label={`${selected.identityKind === "assembly" ? "Assembly" : "Part"} detail sections`}>{(selected.identityKind === "assembly" ? ["Overview", "Components", "Drawings", "Used in configurations", "History"] : ["Overview", "Manufacturing baseline", "Intended sharing", "Mapped workbook lines", "Process lines", "Components", "Purchase details", "Drawings", "Used in configurations", "History"]).map(label => { const id = label.toLowerCase().replaceAll(" ", "-"); return <button key={label} type="button" aria-controls={id} onClick={() => openPartDetailSection(id)}>{label}</button>; })}</div>
-            <PartDetailSection id="overview" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>Rev A</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></PartDetailSection>
+            <PartDetailSection id="overview" title="Overview" initiallyOpen><dl><div><dt>{selected.identityKind === "assembly" ? "Assembly number" : "Part number"}</dt><dd>{selected.partNumber}</dd></div><div><dt>Generated name</dt><dd>{selected.name}</dd></div><div><dt>Scope target</dt><dd>{scopeLabels[selected.scope as Scope]} · {selected.scopeTarget}</dd></div><div><dt>Engineering revision</dt><dd>{engineeringRevisionLabel(details.part || selected)}</dd></div>{selected.identityKind !== "assembly" && <div><dt>Manufacturing baseline</dt><dd>{String(details.manufacturingBaseline?.status || selected.manufacturingBaselineStatus || "not_established").replaceAll("_", " ")}</dd></div>}<div><dt>Metadata version</dt><dd>{selected.metadataVersion}</dd></div><div><dt>Created by</dt><dd>{selected.actor} · {selected.createdAt}</dd></div><div><dt>Reason</dt><dd>{selected.reason}</dd></div></dl><button className="button" onClick={beginEdit}>Review name/scope change</button></PartDetailSection>
             {selected.identityKind === "assembly" ? <PartDetailSection id="manufacturing-baseline" title="Manufacturing baseline"><p>Assembly requirements are represented by its pinned child composition. Workbook mapping, baseline roll-up, and purchased/store composition are deferred.</p></PartDetailSection> : <PartDetailSection id="manufacturing-baseline" title="Accepted Manufacturing baseline">
               <div className="parts-baseline-launcher">
-                <div><strong>{details.manufacturingBaseline?.baseline ? "Review this Part against a workbook" : "Review the empty baseline for this Part"}</strong><p>Choose a source workbook to open the full-width review. Initial publication stays separate from Rev A finalization.</p></div>
+                <div><strong>{details.manufacturingBaseline?.baseline ? "Review this Part against a workbook" : "Review the empty baseline for this Part"}</strong><p>Choose a source workbook to open the full-width review. Initial publication stays separate from engineering-revision finalization.</p></div>
+                {!baselineWorkbookOptions.length && <button type="button" className="button" disabled={baselineWorkbookLoading} onClick={() => void loadBaselineWorkbookOptions()}>{baselineWorkbookLoading ? "Loading comparison sources…" : "Load comparison sources"}</button>}
                 <label>Source workbook<select aria-label="Source workbook for Part baseline review" value={baselineWorkbookPath} disabled={baselineWorkbookLoading || !baselineWorkbookOptions.length} onChange={event => setBaselineWorkbookPath(event.target.value)}>
                   <option value="">{baselineWorkbookLoading ? "Loading associated workbooks…" : baselineWorkbookOptions.length > 1 ? "Choose a workbook explicitly" : baselineWorkbookOptions.length === 1 ? "Select workbook" : "No associated workbook available"}</option>
                   {baselineWorkbookOptions.map(option => <option key={option.path} value={option.path}>{option.label}</option>)}
@@ -446,7 +516,7 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
                 {!baselineWorkbookLoading && !baselineWorkbookOptions.length && <small className="parts-unavailable">{baselineWorkbookEmptyMessage}</small>}
               </div>
               {details.manufacturingBaseline?.baseline ? <>
-                <p><strong>Status:</strong> {String(details.manufacturingBaseline.status || "established").replaceAll("_", " ")} · Rev {details.manufacturingBaseline.revisionLabel || "A"} · {details.manufacturingBaseline.revisionLifecycle || "draft"}</p>
+                <p><strong>Status:</strong> {String(details.manufacturingBaseline.status || "established").replaceAll("_", " ")} · source baseline Rev {details.manufacturingBaseline.revisionLabel || "unverified"} · current {engineeringRevisionLabel(details.part || selected)} · {details.manufacturingBaseline.revisionLifecycle || "draft"}</p>
                 <p><strong>Originating workbook:</strong> {details.manufacturingBaseline.baseline.WorkbookName} · {details.manufacturingBaseline.baseline.WorkbookPath}</p>
                 <p><strong>Workbook hash:</strong> <code>{details.manufacturingBaseline.sourceHash || details.manufacturingBaseline.baseline.SourceHash}</code></p>
                 <h4>Applicable source requirements</h4>
@@ -454,18 +524,19 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
                 {details.manufacturingBaseline.requirements?.length ? <div className="parts-linked-items">{details.manufacturingBaseline.requirements.map((item: any, index: number) => <article key={item.key || index}><div><strong>{manufacturingBaselineRequirementTitle(item)}</strong><small>{item.sheet} · row {item.row} · quantity {item.physical?.quantity ?? "—"} {item.physical?.quantity_uom || ""} · material {item.physical?.material || "—"}</small><small>Dimensions {item.physical?.dimension || [item.physical?.length, item.physical?.width, item.physical?.thickness].filter(Boolean).join(" × ") || "—"} · weight {item.physical?.weight_kg ?? "—"} kg</small>
                   {item.family === "toolshop" && <small>Tool Shop Items Remarks: {item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.toolShopItemsRemarks?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.toolShopItemsRemarks?.value}</small>}
                   {item.family === "cnc" && <small>Plate Part to Cut: {item.lineDetail?.platePartToCut?.sourceStatus === "missing" ? "Column not in source" : item.lineDetail?.platePartToCut?.sourceStatus === "blank" ? "(blank in source)" : item.lineDetail?.platePartToCut?.value}</small>}
-                </div><span>{item.revisionKey || "accepted"}</span></article>)}</div> : <p>This Rev A baseline contains no workbook-derived line requirements. Existing child or purchase requirements remain separate.</p>}
-                <p className="parts-help">Baseline publication does not finalize Rev A. Review the definition, then use the Engineering baseline control in History to finalize it. Future physical changes require the approved Change Request flow.</p>
+                </div><span>{item.revisionKey || "accepted"}</span></article>)}</div> : <p>This Rev {details.manufacturingBaseline.revisionLabel || "unverified"} baseline contains no workbook-derived line requirements. Existing child or purchase requirements remain separate.</p>}
+                <p className="parts-help">Baseline publication does not finalize the current revision. Review the definition, then use the Engineering baseline control in History to finalize it. Future physical changes require the approved Change Request flow.</p>
               </> : <p>{details.manufacturingBaseline?.message || "Manufacturing requirements are not yet established. Establish the initial baseline from a complete, explicitly mapped workbook in Part Mapping."}</p>}
             </PartDetailSection>}
+            {selected.identityKind !== "assembly" && details.manufacturingBaseline?.baseline && <PartDefinitionMaintenance partId={selected.id} onSaved={reloadSelectedDetails} onCompare={() => { void compareWithOds(); }}/>}
             <IntendedSharingSection part={details.part} state={details.intendedSharing} scopes={scopes} onSaved={reloadSelectedDetails}/>
-            {selected.identityKind !== "assembly" && <MappedWorkbookLinesSection state={details.mappedLines}/>}
+            {selected.identityKind !== "assembly" && <MappedWorkbookLinesSection state={mappedLinesLoading ? { ...details.mappedLines, status: "loading", message: "Loading saved workbook assignment evidence…" } : details.mappedLines}/>}
             {selected.identityKind !== "assembly" && <ProcessLineSection partId={selected.id} state={details.processLines} onSaved={reloadSelectedDetails}/>}
             <ComponentSection partId={selected.id} currentPart={selected} parts={allParts} state={details.components} partState={details.part} onOpen={openNestedPart} onSaved={reloadSelectedDetails}/>
             {selected.identityKind !== "assembly" && <PurchaseDetailSection partId={selected.id} state={details.purchases} onSaved={reloadSelectedDetails}/>}
             <DrawingSection partId={selected.id} state={details.drawings} onSaved={reloadSelectedDetails}/>
             <UsedInConfigurationsSection state={details.usedIn} intended={details.intendedSharing?.items || []}/>
-            <PartDetailSection id="history" title={<><History size={15}/> History</>}><h4>Engineering baseline</h4><p>Rev A · {details.part.compositionStatus || "draft"}. Finalized definitions are physically locked; later engineering revisions require the approved CR process.</p>{details.part.compositionStatus === "draft" && <FinalizeBaseline partId={selected.id} onSaved={reloadSelectedDetails}/>}<h4>Name and scope metadata</h4>{selected.metadataHistory?.map((item: any) => <article className="parts-history-item" key={`${item.part_id}:${item.version}`}><strong>Metadata v{item.version} · {item.display_name}</strong><span>{scopeLabels[item.scope_type as Scope] || item.scope_type} · {item.target_label} · {item.shortcode} · {item.occurred_at}</span><p>{item.description}{item.variant ? ` · ${item.variant}` : ""} · {item.actor} · {item.reason}</p></article>)}{selected.aliases.length > 0 && <p>Previous names searchable as aliases: {selected.aliases.join(" · ")}</p>}<h4>Lifecycle</h4>{details.part.lifecycleHistory?.length ? details.part.lifecycleHistory.map((item: any) => <article className="parts-history-item" key={item.event_id}><strong>{item.event_type} · {item.status}</strong><span>{item.occurred_at}</span><p>{item.actor} · {item.reason}</p></article>) : <p>No lifecycle changes recorded.</p>}<h4>Source and mapping audit</h4>{details.mappingHistory?.length ? details.mappingHistory.map((item: any, index: number) => <article className="parts-history-item" key={`${item.RequestKey}:${index}`}><strong>{item.SheetName} · row {item.SourceRow} · source mapping v{item.Version}</strong><span>{item.SourceHash} · association v{item.AssociationVersion} · {item.OccurredAt}</span><p>{item.Actor} · {item.Reason}</p></article>) : <p>No source mapping history is linked to this stable Part identity yet.</p>}{selected.status === "active" && <div className="parts-retire"><label>Reason for retirement<input value={retireReason} onChange={event => setRetireReason(event.target.value)} disabled={busy}/></label><button className="button" disabled={busy || !retireReason.trim()} onClick={() => void retire()}>{retireAttempt ? "Retry retirement" : "Retire Part"}</button></div>}</PartDetailSection>
+            <PartDetailSection id="history" title={<><History size={15}/> History</>}><h4>Current engineering revision</h4><p>{engineeringRevisionLabel(details.part || selected)} · {details.part.compositionStatus || "draft"}. Finalized definitions are physically locked; later engineering revisions require the approved CR process.</p>{details.part.compositionStatus === "draft" && <FinalizeBaseline partId={selected.id} onSaved={reloadSelectedDetails}/>}<h4>Name and scope metadata</h4>{selected.metadataHistory?.map((item: any) => <article className="parts-history-item" key={`${item.part_id}:${item.version}`}><strong>Metadata v{item.version} · {item.display_name}</strong><span>{scopeLabels[item.scope_type as Scope] || item.scope_type} · {item.target_label} · {item.shortcode} · {item.occurred_at}</span><p>{item.description}{item.variant ? ` · ${item.variant}` : ""} · {item.actor} · {item.reason}</p></article>)}{selected.aliases.length > 0 && <p>Previous names searchable as aliases: {selected.aliases.join(" · ")}</p>}<h4>Lifecycle</h4>{details.part.lifecycleHistory?.length ? details.part.lifecycleHistory.map((item: any) => <article className="parts-history-item" key={item.event_id}><strong>{item.event_type} · {item.status}</strong><span>{item.occurred_at}</span><p>{item.actor} · {item.reason}</p></article>) : <p>No lifecycle changes recorded.</p>}<h4>Source and mapping audit</h4>{details.mappingHistory?.length ? details.mappingHistory.map((item: any, index: number) => <article className="parts-history-item" key={`${item.RequestKey}:${index}`}><strong>{item.SheetName} · row {item.SourceRow} · source mapping v{item.Version}</strong><span>{item.SourceHash} · association v{item.AssociationVersion} · {item.OccurredAt}</span><p>{item.Actor} · {item.Reason}</p></article>) : <p>No source mapping history is linked to this stable Part identity yet.</p>}{selected.status === "active" && <div className="parts-retire"><label>Reason for retirement<input value={retireReason} onChange={event => setRetireReason(event.target.value)} disabled={busy}/></label><button className="button" disabled={busy || !retireReason.trim()} onClick={() => void retire()}>{retireAttempt ? "Retry retirement" : "Retire Part"}</button></div>}</PartDetailSection>
           </> : <div className="parts-details-placeholder"><strong>Part summary</strong><span>Open full details for process lines, drawings, explicit code use and history.</span></div>}
         </>}
       </> : mode === "selected" ? <div className="parts-welcome"><Tags size={25}/><h2>Select a Part or assembly</h2><p>Search by permanent number, current name or previous alias, or create a managed identity.</p><div className="parts-welcome-actions"><button className="button primary" onClick={() => startCreate("part")}><Plus size={14}/> New Part</button><button className="button" onClick={() => startCreate("assembly")}><PackagePlus size={14}/> New Assembly</button></div></div> : null}
@@ -587,7 +658,7 @@ function FinalizeBaseline({ partId, onSaved }: { partId: string; onSaved: () => 
     catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
   }
-  return <div className="parts-capture-row"><label>Finalization reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry finalization" : "Finalize Rev A definition"}</button>{error && <p className="parts-error">{error}</p>}</div>;
+  return <div className="parts-capture-row"><label>Finalization reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry finalization" : "Finalize current definition"}</button>{error && <p className="parts-error">{error}</p>}</div>;
 }
 
 function ComponentSection({ partId, currentPart, parts, state, partState, onOpen, onSaved }: { partId: string; currentPart: Part; parts: Part[]; state: any; partState: any; onOpen: (part: Part) => void; onSaved: () => Promise<void> }) {
@@ -637,7 +708,7 @@ function ComponentSection({ partId, currentPart, parts, state, partState, onOpen
       const relationAvailable = !["unavailable_revision", "unavailable_child"].includes(item.relationshipStatus) && Boolean(item.childPartId);
       return <article key={item.componentKey || item.id}><div>{relationAvailable ? <button className="parts-child-link" onClick={() => void openChild(item)}><strong>{item.childPartNumber || "Number unavailable"} · {item.childName || "Name unavailable"}</strong></button> : <strong>{item.childPartNumber || "Unavailable child relationship"} · {item.childName || "Review required"}</strong>}<small>{childAssembly ? "Subassembly" : "Component Part"} · pinned Rev {item.childRevisionLabel || "unknown"} · {item.quantity ?? "quantity unavailable"} {item.uom || "unit unavailable"}</small>{!relationAvailable && <small className="parts-unavailable">{item.relationshipMessage || "This legacy relationship is incomplete and needs review."}</small>}{!isAssembly && <small>{item.sourcingRoute === "make" ? "Manufacture" : item.sourcingRoute === "buy" ? "Purchase" : "Configured route"}</small>}</div></article>;
     })}</div> : state?.status === "unavailable" || state?.status === "partial" ? <p className="parts-unavailable">{state.message || "Composition could not be read completely."}</p> : <p>{isAssembly ? "This assembly is empty. Add Parts or subassemblies to begin its draft composition." : "No child Parts are linked. Existing Part compositions remain optional."}</p>}
-    {partState?.compositionStatus === "draft" && <><button className="button" onClick={() => void toggleEditor()}>{open ? "Close component form" : isAssembly ? "Add Part or subassembly" : "Add child Part"}</button>{open && <div className="parts-capture-grid"><label>{isAssembly ? "Child Part or assembly" : "Child Part"}<select value={childPartId} disabled={busy || loadingCatalog || Boolean(attempt)} onChange={event => setChildPartId(event.target.value)}><option value="">{loadingCatalog ? "Loading managed identities…" : "Choose an existing managed identity"}</option>{childOptions.map(part => <option key={part.id} value={part.id}>{part.identityKind === "assembly" ? "Assembly · " : "Part · "}{part.partNumber} · {part.name} · Rev {part.engineeringRevision || "A"}</option>)}</select></label><label>Quantity per parent<input type="number" min="0.000001" step="any" value={quantity} disabled={busy || Boolean(attempt)} onChange={event => setQuantity(event.target.value)}/></label><label>Unit of measure<input value={uom} disabled={busy || Boolean(attempt)} onChange={event => setUom(event.target.value)}/></label>{!isAssembly && <label>Sourcing route<select value={sourcingRoute} disabled={busy || Boolean(attempt)} onChange={event => setSourcingRoute(event.target.value)}><option value="auto">Use configured Part route</option><option value="make">Manufacture this occurrence</option><option value="buy">Purchase this occurrence</option></select></label>}<label>Reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || loadingCatalog || (!childPartId && !attempt) || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry same component" : isAssembly ? "Save child identity" : "Save child Part"}</button>{error && <p className="parts-error">{error}</p>}</div>}</>}
+    {partState?.compositionStatus === "draft" && <><button className="button" onClick={() => void toggleEditor()}>{open ? "Close component form" : isAssembly ? "Add Part or subassembly" : "Add child Part"}</button>{open && <div className="parts-capture-grid"><label>{isAssembly ? "Child Part or assembly" : "Child Part"}<select value={childPartId} disabled={busy || loadingCatalog || Boolean(attempt)} onChange={event => setChildPartId(event.target.value)}><option value="">{loadingCatalog ? "Loading managed identities…" : "Choose an existing managed identity"}</option>{childOptions.map(part => <option key={part.id} value={part.id}>{part.identityKind === "assembly" ? "Assembly · " : "Part · "}{part.partNumber} · {part.name} · {engineeringRevisionLabel(part)}</option>)}</select></label><label>Quantity per parent<input type="number" min="0.000001" step="any" value={quantity} disabled={busy || Boolean(attempt)} onChange={event => setQuantity(event.target.value)}/></label><label>Unit of measure<input value={uom} disabled={busy || Boolean(attempt)} onChange={event => setUom(event.target.value)}/></label>{!isAssembly && <label>Sourcing route<select value={sourcingRoute} disabled={busy || Boolean(attempt)} onChange={event => setSourcingRoute(event.target.value)}><option value="auto">Use configured Part route</option><option value="make">Manufacture this occurrence</option><option value="buy">Purchase this occurrence</option></select></label>}<label>Reason<input value={reason} disabled={busy || Boolean(attempt)} onChange={event => setReason(event.target.value)}/></label><button className="button primary" disabled={busy || loadingCatalog || (!childPartId && !attempt) || (!reason.trim() && !attempt)} onClick={() => void save()}>{attempt ? "Retry same component" : isAssembly ? "Save child identity" : "Save child Part"}</button>{error && <p className="parts-error">{error}</p>}</div>}</>}
   </PartDetailSection>;
 }
 
@@ -807,7 +878,7 @@ function IntendedSharingSection({ part, state, scopes, onSaved }: { part: Part; 
     finally { setBusy(false); }
   }
   return <PartDetailSection id="intended-sharing" title={<><Tags size={15}/> Intended sharing</>}>
-    <p>Advisory links only. Saving these codes does not configure the Part, assign quantities or create costing history. Membership changes preserve its name, number, scope, Rev A, composition and snapshots.</p>
+    <p>Advisory links only. Saving these codes does not configure the Part, assign quantities or create costing history. Membership changes preserve its name, number, scope, {engineeringRevisionLabel(part)}, composition and snapshots.</p>
     {state?.status === "unavailable" ? <p className="parts-unavailable">{state.message || "Intended-sharing records are unavailable."}</p> : <>
       <CascadeCodePicker scopes={scopes} productId={productId} modelId={modelId} selectedIds={selectedIds} onProductChange={changeEditorProduct} onModelChange={setModelId} onSelectedChange={setSelectedIds} disabled={busy}/>
       {outsideScope.length > 0 && <p className="parts-validation warning">{outsideScope.length} intended code(s) are outside this Part's {part.scope} naming scope. This advisory is allowed and does not rename the Part.</p>}

@@ -29,6 +29,7 @@ async function send<T>(path: string, body: unknown, headers: Record<string, stri
 }
 
 const PART_BASELINE_WRITE_TIMEOUT_MS = 30_000;
+const PART_DEFINITION_WRITE_TIMEOUT_MS = 120_000;
 const SPARES_IMPORT_WRITE_TIMEOUT_MS = 300_000;
 
 export class ApiError extends Error {
@@ -58,6 +59,13 @@ export const api = {
   createAssembly: (payload: unknown, key: string) => send<any>("/api/assemblies", payload, { "Idempotency-Key": key }),
   maintainPartShortcode: (payload: unknown, key: string) => send<any>("/api/parts/shortcodes", payload, { "Idempotency-Key": key }),
   partDetails: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}`),
+  partDefinition: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition`),
+  partDefinitionRecovery: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/recovery`),
+  partDefinitionOptions: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/options`),
+  savePartDefinitionDraft: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/draft`, payload, { "Idempotency-Key": key }, "PUT", PART_DEFINITION_WRITE_TIMEOUT_MS),
+  submitPartDefinitionChangeRequest: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/change-requests`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
+  reopenPartDefinitionChangeRequest: (id: string, changeRequestKey: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/change-requests/${encodeURIComponent(changeRequestKey)}/reopen`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
+  approveAndPublishPartDefinition: (changeRequestKey: string, key: string) => send<any>(`/api/part-definition/change-requests/${encodeURIComponent(changeRequestKey)}/approve-and-publish`, {}, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
   savePartIntendedSharing: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/intended-sharing`, payload, { "Idempotency-Key": key }, "PUT"),
   partMetadataPreview: (id: string, scope: string, targetId: string, description: string, variant: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/metadata-preview?${new URLSearchParams({ scope, target_id: targetId, description, variant })}`),
   updatePartMetadata: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/metadata`, payload, { "Idempotency-Key": key }),
@@ -129,6 +137,7 @@ export const api = {
   validateAssociation: (payload: unknown) => send<AssociationValidation>("/api/associations/validate", payload),
   saveAssociation: (payload: unknown, idempotencyKey: string) => send<Record<string, unknown>>("/api/associations", payload, { "Idempotency-Key": idempotencyKey }),
   mappedFiles: () => get<{ total: number; items: MappedFile[] }>("/api/mapped-files"),
+  mappedPartLines: (partId: string) => get<any>(`/api/parts/${encodeURIComponent(partId)}/mapped-lines`),
   associations: () => get<AssociationState>("/api/associations"),
   reconciliationIssues: (filters: Record<string, string> = {}) => {
     const query = new URLSearchParams(Object.entries(filters).filter(([, value]) => Boolean(value)));

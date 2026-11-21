@@ -658,6 +658,22 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual(detail["baseline"]["WorkbookName"], "pilot.ods")
         self.assertEqual(len(detail["requirements"]), 2)
 
+    def test_established_baseline_status_survives_revision_readback_from_linked_record(self):
+        self.establish([source_row(10)])
+        current = self.registry.current_revision(self.part["id"])
+        current["fields"].pop("ManufacturingBaselineStatus", None)
+        current["fields"].pop("ManufacturingBaselineSourceHash", None)
+
+        baseline = self.service.baseline_detail(self.part["id"])
+        part = self.registry.get_part(self.part["id"])
+        listed = next(item for item in self.registry.list_parts() if item["id"] == self.part["id"])
+
+        self.assertEqual(baseline["status"], "established")
+        self.assertEqual(baseline["sourceHash"], baseline["baseline"]["SourceHash"])
+        self.assertEqual(part["manufacturingBaselineStatus"], "established")
+        self.assertEqual(part["manufacturingBaselineSourceHash"], baseline["baseline"]["SourceHash"])
+        self.assertEqual(listed["manufacturingBaselineStatus"], "established")
+
     def test_toolshop_only_baseline_does_not_require_other_source_families(self):
         result = self.establish_group_set(["toolshop"], source_hash="toolshop-only", file_id="toolshop-only")
         self.assertEqual(result["baselineStatus"], "established")

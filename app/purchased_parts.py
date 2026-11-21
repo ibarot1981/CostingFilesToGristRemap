@@ -99,6 +99,7 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
         return {"status": "review_required", "rate": None, "reason": "The costing as-of date is invalid.", "ratePolicy": RATE_POLICY}
     spec_key = str(specification.get("SpecificationKey") or "")
     spec_id = str(specification.get("recordId") or "")
+    spec_identity = str(specification.get("SpecificationIdentity") or "")
     spec_part = _ref(specification.get("ProductPart"))
     revision_ref = _ref(specification.get("PartRevision"))
     costing_uom = str(specification.get("CostingUOM") or "").strip()
@@ -107,12 +108,13 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
     all_for_spec = []
     for source in records:
         row = source.get("fields", source)
-        if (_ref(row.get("PartPurchaseSpecification")) != spec_id
+        same_identity = bool(spec_identity and str(row.get("SpecificationIdentity") or "") == spec_identity)
+        if (not same_identity and _ref(row.get("PartPurchaseSpecification")) != spec_id
                 and str(row.get("PartPurchaseSpecificationKey") or "") != spec_key):
             continue
         if spec_part and _ref(row.get("ProductPart")) != spec_part:
             continue
-        if revision_ref and _ref(row.get("PartRevision")) != revision_ref:
+        if revision_ref and _ref(row.get("PartRevision")) != revision_ref and not same_identity:
             continue
         eligible_status = str(row.get("Status", "")).casefold() in ELIGIBLE_STATUSES
         eligible_type = str(row.get("RecordType", "")).casefold() in ELIGIBLE_TYPES
@@ -161,9 +163,11 @@ def resolve_purchased_part_rate(specification: dict[str, Any], records: list[dic
                     "reason": "An effective posted correction references evidence that is not an eligible purchase for the same Part revision and specification.",
                     "purchaseRecordId": row["_record_id"], "ratePolicy": RATE_POLICY}
         original_part, correction_part = _ref(original.get("ProductPart")), _ref(row.get("ProductPart"))
+        same_identity = bool(spec_identity and original.get("SpecificationIdentity") == spec_identity
+            and row.get("SpecificationIdentity") == spec_identity)
         if (original_part and correction_part and original_part != correction_part
-                or _ref(original.get("PartPurchaseSpecification")) not in (None, _ref(row.get("PartPurchaseSpecification")))
-                or _ref(original.get("PartRevision")) not in (None, _ref(row.get("PartRevision")))
+                or (not same_identity and _ref(original.get("PartPurchaseSpecification")) not in (None, _ref(row.get("PartPurchaseSpecification"))))
+                or (not same_identity and _ref(original.get("PartRevision")) not in (None, _ref(row.get("PartRevision"))))
                 or original.get("_record_id") == row.get("_record_id")):
             return {"status": "review_required", "rate": None,
                     "reason": "Correction and referenced purchase do not share one Part, specification, revision and distinct transaction.",

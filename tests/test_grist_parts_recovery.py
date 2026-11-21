@@ -183,6 +183,8 @@ class GristPartRecoveryTests(unittest.TestCase):
             retry = features.add_component(**args)
             self.assertEqual(first["id"], retry["id"])
             self.assertTrue(retry["component"].get("RequestFingerprint"))
+            self.assertEqual(retry["components"][0]["componentIdentity"], f"safari-authored-component:{root['id']}:root-nested")
+            self.assertEqual(first["component"].get("ComponentIdentity"), retry["component"].get("ComponentIdentity"))
             self.assertEqual(first["components"][0]["childIdentityKind"], "assembly")
             self.assertEqual(first["components"][0]["quantity"], 2)
             self.assertEqual(first["components"][0]["childRevisionLabel"], "A")
@@ -212,6 +214,36 @@ class GristPartRecoveryTests(unittest.TestCase):
             with self.assertRaises(PartIdentityError) as locked:
                 features.add_component(parent_part_id=root["id"], child_part_id=leaf["id"], quantity=1, uom="each",
                     actor="reviewer", reason="must stay locked", request_key="locked-add")
+            self.assertEqual(locked.exception.code, "PART_REVISION_LOCKED")
+
+    def test_unchanged_established_revision_a_can_be_finalized_without_weakening_mutation_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MemoryGrist()
+            registry = self.make_registry(client, Path(temp) / "parts.sqlite3")
+            features = GristPartFeatures(registry)
+            initial = self.create(registry, request_key="established-initial", description="Established Bracket", variant="")
+            part_row = next(row for row in client.tables["ProductPart"] if row["fields"].get("StablePartId") == initial["part"]["id"])
+            revision = next(row for row in client.tables["PartRevision"]
+                if row["fields"].get("ProductPart") == part_row["id"])
+            client.tables.setdefault("PartBaselineProcessing", []).append({"id": 300, "fields": {
+                "BaselineKey": "baseline:established-bracket", "ProductPart": part_row["id"], "Status": "established"}})
+            client.update_table_records("PartRevision", [{"id": revision["id"], "fields": {
+                "BaselineStatus": "draft", "RevisionLabel": "A", "ManufacturingBaseline": 300}}])
+            client.update_table_records("ProductPart", [{"id": part_row["id"], "fields": {"ManufacturingBaselineStatus": "established"}}])
+            child = self.create(registry, request_key="established-child", description="Unchanged Child", variant="")
+
+            finalized = features.finalize_revision(part_id=initial["part"]["id"], actor="reviewer",
+                reason="Finalize unchanged established Rev A", request_key="established-finalize")
+            replay = features.finalize_revision(part_id=initial["part"]["id"], actor="reviewer",
+                reason="Finalize unchanged established Rev A", request_key="established-finalize")
+
+            self.assertEqual(finalized["revision"]["BaselineStatus"], "finalized")
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(len([row for row in client.tables["AuditEvent"]
+                if row["fields"].get("RequestKey") == "established-finalize"]), 1)
+            with self.assertRaises(PartIdentityError) as locked:
+                features.add_component(parent_part_id=initial["part"]["id"], child_part_id=child["part"]["id"],
+                    quantity=1, uom="each", actor="operator", reason="must use approved CR", request_key="established-physical-edit")
             self.assertEqual(locked.exception.code, "PART_REVISION_LOCKED")
 
     def test_assembly_schema_guard_requires_both_additive_v15_columns(self):
