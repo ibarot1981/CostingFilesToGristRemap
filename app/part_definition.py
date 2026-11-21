@@ -196,15 +196,60 @@ class GristPartDefinitionService:
                 cr = next((row for row in change_requests if int(row.get("id", -1)) == change_request_id), None) if change_request_id else None
             cr_fields = _fields(cr)
             change_request_key = change_request_key or str(cr_fields.get("ChangeRequestKey") or "")
-            request_key = str(fields.get("RequestKey") or cr_fields.get("RequestKey") or "")
-            items.append({"changeRequestKey": change_request_key, "requestKey": request_key,
+            request_key = self._verified_publication_owner(journal, cr)
+            allowed = can_recover and str(plan.get("approver") or "").strip().casefold() == str(actor or "").strip().casefold()
+            items.append({"changeRequestKey": change_request_key, "requestKey": request_key, "rootPartId": str(plan.get("partId") or ""),
                 "status": status or "unknown", "changeRequestStatus": str(cr_fields.get("Status") or "unknown").casefold(),
                 "reason": str(cr_fields.get("Reason") or plan.get("reason") or ""),
                 "completedStages": (_json_cell(fields.get("CompletedStages")) or {}).get("stages", []),
                 "dependentPartCount": len(plan.get("affectedPartRecordIds") or []) - 1,
                 "configurationCount": len(plan.get("affectedCodeRecordIds") or []),
-                "canRetry": bool(can_recover and change_request_key and request_key)})
+                "canRetry": bool(allowed and change_request_key and request_key)})
+            if not allowed:
+                items[-1]["requestKey"] = ""
         return {"status": "recovering" if items else "clear", "items": items}
+
+    def _verified_publication_owner(self, journal: dict[str, Any], cr: dict[str, Any] | None) -> str:
+        """Return the original operation only when all durable ownership facts agree."""
+        fields, cf = _fields(journal), _fields(cr)
+        plan = _json_cell(fields.get("Plan")) or {}
+        key, approver = str(plan.get("operationKey") or ""), str(plan.get("approver") or "").strip()
+        cr_key = str(cf.get("ChangeRequestKey") or "")
+        request = self._find("PartRegistryRequest", "RequestKey", key) if key else None
+        rf = _fields(request)
+        fp = request_fingerprint([cr_key, approver, key])
+        root = (plan.get("parts") or [{}])[0]
+        root_part = next((row for row in self._rows("ProductPart") if int(row.get("id", -1)) == _int_ref(cf.get("ProductPart"))), None)
+        if (not cr or not key or not approver or not cr_key or
+                _int_ref(fields.get("ChangeRequest")) != int(cr["id"]) or
+                request_fingerprint(plan) != fields.get("PlanFingerprint") or
+                plan.get("changeRequestKey") != cr_key or
+                not root_part or plan.get("partId") != _fields(root_part).get("StablePartId") or root.get("partId") != plan.get("partId") or
+                _int_ref(cf.get("ProductPart")) != _int_ref(root.get("partRecordId")) or
+                _int_ref(cf.get("BaseRevision")) != _int_ref(plan.get("baseRevisionId")) or
+                _int_ref(root.get("currentRevisionId")) != _int_ref(cf.get("BaseRevision")) or
+                request_fingerprint(root.get("content")) != request_fingerprint(_json_cell(cf.get("AfterDefinition"))) or
+                plan.get("impactFingerprint") != cf.get("ImpactFingerprint") or
+                str(cf.get("ApprovedBy") or "").strip() != approver or
+                fields.get("RequestKey") != key or fields.get("RequestFingerprint") != fp or
+                rf.get("RequestKey") != key or rf.get("RequestType") != "part_definition_approval_publication" or
+                rf.get("EntityUUID") != cr_key or rf.get("RequestFingerprint") != fp):
+            raise PartIdentityError("PART_PUBLICATION_PLAN_CONFLICT", "The saved publication ownership or reviewed plan cannot be verified.")
+        return key
+
+    def _verified_approval_owner(self, cr: dict[str, Any]) -> str:
+        fields = _fields(cr)
+        cr_key = str(fields.get("ChangeRequestKey") or "")
+        key = str(fields.get("RequestKey") or "")
+        approver = str(fields.get("ApprovedBy") or "").strip()
+        request = self._find("PartRegistryRequest", "RequestKey", key) if key else None
+        fingerprint = request_fingerprint([cr_key, approver, key])
+        if (not cr_key or not key or not approver or not request or fields.get("RequestFingerprint") != fingerprint or
+                _fields(request).get("RequestFingerprint") != fingerprint or
+                _fields(request).get("RequestType") != "part_definition_approval_publication" or
+                _fields(request).get("EntityUUID") != cr_key):
+            raise PartIdentityError("PART_PUBLICATION_PLAN_CONFLICT", "The saved approval ownership cannot be verified.")
+        return key
 
     def _definition_from_rows(self, part_id: str, revision_id: int) -> dict[str, Any]:
         part_row = self._part_row(part_id)
@@ -398,6 +443,11 @@ class GristPartDefinitionService:
             "canReopen": not _int_ref(_fields(row).get("ReopenedDraft"))}
             for row in sorted(stale_requests, key=lambda item: str(_fields(item).get("StaleAt") or ""), reverse=True)]
         definition["canApprove"] = publication_schema_available and str(actor or "").strip().casefold() == os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold()
+        for item, row in zip(definition["pendingChangeRequests"], sorted(part_requests, key=lambda item: str(_fields(item).get("CreatedAt") or ""), reverse=True)):
+            fields = _fields(row)
+            if definition["canApprove"] and str(fields.get("Status") or "").casefold() == "approved" and fields.get("ApprovedBy"):
+                if str(fields.get("ApprovedBy") or "").strip() == str(actor or "").strip():
+                    item["approvalRecoveryKey"] = self._verified_approval_owner(row)
         definition["actions"] = {"editPart": publication_schema_available, "revisionHistory": True, "compareWithOds": True,
             "publicationSchemaAvailable": publication_schema_available,
             "comparisonSourceAvailable": bool(definition["source"].get("workbookPath"))}
@@ -1508,6 +1558,21 @@ class GristPartDefinitionService:
             raise PartIdentityError("PART_CHANGE_REQUEST_APPROVER_REQUIRED", "Only the currently designated Irshad engineering approver can approve Part-definition publication.")
         fields = _fields(cr)
         operation_fingerprint = request_fingerprint([change_request_key, actor.strip(), request_key])
+        publication_key = str(fields.get("PublicationKey") or f"part-definition-publication:{request_fingerprint(change_request_key)}")
+        existing_journal = self._find("PartDefinitionPublication", "PublicationKey", publication_key)
+        if existing_journal:
+            original_key = self._verified_publication_owner(existing_journal, cr)
+            if str((_json_cell(_fields(existing_journal).get("Plan")) or {}).get("approver") or "").strip() != actor.strip():
+                raise PartIdentityError("PART_PUBLICATION_PLAN_CONFLICT", "The publication belongs to a different approver.")
+            if request_key != original_key:
+                raise PartIdentityError("PART_PUBLICATION_RECOVER_ORIGINAL", "This publication already started. Recover its original approved operation before attempting another request.")
+        elif str(fields.get("Status") or "").casefold() in {"approved", "publishing", "publication_failed"} and fields.get("ApprovedBy"):
+            original_key = self._verified_approval_owner(cr)
+            approver = str(fields.get("ApprovedBy") or "").strip()
+            if actor.strip() != approver:
+                raise PartIdentityError("PART_PUBLICATION_PLAN_CONFLICT", "The saved approval ownership cannot be verified.")
+            if request_key != original_key:
+                raise PartIdentityError("PART_PUBLICATION_RECOVER_ORIGINAL", "This approval already started. Retry its original operation.")
         prior = self._find("PartRegistryRequest", "RequestKey", request_key)
         if prior:
             prior = self.registry._begin_request(request_key, "part_definition_approval_publication", operation_fingerprint, change_request_key)

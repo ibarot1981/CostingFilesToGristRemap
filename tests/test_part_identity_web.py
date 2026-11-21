@@ -55,6 +55,27 @@ class PartIdentityWebTests(unittest.TestCase):
                 response = web._part_http_error(PartIdentityError(code, "test retry policy"))
                 self.assertEqual(response.detail["retryDisposition"], expected)
 
+    def test_approval_disposition_requires_proof_that_publication_has_not_started(self):
+        service = mock.Mock()
+        service.approve_and_publish.side_effect = PartIdentityError("PART_CHANGE_REQUEST_STALE", "stale")
+        def find_without_publication(table, field, value):
+            return {"fields": {"Status": "stale", "ApprovedBy": ""}} if table == "PartEngineeringChangeRequest" else None
+        service._find.side_effect = find_without_publication
+        with mock.patch.object(web, "_part_definition_service", return_value=service):
+            with self.assertRaises(HTTPException) as rejected:
+                web.approve_and_publish_part_definition("cr-1", self.request_context(), {}, "key-1")
+        self.assertEqual(rejected.exception.detail["retryDisposition"], "safe_to_edit")
+        service._find.side_effect = lambda table, field, value: {"fields": {"Status": "publishing"}} if table == "PartDefinitionPublication" else None
+        with mock.patch.object(web, "_part_definition_service", return_value=service):
+            with self.assertRaises(HTTPException) as uncertain:
+                web.approve_and_publish_part_definition("cr-1", self.request_context(), {}, "key-1")
+        self.assertEqual(uncertain.exception.detail["retryDisposition"], "retry_same_request")
+        with mock.patch.object(web, "_part_definition_service", return_value=service):
+            with self.assertRaises(HTTPException) as payload:
+                web.approve_and_publish_part_definition("cr-1", self.request_context(), {"unexpected": True}, "key-1")
+        self.assertEqual(payload.exception.detail["code"], "PART_APPROVAL_INPUT_INVALID")
+        self.assertEqual(payload.exception.detail["retryDisposition"], "retry_same_request")
+
     def test_part_creation_prewrite_rejections_are_editable_but_partial_publication_is_not(self):
         safe_codes = {
             "PART_SCOPE_TARGET_INVALID", "PART_INPUT_INVALID", "PART_INPUT_REQUIRED", "PART_SHORTCODE_REQUIRED",

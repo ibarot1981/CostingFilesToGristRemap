@@ -248,6 +248,14 @@ export function PartsView({ active = true, mappingReturn = null, onReturnToMappi
     setPublicationRecoveryBusy(true); setError(""); setNotice("");
     try {
       const result = await api.approveAndPublishPartDefinition(item.changeRequestKey, item.requestKey);
+      try {
+        const storageKey = `safari.part-definition:${item.rootPartId || selectedId}:approve-publish`;
+        const attempt = JSON.parse(localStorage.getItem(storageKey) || "null");
+        const payload = JSON.parse(attempt?.payload || "null");
+        // The confirmed journal may have repaired a pre-fix client attempt that
+        // had already saved a conflicting key for this same Change Request.
+        if (payload?.changeRequestKey === item.changeRequestKey) localStorage.removeItem(storageKey);
+      } catch { /* local storage may be unavailable */ }
       setPublicationRecovery(null);
       await reloadSelectedDetails();
       setNotice(`Approved revision ${result.publishedRevisionLabel || "successor"} was recovered and published. ${result.dependentPartCount || 0} dependent Part/assembly successor(s) and ${result.configurationCount || 0} configuration successor(s) were confirmed.`);

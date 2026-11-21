@@ -170,13 +170,51 @@ it("retries an uncertain approved publication with the same durable request key"
   await screen.findByText(/connection lost after commit/);
   const stored = JSON.parse(localStorage.getItem("safari.part-definition:part-1:approve-publish") || "null");
   expect(stored?.key).toBeTruthy();
-  fireEvent.click(screen.getByRole("button",{name:/Approve and publish/}));
+  fireEvent.click(screen.getByRole("button",{name:"Retry original approval"}));
   await screen.findByText(/Accepted revision B is published/);
   expect(apiMocks.approveAndPublishPartDefinition).toHaveBeenCalledTimes(2);
   expect(apiMocks.approveAndPublishPartDefinition.mock.calls[0][1]).toBe(stored.key);
   expect(apiMocks.approveAndPublishPartDefinition.mock.calls[1][1]).toBe(stored.key);
   expect(onSaved).toHaveBeenCalledTimes(1);
   expect(localStorage.getItem("safari.part-definition:part-1:approve-publish")).toBeNull();
+});
+
+it.each([409, 422])("keeps the original approval after recoverable %s and reload", async status => {
+  const pending = {...accepted,canApprove:true,pendingChangeRequests:[{key:"cr-1",status:"pending_approval",reason:"Reviewed",impact:{fingerprint:"impact-1",assemblies:[],modelCodeConfigurations:[]}}]};
+  apiMocks.partDefinition.mockResolvedValue(pending);
+  apiMocks.approveAndPublishPartDefinition.mockRejectedValueOnce(new ApiError("staged publication",status,"PART_CHILD_REVISION_DRAFT","retry_same_request"));
+  const props = {partId:"part-1",onSaved:vi.fn(),onCompare:vi.fn()};
+  const first = render(<PartDefinitionMaintenance {...props}/>);
+  fireEvent.click(await screen.findByRole("button",{name:/Approve and publish/}));
+  await screen.findByText("staged publication");
+  const stored = JSON.parse(localStorage.getItem("safari.part-definition:part-1:approve-publish") || "null");
+  expect(JSON.parse(stored.payload)).toEqual({changeRequestKey:"cr-1"});
+  expect((screen.getByRole("button",{name:"Edit Part"}) as HTMLButtonElement).disabled).toBe(true);
+  first.unmount();
+  render(<PartDefinitionMaintenance {...props}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Retry original approval"}));
+  await screen.findByText(/Accepted revision B is published/);
+  expect(apiMocks.approveAndPublishPartDefinition.mock.calls.map(call => call.slice(0,2))).toEqual([["cr-1",stored.key],["cr-1",stored.key]]);
+  expect(localStorage.getItem("safari.part-definition:part-1:approve-publish")).toBeNull();
+});
+
+it("unlocks a proven safe prewrite approval rejection", async () => {
+  const pending = {...accepted,canApprove:true,pendingChangeRequests:[{key:"cr-1",status:"pending_approval",impact:{fingerprint:"impact-1",assemblies:[],modelCodeConfigurations:[]}}]};
+  apiMocks.partDefinition.mockResolvedValue(pending);
+  apiMocks.approveAndPublishPartDefinition.mockRejectedValueOnce(new ApiError("Approver required",422,"PART_CHANGE_REQUEST_APPROVER_REQUIRED","safe_to_edit"));
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:/Approve and publish/}));
+  await screen.findByText("Approver required");
+  expect(localStorage.getItem("safari.part-definition:part-1:approve-publish")).toBeNull();
+  expect(screen.queryByRole("button",{name:"Retry original approval"})).toBeNull();
+});
+
+it("uses the verified saved approval when browser storage is empty", async () => {
+  apiMocks.partDefinition.mockResolvedValue({...accepted,canApprove:true,pendingChangeRequests:[{key:"cr-1",status:"approved",approvalRecoveryKey:"server-original",impact:{fingerprint:"impact-1",assemblies:[],modelCodeConfigurations:[]}}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Recover saved approval"}));
+  await screen.findByText(/Accepted revision B is published/);
+  expect(apiMocks.approveAndPublishPartDefinition).toHaveBeenCalledWith("cr-1","server-original");
 });
 
 it("offers explicit classification for duplicate legacy occurrences and shows blank versus missing source status", async () => {

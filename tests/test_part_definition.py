@@ -281,6 +281,68 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertEqual(len([row for row in client.tables["CostingConfigurationRevision"] if row["fields"].get("PublicationCause") == request["changeRequestKey"]]), 1)
             self.assertEqual(len([row for row in client.tables["PartDefinitionPublication"] if row["fields"].get("Status") == "published"]), 1)
 
+    def test_started_publication_exposes_verified_original_and_rejects_replacement_before_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "coordinator.sqlite3"
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, path)
+            _, request = self.draft_and_submit(service, request_suffix="original-owner")
+            client.lose_after_create_table = "LineRevision"
+            with self.assertRaises(TimeoutError):
+                service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="original-approval")
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as conflict:
+                service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="replacement-approval")
+            self.assertEqual(conflict.exception.code, "PART_PUBLICATION_RECOVER_ORIGINAL")
+            self.assertEqual(client.tables, before)
+            recovery = self.make_service(client, path).publication_recovery("p-1", actor="Irshad")
+            self.assertEqual(recovery["items"][0]["requestKey"], "original-approval")
+            self.assertTrue(recovery["items"][0]["canRetry"])
+            other = service.publication_recovery("p-1", actor="other")
+            self.assertFalse(other["items"][0]["canRetry"])
+            self.assertEqual(other["items"][0]["requestKey"], "")
+            with self.assertRaises(PartIdentityError):
+                service.approve_and_publish(request["changeRequestKey"], actor="other", request_key="original-approval")
+            result = self.make_service(client, path).approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="original-approval")
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(len([row for row in client.tables["LineRevision"] if row["fields"].get("RequestKey") == "original-approval"]), 1)
+
+    def test_recovery_rejects_a_tampered_plan_before_disclosing_or_writing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            _, request = self.draft_and_submit(service, request_suffix="tampered-owner")
+            client.lose_after_create_table = "LineRevision"
+            with self.assertRaises(TimeoutError):
+                service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="original-approval")
+            journal = client.tables["PartDefinitionPublication"][0]["fields"]
+            plan = json.loads(journal["Plan"])
+            plan["operationKey"] = "replacement-approval"
+            journal["Plan"] = json.dumps(plan)
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.publication_recovery("p-1", actor="Irshad")
+            self.assertEqual(error.exception.code, "PART_PUBLICATION_PLAN_CONFLICT")
+            self.assertEqual(client.tables, before)
+
+    def test_approval_written_before_journal_keeps_its_original_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            _, request = self.draft_and_submit(service, request_suffix="approved-before-journal")
+            client.lose_after_update_table = "PartEngineeringChangeRequest"
+            with self.assertRaises(TimeoutError):
+                service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="approval-first")
+            projected = service.get_definition("p-1", actor="Irshad")["pendingChangeRequests"][0]
+            self.assertEqual(projected["approvalRecoveryKey"], "approval-first")
+            self.assertNotIn("approvalRecoveryKey", service.get_definition("p-1", actor="other")["pendingChangeRequests"][0])
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="approval-second")
+            self.assertEqual(error.exception.code, "PART_PUBLICATION_RECOVER_ORIGINAL")
+            self.assertEqual(client.tables, before)
+            self.assertEqual(service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="approval-first")["status"], "published")
+
     def test_lost_configuration_pointer_response_recovers_its_own_successor_across_configs(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "coordinator.sqlite3"

@@ -28,7 +28,7 @@ from app.repository import AssociationConflict, AssociationProposal, GovernanceC
 from app.workbook import OdsWorkbook
 from app.milestone2 import build_current_costing_review, build_mcl_rate_warning_index, extract_rate_log, read_ods, resolve_semantic_ambiguities
 from app.libreoffice_refresh import LibreOfficeRefreshError, linked_ods_sources, refreshed_ods_copy
-from app.part_identity import PartIdentityError
+from app.part_identity import PartIdentityError, request_fingerprint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1437,7 +1437,25 @@ def reopen_stale_part_definition_change_request(part_id: str, change_request_key
 
 @app.post("/api/part-definition/change-requests/{change_request_key}/approve-and-publish")
 def approve_and_publish_part_definition(change_request_key: str, request: Request, payload: dict[str, Any] = Body(default={}), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
-    return _part_definition_service().approve_and_publish(change_request_key, actor=_request_actor(request), request_key=idempotency_key or "")
+    service = _part_definition_service()
+    try:
+        if payload:
+            raise PartIdentityError("PART_APPROVAL_INPUT_INVALID", "Approval does not accept a replacement publication payload.")
+        return service.approve_and_publish(change_request_key, actor=_request_actor(request), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        error = _part_http_error(exc)
+        # A generic 4xx is not proof that no publication rows were written.
+        error.detail["retryDisposition"] = "retry_same_request"
+        if exc.code in {"PART_APPROVAL_INPUT_REQUIRED", "PART_CHANGE_REQUEST_APPROVER_REQUIRED", "PART_CHANGE_REQUEST_NOT_FOUND",
+                "PART_DEFINITION_STALE_BASE", "PART_DEPENDENCY_CLOSURE_STALE", "PART_DEPENDENCY_CLOSURE_INCOMPLETE",
+                "PART_CHANGE_REQUEST_STALE", "PART_REQUIREMENT_LINE_IDENTITY_INVALID", "PART_REQUIREMENT_LINE_IDENTITY_UNRESOLVED"}:
+            journal_key = f"part-definition-publication:{request_fingerprint(change_request_key)}"
+            journal = service._find("PartDefinitionPublication", "PublicationKey", journal_key)
+            cr = service._find("PartEngineeringChangeRequest", "ChangeRequestKey", change_request_key)
+            fields = (cr or {}).get("fields", {})
+            if not journal and not fields.get("ApprovedBy") and str(fields.get("Status") or "").casefold() not in {"approved", "publishing", "publication_failed", "published"}:
+                error.detail["retryDisposition"] = "safe_to_edit"
+        raise error
 
 
 @app.put("/api/parts/{part_id}/intended-sharing")
