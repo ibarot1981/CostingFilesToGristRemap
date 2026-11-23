@@ -9,7 +9,32 @@ type Definition = {
 };
 
 const FAMILY_LABEL: Record<string, string> = { mcl: "Material Cut List", toolshop: "Tool Shop", cnc: "CNC" };
+const EDITABLE_FAMILIES = ["mcl", "toolshop", "cnc"] as const;
+const FALLBACK_UNITS = ["Nos", "each", "pcs", "kg", "g", "mm", "cm", "m", "in", "inch", "hour", "minute"];
+const LENGTH_TO_MM: Record<string, number> = { mm: 1, millimeter: 1, millimeters: 1, cm: 10, centimeter: 10, centimeters: 10,
+  m: 1000, meter: 1000, meters: 1000, metre: 1000, metres: 1000, in: 25.4, inch: 25.4, inches: 25.4 };
+const MASS_TO_KG: Record<string, number> = { kg: 1, kilogram: 1, kilograms: 1, g: 0.001, gram: 0.001, grams: 0.001 };
 const fieldStatusText = (status: unknown) => status === "missing" ? "missing in source" : status === "blank" ? "blank in source" : status === "value" || status === "present" ? "value present" : "source status not recorded";
+function savedTotalWeightLabel(item: any, detail: any) {
+  const statuses = item?.fieldStatus || {};
+  const kgStatus = statuses.WeightKg, gramsStatus = statuses.WeightGrams;
+  if ([kgStatus, gramsStatus].includes("blank")) return "blank in source";
+  if (kgStatus === "missing" && gramsStatus === "missing") return "not recorded";
+  const kgKnown = detail.WeightKg != null && kgStatus !== "missing";
+  const gramsKnown = detail.WeightGrams != null && gramsStatus !== "missing";
+  if (kgKnown && gramsKnown) {
+    const kg = Number(detail.WeightKg), grams = Number(detail.WeightGrams);
+    if (Number.isFinite(kg) && Number.isFinite(grams)) {
+      if (Math.abs(kg - grams / 1000) <= Math.max(1e-9, Math.abs(kg) * 1e-9)) return `${detail.WeightKg} kg`;
+      return `${detail.WeightKg} kg / ${detail.WeightGrams} g (saved values conflict)`;
+    }
+  }
+  if (kgKnown) return `${detail.WeightKg} kg`;
+  if (gramsKnown) return `${detail.WeightGrams} g`;
+  if ((detail.WeightKg != null && Number(detail.WeightKg) === 0) || (detail.WeightGrams != null && Number(detail.WeightGrams) === 0))
+    return "0 (source status not recorded)";
+  return "not recorded";
+}
 const emptyContent = (value: Definition) => ({ baseRevisionId: value.revisionId, applicability: value.applicability,
   requirements: value.requirements, components: value.components, purchases: value.purchases,
   finalizeOnPublication: value.revisionStatus === "finalized" });
@@ -77,16 +102,161 @@ function changeRequestDiff(before: any, after: any) {
 }
 const reviewValue = (value: any) => value === null || value === undefined ? "—"
   : typeof value === "object" ? JSON.stringify(value) : String(value);
-function ChangeReview({ before, after, title }: { before: any; after: any; title: string }) {
-  const changes = changeRequestDiff(before, after);
+function readableChange(change: any, before: any, after: any) {
+  const match = String(change.path || "").match(/^(requirements|components|purchases)\[([^\]]+)\](?:\.(.*))?$/);
+  if (!match) {
+    const family = String(change.path || "").match(/^applicability\.(mcl|toolshop|cnc)\.applicable$/)?.[1];
+    return { row: family ? FAMILY_LABEL[family] : "Part definition", occurrence: "—", field: family ? "Family applicability" : String(change.path || "Definition"),
+      before: reviewValue(change.before), after: reviewValue(change.after) };
+  }
+  const [, collection, identity, rawField] = match;
+  const rowsBefore = Array.isArray(before?.[collection]) ? before[collection] : [];
+  const rowsAfter = Array.isArray(after?.[collection]) ? after[collection] : [];
+  const identityFor = (item: any) => item?.requirementKey || item?.componentIdentity || item?.specificationIdentity || item?.identity;
+  const oldRow: any = rowsBefore.find((item: any) => String(identityFor(item)) === identity);
+  const newRow: any = rowsAfter.find((item: any) => String(identityFor(item)) === identity);
+  const row: any = newRow || oldRow || {};
+  const detail = row.detail || {};
+  const itemName = detail.ItemName || detail.PlatePart || detail.MaterialDisplayName || row.childPartNumber || row.childName || row.childPartId || row.code || row.description || row.sourcePartName || collection;
+  const family = collection === "requirements" ? FAMILY_LABEL[row.family] || "Other process" : collection === "components" ? "Store" : "Purchase";
+  const field = String(rawField || "");
+  const tail = field.split(".").at(-1) || "";
+  const labels: Record<string, string> = { quantity: "Quantity per Part", uom: "Quantity unit", family: "Family", childPartId: "Canonical child Part",
+    sourcingRoute: "Sourcing route", DimensionMM: "Dimension to Cut", DimensionInches: "Dimension to Cut", DimensionText: "Dimension to Cut",
+    DimensionUOM: "Cut-length unit", DimensionToCut: "Dimension to Cut", PartWeightKg: "Per Part Weight", WeightKg: "Saved total weight", WeightGrams: "Saved total weight",
+    Quantity: "Consumption per occurrence", QuantityUOM: "Consumption unit", Material: "Canonical material", MaterialDisplayName: "Material display name",
+    ItemName: "Item name", PlatePart: "Plate part to cut", ToolShopRemarks: "Tool Shop remarks", EngineeringAttributes: "Advanced engineering attributes",
+    Length: "Plate length", Width: "Plate width", Thickness: "Plate thickness", manufacturer: "Manufacturer", manufacturerPartNumber: "Manufacturer part number",
+    description: "Description", code: "Specification code", costingUOM: "Costing unit", costingCurrency: "Currency" };
+  const formatRow = (value: any) => {
+    if (!value) return "Not present";
+    if (collection === "requirements") return `${FAMILY_LABEL[value.family] || "Other process"} · ${value.detail?.ItemName || value.detail?.PlatePart || value.detail?.MaterialDisplayName || value.sourcePartName || "Requirement"} · ${value.quantity ?? "—"} ${value.uom || ""}`.trim();
+    if (collection === "components") return `${value.childPartNumber || value.childName || value.childPartId || "Unresolved child Part"} · ${value.quantity ?? "—"} ${value.uom || ""} · ${value.sourcingRoute || "auto"}`;
+    return `${value.code || value.description || value.specificationIdentity || "Purchase specification"} · ${value.manufacturer || ""}`.trim();
+  };
+  function formatField(value: any, sourceRow: any) {
+    if (value == null) return "—";
+    const normalized = tail.toLowerCase();
+    if (typeof value === "object") return reviewValue(value);
+    if (normalized === "quantity" && !field.startsWith("detail.")) return `${value} ${sourceRow?.uom || ""}`.trim();
+    if (tail === "Quantity" && field.startsWith("detail.")) return `${value} ${sourceRow?.detail?.QuantityUOM || ""}`.trim();
+    if (tail === "DimensionMM") return `${value} mm`;
+    if (tail === "DimensionInches") return `${value} in`;
+    if (tail === "PartWeightKg" || tail === "WeightKg") return `${value} kg`;
+    if (tail === "WeightGrams") return `${value} g`;
+    return String(value);
+  }
+  const isWholeRow = !field;
+  return { row: `${family} · ${itemName}`, occurrence: identity,
+    field: isWholeRow ? (collection === "requirements" ? "Requirement row" : collection === "components" ? "Store row" : "Purchase specification") : labels[tail] || tail.replace(/([A-Z])/g, " $1").trim(),
+    before: isWholeRow ? formatRow(change.before) : formatField(change.before, oldRow),
+    after: isWholeRow ? formatRow(change.after) : formatField(change.after, newRow) };
+}
+function definitionContentForDiff(value: any, parts: any[] = []) {
+  const content = value?.content && typeof value.content === "object" ? value.content : value || {};
+  const numeric = (value: any) => {
+    if (typeof value !== "number" && typeof value !== "string") return value;
+    const text = String(value).trim();
+    if (!text || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return value;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : value;
+  };
+  const applicability = Object.fromEntries(["mcl", "toolshop", "cnc"].map(family => [family, {
+    applicable: Boolean(content.applicability?.[family]?.applicable),
+  }]));
+  const requirements = Array.isArray(content.requirements) ? content.requirements.map((row: any) => {
+    const detail = { ...(row.detail || {}) };
+    if (typeof detail.EngineeringAttributes === "string") {
+      try {
+        const attributes = JSON.parse(detail.EngineeringAttributes);
+        if (attributes && typeof attributes === "object" && !Array.isArray(attributes)) {
+          delete attributes.fieldStatus;
+          detail.EngineeringAttributes = attributes;
+        }
+      } catch { /* keep unparsed legacy attributes visible */ }
+    } else if (detail.EngineeringAttributes && typeof detail.EngineeringAttributes === "object") {
+      detail.EngineeringAttributes = { ...detail.EngineeringAttributes };
+      delete detail.EngineeringAttributes.fieldStatus;
+    }
+    delete detail.fieldStatus;
+    if ([detail.DimensionMM, detail.DimensionInches, detail.DimensionText, detail.DimensionUOM].some(item => item != null && String(item) !== ""))
+      detail.DimensionToCut = cutLengthText(detail);
+    delete detail.DimensionMM; delete detail.DimensionInches; delete detail.DimensionText; delete detail.DimensionUOM;
+    if (detail.Quantity != null) detail.Quantity = numeric(detail.Quantity);
+    if (detail.PartWeightKg != null) detail.PartWeightKg = numeric(detail.PartWeightKg);
+    delete detail.ExactQuantityText; delete detail.ExactWeightKgText;
+    return { requirementKey: row.requirementKey, family: row.family, quantity: numeric(row.quantity), uom: row.uom,
+      sourcePartName: row.sourcePartName, detail };
+  }) : [];
+  const components = Array.isArray(content.components) ? content.components.map((row: any) => {
+    const child = parts.find(part => String(part.id) === String(row.childPartId));
+    const childLabel = [child?.partNumber, child?.name].filter(Boolean).join(" · ");
+    return { componentIdentity: row.componentIdentity, childPartId: row.childPartId, childPartRecordId: row.childPartRecordId,
+      childRevisionId: row.childRevisionId, childPartNumber: row.childPartNumber || childLabel || row.childPartId,
+      childName: row.childName || child?.name || "", quantity: numeric(row.quantity), uom: row.uom,
+      sourcingRoute: row.sourcingRoute, status: row.status };
+  }) : [];
+  return { applicability, requirements, components, purchases: Array.isArray(content.purchases) ? content.purchases : [] };
+}
+function positiveNumber(value: unknown) {
+  if (typeof value !== "number" && typeof value !== "string") return false;
+  const text = String(value).trim();
+  if (!text || !/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return false;
+  const number = Number(text);
+  return Number.isFinite(number) && number > 0;
+}
+function decimalProduct(left: unknown, right: unknown): string | null {
+  const parse = (value: unknown) => {
+    const match = String(value ?? "").trim().match(/^([+-]?)(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/);
+    if (!match) return null;
+    const fraction = match[3] || "";
+    const exponent = Number(match[4] || 0);
+    if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1000) return null;
+    let coefficient = BigInt(`${match[2]}${fraction}` || "0") * (match[1] === "-" ? -1n : 1n);
+    let scale = fraction.length - exponent;
+    if (scale < 0) { coefficient *= 10n ** BigInt(-scale); scale = 0; }
+    return { coefficient, scale };
+  };
+  const a = parse(left), b = parse(right);
+  if (!a || !b || !Number.isFinite(Number(left) * Number(right))) return null;
+  const coefficient = a.coefficient * b.coefficient;
+  const scale = a.scale + b.scale;
+  const negative = coefficient < 0n;
+  let digits = (negative ? -coefficient : coefficient).toString();
+  if (scale > 0) {
+    digits = digits.padStart(scale + 1, "0");
+    const split = digits.length - scale;
+    digits = `${digits.slice(0, split)}.${digits.slice(split)}`.replace(/\.?0+$/, "").replace(/\.$/, "");
+  }
+  return `${negative ? "-" : ""}${digits || "0"}`;
+}
+function cutLengthValue(detail: any) {
+  if (detail?.DimensionUOM && ["in", "inch", "inches"].includes(String(detail.DimensionUOM).toLowerCase()))
+    return detail.DimensionInches ?? (detail.DimensionMM == null ? "" : Number(detail.DimensionMM) / 25.4);
+  return detail?.DimensionMM ?? (detail?.DimensionInches == null ? "" : Number(detail.DimensionInches) * 25.4);
+}
+function cutLengthUnit(detail: any) { return ["in", "inch", "inches"].includes(String(detail?.DimensionUOM || "").toLowerCase()) ? "in" : "mm"; }
+function cutLengthText(detail: any) {
+  const text = String(detail?.DimensionText || "").trim();
+  const mm = detail?.DimensionMM, inches = detail?.DimensionInches;
+  if (mm != null && inches != null && Number.isFinite(Number(mm)) && Number.isFinite(Number(inches))
+      && Math.abs(Number(mm) - Number(inches) * 25.4) > Math.max(0.01, Math.abs(Number(mm)) * 1e-7))
+    return `${text || "Conflicting saved values"} · ${mm} mm / ${inches} in`;
+  if (text) return text;
+  if (mm != null) return `${mm} mm`;
+  if (inches != null) return `${inches} in`;
+  return "—";
+}
+function ChangeReview({ before, after, title, parts = [] }: { before: any; after: any; title: string; parts?: any[] }) {
+  const reviewBefore = definitionContentForDiff(before, parts), reviewAfter = definitionContentForDiff(after, parts);
+  const changes = changeRequestDiff(reviewBefore, reviewAfter);
   return <section className="parts-definition-diff" aria-label={title}>
     <h4>{title}</h4>
     <p>Saved before/after values from this Change Request. The table includes additions, field changes and removals.</p>
     {changes.length === 0 ? <p>No definition differences were recorded.</p> : <div className="parts-definition-diff-scroll"><table>
-      <thead><tr><th>Change</th><th>Requirement or field</th><th>Before</th><th>After</th></tr></thead>
+      <thead><tr><th>Change</th><th>Family / item</th><th>Occurrence reference</th><th>Field</th><th>Before</th><th>After</th></tr></thead>
       <tbody>{changes.map((change, index) => <tr key={`${change.path}:${index}`}>
-        <td>{change.kind}</td><td><code>{change.path || "definition"}</code></td>
-        <td>{reviewValue(change.before)}</td><td>{reviewValue(change.after)}</td>
+        {(() => { const readable = readableChange(change, reviewBefore, reviewAfter); return <><td>{change.kind}</td><td>{readable.row}</td><td>{readable.occurrence}</td><td>{readable.field}</td><td>{readable.before}</td><td>{readable.after}</td></>; })()}
       </tr>)}</tbody>
     </table></div>}
   </section>;
@@ -114,6 +284,9 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   const [pendingSave, setPendingSave] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
   const [pendingSubmit, setPendingSubmit] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
   const [pendingApproval, setPendingApproval] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
+  const [focusRequirementKey, setFocusRequirementKey] = useState<string | null>(null);
+  const [focusComponentIdentity, setFocusComponentIdentity] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -137,6 +310,22 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   }
 
   useEffect(() => { void reload(); }, [partId]);
+  useEffect(() => {
+    if (!focusRequirementKey) return;
+    const row = [...document.querySelectorAll<HTMLElement>("[data-requirement-key]")]
+      .find(element => element.dataset.requirementKey === focusRequirementKey);
+    const first = row?.querySelector<HTMLElement>("select:not([disabled]), input:not([disabled]), textarea:not([disabled])");
+    first?.focus(); first?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    setFocusRequirementKey(null);
+  }, [focusRequirementKey, content?.requirements]);
+  useEffect(() => {
+    if (!focusComponentIdentity) return;
+    const row = [...document.querySelectorAll<HTMLElement>("[data-component-key]")]
+      .find(element => element.dataset.componentKey === focusComponentIdentity);
+    const first = row?.querySelector<HTMLElement>("select:not([disabled]), input:not([disabled]), textarea:not([disabled])");
+    first?.focus(); first?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    setFocusComponentIdentity(null);
+  }, [focusComponentIdentity, content?.components]);
 
   const pending = useMemo(() => definition?.pendingChangeRequests?.[0] || null, [definition]);
   const pendingDependents = pending?.impact?.dependents || pending?.impact?.assemblies || [];
@@ -144,7 +333,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
 
   function patchContent(update: Record<string, unknown>) {
     setContent((old: any) => ({ ...old, ...update }));
-    setDirty(true); setNotice("");
+    setDirty(true); setNotice(""); setValidationErrors({});
   }
 
   function updateRequirement(index: number, update: Record<string, unknown>) {
@@ -161,6 +350,101 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     patchContent({ requirements: rows });
   }
 
+  function updateRequirementMaterial(index: number, value: string) {
+    const rows = [...(content?.requirements || [])];
+    const current = rows[index] || {};
+    const material = (options?.materials || []).find((item: any) => String(item.id) === value);
+    rows[index] = { ...current, detail: { ...(current.detail || {}), Material: value ? Number(value) : null,
+      ...(material ? { MaterialDisplayName: material.name, ItemName: current.detail?.ItemName || material.name } : {}) } };
+    patchContent({ requirements: rows });
+  }
+
+  function addRequirement(family: typeof EDITABLE_FAMILIES[number]) {
+    if (!content || busy) return;
+    const requirementKey = `safari-authored-requirement:${crypto.randomUUID()}`;
+    const processType = family === "mcl" ? "material_cut" : family === "toolshop" ? "tool_shop" : "cnc";
+    const row = { requirementKey, identityStatus: "safari_authored", family, quantity: "1", uom: "Nos", processType,
+      detail: { ProcessType: processType, Quantity: "", QuantityUOM: "", EngineeringAttributes: {} },
+      provenance: { type: "safari_authored", evidence: {} } };
+    patchContent({ requirements: [...(content.requirements || []), row], applicability: {
+      ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: true, status: "applicable" },
+    } });
+    setFocusRequirementKey(requirementKey);
+    setNotice(`${FAMILY_LABEL[family]} marked applicable in this draft because you chose Add ${family.toUpperCase()} row.`);
+  }
+
+  function updateCutLength(index: number, value: string, unit: "mm" | "in") {
+    const rows = [...(content?.requirements || [])];
+    const current = rows[index] || {};
+    const detail = { ...(current.detail || {}) };
+    const number = value.trim() === "" ? NaN : Number(value);
+    detail.DimensionUOM = unit;
+    detail.DimensionText = value.trim() ? `${value} ${unit}` : "";
+    if (Number.isFinite(number) && number > 0) {
+      const mm = unit === "mm" ? number : number * 25.4;
+      detail.DimensionMM = mm;
+      detail.DimensionInches = mm / 25.4;
+      const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
+      const factor = LENGTH_TO_MM[rateUnit];
+      if (factor) { detail.Quantity = mm / factor; detail.ExactQuantityText = String(detail.Quantity); }
+    } else {
+      detail.DimensionMM = value;
+      detail.DimensionInches = value;
+    }
+    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), DimensionText: value ? "value" : "blank" } };
+    patchContent({ requirements: rows });
+  }
+
+  function updatePartWeight(index: number, value: string) {
+    const rows = [...(content?.requirements || [])];
+    const current = rows[index] || {};
+    const detail = { ...(current.detail || {}), PartWeightKg: value, ExactWeightKgText: value };
+    const number = value.trim() === "" ? NaN : Number(value);
+    const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
+    const factor = MASS_TO_KG[rateUnit];
+    if (Number.isFinite(number) && number > 0 && factor) { detail.Quantity = number / factor; detail.ExactQuantityText = String(detail.Quantity); }
+    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), PartWeightKg: value ? "value" : "blank" } };
+    patchContent({ requirements: rows });
+  }
+
+  function validateDraftContent() {
+    const errors: Record<string, string> = {};
+    const oldRequirements = new Map((definition?.requirements || []).map((item: any) => [item.requirementKey, item]));
+    for (const row of content?.requirements || []) {
+      const old: any = oldRequirements.get(row.requirementKey) || (row.legacyOccurrenceKey
+        ? (definition?.requirements || []).find((item: any) => item.requirementKey === row.legacyOccurrenceKey) : undefined);
+      const fresh = !old;
+      const changed = (field: string, source: any = row, prior: any = old) => fresh || !sameValue(source?.[field], prior?.[field]);
+      const error = (field: string, message: string) => { errors[`${row.requirementKey}:${field}`] = message; };
+      if (changed("quantity") && !positiveNumber(row.quantity)) error("quantity", "Enter a finite quantity greater than zero.");
+      if (changed("uom") && !String(row.uom || "").trim()) error("uom", "Choose a quantity unit.");
+      const detail = row.detail || {}, oldDetail = old?.detail || {};
+      const rateNeedsValidation = fresh || changed("Quantity", detail, oldDetail) || changed("QuantityUOM", detail, oldDetail);
+      if (rateNeedsValidation && !positiveNumber(detail.Quantity)) error("rateQuantity", "Enter finite positive consumption per occurrence.");
+      if (rateNeedsValidation && !String(detail.QuantityUOM || "").trim()) error("rateUnit", "Choose the consumption unit used by the existing rate basis.");
+      if (row.family === "mcl" && (fresh || changed("Material", detail, oldDetail)) && !detail.Material)
+        error("material", "Choose the canonical material identity.");
+      const cutChanged = fresh || ["DimensionMM", "DimensionInches", "DimensionText", "DimensionUOM"].some(field => changed(field, detail, oldDetail));
+      const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
+      const rateBasisChanged = fresh || changed("QuantityUOM", detail, oldDetail);
+      if ((cutChanged || rateBasisChanged) && ["mcl", "toolshop"].includes(row.family) && LENGTH_TO_MM[rateUnit]
+          && !positiveNumber(cutLengthValue(detail))) error("cutLength", "Enter a finite positive cut length for this length-based rate.");
+      const weightChanged = fresh || changed("PartWeightKg", detail, oldDetail);
+      if ((weightChanged || rateBasisChanged) && row.family === "cnc" && MASS_TO_KG[rateUnit]
+          && !positiveNumber(detail.PartWeightKg)) error("partWeight", "Enter Per Part Weight in kg for this kg-based rate.");
+    }
+    for (const row of content?.components || []) {
+      const old: any = (definition?.components || []).find((item: any) => item.componentIdentity === row.componentIdentity);
+      const fresh = !old;
+      if ((fresh || row.childPartId !== old?.childPartId) && !(options?.parts || []).some((item: any) => item.id === row.childPartId))
+        errors[`${row.componentIdentity}:childPart`] = "Choose an available canonical child Part.";
+      if ((fresh || row.quantity !== old?.quantity) && !positiveNumber(row.quantity)) errors[`${row.componentIdentity}:quantity`] = "Enter a finite quantity greater than zero.";
+      if ((fresh || row.uom !== old?.uom) && !String(row.uom || "").trim()) errors[`${row.componentIdentity}:uom`] = "Choose a quantity unit.";
+    }
+    setValidationErrors(errors);
+    return Object.keys(errors).length === 0;
+  }
+
   function updateComponent(index: number, update: Record<string, unknown>) {
     const rows = [...(content?.components || [])]; rows[index] = { ...rows[index], ...update };
     patchContent({ components: rows });
@@ -171,8 +455,15 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     patchContent({ purchases: rows });
   }
 
+  function addStoreRow() {
+    const componentIdentity = `ui-component:${crypto.randomUUID()}`;
+    patchContent({ components: [...(content?.components || []), { componentIdentity, childPartId: "", quantity: "1", uom: "Nos", sourcingRoute: "buy", provenance: "Safari-authored component" }] });
+    setFocusComponentIdentity(componentIdentity);
+  }
+
   async function saveDraft() {
     if (!definition || !reason.trim() || pendingSave || pendingSubmit || pendingApproval) { setError(pendingSave || pendingSubmit || pendingApproval ? "Resolve the saved request before editing or saving another draft." : "Enter the engineering reason before saving a draft."); return; }
+    if (!validateDraftContent()) { setError("Fix the highlighted requirement and Store row fields before saving this draft."); return; }
     const activeAttributeTexts = [
       ...(content?.requirements || []).map((item: any) => attributeText[`requirement:${item.requirementKey}`]),
       ...(content?.purchases || []).map((item: any) => attributeText[`purchase:${item.specificationIdentity}`]),
@@ -309,6 +600,108 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     finally { setBusy(false); }
   }
 
+  const unitOptions: string[] = [...new Set([...(options?.units || []), ...FALLBACK_UNITS])];
+  function updateRateBasisUnit(index: number, value: string) {
+    const rows = [...(content?.requirements || [])];
+    const current = rows[index] || {};
+    const detail = { ...(current.detail || {}), QuantityUOM: value };
+    const unit = value.trim().toLowerCase();
+    if (["mcl", "toolshop"].includes(current.family) && LENGTH_TO_MM[unit]) {
+      const mm = detail.DimensionMM != null && Number.isFinite(Number(detail.DimensionMM)) ? Number(detail.DimensionMM)
+        : detail.DimensionInches != null && Number.isFinite(Number(detail.DimensionInches)) ? Number(detail.DimensionInches) * 25.4 : NaN;
+      if (Number.isFinite(mm) && mm > 0) {
+        detail.Quantity = mm / LENGTH_TO_MM[unit]; detail.ExactQuantityText = String(detail.Quantity);
+      }
+    } else if (current.family === "cnc" && MASS_TO_KG[unit] && positiveNumber(detail.PartWeightKg)) {
+      detail.Quantity = Number(detail.PartWeightKg) / MASS_TO_KG[unit]; detail.ExactQuantityText = String(detail.Quantity);
+    }
+    rows[index] = { ...current, detail };
+    patchContent({ requirements: rows });
+  }
+
+  function renderRequirementTable(family: typeof EDITABLE_FAMILIES[number]) {
+    const rows = (content?.requirements || []).filter((item: any) => item.family === family);
+    const familyLabel = family === "mcl" ? "MCL" : family === "toolshop" ? "Tool Shop" : "CNC";
+    return <section className="parts-definition-family" key={family} aria-label={`${familyLabel} requirements`}>
+      <div className="parts-definition-list-heading"><h4>{familyLabel}</h4><button type="button" className="button" disabled={busy} onClick={() => addRequirement(family)}>Add {familyLabel} row</button></div>
+      {rows.length === 0 ? <p className="parts-help">No {familyLabel} rows in this draft. Add a row to mark this family applicable in the draft.</p> : <div className="parts-definition-table-scroll"><table className="parts-definition-table">
+        <thead><tr><th>Item / material</th><th>Quantity per Part</th>{family === "cnc" ? <th>Per Part Weight</th> : <th>Dimension to Cut</th>}{family === "cnc" && <th>Plate part</th>}<th>Consumption per occurrence</th>{family === "toolshop" && <th>Remarks</th>}<th>Actions</th></tr></thead>
+        <tbody>{rows.map((item: any, rowPosition: number) => {
+          const index = (content?.requirements || []).indexOf(item);
+          const rowName = `${familyLabel} row ${rowPosition + 1}`;
+          const detail = item.detail || {};
+          const materialValue = String(detail.Material ?? "");
+          const materialFound = (options?.materials || []).some((material: any) => String(material.id) === materialValue);
+          const oldRateUnit = String(detail.QuantityUOM || "");
+          const lengthBasis = Boolean(LENGTH_TO_MM[oldRateUnit.trim().toLowerCase()]) && ["mcl", "toolshop"].includes(family);
+          const weightBasis = Boolean(MASS_TO_KG[oldRateUnit.trim().toLowerCase()]) && family === "cnc";
+          const cutUnit = String(detail.DimensionUOM || cutLengthUnit(detail));
+          const cutValue = cutLengthValue(detail);
+          const occurrenceQuantity = Number(item.quantity);
+          const perOccurrence = Number(detail.Quantity);
+          const derivedTotal = decimalProduct(item.quantity, detail.Quantity);
+          const itemName = detail.ItemName || detail.PlatePart || detail.MaterialDisplayName || item.sourcePartName || "Requirement";
+          const itemError = validationErrors[`${item.requirementKey}:material`];
+          const quantityError = validationErrors[`${item.requirementKey}:quantity`];
+          const unitError = validationErrors[`${item.requirementKey}:uom`];
+          const rateError = validationErrors[`${item.requirementKey}:rateQuantity`];
+          const rateUnitError = validationErrors[`${item.requirementKey}:rateUnit`];
+          const cutError = validationErrors[`${item.requirementKey}:cutLength`];
+          const weightError = validationErrors[`${item.requirementKey}:partWeight`];
+          return <tr key={item.requirementKey} data-requirement-key={item.requirementKey}>
+            <td className="parts-definition-item-cell">
+              <label>Item name<input aria-label={`Item name — ${rowName}`} value={detail.ItemName ?? ""} onChange={event => updateRequirementDetail(index, "ItemName", event.target.value)}/></label>
+              <label>Material / item<select aria-label={`Material / item — ${rowName}`} value={materialValue} aria-invalid={Boolean(itemError)} onChange={event => updateRequirementMaterial(index, event.target.value)}>
+                <option value="">Choose material</option>{materialValue && !materialFound && <option value={materialValue}>{detail.MaterialDisplayName || `Unresolved material identity ${materialValue}`}</option>}
+                {(options?.materials || []).map((material: any) => <option key={material.id} value={String(material.id)}>{material.name || material.canonicalName || `Material ${material.id}`}{material.code ? ` · ${material.code}` : ""}</option>)}
+              </select>{itemError && <small className="parts-definition-error-text">{itemError}</small>}</label>
+              {(detail.identityStatus === "legacy_unclassified" || item.identityStatus?.startsWith("legacy")) && <small>Saved legacy identity is retained for review.</small>}
+            </td>
+            <td><div className="parts-definition-inline-fields">
+              <label>Quantity<input aria-label={`Quantity — ${rowName}`} inputMode="decimal" value={item.quantity ?? ""} aria-invalid={Boolean(quantityError)} onChange={event => updateRequirement(index, { quantity: event.target.value })}/>{quantityError && <small className="parts-definition-error-text">{quantityError}</small>}</label>
+              <label>Unit<select aria-label={`Unit — ${rowName}`} value={String(item.uom || "")} aria-invalid={Boolean(unitError)} onChange={event => updateRequirement(index, { uom: event.target.value })}>
+                <option value="">Choose unit</option>{item.uom && !unitOptions.some(unit => unit.toLowerCase() === String(item.uom).toLowerCase()) && <option value={item.uom}>{item.uom} · saved</option>}
+                {unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
+              </select>{unitError && <small className="parts-definition-error-text">{unitError}</small>}</label>
+            </div><small>Occurrence quantity used once per parent Part.</small></td>
+            {family === "cnc" ? <td><label>Per Part Weight (kg)<input aria-label={`Per Part Weight (kg) — ${rowName}`} inputMode="decimal" value={detail.PartWeightKg ?? ""} aria-invalid={Boolean(weightError)} onChange={event => updatePartWeight(index, event.target.value)}/>{weightError && <small className="parts-definition-error-text">{weightError}</small>}</label>
+              <small>Total per parent Part: {positiveNumber(detail.PartWeightKg) && Number.isFinite(occurrenceQuantity) ? `${decimalProduct(detail.PartWeightKg, item.quantity) ?? "not available"} kg` : "not available"}</small></td>
+              : <td><div className="parts-definition-inline-fields"><label>Dimension to Cut<input aria-label={`Dimension to Cut — ${rowName}`} inputMode="decimal" value={cutValue ?? ""} aria-invalid={Boolean(cutError)} onChange={event => updateCutLength(index, event.target.value, cutUnit.toLowerCase().startsWith("in") ? "in" : "mm")}/>{cutError && <small className="parts-definition-error-text">{cutError}</small>}</label>
+                <label>Cut-length unit<select aria-label={`Cut-length unit — ${rowName}`} value={cutUnit} onChange={event => updateCutLength(index, String(cutValue ?? ""), event.target.value === "in" ? "in" : "mm")}>
+                  {!["mm", "in"].includes(cutUnit) && <option value={cutUnit}>{cutUnit} · saved</option>}<option value="mm">mm</option><option value="in">inch</option>
+                </select></label></div><small>{cutLengthText(detail)} · saved cut-length evidence</small></td>}
+            {family === "cnc" && <td><label>Plate part to cut<input aria-label={`Plate part to cut — ${rowName}`} value={detail.PlatePart ?? ""} onChange={event => updateRequirementDetail(index, "PlatePart", event.target.value)}/></label>
+              <details><summary>Plate dimensions</summary><div className="parts-definition-inline-fields">{(["Length", "Width", "Thickness"] as const).map(field => <label key={field}>{field}<input aria-label={`${field} — ${rowName}`} inputMode="decimal" value={detail[field] ?? ""} onChange={event => updateRequirementDetail(index, field, event.target.value)}/></label>)}
+                <label>Dimension unit<select aria-label={`Dimension unit — ${rowName}`} value={detail.DimensionUOM || "mm"} onChange={event => updateRequirementDetail(index, "DimensionUOM", event.target.value)}><option value="mm">mm</option><option value="in">inch</option></select></label></div></details></td>}
+            <td><label>{lengthBasis || weightBasis ? "Derived consumption per occurrence" : "Consumption per occurrence"}<input aria-label={`Rate-basis quantity — ${rowName}`} inputMode="decimal" value={detail.Quantity ?? ""} readOnly={lengthBasis || weightBasis} aria-invalid={Boolean(rateError)} onChange={event => updateRequirementDetail(index, "Quantity", event.target.value)}/>{rateError && <small className="parts-definition-error-text">{rateError}</small>}</label>
+              <label>Rate-basis unit<select aria-label={`Rate-basis unit — ${rowName}`} value={oldRateUnit} aria-invalid={Boolean(rateUnitError)} onChange={event => updateRateBasisUnit(index, event.target.value)}>
+                <option value="">Choose consumption unit</option>{oldRateUnit && !unitOptions.some(unit => unit.toLowerCase() === oldRateUnit.toLowerCase()) && <option value={oldRateUnit}>{oldRateUnit} · saved</option>}{unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
+              </select>{rateUnitError && <small className="parts-definition-error-text">{rateUnitError}</small>}</label>
+              <small>{derivedTotal === null ? "Total per parent Part: not available" : `Total per parent Part: ${derivedTotal} ${oldRateUnit}`}</small>
+            </td>
+            {family === "toolshop" && <td><label>Remarks<input aria-label={`Tool Shop remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></td>}
+            <td><button type="button" className="button danger" disabled={busy} onClick={() => {
+              if (window.confirm(`Remove ${FAMILY_LABEL[family]} row “${itemName}” from this draft? The accepted revision changes only after approval.`))
+                patchContent({ requirements: (content.requirements || []).filter((row: any) => row.requirementKey !== item.requirementKey) });
+            }}>Remove row</button>
+              <details><summary>Advanced saved fields</summary>{item.identityStatus === "legacy_duplicate_unclassified" && <button type="button" className="button" disabled={busy} onClick={() => updateRequirement(index, { requirementKey: `safari-authored-requirement:${crypto.randomUUID()}`, identityStatus: "safari_authored", legacyOccurrenceKey: item.requirementKey })}>Assign reviewed occurrence identity</button>}
+                {item.lineIdentityStatus === "unresolved" && <p className="parts-definition-error" role="status">Physical line identity is unresolved and remains blocked from publication until reviewed.</p>}
+                <p className="parts-help">Provenance: {item.provenance?.type || "legacy / unclassified"}. A Stores issue route records routing only; it does not create a purchase.</p>
+                <label>Issue route<input aria-label={`Issue route — ${rowName}`} value={detail.IssueRoute ?? ""} onChange={event => updateRequirementDetail(index, "IssueRoute", event.target.value)}/></label>
+                {family !== "toolshop" && <label>Tool Shop remarks<input aria-label={`Tool Shop remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label>}
+                <label>Engineering attributes (JSON)<textarea aria-label={`Engineering attributes (JSON) — ${rowName}`} value={attributeText[`requirement:${item.requirementKey}`] ?? JSON.stringify(detail.EngineeringAttributes || {}, null, 2)} onChange={event => {
+                  const text = event.target.value; setAttributeText(old => ({ ...old, [`requirement:${item.requirementKey}`]: text }));
+                  try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updateRequirementDetail(index, "EngineeringAttributes", parsed); else setDirty(true); }
+                  catch { setDirty(true); }
+                }}/></label>
+              </details>
+            </td>
+          </tr>;
+        })}</tbody>
+      </table></div>}
+    </section>;
+  }
+
   if (loading && !definition) return <section className="parts-definition-card"><p>Loading saved Safari definition…</p></section>;
   if (error && !definition) return <section className="parts-definition-card"><p className="parts-definition-error" role="alert">{error}</p></section>;
   if (!definition) return null;
@@ -329,44 +722,47 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     {editing && <fieldset className="parts-definition-editor" aria-label="Edit saved Part definition" disabled={busy || Boolean(pendingSave) || Boolean(pendingSubmit) || Boolean(pendingApproval)}>
       {definition.draft?.stale && <p className="parts-definition-error" role="status">The saved draft uses an older accepted base. It is retained. Review the current values here and reconcile them manually before saving a new draft on Rev {definition.revisionLabel}.</p>}
       <div className="parts-definition-applicability"><strong>Family applicability</strong>{Object.entries(FAMILY_LABEL).map(([family, label]) => <label key={family}><input type="checkbox" checked={Boolean(content?.applicability?.[family]?.applicable)} onChange={event => patchContent({ applicability: { ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: event.target.checked } } })}/>{label}</label>)}</div>
-      <div className="parts-definition-list-heading"><h4>Manufacturing requirements</h4><button type="button" className="button" disabled={busy || !content?.applicability?.mcl?.applicable && !content?.applicability?.toolshop?.applicable && !content?.applicability?.cnc?.applicable} onClick={() => patchContent({ requirements: [...(content.requirements || []), { requirementKey: `ui-authored:${crypto.randomUUID()}`, identityStatus: "safari_authored", family: content.applicability?.mcl?.applicable ? "mcl" : content.applicability?.toolshop?.applicable ? "toolshop" : "cnc", quantity: "1", uom: "Nos", processType: "", detail: { Quantity: "", QuantityUOM: "" }, provenance: { type: "safari_authored", evidence: {} } }] })}>Add requirement</button></div>
-      {(content?.requirements || []).map((item: any, index: number) => <fieldset className="parts-definition-row" key={`${item.requirementKey}:${index}`}>
-        <legend>{FAMILY_LABEL[item.family] || "Legacy requirement"} · {item.identityStatus === "legacy_unclassified" || item.identityStatus === "legacy_duplicate_unclassified" ? "legacy identity needs review" : item.requirementKey}</legend>
-        {item.lineIdentityStatus === "unresolved" && <p className="parts-definition-error">The saved physical line identity is unresolved and requires review before publication.</p>}
-        {item.identityStatus === "legacy_duplicate_unclassified" && <div className="parts-definition-notice" role="status">Several historical requirement rows share legacy key “{item.legacyRequirementKey}”. Each row remains unchanged in its original revision. Assign an identity only after reviewing this occurrence.</div>}
-        <div className="parts-definition-grid">
-          {item.identityStatus === "legacy_duplicate_unclassified" && <button type="button" className="button" disabled={busy} onClick={() => updateRequirement(index, { requirementKey: `safari-authored-requirement:${crypto.randomUUID()}`, identityStatus: "safari_authored" })}>Assign reviewed requirement identity</button>}
-          <label>Family<select value={item.family} disabled={item.family === "other"} onChange={event => updateRequirement(index, { family: event.target.value, processType: event.target.value === "mcl" ? "material_cut" : event.target.value === "toolshop" ? "tool_shop" : "cnc" })}><option value="mcl">MCL</option><option value="toolshop">Tool Shop</option><option value="cnc">CNC</option>{item.family === "other" && <option value="other">Legacy / other</option>}</select></label>
-          <label>Quantity<input inputMode="decimal" value={item.quantity ?? ""} onChange={event => updateRequirement(index, { quantity: event.target.value })}/></label>
-          <label>Unit<input value={item.uom || ""} onChange={event => updateRequirement(index, { uom: event.target.value })}/></label>
-          <label>Item name<input value={item.detail?.ItemName ?? ""} onChange={event => updateRequirementDetail(index, "ItemName", event.target.value)}/></label>
-          <label>Material display name<input value={item.detail?.MaterialDisplayName ?? ""} onChange={event => updateRequirementDetail(index, "MaterialDisplayName", event.target.value)}/></label>
-          <label>Material identity<select value={item.detail?.Material || ""} onChange={event => updateRequirementDetail(index, "Material", event.target.value || null)}><option value="">Not assigned</option>{(options?.materials || []).map((material: any) => <option key={material.id} value={material.id}>{material.name}{material.code ? ` · ${material.code}` : ""}</option>)}</select></label>
-          <label>Rate-basis quantity<input inputMode="decimal" value={item.detail?.Quantity ?? ""} onChange={event => updateRequirementDetail(index, "Quantity", event.target.value)}/></label>
-          <label>Rate-basis unit<input value={item.detail?.QuantityUOM ?? ""} onChange={event => updateRequirementDetail(index, "QuantityUOM", event.target.value)}/></label>
-          <label>Length<input inputMode="decimal" value={item.detail?.Length ?? ""} onChange={event => updateRequirementDetail(index, "Length", event.target.value === "" ? null : event.target.value)}/></label>
-          <label>Width<input inputMode="decimal" value={item.detail?.Width ?? ""} onChange={event => updateRequirementDetail(index, "Width", event.target.value === "" ? null : event.target.value)}/></label>
-          <label>Thickness<input inputMode="decimal" value={item.detail?.Thickness ?? ""} onChange={event => updateRequirementDetail(index, "Thickness", event.target.value === "" ? null : event.target.value)}/></label>
-          <label>Dimension unit<select value={item.detail?.DimensionUOM || ""} onChange={event => updateRequirementDetail(index, "DimensionUOM", event.target.value)}><option value="">Not supplied</option><option value="mm">mm</option><option value="in">inch</option></select></label>
-          {item.family === "toolshop" && <label>Tool Shop remarks<input value={item.detail?.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></label>}
-          {item.family === "cnc" && <label>Plate part to cut<input value={item.detail?.PlatePart ?? ""} onChange={event => updateRequirementDetail(index, "PlatePart", event.target.value)}/><small>{fieldStatusText(item.fieldStatus?.PlatePart)}</small></label>}
-          <label>Issue route<input value={item.detail?.IssueRoute ?? ""} onChange={event => updateRequirementDetail(index, "IssueRoute", event.target.value)}/></label>
-          <label className="parts-definition-wide">Engineering attributes (JSON)<textarea value={attributeText[`requirement:${item.requirementKey}`] ?? JSON.stringify(item.detail?.EngineeringAttributes || {}, null, 2)} onChange={event => {
-            const text = event.target.value; setAttributeText(old => ({ ...old, [`requirement:${item.requirementKey}`]: text }));
-            try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updateRequirementDetail(index, "EngineeringAttributes", parsed); else setDirty(true); }
-            catch { setDirty(true); }
-          }}/></label>
-        </div><p className="parts-help">A Stores issue route is line-level routing evidence; it does not create a purchased component. Provenance: {item.provenance?.type || "legacy / unclassified"}.</p>
-        <button type="button" className="button danger" disabled={busy} onClick={() => patchContent({ requirements: content.requirements.filter((_: any, rowIndex: number) => rowIndex !== index) })}>Remove from new revision</button>
-      </fieldset>)}
+      <div className="parts-definition-list-heading"><h4>Manufacturing requirements</h4><span>Choose the family before adding a row. First-row selection also records applicability in this draft.</span></div>
+      {EDITABLE_FAMILIES.map(renderRequirementTable)}
+      {(content?.requirements || []).some((item: any) => !EDITABLE_FAMILIES.includes(item.family)) && <details className="parts-definition-legacy"><summary>Preserved legacy / other-process rows</summary>
+        <div className="parts-definition-items">{(content?.requirements || []).filter((item: any) => !EDITABLE_FAMILIES.includes(item.family)).map((item: any) => <article key={item.requirementKey}>
+          <strong>{item.detail?.ItemName || item.detail?.PlatePart || item.detail?.MaterialDisplayName || item.sourcePartName || "Unclassified saved process"}</strong>
+          <span>{item.quantity ?? "—"} {item.uom || ""} · {cutLengthText(item.detail)} · per part weight {item.detail?.PartWeightKg ?? "—"} kg</span>
+          <small>{item.identityStatus === "legacy_unclassified" || item.identityStatus === "legacy_duplicate_unclassified" ? "Legacy identity requires review; saved row remains unchanged." : item.requirementKey} · {item.provenance?.type || "legacy / unclassified"}</small>
+        </article>)}</div></details>}
 
-      <div className="parts-definition-list-heading"><h4>Purchased or Stores components</h4><button type="button" className="button" disabled={busy || !(options?.parts || []).length} onClick={() => patchContent({ components: [...(content.components || []), { componentIdentity: `ui-component:${crypto.randomUUID()}`, childPartId: "", quantity: "1", uom: "Nos", sourcingRoute: "buy", provenance: "Safari-authored component" }] })}>Add component</button></div>
-      {(content?.components || []).map((item: any, index: number) => <fieldset className="parts-definition-row" key={`${item.componentIdentity}:${index}`}><legend>{item.identityStatus === "legacy_unclassified" ? "Legacy component identity needs review" : item.componentIdentity}</legend><div className="parts-definition-grid">
-        <label>Canonical child Part<select value={item.childPartId || ""} onChange={event => updateComponent(index, { childPartId: event.target.value, childRevisionId: undefined })}><option value="">Choose a Part</option>{(options?.parts || []).filter((part: any) => part.id !== partId).map((part: any) => <option key={part.id} value={part.id}>{part.partNumber} · {part.name}</option>)}</select></label>
-        <label>Quantity<input inputMode="decimal" value={item.quantity ?? ""} onChange={event => updateComponent(index, { quantity: event.target.value })}/></label><label>Unit<input value={item.uom || ""} onChange={event => updateComponent(index, { uom: event.target.value })}/></label>
-        <label>Route<select value={item.sourcingRoute || "auto"} onChange={event => updateComponent(index, { sourcingRoute: event.target.value })}><option value="auto">Automatic</option><option value="make">Manufacture</option><option value="buy">Purchased / Stores</option></select></label>
-      </div><p className="parts-help">Child pin: {item.childRevisionLabel || item.childRevisionId || "current accepted revision"}. Replacing a child requires a new occurrence identity.</p><button type="button" className="button danger" disabled={busy} onClick={() => patchContent({ components: content.components.filter((_: any, rowIndex: number) => rowIndex !== index) })}>Remove component</button></fieldset>)}
+      <section className="parts-definition-family" aria-label="Store requirements">
+        <div className="parts-definition-list-heading"><h4>Store</h4><button type="button" className="button" disabled={busy} onClick={addStoreRow}>Add Store row</button></div>
+        <p className="parts-help">Store rows select a canonical child Part and reuse existing purchase/component routing. Issue Slip choices stay separate.</p>
+        {(content?.components || []).length ? <div className="parts-definition-table-scroll"><table className="parts-definition-table"><thead><tr><th>Canonical child Part</th><th>Quantity</th><th>Unit</th><th>Sourcing route</th><th>Revision pin</th><th>Actions</th></tr></thead><tbody>
+          {(content?.components || []).map((item: any, index: number) => {
+            const selectedId = String(item.childPartId || "");
+            const selectedKnown = (options?.parts || []).some((part: any) => part.id === item.childPartId);
+            const partError = validationErrors[`${item.componentIdentity}:childPart`];
+            const quantityError = validationErrors[`${item.componentIdentity}:quantity`];
+            const unitError = validationErrors[`${item.componentIdentity}:uom`];
+            const rowLabel = `Store row ${index + 1}`;
+            return <tr key={item.componentIdentity} data-component-key={item.componentIdentity}>
+              <td><label>Canonical child Part<select aria-label={`Canonical child Part — ${rowLabel}`} value={selectedId} aria-invalid={Boolean(partError)} onChange={event => updateComponent(index, { childPartId: event.target.value, childRevisionId: undefined })}>
+                <option value="">Choose a Part</option>{selectedId && !selectedKnown && <option value={selectedId}>{item.childPartNumber || item.childName || `Unresolved Part ${selectedId}`}</option>}
+                {(options?.parts || []).filter((part: any) => part.id !== partId).map((part: any) => <option key={part.id} value={part.id}>{part.partNumber} · {part.name || "Unnamed Part"}</option>)}
+              </select>{partError && <small className="parts-definition-error-text">{partError}</small>}</label></td>
+              <td><label>Quantity<input aria-label={`Quantity — ${rowLabel}`} inputMode="decimal" value={item.quantity ?? ""} aria-invalid={Boolean(quantityError)} onChange={event => updateComponent(index, { quantity: event.target.value })}/>{quantityError && <small className="parts-definition-error-text">{quantityError}</small>}</label></td>
+              <td><label>Unit<select aria-label={`Unit — ${rowLabel}`} value={String(item.uom || "")} aria-invalid={Boolean(unitError)} onChange={event => updateComponent(index, { uom: event.target.value })}><option value="">Choose unit</option>
+                {item.uom && !unitOptions.some(unit => unit.toLowerCase() === String(item.uom).toLowerCase()) && <option value={item.uom}>{item.uom} · saved</option>}{unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
+              </select>{unitError && <small className="parts-definition-error-text">{unitError}</small>}</label></td>
+              <td><label>Sourcing route<select aria-label={`Sourcing route — ${rowLabel}`} value={item.sourcingRoute || "auto"} onChange={event => updateComponent(index, { sourcingRoute: event.target.value })}><option value="auto">Automatic</option><option value="make">Manufacture</option><option value="buy">Purchased / Stores</option></select></label></td>
+              <td>{item.childRevisionLabel || item.childRevisionId || "Current accepted child revision"}<small>Changing the child creates a different occurrence identity.</small></td>
+              <td><button type="button" className="button danger" disabled={busy} onClick={() => {
+                if (window.confirm(`Remove Store row “${item.childPartNumber || item.childName || "unselected child Part"}” from this draft? The accepted revision changes only after approval.`))
+                  patchContent({ components: (content.components || []).filter((row: any) => row.componentIdentity !== item.componentIdentity) });
+              }}>Remove row</button></td>
+            </tr>;
+          })}
+        </tbody></table></div> : <p className="parts-help">No Store rows in this draft.</p>}
+      </section>
 
+      <details className="parts-definition-purchases"><summary>Purchase specifications · {(content?.purchases || []).length} saved</summary>
       <div className="parts-definition-list-heading"><h4>Purchase specifications</h4><button type="button" className="button" disabled={busy} onClick={() => patchContent({ purchases: [...(content.purchases || []), { specificationIdentity: `ui-spec:${crypto.randomUUID()}`, purchaseItemId: null, code: "", manufacturer: "", manufacturerPartNumber: "", description: "", costingUOM: "each", costingCurrency: "INR", attributes: {} }] })}>Add purchase specification</button></div>
       {(content?.purchases || []).map((item: any, index: number) => <fieldset className="parts-definition-row" key={`${item.specificationIdentity}:${index}`}><legend>{item.identityStatus === "legacy_unclassified" ? "Legacy purchase identity needs review" : item.specificationIdentity}</legend><div className="parts-definition-grid">
         <label>Purchase item<select value={item.purchaseItemId || ""} onChange={event => updatePurchase(index, { purchaseItemId: event.target.value ? Number(event.target.value) : null })}><option value="">No canonical item</option>{(options?.purchaseItems || []).map((purchase: any) => <option key={purchase.id} value={purchase.id}>{purchase.name}{purchase.code ? ` · ${purchase.code}` : ""}</option>)}</select></label>
@@ -378,7 +774,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updatePurchase(index, { attributes: parsed }); else setDirty(true); }
           catch { setDirty(true); }
         }}/></label>
-      </div><button type="button" className="button danger" disabled={busy} onClick={() => patchContent({ purchases: content.purchases.filter((_: any, rowIndex: number) => rowIndex !== index) })}>Remove purchase specification</button></fieldset>)}
+      </div><button type="button" className="button danger" disabled={busy} onClick={() => { if (window.confirm(`Remove purchase specification “${item.code || item.description || item.specificationIdentity}” from this draft?`)) patchContent({ purchases: content.purchases.filter((row: any) => row.specificationIdentity !== item.specificationIdentity) }); }}>Remove purchase specification</button></fieldset>)}
+      </details>
 
       {!isFinalized && <label className="parts-definition-finalize"><input type="checkbox" checked={Boolean(content?.finalizeOnPublication)} onChange={event => patchContent({ finalizeOnPublication: event.target.checked })}/> Finalize this successor definition through the approved Change Request</label>}
       <label className="parts-definition-reason">Engineering change reason<input value={reason} onChange={event => { setReason(event.target.value); setDirty(true); }}/></label>
@@ -391,12 +788,29 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       <div className="parts-definition-applicability"><strong>Applicable families</strong>{Object.entries(FAMILY_LABEL).map(([family, label]) => <span key={family}>{label}: {definition.applicability?.[family]?.applicable === null ? "unknown" : definition.applicability?.[family]?.applicable ? "applicable" : "not applicable"}</span>)}</div>
       <div className="parts-definition-list-heading"><h4>Accepted requirements</h4><span>{definition.requirements.length} saved</span></div>
       {definition.requirements.some((item: any) => item.lineIdentityStatus === "unresolved") && <p className="parts-definition-error">A saved physical line identity is unresolved and requires review before publication.</p>}
-      {definition.requirements.length ? <div className="parts-definition-items">{definition.requirements.map((item: any, index: number) => <article key={`${item.requirementKey}:${index}`}><strong>{FAMILY_LABEL[item.family] || "Other process"} · {item.detail?.ItemName || item.detail?.PlatePart || item.detail?.MaterialDisplayName || item.sourcePartName || "Requirement"}</strong><span>{item.quantity ?? "—"} {item.uom} · {item.detail?.MaterialDisplayName || "Material not named"} · {item.detail?.Length ?? "—"} × {item.detail?.Width ?? "—"} × {item.detail?.Thickness ?? "—"} {item.detail?.DimensionUOM || ""}</span><small>{item.identityStatus === "legacy_unclassified" ? "Legacy identity is unclassified; no historical row was rewritten." : `Requirement ${item.requirementKey}`} · {item.provenance?.type || "legacy / unclassified"}</small></article>)}</div> : <p>No manufacturing line requirements are saved on this revision.</p>}
-      {definition.components.length > 0 && <><h4>Components</h4><div className="parts-definition-items">{definition.components.map((item: any) => <article key={item.componentIdentity}><strong>{item.childPartNumber} · {item.childName}</strong><span>{item.quantity} {item.uom} · {item.sourcingRoute || "auto"} · pinned Rev {item.childRevisionLabel || "unknown"}</span><small>{item.componentIdentity} · {item.identityStatus || "stable"}</small></article>)}</div></>}
+      {definition.requirements.length ? <div className="parts-definition-saved-families">{EDITABLE_FAMILIES.map(family => {
+        const rows = definition.requirements.filter((item: any) => item.family === family);
+        const label = family === "mcl" ? "MCL" : family === "toolshop" ? "Tool Shop" : "CNC";
+        return <section className="parts-definition-family" key={family} aria-label={`Accepted ${label} requirements`}><h4>{label}</h4>
+          {rows.length ? <div className="parts-definition-table-scroll"><table className="parts-definition-table parts-definition-readonly"><thead><tr><th>Item / material</th><th>Quantity per Part</th>{family === "cnc" ? <th>Per Part Weight (kg)</th> : <th>Dimension to Cut</th>}<th>Rate-basis consumption</th><th>Saved identity / evidence</th></tr></thead><tbody>
+            {rows.map((item: any) => {
+              const detail = item.detail || {};
+              const totalWeight = positiveNumber(detail.PartWeightKg) && positiveNumber(item.quantity) ? decimalProduct(detail.PartWeightKg, item.quantity) : null;
+              const displayName = detail.ItemName || detail.PlatePart || detail.MaterialDisplayName || item.sourcePartName || "Requirement";
+              return <tr key={item.requirementKey}><td><strong>{displayName}</strong><small>{detail.MaterialDisplayName || (detail.Material ? `Material identity ${detail.Material}` : "Material not resolved")}</small></td>
+                <td>{item.quantity ?? "—"} {item.uom || ""}</td>
+              <td>{family === "cnc" ? <><strong>{detail.PartWeightKg == null ? "unknown" : `${detail.PartWeightKg} kg`}</strong><small>Total per Part: {totalWeight == null ? "not available" : `${totalWeight} kg`} · separate saved total weight: {savedTotalWeightLabel(item, detail)}</small></> : cutLengthText(detail)}</td>
+                <td>{detail.Quantity == null ? "unknown" : `${detail.Quantity} ${detail.QuantityUOM || "unit not recorded"}`}<small>Per linked occurrence; multiplicity is the Part quantity above.</small></td>
+                <td><small>{item.identityStatus === "legacy_unclassified" || item.identityStatus === "legacy_duplicate_unclassified" ? "Legacy identity needs review; no old row was rewritten." : `Requirement ${item.requirementKey}`}</small><small>{item.provenance?.type || "legacy / unclassified"}{item.lineIdentityStatus === "unresolved" ? " · physical line unresolved" : ""}</small></td></tr>;
+            })}
+          </tbody></table></div> : <p className="parts-help">No saved {label} rows.</p>}
+        </section>;
+      })}{definition.requirements.some((item: any) => !EDITABLE_FAMILIES.includes(item.family)) && <section className="parts-definition-family"><h4>Other saved process rows</h4><div className="parts-definition-items">{definition.requirements.filter((item: any) => !EDITABLE_FAMILIES.includes(item.family)).map((item: any) => <article key={item.requirementKey}><strong>{item.detail?.ItemName || item.sourcePartName || "Unclassified process"}</strong><span>{item.quantity ?? "—"} {item.uom || ""} · {cutLengthText(item.detail)} · Part weight {item.detail?.PartWeightKg ?? "—"} kg</span><small>{item.requirementKey} · {item.identityStatus || "legacy"}</small></article>)}</div></section>}</div> : <p>No manufacturing line requirements are saved on this revision.</p>}
+      {definition.components.length > 0 && <><h4>Store / purchased components</h4><div className="parts-definition-items">{definition.components.map((item: any) => <article key={item.componentIdentity}><strong>{item.childPartNumber || "Unresolved child Part"} · {item.childName}</strong><span>{item.quantity} {item.uom} · {item.sourcingRoute || "auto"} · pinned Rev {item.childRevisionLabel || "unknown"}</span><small>{item.componentIdentity} · {item.identityStatus || "stable"}</small></article>)}</div></>}
       {definition.purchases.length > 0 && <><h4>Purchase specifications</h4><div className="parts-definition-items">{definition.purchases.map((item: any) => <article key={item.specificationIdentity}><strong>{item.code} · {item.description || item.manufacturerPartNumber}</strong><span>{item.manufacturer} · {item.costingUOM} · {item.costingCurrency}</span><small>{item.specificationIdentity} · {item.identityStatus || "stable"}</small></article>)}</div></>}
       {definition.draft && <p className={definition.draft.stale ? "parts-definition-error" : "parts-definition-notice"} role="status">{definition.draft.stale ? `Draft v${definition.draft.saveVersion} is based on an older accepted revision. Its saved content is retained; review the current accepted definition, reconcile changes, then save a new draft.` : `Saved draft v${definition.draft.saveVersion} · ${definition.draft.updatedAt}. Accepted Rev ${definition.revisionLabel} is unchanged.`}</p>}
      {pending && <div className="parts-definition-pending"><strong>Change Request · {pending.status.replaceAll("_", " ")}</strong><p>{pending.reason}</p>
-       <ChangeReview before={pending.before} after={pending.after} title="Submitted definition before and after"/>
+       <ChangeReview before={pending.before} after={pending.after} parts={options?.parts || []} title="Submitted definition before and after"/>
        <span>{pendingDependents.length} current dependent Part/assembly successor(s) · {pending.impact?.modelCodeConfigurations?.length || 0} Model Code configuration successor(s)</span>
         {pending.impact?.target && <p>Part {pending.impact.target.partId} · record {pending.impact.target.partRecordId}: Rev {pending.impact.target.currentRevisionLabel} → proposed Rev {pending.impact.target.proposedRevisionLabel || "unclassified"}</p>}
         {pendingDependents.length > 0 && <div className="parts-definition-impact"><h4>Current dependent Part/assembly closure</h4>{pendingDependents.map((dependent: any) => <article key={dependent.partId}><strong>{dependent.kind === "part" ? "Part" : "Assembly"} · {dependent.partNumber || dependent.partId} · {dependent.partId} (record {dependent.partRecordId})</strong><span>Current Rev {dependent.currentRevisionLabel} → proposed Rev {dependent.proposedRevisionLabel || "unclassified"}</span>
@@ -412,13 +826,15 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
          <strong>Stale Change Request · {stale.key}</strong><p>{stale.reason}</p>
          <p className="parts-definition-error">{stale.staleReason || "The accepted base or reviewed dependency closure changed."}</p>
          <small>{stale.staleCode || "Stale review"} · detected {stale.staleAt || "date not recorded"}</small>
-         <details><summary>Review the preserved submitted definition</summary><ChangeReview before={stale.before} after={stale.after} title="Stale request before and after"/></details>
+         <details><summary>Review the preserved submitted definition</summary><ChangeReview before={stale.before} after={stale.after} parts={options?.parts || []} title="Stale request before and after"/></details>
          {stale.canReopen ? <><label className="parts-definition-reason">Reason for reopening this saved change<input value={reopenReason} onChange={event => setReopenReason(event.target.value)}/></label>
            <button type="button" className="button primary" onClick={() => void reopenStaleChangeRequest(stale)} disabled={busy || Boolean(pendingSubmit) || Boolean(pendingApproval) || !reopenReason.trim()}>Reopen saved changes as a new draft</button></>
            : <p className="parts-definition-notice" role="status">This stale request already has a linked reopened draft. Edit that saved draft and request fresh approval.</p>}
        </article>)}
      </div>}
-      <details id="part-definition-history" className="parts-definition-history"><summary>Engineering revision history</summary>{definition.revisionHistory.map((revision: any) => <article key={revision.id}><strong>Rev {revision.revisionLabel} · {revision.status.replaceAll("_", " ")}{revision.current ? " · current" : ""}</strong><span>{revision.actor || "Actor not recorded"} · {revision.occurredAt || "Date not recorded"}</span><p>{revision.reason || "No reason recorded"}{revision.publicationCause ? ` · cause ${revision.publicationCause}` : ""}</p></article>)}</details>
+       <details id="part-definition-history" className="parts-definition-history"><summary>Engineering revision history</summary>{definition.revisionHistory.map((revision: any) => <article key={revision.id}><strong>Rev {revision.revisionLabel} · {revision.status.replaceAll("_", " ")}{revision.current ? " · current" : ""}</strong><span>{revision.actor || "Actor not recorded"} · {revision.occurredAt || "Date not recorded"}</span><p>{revision.reason || "No reason recorded"}{revision.publicationCause ? ` · cause ${revision.publicationCause}` : ""}</p>
+         <details className="parts-definition-changed-rows"><summary>Changed rows · {revision.changedRows?.length ?? "earlier evidence unavailable"}</summary>{Array.isArray(revision.changedRows) && revision.changedRows.length > 0 ? <div className="parts-definition-table-scroll"><table className="parts-definition-table"><thead><tr><th>Change</th><th>Family / item / occurrence</th><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>{revision.changedRows.map((change: any, index: number) => <tr key={`${change.occurrence}:${change.field}:${index}`}><td>{change.kind}</td><td>{change.family} · {change.item} · {change.occurrence}</td><td>{change.field}</td><td>{change.before ?? "—"}</td><td>{change.after ?? "—"}</td></tr>)}</tbody></table></div> : <p>{revision.changedRows ? "No business-field changes were recorded for this revision." : "Saved before-values are unavailable for this earlier revision."}</p>}</details>
+       </article>)}</details>
     </>}
   </section>;
 }

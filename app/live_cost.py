@@ -635,6 +635,11 @@ class GristLiveCostService:
                     warn("MATERIAL_RATE_UNAVAILABLE", f"Material rate is {rate.get('status') or material_response.get('status') or 'unavailable'} in read-only Costing-New.", candidate["occurrencePath"])
                     lines_out.append(self._unpriced_line(candidate, "Material rate is unavailable or unmapped.", "material"))
                     continue
+                material_rate_uom = str(rate.get("uom") or rate.get("rateUOM") or rate.get("costingUOM") or "").strip()
+                if material_rate_uom and material_rate_uom.casefold() != str(candidate["uom"]).casefold():
+                    warn("MATERIAL_RATE_BASIS_MISMATCH", f"Material rate unit {material_rate_uom} does not match normalized consumption unit {candidate['uom']}.", candidate["occurrencePath"])
+                    lines_out.append(self._unpriced_line(candidate, "Material rate unit does not match saved normalized consumption; no conversion is available.", "material"))
+                    continue
                 unit_rate = float(rate["costingNewRate"])
                 amount = candidate["quantity"] * unit_rate
                 date_basis = str(rate.get("rateDateBasis") or ("effective" if rate.get("effectiveAt") else "unknown"))

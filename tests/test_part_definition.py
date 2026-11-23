@@ -253,6 +253,11 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertEqual(published_part_revision["fields"]["ManufacturingBaselineStatus"], "established")
             self.assertEqual(published_part_revision["fields"]["ManufacturingBaselineSourceHash"], "source-hash")
             self.assertEqual(service.get_definition("p-1")["baselineStatus"], "established")
+            published_view = service.get_definition("p-1")
+            published_history = next(item for item in published_view["revisionHistory"] if item["id"] == published["publishedRevisionId"])
+            self.assertEqual(published_history["beforeRevisionLabel"], "A")
+            self.assertTrue(any(change["kind"] == "modified" and change["field"] == "Quantity per Part"
+                and change["before"] == "1 Nos" and change["after"] == "2 Nos" for change in published_history["changedRows"]))
             self.assertEqual(client.tables["LineDetail"][0], original_line)
             self.assertEqual(client.tables["PartRevisionLine"][0], original_membership)
             self.assertEqual(client.tables["ConfigurationPartSelection"][0], original_selection)
@@ -264,6 +269,47 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             new_selection = next(row for row in client.tables["ConfigurationPartSelection"] if row["fields"].get("ConfigurationRevision") == new_revision)
             self.assertEqual(new_selection["fields"]["PartRevision"], published["publishedRevisionId"])
             self.assertEqual(service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="approval-normal")["idempotent"], False)
+
+    def test_published_history_omits_family_irrelevant_defaults_but_keeps_recorded_zero_weights(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
+            authored_cnc = {"requirementKey": "requirement:p-1:added-cnc", "identityStatus": "safari_authored", "family": "cnc", "quantity": 2,
+                "uom": "Nos", "fieldStatus": {"WeightKg": "missing", "WeightGrams": "missing"},
+                "detail": {"ItemName": "QA plate", "PartWeightKg": 0.25, "Quantity": 0.5, "QuantityUOM": "kg",
+                    "WeightKg": 0, "WeightGrams": 0, "DimensionMM": 0, "Length": 0, "Width": 0, "Thickness": 0}}
+            changes = service._definition_changes({"requirements": [], "components": [], "purchases": []},
+                {"requirements": [authored_cnc], "components": [], "purchases": []})
+            fields = {change["field"] for change in changes}
+            self.assertEqual(fields, {"Quantity per Part", "Item name", "Per Part Weight", "Rate-basis consumption"})
+            self.assertFalse(any("0 kg" in str(change["after"]) or "Plate length" in change["field"] for change in changes))
+
+            recorded_zero = deepcopy(authored_cnc)
+            recorded_zero["fieldStatus"] = {"WeightKg": "value", "WeightGrams": "value"}
+            recorded_zero["detail"].update({"WeightKg": 0, "WeightGrams": 0})
+            recorded_changes = service._definition_changes({"requirements": [], "components": [], "purchases": []},
+                {"requirements": [recorded_zero], "components": [], "purchases": []})
+            saved_weight = next(change for change in recorded_changes if change["field"] == "Saved total weight")
+            self.assertEqual(saved_weight["after"], "0 kg / 0 g")
+
+    def test_definition_reads_editor_default_zero_weights_as_missing_and_legacy_zero_as_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["PartRevisionLine"][0]["fields"]["ProvenanceType"] = "safari_edited"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 0, "WeightGrams": 0})
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+
+            authored = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((authored["fieldStatus"]["WeightKg"], authored["fieldStatus"]["WeightGrams"]), ("missing", "missing"))
+
+            client.tables["LineRevision"][0]["fields"]["Status"] = "accepted"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 1, "WeightGrams": 1000})
+            recorded = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((recorded["fieldStatus"]["WeightKg"], recorded["fieldStatus"]["WeightGrams"]), ("value", "value"))
+
+            client.tables["PartRevisionLine"][0]["fields"]["ProvenanceType"] = "ods_baseline"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 0, "WeightGrams": 0})
+            ambiguous_legacy = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((ambiguous_legacy["fieldStatus"]["WeightKg"], ambiguous_legacy["fieldStatus"]["WeightGrams"]), ("unknown", "unknown"))
 
     def test_partial_pointer_commit_recovers_from_durable_plan_without_duplicate_successors(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -717,6 +763,86 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
 
                 normalized = saved["content"]["requirements"][0]
                 self.assertEqual((normalized["processType"], normalized["detail"]["Quantity"], normalized["detail"]["QuantityUOM"]), (process_type, 2.5, uom))
+
+    def test_mcl_cut_length_is_scalar_and_drives_only_an_existing_length_basis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            requirement = {"requirementKey": "safari-authored-requirement:cut-mcl", "identityStatus": "safari_authored",
+                "family": "mcl", "quantity": "2", "uom": "Nos", "processType": "material_cut",
+                "detail": {"Material": 5, "ItemName": "Flat blank", "Quantity": "", "QuantityUOM": "cm",
+                    "DimensionMM": "250", "DimensionInches": str(250 / 25.4), "DimensionText": "250 mm", "DimensionUOM": "mm"},
+                "provenance": {"type": "safari_authored", "evidence": {}}}
+            payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": [requirement], "components": [], "purchases": [], "finalizeOnPublication": False}
+
+            saved = service.save_draft("p-1", payload, actor="operator", reason="add measured cut", request_key="draft-cut-mcl")
+
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual((normalized["DimensionMM"], normalized["DimensionText"], normalized["Quantity"], normalized["QuantityUOM"]), (250.0, "250 mm", 25.0, "cm"))
+            self.assertAlmostEqual(normalized["DimensionInches"], 250 / 25.4)
+            self.assertEqual(normalized["ExactQuantityText"], "25")
+            self.assertNotIn("Length", normalized)
+            self.assertNotIn("Width", normalized)
+            self.assertNotIn("Thickness", normalized)
+
+            payload["expectedSaveVersion"] = 1
+            payload["requirements"][0]["detail"].update({"DimensionMM": "300", "DimensionInches": str(300 / 25.4), "DimensionText": "300 mm"})
+            saved = service.save_draft("p-1", payload, actor="operator", reason="increase cut", request_key="draft-cut-mcl-v2")
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual(normalized["Quantity"], 30.0)
+
+            inconsistent = deepcopy(payload)
+            inconsistent["expectedSaveVersion"] = 2
+            inconsistent["requirements"][0]["detail"]["DimensionInches"] = "1"
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", inconsistent, actor="operator", reason="conflicting cut evidence", request_key="draft-cut-mcl-conflict")
+            self.assertEqual(error.exception.code, "PART_DEFINITION_CUT_LENGTH_INCONSISTENT")
+
+    def test_cnc_kg_basis_uses_per_part_weight_and_rejects_nonpositive_weight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            applicability = deepcopy(definition["applicability"])
+            applicability["cnc"] = {"applicable": True, "status": "applicable"}
+            requirement = {"requirementKey": "safari-authored-requirement:cnc-weight", "identityStatus": "safari_authored",
+                "family": "cnc", "quantity": "3", "uom": "Nos", "processType": "cnc",
+                "detail": {"ItemName": "CNC plate", "PartWeightKg": "0.25", "WeightKg": "1", "WeightGrams": "1000", "Quantity": "", "QuantityUOM": "kg"},
+                "provenance": {"type": "safari_authored", "evidence": {}}}
+            payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0, "applicability": applicability,
+                "requirements": [requirement], "components": [], "purchases": [], "finalizeOnPublication": False}
+
+            saved = service.save_draft("p-1", payload, actor="operator", reason="add CNC weight", request_key="draft-cnc-weight")
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual((normalized["PartWeightKg"], normalized["Quantity"], normalized["QuantityUOM"], normalized["WeightKg"], normalized["WeightGrams"]),
+                (0.25, 0.25, "kg", 1.0, 1000.0))
+            self.assertEqual(normalized["ExactWeightKgText"], "0.25")
+            self.assertEqual(saved["content"]["requirements"][0]["fieldStatus"]["WeightKg"], "value")
+            self.assertEqual(saved["content"]["requirements"][0]["fieldStatus"]["WeightGrams"], "value")
+
+            missing_saved_weight = deepcopy(payload)
+            missing_saved_weight["expectedSaveVersion"] = 1
+            missing_saved_weight["requirements"][0]["detail"]["WeightKg"] = 0
+            missing_saved_weight["requirements"][0]["detail"]["WeightGrams"] = 0
+            saved = service.save_draft("p-1", missing_saved_weight, actor="operator", reason="do not invent a saved total from default zero cells", request_key="draft-cnc-weight-default-zero")
+            field_status = saved["content"]["requirements"][0]["fieldStatus"]
+            self.assertEqual((field_status["WeightKg"], field_status["WeightGrams"]), ("missing", "missing"))
+
+            missing_saved_weight["expectedSaveVersion"] = 2
+            missing_saved_weight["requirements"][0]["detail"].pop("WeightKg")
+            missing_saved_weight["requirements"][0]["detail"].pop("WeightGrams")
+            saved = service.save_draft("p-1", missing_saved_weight, actor="operator", reason="leave total weight unrecorded", request_key="draft-cnc-weight-unrecorded")
+            field_status = saved["content"]["requirements"][0]["fieldStatus"]
+            self.assertEqual((field_status["WeightKg"], field_status["WeightGrams"]), ("missing", "missing"))
+
+            invalid = deepcopy(payload)
+            invalid["expectedSaveVersion"] = 2
+            invalid["requirements"][0]["detail"]["PartWeightKg"] = "-0.3"
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", invalid, actor="operator", reason="invalid CNC weight", request_key="draft-cnc-weight-invalid")
+            self.assertEqual(error.exception.code, "PART_DEFINITION_PART_WEIGHT_INVALID")
 
     def test_draft_save_versions_reject_stale_edit_and_superseded_replay(self):
         with tempfile.TemporaryDirectory() as temp:

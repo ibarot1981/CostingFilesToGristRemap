@@ -446,6 +446,48 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(by_description["Authored cnc"]["netCost"], created["cnc"])
         self.assertTrue(all(item["rateAge"]["rateAgeStatus"] == "dated" for item in authored))
 
+    def test_mcl_cut_length_and_cnc_per_part_weight_drive_matching_rates_once(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-length-bar", "CanonicalName": "Length bar", "MappingStatus": "reviewed"}}])["records"][0]
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:length-bar", "ProcessType": "material_cut", "SourcePartName": "Length bar"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:length-bar", "LineMaster": master["id"],
+            "ProcessType": "material_cut", "PhysicalSignature": "length-bar-v1", "Status": "active"}}])["records"][0]
+        detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:length-bar", "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "Material": material["id"], "MaterialDisplayName": "Length bar", "ItemName": "Length bar cut", "Quantity": 25, "QuantityUOM": "cm",
+            "DimensionMM": 250, "DimensionInches": 250 / 25.4, "DimensionText": "250 mm", "DimensionUOM": "mm"}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:length-bar", "RequirementKey": "length-bar-occurrence",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 3, "QuantityExact": "3", "QuantityUOM": "Nos", "Status": "active"}}])
+        self.rate["Length bar"] = "2.5"
+        self.rate_metadata["Length bar"] = {"uom": "cm"}
+
+        first = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
+        self.assertEqual((first["quantity"], first["quantityUOM"], first["netCost"]), (150, "cm", 375.0))
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"Quantity": 30, "DimensionMM": 300,
+            "DimensionInches": 300 / 25.4, "DimensionText": "300 mm"}}])
+        changed = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
+        self.assertEqual((changed["quantity"], changed["quantityUOM"], changed["netCost"]), (180, "cm", 450.0))
+        self.rate_metadata["Length bar"] = {"uom": "kg"}
+        mismatch = self.service.live_cost(100)
+        self.assertIn("MATERIAL_RATE_BASIS_MISMATCH", {warning["code"] for warning in mismatch["warnings"]})
+        self.assertIsNone(next(line for line in mismatch["lines"] if line["description"] == "Length bar cut")["netCost"])
+
+        cnc_master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:weighted-cnc", "ProcessType": "cnc", "SourcePartName": "Weighted CNC"}}])["records"][0]
+        cnc_revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:weighted-cnc", "LineMaster": cnc_master["id"],
+            "ProcessType": "cnc", "PhysicalSignature": "weighted-cnc-v1", "Status": "active"}}])["records"][0]
+        cnc_detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:weighted-cnc", "LineRevision": cnc_revision["id"], "ProcessType": "cnc",
+            "ItemName": "Weighted CNC", "PartWeightKg": 0.5, "Quantity": 0.5, "QuantityUOM": "kg"}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:weighted-cnc", "RequirementKey": "weighted-cnc-occurrence",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": cnc_master["id"], "LineRevision": cnc_revision["id"], "ProcessType": "cnc",
+            "QuantityPerPart": 3, "QuantityExact": "3", "QuantityUOM": "Nos", "Status": "active"}}])
+        self.service.record_process_rate(cnc_master["id"], {"rate": 4, "uom": "kg", "currency": "INR", "effectiveAt": "2026-11-20T00:00:00Z",
+            "sourceReference": "approved kg-basis fixture", "reason": "unit-tested CNC physical basis"}, actor="reviewer", request_key="weighted-cnc-rate")
+
+        cnc_first = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Weighted CNC")
+        self.assertEqual((cnc_first["quantity"], cnc_first["quantityUOM"], cnc_first["netCost"]), (3, "kg", 12.0))
+        self.client.update_table_records("LineDetail", [{"id": cnc_detail["id"], "fields": {"PartWeightKg": 0.75, "Quantity": 0.75, "ExactWeightKgText": "0.75", "ExactQuantityText": "0.75"}}])
+        cnc_changed = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Weighted CNC")
+        self.assertEqual((cnc_changed["quantity"], cnc_changed["quantityUOM"], cnc_changed["netCost"]), (4.5, "kg", 18.0))
+
     def test_rate_age_uses_kolkata_calendar_and_aggregates_unknown_and_future_inputs(self):
         now = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
         same_india_day = _rate_age("2026-11-18T20:00:00Z", as_of=now)
