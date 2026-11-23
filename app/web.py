@@ -345,10 +345,11 @@ def _part_features():
 def _part_definition_service():
     from app.grist_parts import GristPartRegistry
     from app.part_definition import GristPartDefinitionService
+    from app.interim_rates import load_material_weight_catalog
     registry = _part_registry()
     if not isinstance(registry, GristPartRegistry):
         raise _error(503, "PART_GRIST_REQUIRED", "Direct Part-definition maintenance requires the configured Safari Manufacturing Grist adapter.")
-    return GristPartDefinitionService(registry)
+    return GristPartDefinitionService(registry, material_weight_catalog_provider=load_material_weight_catalog)
 
 
 def _part_baseline_service():

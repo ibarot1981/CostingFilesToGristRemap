@@ -1,8 +1,33 @@
 import unittest
-from app.interim_rates import compare_interim_rates
+from unittest.mock import patch
+from app.interim_rates import compare_interim_rates, load_material_weight_catalog
 
 
 class InterimRatesTests(unittest.TestCase):
+    def test_material_weight_catalog_uses_explicit_costing_new_document_and_governed_factor(self):
+        records = [{"id": 55, "fields": {"MasterMaterial": "MS-Round Bar 16 mm", "InUse": True,
+            "KGsPerMeter": 1.58, "LatestKGsPerMeterDate": "2026-09-24"}}]
+        with patch.dict("os.environ", {"GRIST_API_KEY": "qa-key", "COSTING_NEW_GRIST_DOC_ID": "costing-new-doc",
+                "GRIST_BASE_URL": "https://grist.invalid", "GRIST_DOC_ID": ""}, clear=False), \
+             patch("app.grist.GristClient.fetch_table_records_with_ids", return_value=records) as fetch, \
+             patch("app.grist_admin.GristAdminClient.get_document", return_value=type("Document", (), {"name": "Costing-New"})()):
+            catalog = load_material_weight_catalog()
+
+        fetch.assert_called_once_with("MasterMaterial")
+        self.assertEqual(catalog["sourceDocumentId"], "costing-new-doc")
+        self.assertEqual(catalog["records"][0], {
+            "canonicalName": "MS-Round Bar 16 mm", "masterMaterialId": 55, "inUse": True,
+            "kgPerMeter": "1.58", "factorStatus": "available", "sourceDate": "2026-09-24",
+            "source": "Costing-New", "sourceDocumentId": "costing-new-doc", "sourceTable": "MasterMaterial",
+            "sourceField": "KGsPerMeter", "factorUnit": "kg/m"})
+
+    def test_material_weight_catalog_rejects_non_costing_new_document(self):
+        with patch.dict("os.environ", {"GRIST_API_KEY": "qa-key", "COSTING_NEW_GRIST_DOC_ID": "wrong-doc",
+                "GRIST_BASE_URL": "https://grist.invalid", "GRIST_DOC_ID": ""}, clear=False), \
+             patch("app.grist_admin.GristAdminClient.get_document", return_value=type("Document", (), {"name": "Safari Manufacturing"})()):
+            with self.assertRaisesRegex(ValueError, "exactly Costing-New"):
+                load_material_weight_catalog()
+
     def test_latest_display_default_fallback_and_zero_are_preserved(self):
         masters = [{'id': 1, 'fields': {'MasterMaterial': 'Steel', 'MaterialLatestRate': 55, 'Default_MaterialRate': 40}},
                    {'id': 2, 'fields': {'MasterMaterial': 'Zero', 'MaterialLatestRate': 90, 'Default_MaterialRate': 0}}]

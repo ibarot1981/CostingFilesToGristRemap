@@ -58,6 +58,8 @@ def _stable(value: Any) -> str:
 
 
 def _num(value: Any, *, allow_blank: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
     if value in (None, "") and allow_blank:
         return None
     try:
@@ -85,10 +87,12 @@ def _next_revision_label(value: Any) -> str:
 class GristPartDefinitionService:
     """Read editable definitions, save drafts and publish approved successors."""
 
-    def __init__(self, registry: GristPartRegistry):
+    def __init__(self, registry: GristPartRegistry, *, material_weight_catalog_provider=None):
         self.registry = registry
         self.client = registry.client
         self.features = GristPartFeatures(registry)
+        self.material_weight_catalog_provider = material_weight_catalog_provider
+        self._material_weight_catalog_cache: dict[str, Any] | None = None
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.registry._rows(table)
@@ -105,6 +109,37 @@ class GristPartDefinitionService:
             if self._missing_table(exc, table):
                 return []
             raise
+
+    def _material_weight_catalog(self) -> dict[str, Any]:
+        if self._material_weight_catalog_cache is not None:
+            return self._material_weight_catalog_cache
+        if self.material_weight_catalog_provider is None:
+            self._material_weight_catalog_cache = {"status": "unavailable", "source": "Costing-New", "records": []}
+            return self._material_weight_catalog_cache
+        try:
+            result = self.material_weight_catalog_provider()
+            if not isinstance(result, dict) or result.get("status") != "available" or not isinstance(result.get("records"), list):
+                raise ValueError("The material weight source did not return a usable catalogue.")
+            self._material_weight_catalog_cache = result
+        except Exception as exc:
+            self._material_weight_catalog_cache = {"status": "unavailable", "source": "Costing-New", "records": [],
+                "message": str(exc)[:300]}
+        return self._material_weight_catalog_cache
+
+    def _material_weight_evidence(self, saved_name: Any) -> dict[str, Any] | None:
+        name = str(saved_name or "").strip()
+        if not name:
+            return None
+        from app.config import load_material_mapping
+        from app.material_resolution import resolve_material
+        resolved = resolve_material(name, load_material_mapping())
+        canonical = resolved.canonical_name or name
+        matches = [row for row in self._material_weight_catalog().get("records", [])
+            if str(row.get("canonicalName") or "").strip() == canonical]
+        if len(matches) != 1:
+            return {"status": "ambiguous" if len(matches) > 1 else "unavailable", "canonicalName": canonical,
+                "source": "Costing-New", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+        return deepcopy(matches[0])
 
     def _require_publication_schema(self) -> None:
         missing = []
@@ -225,6 +260,15 @@ class GristPartDefinitionService:
                         return None
                     return value if isinstance(value, str) else f"{value} {unit}"
 
+                def flatten_attributes(prefix: str, value: Any) -> None:
+                    if isinstance(value, dict):
+                        for key in sorted(value):
+                            if str(key) == "fieldStatus":
+                                continue
+                            flatten_attributes(f"{prefix}.{key}" if prefix else str(key), value[key])
+                    elif prefix:
+                        result[f"Engineering attribute · {prefix}"] = value
+
                 result: dict[str, Any] = {}
                 quantity = item.get("quantity")
                 if quantity not in (None, ""):
@@ -250,7 +294,33 @@ class GristPartDefinitionService:
                         elif inches is not None:
                             cut_length = f"{inches} in"
                     if cut_length:
-                        result["Dimension to Cut"] = cut_length
+                        text_match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", cut_length, re.IGNORECASE)
+                        if text_match:
+                            unit = text_match.group(2).casefold()
+                            factor_mm = next((LENGTH_TO_MM[key] for key in (unit, unit.rstrip("s")) if key in LENGTH_TO_MM), None)
+                            numeric = _num(text_match.group(1))
+                            result["Dimension to Cut"] = f"{numeric * factor_mm:g} mm" if numeric is not None and factor_mm else cut_length
+                        else:
+                            result["Dimension to Cut"] = cut_length
+                    attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+                    weight_evidence = attributes.get("materialWeightEvidence") if isinstance(attributes, dict) else None
+                    factor = _num(weight_evidence.get("kgPerMeter")) if isinstance(weight_evidence, dict) else None
+                    length_mm = _num(detail.get("DimensionMM"))
+                    if length_mm is None and _num(detail.get("DimensionInches")) is not None:
+                        length_mm = _num(detail.get("DimensionInches")) * LENGTH_TO_MM["in"]
+                    if length_mm is None and cut_length:
+                        match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", cut_length, re.IGNORECASE)
+                        if match:
+                            unit = match.group(2).casefold()
+                            factor_mm = next((LENGTH_TO_MM[key] for key in (unit, unit.rstrip("s")) if key in LENGTH_TO_MM), None)
+                            amount = _num(match.group(1))
+                            length_mm = amount * factor_mm if amount is not None and factor_mm else None
+                    if factor is not None and factor > 0 and length_mm is not None and length_mm > 0:
+                        per_piece_kg = length_mm / 1000.0 * factor
+                        result["Calculated weight per piece"] = f"{format(per_piece_kg, '.12g')} kg"
+                        parent_quantity = _num(item.get("quantity"))
+                        if parent_quantity is not None and parent_quantity > 0:
+                            result["Calculated weight per parent Part"] = f"{format(per_piece_kg * parent_quantity, '.12g')} kg"
                 if family == "cnc":
                     part_weight = number("PartWeightKg", "kg")
                     saved_kg = recorded("WeightKg", detail.get("WeightKg"))
@@ -270,13 +340,28 @@ class GristPartDefinitionService:
                 rate_quantity = recorded("Quantity", detail.get("Quantity"))
                 if rate_quantity is not None and detail.get("QuantityUOM"):
                     result["Rate-basis consumption"] = rate_quantity if isinstance(rate_quantity, str) else f"{rate_quantity} {detail.get('QuantityUOM')}"
-                if family == "toolshop":
-                    remarks = recorded("ToolShopRemarks", detail.get("ToolShopRemarks"))
-                    if remarks is not None:
-                        result["Tool Shop remarks"] = remarks
+                remarks = recorded("ToolShopRemarks", detail.get("ToolShopRemarks"))
+                if remarks is not None:
+                    result["Remarks"] = remarks
                 plate_part = recorded("PlatePart", detail.get("PlatePart"))
                 if plate_part is not None:
                     result["Plate part to cut"] = plate_part
+                field_labels = {
+                    "IssueRoute": "Issue route", "ActivityKind": "Activity kind", "SourceDepartment": "Source department",
+                    "ItemCode": "Item code", "PartCategory": "Part category", "OptionGroup": "Option group",
+                    "ProcessType": "Process type", "InternalMakingCost": "Internal making cost",
+                    "ExternalMachiningCost": "External machining cost", "WeightUOM": "Weight unit",
+                    "WeightKg": "Saved total weight", "WeightGrams": "Saved total weight",
+                }
+                for source_name, label in field_labels.items():
+                    if label in result:
+                        continue
+                    value = recorded(source_name, detail.get(source_name))
+                    if value is not None:
+                        unit = "kg" if source_name == "WeightKg" else "g" if source_name == "WeightGrams" else ""
+                        result[label] = f"{value} {unit}".strip() if unit and not isinstance(value, str) else value
+                attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+                flatten_attributes("", attributes)
                 return result
             if collection == "components":
                 return {"Canonical child Part": item_name(collection, item), "Quantity": f"{item.get('quantity') if item.get('quantity') is not None else '—'} {item.get('uom') or ''}".strip(),
@@ -284,6 +369,29 @@ class GristPartDefinitionService:
             return {"Specification code": item.get("code") or "—", "Manufacturer": item.get("manufacturer") or "—",
                 "Manufacturer part number": item.get("manufacturerPartNumber") or "—", "Description": item.get("description") or "—",
                 "Costing unit": item.get("costingUOM") or "—", "Currency": item.get("costingCurrency") or "—"}
+
+        def semantic_value(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {str(key): semantic_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+            if isinstance(value, list):
+                return [semantic_value(item) for item in value]
+            if isinstance(value, bool) or value is None:
+                return value
+            candidate = value
+            unit = ""
+            if isinstance(value, str):
+                match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([^\d\s].*?)?\s*", value)
+                if not match:
+                    return value
+                candidate, unit = match.group(1), str(match.group(2) or "").strip().casefold()
+            numeric = _num(candidate)
+            if numeric is None:
+                return value
+            # Do not let display formatting such as 1 vs 1.0 create an edit.
+            normalized = format(numeric, ".12g")
+            if unit:
+                return f"{normalized} {unit}"
+            return normalized
 
         changes: list[dict[str, Any]] = []
         for collection in ("requirements", "components", "purchases"):
@@ -309,7 +417,7 @@ class GristPartDefinitionService:
                 values_after = values(collection, new) if new else {}
                 for field in sorted(values_before.keys() | values_after.keys()):
                     left, right = values_before.get(field), values_after.get(field)
-                    if old and new and left == right:
+                    if old and new and semantic_value(left) == semantic_value(right):
                         continue
                     changes.append({"kind": "added" if old is None else "removed" if new is None else "modified", "family": family,
                         "item": item_name(collection, sample), "occurrence": key, "field": field,
@@ -631,8 +739,14 @@ class GristPartDefinitionService:
         self._check_established(self._current_revision(part_id))
         parts = [{"id": _fields(row).get("StablePartId"), "partNumber": _fields(row).get("PartNumber"), "name": _fields(row).get("DisplayName") or ""}
             for row in self._rows("ProductPart") if _fields(row).get("StablePartId") and str(_fields(row).get("Status") or "active").casefold() == "active"]
-        materials = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("CanonicalName") or _fields(row).get("MaterialDisplayName") or _fields(row).get("Description") or f"Material {row['id']}", "code": _fields(row).get("Code") or _fields(row).get("MaterialCode") or ""}
-            for row in self._rows("Material")]
+        materials = []
+        for row in self._rows("Material"):
+            fields = _fields(row)
+            name = fields.get("CanonicalName") or fields.get("Name") or fields.get("MaterialDisplayName") or fields.get("Description") or f"Material {row['id']}"
+            evidence = self._material_weight_evidence(name)
+            materials.append({"id": int(row["id"]), "name": name, "code": fields.get("Code") or fields.get("MaterialCode") or "",
+                "weightEvidence": evidence, "kgPerMeter": evidence.get("kgPerMeter") if evidence else None,
+                "weightStatus": evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
         purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
             for row in self._rows("PurchaseItem")]
         units = {"Nos", "each", "pcs", "kg", "g", "mm", "cm", "m", "in", "inch"}
@@ -641,9 +755,12 @@ class GristPartDefinitionService:
             for row in self._optional_rows(table):
                 fields = _fields(row)
                 units.update(str(fields.get(name) or "").strip() for name in field_names if str(fields.get(name) or "").strip())
+        catalog = self._material_weight_catalog()
         return {"parts": sorted(parts, key=lambda item: str(item["partNumber"])), "materials": sorted(materials, key=lambda item: str(item["name"]).casefold()),
             "purchaseItems": sorted(purchase_items, key=lambda item: str(item["name"]).casefold()), "families": list(FAMILY_PROCESS),
-            "units": sorted(units, key=lambda item: item.casefold())}
+            "units": sorted(units, key=lambda item: item.casefold()),
+            "materialWeightSource": {"status": catalog.get("status", "unavailable"), "source": "Costing-New",
+                "readAt": catalog.get("readAt"), "catalogCount": len(catalog.get("records", []))}}
 
     def _requirement_line_identity(self, raw: dict[str, Any], existing: dict[str, Any] | None,
                                    base_requirements: list[dict[str, Any]]) -> tuple[int | None, int | None]:
@@ -766,6 +883,26 @@ class GristPartDefinitionService:
             detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
             detail = {str(name): deepcopy(value) for name, value in detail.items() if str(name) in LINE_DETAIL_FIELDS}
             unchanged_legacy_line = bool(existing and self._same_requirement_physical_content(raw, existing, detail))
+            old_detail = (existing or {}).get("detail") if isinstance((existing or {}).get("detail"), dict) else {}
+            submitted_field_status = raw.get("fieldStatus") if isinstance(raw.get("fieldStatus"), dict) else {}
+            old_field_status = (existing or {}).get("fieldStatus") if isinstance((existing or {}).get("fieldStatus"), dict) else {}
+
+            def unchanged_raw_detail_value(name: str) -> bool:
+                if not existing:
+                    return False
+                was_present, is_present = name in old_detail, name in detail
+                if was_present != is_present:
+                    return False
+                if not was_present:
+                    return True
+                previous, submitted = old_detail.get(name), detail.get(name)
+                if name in {"QuantityUOM", "DimensionUOM", "WeightUOM"}:
+                    return str(previous or "").strip().casefold() == str(submitted or "").strip().casefold()
+                previous_number, submitted_number = _num(previous, allow_blank=True), _num(submitted, allow_blank=True)
+                if previous_number is not None and submitted_number is not None:
+                    return previous_number == submitted_number
+                return previous == submitted
+
             quantity = _num(raw.get("quantity"), allow_blank=True)
             uom = str(raw.get("uom") or "").strip()
             if quantity is None and not unchanged_legacy_line:
@@ -793,22 +930,43 @@ class GristPartDefinitionService:
                 detail[name] = ref
             dimension_uom = str(detail.get("DimensionUOM") or "").strip().casefold()
             dimensions = [_num(detail.get(name), allow_blank=True) for name in ("Length", "Width", "Thickness")]
-            old_detail = (existing or {}).get("detail") if isinstance((existing or {}).get("detail"), dict) else {}
+            legacy_unknown_numeric_fields: set[str] = set()
+            for name in ("DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"):
+                submitted_value = detail.get(name)
+                if submitted_value in (None, ""):
+                    continue
+                number = _num(submitted_value)
+                if number is None:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
+                        continue
+                    raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite numeric value where supplied.")
+                if name in {"DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"} and number <= 0:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
+                        continue
+                    if name == "PartWeightKg":
+                        raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_INVALID", "Per Part Weight must be a finite positive kg value.")
+                    if name in {"DimensionMM", "DimensionInches"}:
+                        raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
+                    raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be greater than zero where supplied.")
             preserved_zero_dimensions = {
                 name for name, value in zip(("Length", "Width", "Thickness"), dimensions)
-                if existing and value == 0 and _num(old_detail.get(name), allow_blank=True) == 0
+                if unchanged_raw_detail_value(name) and value == 0
             }
             effective_dimensions = [None if name in preserved_zero_dimensions else value
                                     for name, value in zip(("Length", "Width", "Thickness"), dimensions)]
+            dimension_group_unchanged = bool(existing and all(unchanged_raw_detail_value(name)
+                for name in ("Length", "Width", "Thickness", "DimensionUOM")))
             if family == "cnc":
-                if any(value is not None and value <= 0 for value in effective_dimensions) and not unchanged_legacy_line:
+                if any(value is not None and value <= 0 for value in effective_dimensions) and not dimension_group_unchanged:
                     raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered CNC plate dimensions must be finite and positive.")
-                if any(value is not None for value in effective_dimensions) and (not all(value is not None for value in effective_dimensions) or dimension_uom not in LENGTH_TO_MM) and not unchanged_legacy_line:
+                if any(value is not None for value in effective_dimensions) and (not all(value is not None for value in effective_dimensions) or dimension_uom not in LENGTH_TO_MM) and not dimension_group_unchanged:
                     raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "CNC length, width and thickness must be supplied together with a supported unit.")
             elif any(value is not None for value in effective_dimensions):
-                if any(value is not None and value <= 0 for value in effective_dimensions) and not unchanged_legacy_line:
+                if any(value is not None and value <= 0 for value in effective_dimensions) and not dimension_group_unchanged:
                     raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
-                if dimension_uom not in LENGTH_TO_MM and not unchanged_legacy_line:
+                if dimension_uom not in LENGTH_TO_MM and not dimension_group_unchanged:
                     raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "Entered dimensions need a supported unit.")
 
             dimension_mm = _num(detail.get("DimensionMM"), allow_blank=True)
@@ -816,10 +974,12 @@ class GristPartDefinitionService:
             old_dimension_mm = _num(old_detail.get("DimensionMM"), allow_blank=True)
             old_dimension_inches = _num(old_detail.get("DimensionInches"), allow_blank=True)
             dimension_text = str(detail.get("DimensionText") or "")
-            dimension_changed = (dimension_mm != old_dimension_mm or dimension_inches != old_dimension_inches
-                or dimension_text != str(old_detail.get("DimensionText") or "")
-                or dimension_uom != str(old_detail.get("DimensionUOM") or "").strip().casefold())
+            dimension_changed = any(not unchanged_raw_detail_value(name)
+                for name in ("DimensionMM", "DimensionInches", "DimensionText", "DimensionUOM"))
             value_mm = dimension_mm if dimension_mm is not None else dimension_inches * LENGTH_TO_MM["in"] if dimension_inches is not None else None
+            parsed_text = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", dimension_text, re.IGNORECASE) if dimension_text.strip() else None
+            if dimension_text.strip() and not parsed_text and not unchanged_raw_detail_value("DimensionText"):
+                raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite number followed by a supported length unit.")
             if dimension_changed and (dimension_mm is not None or dimension_inches is not None):
                 if any(value is not None and value <= 0 for value in (dimension_mm, dimension_inches)):
                     raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
@@ -829,7 +989,6 @@ class GristPartDefinitionService:
                     equivalent_mm = dimension_inches * LENGTH_TO_MM["in"]
                     if abs(dimension_mm - equivalent_mm) > max(0.01, abs(dimension_mm) * 1e-7):
                         raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INCONSISTENT", "The saved mm and inch cut-length values do not agree.")
-                parsed_text = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", dimension_text, re.IGNORECASE)
                 if parsed_text:
                     text_mm = float(parsed_text.group(1)) * LENGTH_TO_MM[parsed_text.group(2).casefold()]
                     if abs((dimension_mm if dimension_mm is not None else value_mm) - text_mm) > max(0.01, abs(value_mm) * 1e-7):
@@ -837,7 +996,7 @@ class GristPartDefinitionService:
 
             part_weight = _num(detail.get("PartWeightKg"), allow_blank=True)
             old_part_weight = _num(old_detail.get("PartWeightKg"), allow_blank=True)
-            weight_changed = part_weight != old_part_weight
+            weight_changed = not unchanged_raw_detail_value("PartWeightKg")
             if weight_changed and part_weight is not None and part_weight <= 0:
                 raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_INVALID", "Per Part Weight must be a finite positive kg value.")
             if weight_changed and part_weight is not None:
@@ -845,21 +1004,103 @@ class GristPartDefinitionService:
             if dimension_changed and (dimension_mm is not None or dimension_inches is not None) and family in {"mcl", "toolshop"} and (value_mm is None or value_mm <= 0):
                 raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
 
+            material_changed = (not unchanged_raw_detail_value("Material")
+                or not unchanged_raw_detail_value("MaterialDisplayName"))
+            saved_attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+            old_attributes = _json_cell(old_detail.get("EngineeringAttributes")) or {}
+            saved_weight_evidence = saved_attributes.get("materialWeightEvidence") if isinstance(saved_attributes, dict) else None
+            old_weight_evidence = old_attributes.get("materialWeightEvidence") if isinstance(old_attributes, dict) else None
+            material_weight_evidence = saved_weight_evidence if isinstance(saved_weight_evidence, dict) else old_weight_evidence
+            if family in {"mcl", "toolshop"} and value_mm is not None and value_mm > 0:
+                if material_changed or dimension_changed or not isinstance(material_weight_evidence, dict):
+                    material_label = detail.get("MaterialDisplayName")
+                    if not material_label and _int_ref(detail.get("Material")):
+                        material_row = next((row for row in self._rows("Material")
+                            if int(row.get("id", -1)) == _int_ref(detail.get("Material"))), None)
+                        material_fields = _fields(material_row)
+                        material_label = (material_fields.get("CanonicalName") or material_fields.get("Name")
+                            or material_fields.get("MaterialDisplayName") or material_fields.get("Description"))
+                    material_weight_evidence = self._material_weight_evidence(material_label)
+                    if not isinstance(material_weight_evidence, dict):
+                        material_weight_evidence = {"status": "unavailable", "canonicalName": str(material_label or ""),
+                            "source": "Costing-New", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+                detail_attributes = deepcopy(saved_attributes) if isinstance(saved_attributes, dict) else {}
+                detail_attributes["materialWeightEvidence"] = deepcopy(material_weight_evidence)
+                detail["EngineeringAttributes"] = detail_attributes
+            elif family in {"mcl", "toolshop"} and (material_changed or dimension_changed):
+                detail_attributes = deepcopy(saved_attributes) if isinstance(saved_attributes, dict) else {}
+                detail_attributes["materialWeightEvidence"] = {"status": "unavailable",
+                    "canonicalName": str(detail.get("MaterialDisplayName") or ""), "source": "Costing-New",
+                    "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+                detail["EngineeringAttributes"] = detail_attributes
+            weight_factor = _num(material_weight_evidence.get("kgPerMeter")) if isinstance(material_weight_evidence, dict) else None
+            calculated_material_weight_kg = (value_mm / 1000.0 * weight_factor
+                if family in {"mcl", "toolshop"} and value_mm is not None and value_mm > 0 and weight_factor is not None and weight_factor > 0 else None)
+
             rate_uom = str(detail.get("QuantityUOM") or "").strip()
             if rate_uom and rate_uom.casefold() not in known_uoms and not unchanged_legacy_line:
                 raise PartIdentityError("PART_DEFINITION_RATE_UOM_UNSUPPORTED", "Choose a saved or supported consumption unit.")
             rate_unit = rate_uom.casefold()
-            rate_unit_changed = rate_unit != str(old_detail.get("QuantityUOM") or "").strip().casefold()
-            if family in {"mcl", "toolshop"} and (dimension_changed or rate_unit_changed or not existing) and rate_unit in LENGTH_TO_MM:
-                if value_mm is None or value_mm <= 0:
+            rate_unit_changed = not unchanged_raw_detail_value("QuantityUOM")
+            quantity_changed = not unchanged_raw_detail_value("Quantity")
+            rate_quantity_value = _num(detail.get("Quantity"), allow_blank=True)
+            if detail.get("Quantity") not in (None, "") and rate_quantity_value is None and quantity_changed:
+                raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", "Normalized consumption must be a finite numeric value where supplied.")
+            consumption_derived = False
+            missing_cross_dimension_conversion = False
+            if family in {"mcl", "toolshop"} and rate_unit in LENGTH_TO_MM:
+                if value_mm is not None and value_mm > 0:
+                    detail["Quantity"] = value_mm / LENGTH_TO_MM[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                elif not existing or dimension_changed or rate_unit_changed:
                     raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_REQUIRED", "A length-based consumption row needs a positive Dimension to Cut.")
-                detail["Quantity"] = value_mm / LENGTH_TO_MM[rate_unit]
-                detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
-            elif family == "cnc" and (weight_changed or rate_unit_changed or not existing) and rate_unit in MASS_TO_KG:
-                if part_weight is None or part_weight <= 0:
+            elif family in {"mcl", "toolshop"} and rate_unit in MASS_TO_KG:
+                if calculated_material_weight_kg is not None:
+                    detail["Quantity"] = calculated_material_weight_kg / MASS_TO_KG[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                else:
+                    # Existing rows may retain a truly unchanged legacy basis,
+                    # but a changed/new material or cut length cannot reuse it.
+                    unchanged_basis = bool(existing and not dimension_changed and not material_changed and not rate_unit_changed and not quantity_changed)
+                    if not unchanged_basis:
+                        detail["Quantity"] = None
+                        detail["ExactQuantityText"] = None
+                        rate_quantity_value = None
+                    has_physical_measure = value_mm is not None and value_mm > 0
+                    missing_cross_dimension_conversion = has_physical_measure and not unchanged_basis
+            elif family == "cnc" and rate_unit in MASS_TO_KG:
+                if part_weight is not None and part_weight > 0:
+                    detail["Quantity"] = part_weight / MASS_TO_KG[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                elif not existing or weight_changed or rate_unit_changed:
                     raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_REQUIRED", "A kg-based CNC consumption row needs a positive Per Part Weight.")
-                detail["Quantity"] = part_weight / MASS_TO_KG[rate_unit]
-                detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+            else:
+                needs_cross_dimension_conversion = (
+                    family in {"mcl", "toolshop"} and rate_unit in MASS_TO_KG
+                    or family == "cnc" and rate_unit in LENGTH_TO_MM)
+                physical_basis_changed = dimension_changed if family in {"mcl", "toolshop"} else weight_changed
+                explicitly_reaffirmed_manual = submitted_field_status.get("Quantity") == "manual-reaffirmed"
+                if needs_cross_dimension_conversion and (physical_basis_changed or rate_unit_changed) and existing \
+                        and not quantity_changed and not explicitly_reaffirmed_manual:
+                    # A cut length cannot keep an old mass quantity, or a per-part
+                    # weight keep an old length quantity, without conversion evidence.
+                    detail["Quantity"] = None
+                    detail["ExactQuantityText"] = None
+                    rate_quantity_value = None
+                    missing_cross_dimension_conversion = (value_mm is not None and value_mm > 0) if family in {"mcl", "toolshop"} else (part_weight is not None and part_weight > 0)
+                elif needs_cross_dimension_conversion and rate_quantity_value in (None, ""):
+                    missing_cross_dimension_conversion = (value_mm is not None and value_mm > 0) if family in {"mcl", "toolshop"} else (part_weight is not None and part_weight > 0)
+                if rate_quantity_value is not None:
+                    numeric_quantity = _num(rate_quantity_value)
+                    if numeric_quantity is not None:
+                        detail["Quantity"] = numeric_quantity
+                        detail["ExactQuantityText"] = format(numeric_quantity, ".15g")
 
             if dimension_changed and (dimension_mm is not None or dimension_inches is not None) and family in {"mcl", "toolshop"}:
                 if dimension_mm is None:
@@ -876,8 +1117,8 @@ class GristPartDefinitionService:
                     continue
                 numeric = _num(detail[name])
                 if numeric is None or (name in {"Quantity", "Length", "Width", "Thickness"} and numeric <= 0 and name not in preserved_zero_dimensions):
-                    old_numeric = _num(old_detail.get(name), allow_blank=True)
-                    if unchanged_legacy_line or name in {"DimensionMM", "DimensionInches", "WeightGrams", "WeightKg", "PartWeightKg"} and old_numeric == numeric:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
                         continue
                     raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite positive number where supplied.")
                 detail[name] = numeric
@@ -886,11 +1127,21 @@ class GristPartDefinitionService:
                 detail["ProcessType"] = process_type
                 rate_quantity = _num(detail.get("Quantity"), allow_blank=True)
                 rate_uom = str(detail.get("QuantityUOM") or "").strip()
-                if not unchanged_legacy_line and (rate_quantity is None or rate_quantity <= 0 or not rate_uom):
+                if not unchanged_legacy_line and (rate_quantity is None or rate_quantity <= 0 or not rate_uom) \
+                        and not (missing_cross_dimension_conversion and rate_uom):
                     raise PartIdentityError("PART_DEFINITION_RATE_BASIS_INVALID", "New or changed manufacturing requirements need a finite positive rate quantity and its unit.")
-                if family == "mcl" and not unchanged_legacy_line and not _int_ref(detail.get("Material")):
-                    raise PartIdentityError("PART_DEFINITION_MATERIAL_REQUIRED", "Choose a canonical Material for a new or changed MCL requirement.")
-            field_status = deepcopy(raw.get("fieldStatus") or {})
+                if family in {"mcl", "toolshop"} and not unchanged_legacy_line and not _int_ref(detail.get("Material")):
+                    raise PartIdentityError("PART_DEFINITION_MATERIAL_REQUIRED", "Choose the canonical Material To Use for a new or changed MCL or Tool Shop requirement.")
+            field_status = deepcopy(submitted_field_status)
+            if legacy_unknown_numeric_fields:
+                for name in legacy_unknown_numeric_fields:
+                    field_status.setdefault(name, "unknown")
+            if consumption_derived:
+                field_status["Quantity"] = "derived"
+            elif missing_cross_dimension_conversion or detail.get("Quantity") in (None, ""):
+                field_status["Quantity"] = "missing"
+            else:
+                field_status["Quantity"] = "manual"
             if not existing:
                 for name in ("WeightKg", "WeightGrams"):
                     prior_status = str(field_status.get(name) or "").casefold()
@@ -1748,6 +1999,17 @@ class GristPartDefinitionService:
         impact = _json_cell(fields.get("ImpactPreview"))
         if not after or not impact or impact.get("fingerprint") != fields.get("ImpactFingerprint"):
             raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The approved Change Request does not match its saved definition or reviewed impact.")
+        validated_after = self._normalize_content(part_id, int(current["id"]), after, f"publication-validation:{fields.get('ChangeRequestKey')}")
+        comparable_after = deepcopy(after)
+        normalized_by_key = {str(item.get("requirementKey")): item for item in validated_after.get("requirements", [])}
+        for item in comparable_after.get("requirements", []):
+            normalized = normalized_by_key.get(str(item.get("requirementKey"))) or {}
+            for name in ("lineMasterId", "lineRevisionId"):
+                if item.get(name) in (None, "") and normalized.get(name) is not None:
+                    item[name] = normalized[name]
+        if request_fingerprint(validated_after) != request_fingerprint(comparable_after):
+            raise PartIdentityError("PART_CHANGE_REQUEST_DEFINITION_INVALID", "The approved saved definition no longer satisfies current physical-consumption and numeric invariants. Reopen it, save a corrected draft and request approval again.")
+        after = validated_after
         current_impact = self.impact_preview(part_id, after)
         if current_impact.get("fingerprint") != impact.get("fingerprint"):
             raise PartIdentityError("PART_DEPENDENCY_CLOSURE_STALE", "Current assemblies or Model Code configurations changed after the dependency preview. Reopen the definition, review the new impact and submit a new Change Request.")

@@ -124,7 +124,7 @@ function readableChange(change: any, before: any, after: any) {
   const labels: Record<string, string> = { quantity: "Quantity per Part", uom: "Quantity unit", family: "Family", childPartId: "Canonical child Part",
     sourcingRoute: "Sourcing route", DimensionMM: "Dimension to Cut", DimensionInches: "Dimension to Cut", DimensionText: "Dimension to Cut",
     DimensionUOM: "Cut-length unit", DimensionToCut: "Dimension to Cut", PartWeightKg: "Per Part Weight", WeightKg: "Saved total weight", WeightGrams: "Saved total weight",
-    Quantity: "Consumption per occurrence", QuantityUOM: "Consumption unit", Material: "Canonical material", MaterialDisplayName: "Material display name",
+    Quantity: "Normalized consumption", QuantityUOM: "Costing unit", Material: "Material To Use", MaterialDisplayName: "Material To Use",
     ItemName: "Item name", PlatePart: "Plate part to cut", ToolShopRemarks: "Tool Shop remarks", EngineeringAttributes: "Advanced engineering attributes",
     Length: "Plate length", Width: "Plate width", Thickness: "Plate thickness", manufacturer: "Manufacturer", manufacturerPartNumber: "Manufacturer part number",
     description: "Description", code: "Specification code", costingUOM: "Costing unit", costingCurrency: "Currency" };
@@ -247,6 +247,103 @@ function cutLengthText(detail: any) {
   if (inches != null) return `${inches} in`;
   return "—";
 }
+function engineeringAttributes(detail: any) {
+  const value = detail?.EngineeringAttributes;
+  if (typeof value === "string") {
+    try { const parsed = JSON.parse(value); return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}; }
+    catch { return {}; }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function kgText(value: number | null) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  return Number(value.toPrecision(10)).toString();
+}
+function cutWeight(item: any, materials: any[] = []) {
+  const detail = item?.detail || {};
+  const saved = engineeringAttributes(detail).materialWeightEvidence;
+  const selected = materials.find(material => String(material.id) === String(detail.Material));
+  const savedFactor = Number(saved?.kgPerMeter);
+  const currentFactor = Number(selected?.kgPerMeter);
+  const evidence = Number.isFinite(savedFactor) && savedFactor > 0 ? saved
+    : Number.isFinite(currentFactor) && currentFactor > 0 ? selected?.weightEvidence : saved || selected?.weightEvidence;
+  const factor = Number(evidence?.kgPerMeter ?? selected?.kgPerMeter);
+  const mm = Number(cutLengthValue(detail));
+  const quantity = Number(item?.quantity);
+  if (!Number.isFinite(factor) || factor <= 0 || !Number.isFinite(mm) || mm <= 0) return { evidence, perPiece: null, total: null };
+  const perPiece = mm / 1000 * factor;
+  const total = perPiece * quantity;
+  return { evidence, perPiece: Number.isFinite(perPiece) && perPiece > 0 ? perPiece : null,
+    total: Number.isFinite(total) && total > 0 ? total : null };
+}
+function materialWeightFactor(detail: any, materials: any[] = []) {
+  const selected = materials.find(material => String(material.id) === String(detail?.Material));
+  const evidence = selected?.weightEvidence;
+  const factor = Number(evidence?.kgPerMeter ?? selected?.kgPerMeter);
+  return Number.isFinite(factor) && factor > 0 ? factor : null;
+}
+function stablePhysicalNumber(value: number) {
+  return Number.isFinite(value) ? Number(value.toPrecision(15)) : null;
+}
+function derivedConsumptionForPhysicalBasis(family: string, detail: any, unit: string, materials: any[] = []) {
+  const normalizedUnit = String(unit || "").trim().toLowerCase();
+  if (["mcl", "toolshop"].includes(family)) {
+    const mm = Number(cutLengthValue(detail));
+    if (!Number.isFinite(mm) || mm <= 0) return null;
+    if (LENGTH_TO_MM[normalizedUnit]) return stablePhysicalNumber(mm / LENGTH_TO_MM[normalizedUnit]);
+    const massFactor = MASS_TO_KG[normalizedUnit];
+    const kgPerMeter = materialWeightFactor(detail, materials);
+    if (massFactor && kgPerMeter) return stablePhysicalNumber((mm / 1000 * kgPerMeter) / massFactor);
+  }
+  if (family === "cnc" && MASS_TO_KG[normalizedUnit]) {
+    const weight = Number(detail?.PartWeightKg);
+    return Number.isFinite(weight) && weight > 0 ? stablePhysicalNumber(weight / MASS_TO_KG[normalizedUnit]) : null;
+  }
+  return null;
+}
+function usesPhysicalConsumptionBasis(family: string, unit: string) {
+  const normalizedUnit = String(unit || "").trim().toLowerCase();
+  return (["mcl", "toolshop"].includes(family) && (Boolean(LENGTH_TO_MM[normalizedUnit]) || Boolean(MASS_TO_KG[normalizedUnit])))
+    || (family === "cnc" && (Boolean(MASS_TO_KG[normalizedUnit]) || Boolean(LENGTH_TO_MM[normalizedUnit])));
+}
+function savedTotalWeightDescription(item: any) {
+  const detail = item?.detail || {};
+  const status = item?.fieldStatus || {};
+  const describe = (field: "WeightKg" | "WeightGrams", unit: string) => {
+    if (status[field] === "missing") return "not recorded";
+    if (status[field] === "blank") return "blank in source";
+    const value = detail[field];
+    if (value == null || value === "") return "not recorded";
+    return `${value} ${unit}${status[field] ? "" : " · source status unavailable"}`;
+  };
+  const kg = describe("WeightKg", "kg"), grams = describe("WeightGrams", "g");
+  if (kg === "not recorded" && grams === "not recorded") return "Saved total weight: not recorded";
+  return `Saved total weight fields: WeightKg ${kg}; WeightGrams ${grams}`;
+}
+function isCrossDimensionConsumption(family: string, unit: string) {
+  const normalized = String(unit || "").trim().toLowerCase();
+  return (["mcl", "toolshop"].includes(family) && Boolean(MASS_TO_KG[normalized]))
+    || (family === "cnc" && Boolean(LENGTH_TO_MM[normalized]));
+}
+function hasCrossDimensionPhysicalValue(row: any) {
+  const detail = row?.detail || {};
+  return ["mcl", "toolshop"].includes(row?.family)
+    ? positiveNumber(cutLengthValue(detail))
+    : row?.family === "cnc" && positiveNumber(detail.PartWeightKg);
+}
+function missingCrossDimensionConsumption(row: any) {
+  return isCrossDimensionConsumption(String(row?.family || ""), String(row?.detail?.QuantityUOM || ""))
+    && hasCrossDimensionPhysicalValue(row) && !positiveNumber(row?.detail?.Quantity);
+}
+function physicalNumberChanged(value: any, prior: any, fresh: boolean) {
+  if (fresh) return true;
+  const valueBlank = value == null || String(value).trim() === "";
+  const priorBlank = prior == null || String(prior).trim() === "";
+  if (valueBlank || priorBlank) return valueBlank !== priorBlank;
+  const parsed = Number(value), oldParsed = Number(prior);
+  if (Number.isFinite(parsed) && Number.isFinite(oldParsed)) return parsed !== oldParsed;
+  return !sameValue(value, prior);
+}
 function ChangeReview({ before, after, title, parts = [] }: { before: any; after: any; title: string; parts?: any[] }) {
   const reviewBefore = definitionContentForDiff(before, parts), reviewAfter = definitionContentForDiff(after, parts);
   const changes = changeRequestDiff(reviewBefore, reviewAfter);
@@ -346,7 +443,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const rows = [...(content?.requirements || [])];
     const current = rows[index] || {};
     rows[index] = { ...current, detail: { ...(current.detail || {}), [field]: value },
-      fieldStatus: { ...(current.fieldStatus || {}), [field]: value === "" ? "blank" : "value" } };
+      fieldStatus: { ...(current.fieldStatus || {}), [field]: field === "Quantity"
+        ? (value === "" ? "missing" : "manual-reaffirmed") : value === "" ? "blank" : "value" } };
     patchContent({ requirements: rows });
   }
 
@@ -354,8 +452,16 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const rows = [...(content?.requirements || [])];
     const current = rows[index] || {};
     const material = (options?.materials || []).find((item: any) => String(item.id) === value);
-    rows[index] = { ...current, detail: { ...(current.detail || {}), Material: value ? Number(value) : null,
-      ...(material ? { MaterialDisplayName: material.name, ItemName: current.detail?.ItemName || material.name } : {}) } };
+    const detail = { ...(current.detail || {}), Material: value ? Number(value) : null,
+      ...(material ? { MaterialDisplayName: material.name } : {}) };
+    const unit = String(detail.QuantityUOM || "").trim().toLowerCase();
+    const derived = derivedConsumptionForPhysicalBasis(current.family, detail, unit, options?.materials || []);
+    if (usesPhysicalConsumptionBasis(current.family, unit)) {
+      detail.Quantity = derived == null ? "" : derived;
+      detail.ExactQuantityText = derived == null ? "" : String(derived);
+    }
+    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}),
+      ...(usesPhysicalConsumptionBasis(current.family, unit) ? { Quantity: derived == null ? "missing" : "derived" } : {}) } };
     patchContent({ requirements: rows });
   }
 
@@ -364,7 +470,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const requirementKey = `safari-authored-requirement:${crypto.randomUUID()}`;
     const processType = family === "mcl" ? "material_cut" : family === "toolshop" ? "tool_shop" : "cnc";
     const row = { requirementKey, identityStatus: "safari_authored", family, quantity: "1", uom: "Nos", processType,
-      detail: { ProcessType: processType, Quantity: "", QuantityUOM: "", EngineeringAttributes: {} },
+      detail: { ProcessType: processType, Quantity: "", QuantityUOM: "kg", EngineeringAttributes: {} },
       provenance: { type: "safari_authored", evidence: {} } };
     patchContent({ requirements: [...(content.requirements || []), row], applicability: {
       ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: true, status: "applicable" },
@@ -384,14 +490,18 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       const mm = unit === "mm" ? number : number * 25.4;
       detail.DimensionMM = mm;
       detail.DimensionInches = mm / 25.4;
-      const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
-      const factor = LENGTH_TO_MM[rateUnit];
-      if (factor) { detail.Quantity = mm / factor; detail.ExactQuantityText = String(detail.Quantity); }
     } else {
       detail.DimensionMM = value;
       detail.DimensionInches = value;
     }
-    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), DimensionText: value ? "value" : "blank" } };
+    const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
+    const derived = derivedConsumptionForPhysicalBasis(current.family, detail, rateUnit, options?.materials || []);
+    if (usesPhysicalConsumptionBasis(current.family, rateUnit)) {
+      detail.Quantity = derived == null ? "" : derived;
+      detail.ExactQuantityText = derived == null ? "" : String(derived);
+    }
+    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), DimensionText: value ? "value" : "blank",
+      ...(usesPhysicalConsumptionBasis(current.family, rateUnit) ? { Quantity: derived == null ? "missing" : "derived" } : {}) } };
     patchContent({ requirements: rows });
   }
 
@@ -402,8 +512,11 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const number = value.trim() === "" ? NaN : Number(value);
     const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
     const factor = MASS_TO_KG[rateUnit];
-    if (Number.isFinite(number) && number > 0 && factor) { detail.Quantity = number / factor; detail.ExactQuantityText = String(detail.Quantity); }
-    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), PartWeightKg: value ? "value" : "blank" } };
+    const derivedMass = Number.isFinite(number) && number > 0 && factor;
+    if (derivedMass) { detail.Quantity = number / factor; detail.ExactQuantityText = String(detail.Quantity); }
+    else if (factor || LENGTH_TO_MM[rateUnit]) { detail.Quantity = ""; detail.ExactQuantityText = ""; }
+    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}), PartWeightKg: value ? "value" : "blank",
+      ...(derivedMass ? { Quantity: "derived" } : (factor || LENGTH_TO_MM[rateUnit]) ? { Quantity: "missing" } : {}) } };
     patchContent({ requirements: rows });
   }
 
@@ -419,10 +532,16 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       if (changed("quantity") && !positiveNumber(row.quantity)) error("quantity", "Enter a finite quantity greater than zero.");
       if (changed("uom") && !String(row.uom || "").trim()) error("uom", "Choose a quantity unit.");
       const detail = row.detail || {}, oldDetail = old?.detail || {};
+      for (const name of ["DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"]) {
+        if (!physicalNumberChanged(detail[name], oldDetail[name], fresh) || detail[name] == null || String(detail[name]).trim() === "") continue;
+        if (!positiveNumber(detail[name])) error(name === "PartWeightKg" ? "partWeight" : name === "DimensionMM" || name === "DimensionInches" ? "cutLength" : "dimensions",
+          `${name} must be a finite number greater than zero.`);
+      }
       const rateNeedsValidation = fresh || changed("Quantity", detail, oldDetail) || changed("QuantityUOM", detail, oldDetail);
-      if (rateNeedsValidation && !positiveNumber(detail.Quantity)) error("rateQuantity", "Enter finite positive consumption per occurrence.");
+      const missingConversion = missingCrossDimensionConsumption(row);
+      if (rateNeedsValidation && !positiveNumber(detail.Quantity) && !missingConversion) error("rateQuantity", "Enter finite positive consumption per occurrence.");
       if (rateNeedsValidation && !String(detail.QuantityUOM || "").trim()) error("rateUnit", "Choose the consumption unit used by the existing rate basis.");
-      if (row.family === "mcl" && (fresh || changed("Material", detail, oldDetail)) && !detail.Material)
+      if (["mcl", "toolshop"].includes(row.family) && (fresh || changed("Material", detail, oldDetail)) && !detail.Material)
         error("material", "Choose the canonical material identity.");
       const cutChanged = fresh || ["DimensionMM", "DimensionInches", "DimensionText", "DimensionUOM"].some(field => changed(field, detail, oldDetail));
       const rateUnit = String(detail.QuantityUOM || "").trim().toLowerCase();
@@ -432,6 +551,11 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       const weightChanged = fresh || changed("PartWeightKg", detail, oldDetail);
       if ((weightChanged || rateBasisChanged) && row.family === "cnc" && MASS_TO_KG[rateUnit]
           && !positiveNumber(detail.PartWeightKg)) error("partWeight", "Enter Per Part Weight in kg for this kg-based rate.");
+      const hasPlateDimensions = [detail.Length, detail.Width, detail.Thickness].some(value => value != null && String(value).trim() !== "");
+      const plateDimensionsChanged = ["Length", "Width", "Thickness", "DimensionUOM"].some(field => physicalNumberChanged(detail[field], oldDetail[field], fresh));
+      if (row.family === "cnc" && plateDimensionsChanged && hasPlateDimensions
+          && (![detail.Length, detail.Width, detail.Thickness].every(positiveNumber) || !LENGTH_TO_MM[String(detail.DimensionUOM || "").toLowerCase()]))
+        error("dimensions", "CNC plate length, width and thickness must be finite positive values with a supported dimension unit.");
     }
     for (const row of content?.components || []) {
       const old: any = (definition?.components || []).find((item: any) => item.componentIdentity === row.componentIdentity);
@@ -606,16 +730,17 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const current = rows[index] || {};
     const detail = { ...(current.detail || {}), QuantityUOM: value };
     const unit = value.trim().toLowerCase();
-    if (["mcl", "toolshop"].includes(current.family) && LENGTH_TO_MM[unit]) {
-      const mm = detail.DimensionMM != null && Number.isFinite(Number(detail.DimensionMM)) ? Number(detail.DimensionMM)
-        : detail.DimensionInches != null && Number.isFinite(Number(detail.DimensionInches)) ? Number(detail.DimensionInches) * 25.4 : NaN;
-      if (Number.isFinite(mm) && mm > 0) {
-        detail.Quantity = mm / LENGTH_TO_MM[unit]; detail.ExactQuantityText = String(detail.Quantity);
-      }
-    } else if (current.family === "cnc" && MASS_TO_KG[unit] && positiveNumber(detail.PartWeightKg)) {
-      detail.Quantity = Number(detail.PartWeightKg) / MASS_TO_KG[unit]; detail.ExactQuantityText = String(detail.Quantity);
+    const derived = derivedConsumptionForPhysicalBasis(current.family, detail, unit, options?.materials || []);
+    if (usesPhysicalConsumptionBasis(current.family, unit)) {
+      detail.Quantity = derived == null ? "" : derived;
+      detail.ExactQuantityText = derived == null ? "" : String(derived);
     }
     rows[index] = { ...current, detail };
+    if (usesPhysicalConsumptionBasis(current.family, unit) && derived == null) {
+      rows[index] = { ...rows[index], fieldStatus: { ...(current.fieldStatus || {}), Quantity: "missing" } };
+    } else if (usesPhysicalConsumptionBasis(current.family, unit)) {
+      rows[index] = { ...rows[index], fieldStatus: { ...(current.fieldStatus || {}), Quantity: "derived" } };
+    }
     patchContent({ requirements: rows });
   }
 
@@ -625,7 +750,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     return <section className="parts-definition-family" key={family} aria-label={`${familyLabel} requirements`}>
       <div className="parts-definition-list-heading"><h4>{familyLabel}</h4><button type="button" className="button" disabled={busy} onClick={() => addRequirement(family)}>Add {familyLabel} row</button></div>
       {rows.length === 0 ? <p className="parts-help">No {familyLabel} rows in this draft. Add a row to mark this family applicable in the draft.</p> : <div className="parts-definition-table-scroll"><table className="parts-definition-table">
-        <thead><tr><th>Item / material</th><th>Quantity per Part</th>{family === "cnc" ? <th>Per Part Weight</th> : <th>Dimension to Cut</th>}{family === "cnc" && <th>Plate part</th>}<th>Consumption per occurrence</th>{family === "toolshop" && <th>Remarks</th>}<th>Actions</th></tr></thead>
+        <thead><tr>{family === "cnc" && <th>Plate part to cut</th>}<th>Material To Use</th><th>Qty per Part</th>{family === "cnc" ? <><th>Per Part Weight (kg)</th><th>Total weight (kg)</th></> : <><th>Dimension to Cut</th><th>Calculated weight (kg)</th></>}<th>Remarks</th><th>Actions</th></tr></thead>
         <tbody>{rows.map((item: any, rowPosition: number) => {
           const index = (content?.requirements || []).indexOf(item);
           const rowName = `${familyLabel} row ${rowPosition + 1}`;
@@ -633,14 +758,11 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           const materialValue = String(detail.Material ?? "");
           const materialFound = (options?.materials || []).some((material: any) => String(material.id) === materialValue);
           const oldRateUnit = String(detail.QuantityUOM || "");
-          const lengthBasis = Boolean(LENGTH_TO_MM[oldRateUnit.trim().toLowerCase()]) && ["mcl", "toolshop"].includes(family);
-          const weightBasis = Boolean(MASS_TO_KG[oldRateUnit.trim().toLowerCase()]) && family === "cnc";
           const cutUnit = String(detail.DimensionUOM || cutLengthUnit(detail));
           const cutValue = cutLengthValue(detail);
-          const occurrenceQuantity = Number(item.quantity);
-          const perOccurrence = Number(detail.Quantity);
           const derivedTotal = decimalProduct(item.quantity, detail.Quantity);
-          const itemName = detail.ItemName || detail.PlatePart || detail.MaterialDisplayName || item.sourcePartName || "Requirement";
+          const weight = cutWeight(item, options?.materials || []);
+          const itemName = detail.MaterialDisplayName || detail.PlatePart || detail.ItemName || item.sourcePartName || "Requirement";
           const itemError = validationErrors[`${item.requirementKey}:material`];
           const quantityError = validationErrors[`${item.requirementKey}:quantity`];
           const unitError = validationErrors[`${item.requirementKey}:uom`];
@@ -648,13 +770,17 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           const rateUnitError = validationErrors[`${item.requirementKey}:rateUnit`];
           const cutError = validationErrors[`${item.requirementKey}:cutLength`];
           const weightError = validationErrors[`${item.requirementKey}:partWeight`];
+          const dimensionsError = validationErrors[`${item.requirementKey}:dimensions`];
           return <tr key={item.requirementKey} data-requirement-key={item.requirementKey}>
+            {family === "cnc" && <td><label>Plate part to cut<input aria-label={`Plate part to cut — ${rowName}`} value={detail.PlatePart ?? ""} onChange={event => updateRequirementDetail(index, "PlatePart", event.target.value)}/></label>
+              <details><summary>Plate dimensions</summary><div className="parts-definition-inline-fields">{(["Length", "Width", "Thickness"] as const).map(field => <label key={field}>{field}<input aria-label={`${field} — ${rowName}`} inputMode="decimal" value={detail[field] ?? ""} onChange={event => updateRequirementDetail(index, field, event.target.value)}/></label>)}
+                <label>Dimension unit<select aria-label={`Dimension unit — ${rowName}`} value={detail.DimensionUOM || "mm"} onChange={event => updateRequirementDetail(index, "DimensionUOM", event.target.value)}><option value="mm">mm</option><option value="in">inch</option></select></label></div></details></td>}
             <td className="parts-definition-item-cell">
-              <label>Item name<input aria-label={`Item name — ${rowName}`} value={detail.ItemName ?? ""} onChange={event => updateRequirementDetail(index, "ItemName", event.target.value)}/></label>
-              <label>Material / item<select aria-label={`Material / item — ${rowName}`} value={materialValue} aria-invalid={Boolean(itemError)} onChange={event => updateRequirementMaterial(index, event.target.value)}>
+              <label>Material To Use<select aria-label={`Material To Use — ${rowName}`} value={materialValue} aria-invalid={Boolean(itemError)} onChange={event => updateRequirementMaterial(index, event.target.value)}>
                 <option value="">Choose material</option>{materialValue && !materialFound && <option value={materialValue}>{detail.MaterialDisplayName || `Unresolved material identity ${materialValue}`}</option>}
                 {(options?.materials || []).map((material: any) => <option key={material.id} value={String(material.id)}>{material.name || material.canonicalName || `Material ${material.id}`}{material.code ? ` · ${material.code}` : ""}</option>)}
               </select>{itemError && <small className="parts-definition-error-text">{itemError}</small>}</label>
+              {!materialValue && detail.MaterialDisplayName && <small role="status">Saved label: {detail.MaterialDisplayName} · material identity unresolved</small>}
               {(detail.identityStatus === "legacy_unclassified" || item.identityStatus?.startsWith("legacy")) && <small>Saved legacy identity is retained for review.</small>}
             </td>
             <td><div className="parts-definition-inline-fields">
@@ -664,22 +790,29 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
                 {unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
               </select>{unitError && <small className="parts-definition-error-text">{unitError}</small>}</label>
             </div><small>Occurrence quantity used once per parent Part.</small></td>
-            {family === "cnc" ? <td><label>Per Part Weight (kg)<input aria-label={`Per Part Weight (kg) — ${rowName}`} inputMode="decimal" value={detail.PartWeightKg ?? ""} aria-invalid={Boolean(weightError)} onChange={event => updatePartWeight(index, event.target.value)}/>{weightError && <small className="parts-definition-error-text">{weightError}</small>}</label>
-              <small>Total per parent Part: {positiveNumber(detail.PartWeightKg) && Number.isFinite(occurrenceQuantity) ? `${decimalProduct(detail.PartWeightKg, item.quantity) ?? "not available"} kg` : "not available"}</small></td>
-              : <td><div className="parts-definition-inline-fields"><label>Dimension to Cut<input aria-label={`Dimension to Cut — ${rowName}`} inputMode="decimal" value={cutValue ?? ""} aria-invalid={Boolean(cutError)} onChange={event => updateCutLength(index, event.target.value, cutUnit.toLowerCase().startsWith("in") ? "in" : "mm")}/>{cutError && <small className="parts-definition-error-text">{cutError}</small>}</label>
+            {family !== "cnc" && <td><div className="parts-definition-inline-fields"><label>Dimension to Cut<input aria-label={`Dimension to Cut — ${rowName}`} inputMode="decimal" value={cutValue ?? ""} aria-invalid={Boolean(cutError)} onChange={event => updateCutLength(index, event.target.value, cutUnit.toLowerCase().startsWith("in") ? "in" : "mm")}/>{cutError && <small className="parts-definition-error-text">{cutError}</small>}</label>
                 <label>Cut-length unit<select aria-label={`Cut-length unit — ${rowName}`} value={cutUnit} onChange={event => updateCutLength(index, String(cutValue ?? ""), event.target.value === "in" ? "in" : "mm")}>
                   {!["mm", "in"].includes(cutUnit) && <option value={cutUnit}>{cutUnit} · saved</option>}<option value="mm">mm</option><option value="in">inch</option>
                 </select></label></div><small>{cutLengthText(detail)} · saved cut-length evidence</small></td>}
-            {family === "cnc" && <td><label>Plate part to cut<input aria-label={`Plate part to cut — ${rowName}`} value={detail.PlatePart ?? ""} onChange={event => updateRequirementDetail(index, "PlatePart", event.target.value)}/></label>
-              <details><summary>Plate dimensions</summary><div className="parts-definition-inline-fields">{(["Length", "Width", "Thickness"] as const).map(field => <label key={field}>{field}<input aria-label={`${field} — ${rowName}`} inputMode="decimal" value={detail[field] ?? ""} onChange={event => updateRequirementDetail(index, field, event.target.value)}/></label>)}
-                <label>Dimension unit<select aria-label={`Dimension unit — ${rowName}`} value={detail.DimensionUOM || "mm"} onChange={event => updateRequirementDetail(index, "DimensionUOM", event.target.value)}><option value="mm">mm</option><option value="in">inch</option></select></label></div></details></td>}
-            <td><label>{lengthBasis || weightBasis ? "Derived consumption per occurrence" : "Consumption per occurrence"}<input aria-label={`Rate-basis quantity — ${rowName}`} inputMode="decimal" value={detail.Quantity ?? ""} readOnly={lengthBasis || weightBasis} aria-invalid={Boolean(rateError)} onChange={event => updateRequirementDetail(index, "Quantity", event.target.value)}/>{rateError && <small className="parts-definition-error-text">{rateError}</small>}</label>
-              <label>Rate-basis unit<select aria-label={`Rate-basis unit — ${rowName}`} value={oldRateUnit} aria-invalid={Boolean(rateUnitError)} onChange={event => updateRateBasisUnit(index, event.target.value)}>
-                <option value="">Choose consumption unit</option>{oldRateUnit && !unitOptions.some(unit => unit.toLowerCase() === oldRateUnit.toLowerCase()) && <option value={oldRateUnit}>{oldRateUnit} · saved</option>}{unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
-              </select>{rateUnitError && <small className="parts-definition-error-text">{rateUnitError}</small>}</label>
-              <small>{derivedTotal === null ? "Total per parent Part: not available" : `Total per parent Part: ${derivedTotal} ${oldRateUnit}`}</small>
+            {family === "cnc" && <td><label>Per Part Weight (kg)<input aria-label={`Per Part Weight (kg) — ${rowName}`} inputMode="decimal" value={detail.PartWeightKg ?? ""} aria-invalid={Boolean(weightError)} onChange={event => updatePartWeight(index, event.target.value)}/>{weightError && <small className="parts-definition-error-text">{weightError}</small>}</label></td>}
+            <td>{family === "cnc" ? <><strong>{positiveNumber(detail.PartWeightKg) && positiveNumber(item.quantity) ? `${kgText(Number(detail.PartWeightKg) * Number(item.quantity))} kg` : "Unavailable"}</strong><small>Per Part: {positiveNumber(detail.PartWeightKg) ? `${detail.PartWeightKg} kg` : "weight unavailable"} · Qty per Part counted once.</small></>
+              : <><strong>{weight.perPiece == null ? "Unavailable" : `${kgText(weight.perPiece)} kg / piece`}</strong><small>{weight.total == null ? "Total per parent Part is unavailable." : `${kgText(weight.total)} kg per parent Part`}</small>
+                {weight.evidence?.kgPerMeter && <small>{weight.evidence.kgPerMeter} kg/m · {weight.evidence.source || "Costing-New"}{weight.evidence.sourceDate ? ` · ${weight.evidence.sourceDate}` : " · source date unavailable"}</small>}
+                {!weight.evidence?.kgPerMeter && <small role="status">No verified kg/m factor; calculated weight and mass-based cost are incomplete.</small>}</>}
+              <details><summary>Calculation and costing details</summary>
+                <p className="parts-help">Normalized consumption is stored per requirement occurrence. Qty per Part and any parent assembly quantity are applied separately, once each.</p>
+                <label>Existing costing unit<select aria-label={`Existing costing unit — ${rowName}`} value={oldRateUnit} aria-invalid={Boolean(rateUnitError)} onChange={event => updateRateBasisUnit(index, event.target.value)}>
+                  <option value="">Choose unit</option>{oldRateUnit && !unitOptions.some(unit => unit.toLowerCase() === oldRateUnit.toLowerCase()) && <option value={oldRateUnit}>{oldRateUnit} · saved</option>}{unitOptions.map(unit => <option key={unit} value={unit}>{unit}</option>)}
+                </select>{rateUnitError && <small className="parts-definition-error-text">{rateUnitError}</small>}</label>
+                <label>Normalized consumption<input aria-label={`Normalized consumption — ${rowName}`} value={detail.Quantity ?? ""} readOnly aria-invalid={Boolean(rateError)}/>{rateError && <small className="parts-definition-error-text">{rateError}</small>}</label>
+                {missingCrossDimensionConsumption(item) && <small role="status">No verified conversion maps this physical input to {oldRateUnit}; cost stays incomplete.</small>}
+                {!missingCrossDimensionConsumption(item) && isCrossDimensionConsumption(family, oldRateUnit) && item.fieldStatus?.Quantity === "manual" && <small role="status">Legacy manual consumption is retained. No physical conversion was inferred.</small>}
+                {dimensionsError && <small className="parts-definition-error-text">{dimensionsError}</small>}
+                <small>{derivedTotal === null ? "Total normalized consumption: not available" : `Total normalized consumption: ${derivedTotal} ${oldRateUnit}`}</small>
+                {weight.evidence && <small>Material factor evidence: {JSON.stringify(weight.evidence)}</small>}
+              </details>
             </td>
-            {family === "toolshop" && <td><label>Remarks<input aria-label={`Tool Shop remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></td>}
+            <td><label>Remarks<input aria-label={`Remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></td>
             <td><button type="button" className="button danger" disabled={busy} onClick={() => {
               if (window.confirm(`Remove ${FAMILY_LABEL[family]} row “${itemName}” from this draft? The accepted revision changes only after approval.`))
                 patchContent({ requirements: (content.requirements || []).filter((row: any) => row.requirementKey !== item.requirementKey) });
@@ -688,7 +821,6 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
                 {item.lineIdentityStatus === "unresolved" && <p className="parts-definition-error" role="status">Physical line identity is unresolved and remains blocked from publication until reviewed.</p>}
                 <p className="parts-help">Provenance: {item.provenance?.type || "legacy / unclassified"}. A Stores issue route records routing only; it does not create a purchase.</p>
                 <label>Issue route<input aria-label={`Issue route — ${rowName}`} value={detail.IssueRoute ?? ""} onChange={event => updateRequirementDetail(index, "IssueRoute", event.target.value)}/></label>
-                {family !== "toolshop" && <label>Tool Shop remarks<input aria-label={`Tool Shop remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label>}
                 <label>Engineering attributes (JSON)<textarea aria-label={`Engineering attributes (JSON) — ${rowName}`} value={attributeText[`requirement:${item.requirementKey}`] ?? JSON.stringify(detail.EngineeringAttributes || {}, null, 2)} onChange={event => {
                   const text = event.target.value; setAttributeText(old => ({ ...old, [`requirement:${item.requirementKey}`]: text }));
                   try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updateRequirementDetail(index, "EngineeringAttributes", parsed); else setDirty(true); }
@@ -721,6 +853,9 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     {pendingApproval && <p className="parts-definition-error" role="alert">An approval is unresolved. Retry the original operation before making another change. <button type="button" className="button" onClick={() => void confirmApproval(pendingApproval)} disabled={busy}>{busy ? "Recovering…" : "Retry original approval"}</button></p>}
     {editing && <fieldset className="parts-definition-editor" aria-label="Edit saved Part definition" disabled={busy || Boolean(pendingSave) || Boolean(pendingSubmit) || Boolean(pendingApproval)}>
       {definition.draft?.stale && <p className="parts-definition-error" role="status">The saved draft uses an older accepted base. It is retained. Review the current values here and reconcile them manually before saving a new draft on Rev {definition.revisionLabel}.</p>}
+      {options?.materialWeightSource?.status === "available"
+        ? <p className="parts-definition-notice" role="status">Weight factor source read from Costing-New ({options.materialWeightSource.catalogCount} master rows). This picker currently contains {options.materials?.length || 0} Safari Material identities; unbound upstream materials are not presented as selectable Safari IDs.</p>
+        : <p className="parts-definition-error" role="status">Costing-New weight factors are unavailable. Saved labels remain visible; calculated material weight and mass-based cost are incomplete.</p>}
       <div className="parts-definition-applicability"><strong>Family applicability</strong>{Object.entries(FAMILY_LABEL).map(([family, label]) => <label key={family}><input type="checkbox" checked={Boolean(content?.applicability?.[family]?.applicable)} onChange={event => patchContent({ applicability: { ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: event.target.checked } } })}/>{label}</label>)}</div>
       <div className="parts-definition-list-heading"><h4>Manufacturing requirements</h4><span>Choose the family before adding a row. First-row selection also records applicability in this draft.</span></div>
       {EDITABLE_FAMILIES.map(renderRequirementTable)}
@@ -792,16 +927,27 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
         const rows = definition.requirements.filter((item: any) => item.family === family);
         const label = family === "mcl" ? "MCL" : family === "toolshop" ? "Tool Shop" : "CNC";
         return <section className="parts-definition-family" key={family} aria-label={`Accepted ${label} requirements`}><h4>{label}</h4>
-          {rows.length ? <div className="parts-definition-table-scroll"><table className="parts-definition-table parts-definition-readonly"><thead><tr><th>Item / material</th><th>Quantity per Part</th>{family === "cnc" ? <th>Per Part Weight (kg)</th> : <th>Dimension to Cut</th>}<th>Rate-basis consumption</th><th>Saved identity / evidence</th></tr></thead><tbody>
+          {rows.length ? <div className="parts-definition-table-scroll"><table className="parts-definition-table parts-definition-readonly"><thead><tr>{family === "cnc" && <th>Plate part to cut</th>}<th>Material To Use</th><th>Qty per Part</th>{family === "cnc" ? <><th>Per Part Weight (kg)</th><th>Total weight (kg)</th></> : <><th>Dimension to Cut</th><th>Calculated weight (kg)</th></>}<th>Remarks</th><th>Saved details</th></tr></thead><tbody>
             {rows.map((item: any) => {
               const detail = item.detail || {};
-              const totalWeight = positiveNumber(detail.PartWeightKg) && positiveNumber(item.quantity) ? decimalProduct(detail.PartWeightKg, item.quantity) : null;
-              const displayName = detail.ItemName || detail.PlatePart || detail.MaterialDisplayName || item.sourcePartName || "Requirement";
-              return <tr key={item.requirementKey}><td><strong>{displayName}</strong><small>{detail.MaterialDisplayName || (detail.Material ? `Material identity ${detail.Material}` : "Material not resolved")}</small></td>
+              const material = (options?.materials || []).find((candidate: any) => String(candidate.id) === String(detail.Material));
+              const displayName = detail.MaterialDisplayName || material?.name || detail.ItemName || item.sourcePartName || "Saved material label unavailable";
+              const weight = cutWeight(item, options?.materials || []);
+              const totalWeight = positiveNumber(detail.PartWeightKg) && positiveNumber(item.quantity) ? kgText(Number(detail.PartWeightKg) * Number(item.quantity)) : null;
+              const attrs = engineeringAttributes(detail);
+              return <tr key={item.requirementKey}>
+                {family === "cnc" && <td>{detail.PlatePart || "—"}</td>}
+                <td><strong>{displayName}</strong>{!detail.Material && <small>Saved label retained · Safari material identity unresolved</small>}</td>
                 <td>{item.quantity ?? "—"} {item.uom || ""}</td>
-              <td>{family === "cnc" ? <><strong>{detail.PartWeightKg == null ? "unknown" : `${detail.PartWeightKg} kg`}</strong><small>Total per Part: {totalWeight == null ? "not available" : `${totalWeight} kg`} · separate saved total weight: {savedTotalWeightLabel(item, detail)}</small></> : cutLengthText(detail)}</td>
-                <td>{detail.Quantity == null ? "unknown" : `${detail.Quantity} ${detail.QuantityUOM || "unit not recorded"}`}<small>Per linked occurrence; multiplicity is the Part quantity above.</small></td>
-                <td><small>{item.identityStatus === "legacy_unclassified" || item.identityStatus === "legacy_duplicate_unclassified" ? "Legacy identity needs review; no old row was rewritten." : `Requirement ${item.requirementKey}`}</small><small>{item.provenance?.type || "legacy / unclassified"}{item.lineIdentityStatus === "unresolved" ? " · physical line unresolved" : ""}</small></td></tr>;
+                {family === "cnc" ? <><td>{positiveNumber(detail.PartWeightKg) ? `${detail.PartWeightKg} kg` : "Unavailable"}</td><td>{totalWeight == null ? "Unavailable" : `${totalWeight} kg`}</td></>
+                  : <><td>{cutLengthText(detail)}</td><td><strong>{weight.perPiece == null ? "Unavailable" : `${kgText(weight.perPiece)} kg / piece`}</strong><small>{weight.total == null ? "Total per parent Part unavailable" : `${kgText(weight.total)} kg per parent Part`}</small>{weight.evidence?.kgPerMeter && <small>{weight.evidence.kgPerMeter} kg/m · {weight.evidence.source || "Costing-New"}{weight.evidence.sourceDate ? ` · ${weight.evidence.sourceDate}` : " · source date unavailable"}</small>}</td></>}
+                <td>{detail.ToolShopRemarks || "—"}</td>
+                <td><details><summary>Saved calculation and identity</summary><small>{detail.Quantity == null ? "Normalized consumption unavailable" : `${detail.Quantity} ${detail.QuantityUOM || "unit not recorded"} per requirement occurrence`}</small>
+                  <small>{savedTotalWeightDescription(item)}</small>
+                  {attrs.materialWeightEvidence && <small>Weight source evidence: {JSON.stringify(attrs.materialWeightEvidence)}</small>}
+                  {detail.ItemName && <small>Saved source item label: {detail.ItemName}</small>}
+                  <small>{item.identityStatus === "legacy_unclassified" || item.identityStatus === "legacy_duplicate_unclassified" ? "Legacy identity needs review; no old row was rewritten." : item.provenance?.type || "legacy / unclassified"}{item.lineIdentityStatus === "unresolved" ? " · physical line unresolved" : ""}</small>
+                </details></td></tr>;
             })}
           </tbody></table></div> : <p className="parts-help">No saved {label} rows.</p>}
         </section>;
