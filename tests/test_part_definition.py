@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -444,6 +445,74 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertEqual((alias["EntityId"], alias["SourceRow"]), ("material-weight:costing-new-test:MasterMaterial:56", 56))
             self.assertNotEqual(alias["EntityId"], str(alias["SourceRow"]))
 
+    def test_source_only_master_capture_is_reviewed_idempotent_and_recovers_after_lost_response(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                    "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                    "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"},
+                {"canonicalName": "Alang Cut Piece-Casting Template No. 83 - Round Plate", "masterMaterialId": 56,
+                    "kgPerMeter": "5", "factorStatus": "available", "source": "Costing-New",
+                    "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                    "factorUnit": "kg/m", "sourceDate": "2026-11-10"},
+                {"canonicalName": "Concurrent QA casting stock", "masterMaterialId": 57,
+                    "kgPerMeter": "3.25", "factorStatus": "available", "source": "Costing-New",
+                    "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                    "factorUnit": "kg/m", "sourceDate": "2026-11-11"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            self.assertEqual(next(item for item in service.options("p-1")["materialCatalog"] if item["masterMaterialId"] == 56)["bindingStatus"], "unbound")
+            client.lose_after_create_table = "Material"
+            with self.assertRaises(TimeoutError):
+                service.bind_material_master("p-1", source_master_id=56, actor="Irshad", reason="Capture reviewed source-only material identity",
+                    request_key="capture-source-master-original", capture_canonical_identity=True)
+
+            captured_rows = [row for row in client.tables["Material"] if row["fields"].get("MaterialKey") == "material-master:costing-new-test:MasterMaterial:56"]
+            self.assertEqual(len(captured_rows), 1)
+            safari_id = captured_rows[0]["id"]
+            self.assertNotEqual(safari_id, 56)
+            self.assertEqual(captured_rows[0]["fields"], {"MaterialKey": "material-master:costing-new-test:MasterMaterial:56",
+                "CanonicalName": "Alang Cut Piece-Casting Template No. 83 - Round Plate",
+                "ODSDisplayName": "Alang Cut Piece-Casting Template No. 83 - Round Plate",
+                "MappingStatus": "reviewed_source_master_capture"})
+
+            offline_provider = lambda: (_ for _ in ()).throw(OSError("Costing-New unavailable during same-key recovery"))
+            restarted = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=offline_provider)
+            result = restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad", reason="Capture reviewed source-only material identity",
+                request_key="capture-source-master-original", capture_canonical_identity=True)
+            self.assertEqual((result["status"], result["materialId"], result["identityCaptured"]), ("bound", safari_id, True))
+            self.assertEqual(restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad",
+                reason="Capture reviewed source-only material identity", request_key="capture-source-master-original",
+                capture_canonical_identity=True), result)
+            available_restarted = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            replay = available_restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad",
+                reason="Capture reviewed source-only material identity", request_key="capture-source-master-repeat",
+                capture_canonical_identity=True)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(len([row for row in client.tables["Material"]
+                if row["fields"].get("MaterialKey") == "material-master:costing-new-test:MasterMaterial:56"]), 1)
+
+            refreshed = available_restarted.options("p-1")
+            source = next(item for item in refreshed["materialCatalog"] if item["masterMaterialId"] == 56)
+            material = next(item for item in refreshed["materials"] if item["id"] == safari_id)
+            self.assertEqual((source["bindingStatus"], source["materialId"]), ("bound", safari_id))
+            self.assertEqual((material["name"], material["kgPerMeter"], material["weightEvidence"]["sourceDate"]),
+                ("Alang Cut Piece-Casting Template No. 83 - Round Plate", "5", "2026-11-10"))
+            audit = [row for row in client.tables["AuditEvent"] if row["fields"].get("EventType") == "part_material_master_canonical_capture_reviewed"]
+            self.assertEqual(len(audit), 2)
+
+            concurrent_service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                attempts = [pool.submit(candidate.bind_material_master, "p-1", source_master_id=57, actor="Irshad",
+                    reason="Capture concurrent QA identity", request_key="capture-source-master-concurrent", capture_canonical_identity=True)
+                    for candidate in (available_restarted, concurrent_service)]
+                concurrent_results = [attempt.result(timeout=10) for attempt in attempts]
+            self.assertEqual(concurrent_results[0], concurrent_results[1])
+            concurrent_key = "material-master:costing-new-test:MasterMaterial:57"
+            self.assertEqual(len([row for row in client.tables["Material"] if row["fields"].get("MaterialKey") == concurrent_key]), 1)
+            self.assertEqual(len([row for row in client.tables["IdentityAlias"]
+                if row["fields"].get("EntityId") == "material-weight:costing-new-test:MasterMaterial:57"]), 1)
+
     def test_history_includes_route_and_advanced_attributes_without_format_only_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
@@ -462,6 +531,34 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertIn("Engineering attribute · grain", fields)
             self.assertNotIn("Quantity per Part", fields)
             self.assertNotIn("Rate-basis consumption", fields)
+
+    def test_history_compares_text_exactly_and_normalizes_only_typed_numbers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
+            before_row = {"requirementKey": "stable:mcl:typed-history", "identityStatus": "stable", "family": "mcl",
+                "quantity": 1, "uom": "Nos", "detail": {"ItemName": "Bar", "MaterialDisplayName": "Steel",
+                    "DimensionMM": 10, "DimensionText": "10 mm", "Quantity": 1, "QuantityUOM": "kg",
+                    "ToolShopRemarks": "001", "ItemCode": "001",
+                    "EngineeringAttributes": {"numeric": 1, "text": "001", "nested": {"code": "0007"}}}}
+            after_row = deepcopy(before_row)
+            after_row["quantity"] = 1.0
+            after_row["uom"] = "each"
+            after_row["detail"].update({"DimensionMM": 10.0, "DimensionText": "1 cm", "Quantity": 1000,
+                "QuantityUOM": "g", "ToolShopRemarks": "1", "ItemCode": "1",
+                "EngineeringAttributes": {"nested": {"code": "0007"}, "text": "1", "numeric": 1.0}})
+            before_purchase = {"specificationIdentity": "purchase:typed-history", "code": "001", "manufacturer": "QA",
+                "manufacturerPartNumber": "001", "description": "Numeric-looking engineering identifier", "costingUOM": "each", "costingCurrency": "INR"}
+            after_purchase = {**before_purchase, "code": "1", "manufacturerPartNumber": "1"}
+            changes = service._definition_changes({"requirements": [before_row], "components": [], "purchases": [before_purchase]},
+                {"requirements": [after_row], "components": [], "purchases": [after_purchase]})
+            changed = {(change["field"], change["before"], change["after"]) for change in changes if change["kind"] == "modified"}
+            self.assertEqual(changed, {
+                ("Remarks", "001", "1"),
+                ("Item code", "001", "1"),
+                ("Engineering attribute · text", "001", "1"),
+                ("Specification code", "001", "1"),
+                ("Manufacturer part number", "001", "1"),
+            })
 
     def test_approval_revalidates_frozen_change_request_consumption_before_publication_plan(self):
         with tempfile.TemporaryDirectory() as temp:

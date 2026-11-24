@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 import "./partDefinition.css";
 
@@ -372,6 +372,25 @@ function savedAttempt(partId: string, action: string) {
   } catch { return null; }
 }
 const savedDraftAttempt = (partId: string) => savedAttempt(partId, "draft-save");
+function materialBindingAttempt(partId: string, requirementKey: string, payload: Record<string, unknown>) {
+  const storageKey = `safari.part-definition:${partId}:material-binding:${encodeURIComponent(requirementKey)}`;
+  const signature = JSON.stringify(payload);
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
+    if (saved?.status === "pending" && saved?.key) {
+      if (saved.signature === signature) return { key: String(saved.key), storageKey };
+      throw new Error("Recover the earlier material review before changing its source, selection, or reason.");
+    }
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.startsWith("Recover the earlier material review")) throw cause;
+  }
+  const key = `material-binding:${crypto.randomUUID()}`;
+  try { localStorage.setItem(storageKey, JSON.stringify({ key, signature, status: "pending" })); } catch { /* the server journal still protects a delivered request */ }
+  return { key, storageKey };
+}
+function clearMaterialBindingAttempt(storageKey: string) {
+  try { localStorage.removeItem(storageKey); } catch { /* server request journal remains authoritative */ }
+}
 
 export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { partId: string; onSaved: () => void; onCompare: () => void }) {
   const [definition, setDefinition] = useState<Definition | null>(null);
@@ -389,6 +408,10 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
   const [materialMasterSearch, setMaterialMasterSearch] = useState<Record<string, string>>({});
   const [materialMasterSelection, setMaterialMasterSelection] = useState<Record<string, string>>({});
+  const [pendingRemoval, setPendingRemoval] = useState<{ description: string; confirm: () => void } | null>(null);
+  const removalCancelRef = useRef<HTMLButtonElement | null>(null);
+  const removalDialogRef = useRef<HTMLDivElement | null>(null);
+  const removalFocusRef = useRef<{ trigger: HTMLElement | null; fallback: HTMLElement | null }>({ trigger: null, fallback: null });
   const [focusRequirementKey, setFocusRequirementKey] = useState<string | null>(null);
   const [focusComponentIdentity, setFocusComponentIdentity] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -430,6 +453,27 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     first?.focus(); first?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     setFocusComponentIdentity(null);
   }, [focusComponentIdentity, content?.components]);
+  useEffect(() => {
+    if (!pendingRemoval) return;
+    removalCancelRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); setPendingRemoval(null);
+        window.setTimeout(() => {
+          const { trigger, fallback } = removalFocusRef.current;
+          (trigger?.isConnected ? trigger : fallback)?.focus();
+        }, 0);
+      } else if (event.key === "Tab") {
+        const buttons = [...(removalDialogRef.current?.querySelectorAll<HTMLButtonElement>("button:not([disabled])") || [])];
+        if (buttons.length < 2) return;
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [pendingRemoval]);
 
   const pending = useMemo(() => definition?.pendingChangeRequests?.[0] || null, [definition]);
   const pendingDependents = pending?.impact?.dependents || pending?.impact?.assemblies || [];
@@ -438,6 +482,25 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   function patchContent(update: Record<string, unknown>) {
     setContent((old: any) => ({ ...old, ...update }));
     setDirty(true); setNotice(""); setValidationErrors({});
+  }
+
+  function requestRemoval(description: string, confirm: () => void) {
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const family = trigger?.closest(".parts-definition-family");
+    const fallback = (family?.querySelector("h4") || document.querySelector(".parts-definition-heading h3")) as HTMLElement | null;
+    removalFocusRef.current = { trigger, fallback };
+    setPendingRemoval({ description, confirm });
+  }
+
+  function finishRemoval(confirmed: boolean) {
+    if (!pendingRemoval) return;
+    const pending = pendingRemoval;
+    if (confirmed) pending.confirm();
+    setPendingRemoval(null);
+    window.setTimeout(() => {
+      const { trigger, fallback } = removalFocusRef.current;
+      (trigger?.isConnected ? trigger : fallback)?.focus();
+    }, 0);
   }
 
   function updateRequirement(index: number, update: Record<string, unknown>) {
@@ -472,23 +535,54 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     patchContent({ requirements: rows });
   }
 
-  async function reviewAndBindMaterial(index: number) {
+  async function reviewAndBindMaterial(index: number, captureCanonicalIdentity = false) {
     const item = content?.requirements?.[index];
     const materialId = Number(item?.detail?.Material);
     const sourceMasterMaterialId = Number(materialMasterSelection[item?.requirementKey || ""]);
-    if (!Number.isInteger(materialId) || materialId <= 0 || !Number.isInteger(sourceMasterMaterialId) || sourceMasterMaterialId <= 0 || !reason.trim()) {
-      setError("Choose an existing Safari Material, a Costing-New master, and enter the review reason before binding.");
+    if ((!captureCanonicalIdentity && (!Number.isInteger(materialId) || materialId <= 0))
+        || !Number.isInteger(sourceMasterMaterialId) || sourceMasterMaterialId <= 0 || !reason.trim()) {
+      setError("Choose a Costing-New master and enter the review reason before binding or capturing its canonical identity.");
       return;
     }
     setBusy(true); setError(""); setNotice("");
+    const payload = { ...(captureCanonicalIdentity ? {} : { materialId }), sourceMasterMaterialId, reason: reason.trim(),
+      ...(captureCanonicalIdentity ? { captureCanonicalIdentity: true } : {}) };
+    let attempt: { key: string; storageKey: string };
     try {
-      await api.bindPartDefinitionMaterial(partId, { materialId, sourceMasterMaterialId, reason: reason.trim() }, `material-binding:${crypto.randomUUID()}`);
+      attempt = materialBindingAttempt(partId, String(item.requirementKey || "unidentified-row"), payload);
+      const result = await api.bindPartDefinitionMaterial(partId, payload, attempt.key);
+      clearMaterialBindingAttempt(attempt.storageKey);
       const nextOptions = await api.partDefinitionOptions(partId);
       setOptions(nextOptions);
-      const trustedMaterial = (nextOptions.materials || []).find((candidate: any) => String(candidate.id) === String(materialId));
-      setContent((old: any) => ({ ...old, requirements: (old?.requirements || []).map((row: any, rowIndex: number) =>
-        rowIndex === index ? { ...row, materialWeightEvidence: trustedMaterial?.weightEvidence || { status: "unavailable" } } : row) }));
-      setNotice(`Reviewed ${nextOptions.materialCatalog?.find((candidate: any) => candidate.masterMaterialId === sourceMasterMaterialId)?.canonicalName || "Costing-New material"} binding is saved. The selected Safari Material identity remains ${trustedMaterial?.name || materialId}.`);
+      const selectedMaterialId = Number(result.materialId ?? materialId);
+      const trustedMaterial = (nextOptions.materials || []).find((candidate: any) => String(candidate.id) === String(selectedMaterialId));
+      if (captureCanonicalIdentity && !trustedMaterial) throw new Error("The reviewed identity was saved, but a fresh Safari read did not return its canonical Material. Reload before editing this row.");
+      if (captureCanonicalIdentity && trustedMaterial) {
+        setContent((old: any) => {
+          const requirements = [...(old?.requirements || [])];
+          const current = requirements[index];
+          if (!current) return old;
+          const detail = { ...(current.detail || {}), Material: selectedMaterialId, MaterialDisplayName: trustedMaterial.name };
+          const unit = String(detail.QuantityUOM || "").trim().toLowerCase();
+          const derived = derivedConsumptionForPhysicalBasis(current.family, detail, unit, nextOptions.materials || []);
+          if (usesPhysicalConsumptionBasis(current.family, unit)) {
+            detail.Quantity = derived == null ? "" : derived;
+            detail.ExactQuantityText = derived == null ? "" : String(derived);
+          }
+          requirements[index] = { ...current, detail, materialWeightEvidence: trustedMaterial.weightEvidence || { status: "unavailable" },
+            fieldStatus: { ...(current.fieldStatus || {}), ...(usesPhysicalConsumptionBasis(current.family, unit)
+              ? { Quantity: derived == null ? "missing" : "derived" } : {}) } };
+          return { ...old, requirements };
+        });
+        setDirty(true);
+      } else {
+        setContent((old: any) => ({ ...old, requirements: (old?.requirements || []).map((row: any, rowIndex: number) =>
+          rowIndex === index ? { ...row, materialWeightEvidence: trustedMaterial?.weightEvidence || { status: "unavailable" } } : row) }));
+      }
+      const masterName = nextOptions.materialCatalog?.find((candidate: any) => candidate.masterMaterialId === sourceMasterMaterialId)?.canonicalName || "Costing-New material";
+      setNotice(captureCanonicalIdentity
+        ? `Reviewed ${masterName} is now a canonical Safari Material and is selected for this row. Save the draft to persist the row selection.`
+        : `Reviewed ${masterName} binding is saved. The selected Safari Material identity remains ${trustedMaterial?.name || materialId}.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The material binding could not be saved.");
     } finally { setBusy(false); }
@@ -804,7 +898,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const rows = (content?.requirements || []).filter((item: any) => item.family === family);
     const familyLabel = family === "mcl" ? "MCL" : family === "toolshop" ? "Tool Shop" : "CNC";
     return <section className="parts-definition-family" key={family} aria-label={`${familyLabel} requirements`}>
-      <div className="parts-definition-list-heading"><h4>{familyLabel}</h4><button type="button" className="button" disabled={busy} onClick={() => addRequirement(family)}>Add {familyLabel} row</button></div>
+      <div className="parts-definition-list-heading"><h4 tabIndex={-1}>{familyLabel}</h4><button type="button" className="button" disabled={busy} onClick={() => addRequirement(family)}>Add {familyLabel} row</button></div>
       {rows.length === 0 ? <p className="parts-help">No {familyLabel} rows in this draft. Add a row to mark this family applicable in the draft.</p> : <div className="parts-definition-table-scroll"><table className="parts-definition-table">
         <thead><tr>{family === "cnc" && <th>Plate part to cut</th>}<th>Material To Use</th><th>Qty per Part</th>{family === "cnc" ? <><th>Per Part Weight (kg)</th><th>Total weight (kg)</th></> : <><th>Dimension to Cut</th><th>Calculated weight (kg)</th></>}<th>Remarks</th><th>Actions</th></tr></thead>
         <tbody>{rows.map((item: any, rowPosition: number) => {
@@ -846,7 +940,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
               </select>{itemError && <small className="parts-definition-error-text">{itemError}</small>}</label>
               {!materialValue && detail.MaterialDisplayName && <small role="status">Saved label: {detail.MaterialDisplayName} · material identity unresolved</small>}
               {(detail.identityStatus === "legacy_unclassified" || item.identityStatus?.startsWith("legacy")) && <small>Saved legacy identity is retained for review.</small>}
-              {family !== "cnc" && <details className="parts-definition-material-binding"><summary>Search and review a Costing-New material binding</summary>
+              <details className="parts-definition-material-binding"><summary>Search and review a Costing-New material binding</summary>
                 {options?.materialWeightSource?.status === "available" ? <>
                   <label>Search source catalogue<input aria-label={`Search Costing-New materials — ${rowName}`} value={materialMasterSearch[item.requirementKey] || ""}
                     onChange={event => setMaterialMasterSearch(old => ({ ...old, [item.requirementKey]: event.target.value }))}/></label>
@@ -860,16 +954,21 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
                   {masterSearch && masterChoices.length === 0 && <small>No Costing-New materials match this search.</small>}
                   {masterChoices.length === 40 && <small>Showing the first 40 matches; refine the search to narrow the catalogue.</small>}
                   {selectedMaster?.bindingStatus === "unbound" && <>
-                    {!materialValue && <small>First choose the Safari Material identity that this source material should represent.</small>}
-                    <button type="button" className="button" disabled={busy || !materialValue || !reason.trim()} onClick={() => void reviewAndBindMaterial(index)}>
-                      Review and bind to selected Safari Material
+                    {materialValue && <>
+                      <button type="button" className="button" disabled={busy || !reason.trim()} onClick={() => void reviewAndBindMaterial(index)}>
+                        Review and bind to selected existing Material
+                      </button>
+                      <small>Use this only when both names refer to the same real material identity.</small>
+                    </>}
+                    <button type="button" className="button" disabled={busy || !reason.trim()} onClick={() => void reviewAndBindMaterial(index, true)}>
+                      Review and capture as canonical Material
                     </button>
-                    <small>This records an approver-reviewed, signed alias. It does not create or re-key either master identity.</small>
+                    <small>This records an approver-reviewed, signed source link. If no matching Safari identity exists, it creates one reviewable Material with a new local Grist ID and then selects it here. CNC weights remain operator-entered.</small>
                   </>}
                   {selectedMaster?.bindingStatus === "bound" && <small>Already bound to Safari Material {selectedMaster.materialId}; changing it requires reviewed data repair.</small>}
                   {selectedMaster?.bindingStatus === "ambiguous" && <small>This source identity has conflicting Safari bindings and cannot be selected.</small>}
                 </> : <small role="status">Costing-New is unavailable. Existing saved material selections and verified factor evidence remain available offline.</small>}
-              </details>}
+              </details>
             </td>
             <td><div className="parts-definition-inline-fields">
               <label>Quantity<input aria-label={`Quantity — ${rowName}`} inputMode="decimal" value={item.quantity ?? ""} aria-invalid={Boolean(quantityError)} onChange={event => updateRequirement(index, { quantity: event.target.value })}/>{quantityError && <small className="parts-definition-error-text">{quantityError}</small>}</label>
@@ -913,8 +1012,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
             </td>
             <td><label>Remarks<input aria-label={`Remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></td>
             <td><button type="button" className="button danger" disabled={busy} onClick={() => {
-              if (window.confirm(`Remove ${FAMILY_LABEL[family]} row “${itemName}” from this draft? The accepted revision changes only after approval.`))
-                patchContent({ requirements: (content.requirements || []).filter((row: any) => row.requirementKey !== item.requirementKey) });
+              requestRemoval(`Remove ${FAMILY_LABEL[family]} row “${itemName}” from this draft? The accepted revision changes only after approval.`,
+                () => patchContent({ requirements: (content.requirements || []).filter((row: any) => row.requirementKey !== item.requirementKey) }));
             }}>Remove row</button>
               <details><summary>Advanced saved fields</summary>{item.identityStatus === "legacy_duplicate_unclassified" && <button type="button" className="button" disabled={busy} onClick={() => updateRequirement(index, { requirementKey: `safari-authored-requirement:${crypto.randomUUID()}`, identityStatus: "safari_authored", legacyOccurrenceKey: item.requirementKey })}>Assign reviewed occurrence identity</button>}
                 {item.lineIdentityStatus === "unresolved" && <p className="parts-definition-error" role="status">Physical line identity is unresolved and remains blocked from publication until reviewed.</p>}
@@ -938,7 +1037,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   if (!definition) return null;
 
   return <section className="parts-section-card parts-definition-card" aria-label="Saved Part definition">
-    <header className="parts-definition-heading"><div><h3>Saved Part definition</h3><p>{definition.partNumber} · accepted Rev {definition.revisionLabel} · {definition.revisionStatus.replaceAll("_", " ")}</p></div>
+    <header className="parts-definition-heading"><div><h3 tabIndex={-1}>Saved Part definition</h3><p>{definition.partNumber} · accepted Rev {definition.revisionLabel} · {definition.revisionStatus.replaceAll("_", " ")}</p></div>
       <div className="parts-definition-actions"><button type="button" className="button" onClick={() => { setEditing(true); setNotice(""); }} disabled={busy || Boolean(pending) || Boolean(pendingSave) || Boolean(pendingSubmit) || Boolean(pendingApproval) || !definition.actions?.editPart}>Edit Part</button>
         <button type="button" className="button" onClick={() => document.getElementById("part-definition-history")?.scrollIntoView({ behavior: "smooth", block: "center" })}>Revision history</button>
         <button type="button" className="button" onClick={onCompare}>Compare with ODS</button></div></header>
@@ -953,7 +1052,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     {editing && <fieldset className="parts-definition-editor" aria-label="Edit saved Part definition" disabled={busy || Boolean(pendingSave) || Boolean(pendingSubmit) || Boolean(pendingApproval)}>
       {definition.draft?.stale && <p className="parts-definition-error" role="status">The saved draft uses an older accepted base. It is retained. Review the current values here and reconcile them manually before saving a new draft on Rev {definition.revisionLabel}.</p>}
       {options?.materialWeightSource?.status === "available"
-        ? <p className="parts-definition-notice" role="status">Weight factor source read from Costing-New ({options.materialWeightSource.catalogCount} master rows). This picker currently contains {options.materials?.length || 0} Safari Material identities; unbound upstream materials are not presented as selectable Safari IDs.</p>
+        ? <p className="parts-definition-notice" role="status">Weight factors are read from Costing-New ({options.materialWeightSource.catalogCount} master rows). Material To Use selects canonical Safari identities ({options.materials?.length || 0}); a distinct source-only identity needs explicit reviewed capture before it can be selected.</p>
         : <p className="parts-definition-error" role="status">Costing-New weight factors are unavailable. Saved labels remain visible; calculated material weight and mass-based cost are incomplete.</p>}
       <div className="parts-definition-applicability"><strong>Family applicability</strong>{Object.entries(FAMILY_LABEL).map(([family, label]) => <label key={family}><input type="checkbox" checked={Boolean(content?.applicability?.[family]?.applicable)} onChange={event => patchContent({ applicability: { ...content.applicability, [family]: { ...(content.applicability?.[family] || {}), applicable: event.target.checked } } })}/>{label}</label>)}</div>
       <div className="parts-definition-list-heading"><h4>Manufacturing requirements</h4><span>Choose the family before adding a row. First-row selection also records applicability in this draft.</span></div>
@@ -966,7 +1065,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
         </article>)}</div></details>}
 
       <section className="parts-definition-family" aria-label="Store requirements">
-        <div className="parts-definition-list-heading"><h4>Store</h4><button type="button" className="button" disabled={busy} onClick={addStoreRow}>Add Store row</button></div>
+        <div className="parts-definition-list-heading"><h4 tabIndex={-1}>Store</h4><button type="button" className="button" disabled={busy} onClick={addStoreRow}>Add Store row</button></div>
         <p className="parts-help">Store rows select a canonical child Part and reuse existing purchase/component routing. Issue Slip choices stay separate.</p>
         {(content?.components || []).length ? <div className="parts-definition-table-scroll"><table className="parts-definition-table"><thead><tr><th>Canonical child Part</th><th>Quantity</th><th>Unit</th><th>Sourcing route</th><th>Revision pin</th><th>Actions</th></tr></thead><tbody>
           {(content?.components || []).map((item: any, index: number) => {
@@ -988,8 +1087,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
               <td><label>Sourcing route<select aria-label={`Sourcing route — ${rowLabel}`} value={item.sourcingRoute || "auto"} onChange={event => updateComponent(index, { sourcingRoute: event.target.value })}><option value="auto">Automatic</option><option value="make">Manufacture</option><option value="buy">Purchased / Stores</option></select></label></td>
               <td>{item.childRevisionLabel || item.childRevisionId || "Current accepted child revision"}<small>Changing the child creates a different occurrence identity.</small></td>
               <td><button type="button" className="button danger" disabled={busy} onClick={() => {
-                if (window.confirm(`Remove Store row “${item.childPartNumber || item.childName || "unselected child Part"}” from this draft? The accepted revision changes only after approval.`))
-                  patchContent({ components: (content.components || []).filter((row: any) => row.componentIdentity !== item.componentIdentity) });
+                requestRemoval(`Remove Store row “${item.childPartNumber || item.childName || "unselected child Part"}” from this draft? The accepted revision changes only after approval.`,
+                  () => patchContent({ components: (content.components || []).filter((row: any) => row.componentIdentity !== item.componentIdentity) }));
               }}>Remove row</button></td>
             </tr>;
           })}
@@ -1008,7 +1107,9 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updatePurchase(index, { attributes: parsed }); else setDirty(true); }
           catch { setDirty(true); }
         }}/></label>
-      </div><button type="button" className="button danger" disabled={busy} onClick={() => { if (window.confirm(`Remove purchase specification “${item.code || item.description || item.specificationIdentity}” from this draft?`)) patchContent({ purchases: content.purchases.filter((row: any) => row.specificationIdentity !== item.specificationIdentity) }); }}>Remove purchase specification</button></fieldset>)}
+      </div><button type="button" className="button danger" disabled={busy} onClick={() => requestRemoval(
+        `Remove purchase specification “${item.code || item.description || item.specificationIdentity}” from this draft?`,
+        () => patchContent({ purchases: content.purchases.filter((row: any) => row.specificationIdentity !== item.specificationIdentity) }))}>Remove purchase specification</button></fieldset>)}
       </details>
 
       {!isFinalized && <label className="parts-definition-finalize"><input type="checkbox" checked={Boolean(content?.finalizeOnPublication)} onChange={event => patchContent({ finalizeOnPublication: event.target.checked })}/> Finalize this successor definition through the approved Change Request</label>}
@@ -1081,5 +1182,16 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
          <details className="parts-definition-changed-rows"><summary>Changed rows · {revision.changedRows?.length ?? "earlier evidence unavailable"}</summary>{Array.isArray(revision.changedRows) && revision.changedRows.length > 0 ? <div className="parts-definition-table-scroll"><table className="parts-definition-table"><thead><tr><th>Change</th><th>Family / item / occurrence</th><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>{revision.changedRows.map((change: any, index: number) => <tr key={`${change.occurrence}:${change.field}:${index}`}><td>{change.kind}</td><td>{change.family} · {change.item} · {change.occurrence}</td><td>{change.field}</td><td>{change.before ?? "—"}</td><td>{change.after ?? "—"}</td></tr>)}</tbody></table></div> : <p>{revision.changedRows ? "No business-field changes were recorded for this revision." : "Saved before-values are unavailable for this earlier revision."}</p>}</details>
        </article>)}</details>
     </>}
+    {pendingRemoval && <div className="parts-definition-confirm-backdrop">
+      <div ref={removalDialogRef} className="parts-definition-confirm-dialog" role="alertdialog" aria-modal="true"
+        aria-labelledby="parts-definition-confirm-title" aria-describedby="parts-definition-confirm-description" tabIndex={-1}>
+        <h3 id="parts-definition-confirm-title">Remove this draft row?</h3>
+        <p id="parts-definition-confirm-description">{pendingRemoval.description}</p>
+        <div className="parts-definition-confirm-actions">
+          <button ref={removalCancelRef} type="button" className="button" onClick={() => finishRemoval(false)}>Cancel removal</button>
+          <button type="button" className="button danger" onClick={() => finishRemoval(true)}>Remove from draft</button>
+        </div>
+      </div>
+    </div>}
   </section>;
 }

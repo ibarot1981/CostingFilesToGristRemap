@@ -318,40 +318,177 @@ class GristPartDefinitionService:
         return (detail_unit in piece_units and row_unit in piece_units and detail_quantity is not None
             and occurrence_quantity is not None and math.isclose(detail_quantity, occurrence_quantity, rel_tol=0, abs_tol=1e-12))
 
-    def _material_binding_choice(self, source_master_id: int, material_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _material_source_master(self, source_master_id: int) -> dict[str, Any]:
         catalog = self._material_weight_catalog()
         if catalog.get("status") != "available":
             raise PartIdentityError("PART_MATERIAL_CATALOG_UNAVAILABLE", "Costing-New is unavailable; a new material binding cannot be reviewed right now.")
         records = [record for record in catalog.get("records", [])
             if _int_ref(record.get("masterMaterialId")) == source_master_id]
+        if len(records) != 1 or not str(records[0].get("canonicalName") or "").strip():
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "Choose one existing Costing-New master with a canonical name.")
+        return deepcopy(records[0])
+
+    def _material_binding_choice(self, source_master_id: int, material_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        record = self._material_source_master(source_master_id)
         material = self._material_row(material_id)
-        if len(records) != 1 or not material or not self._material_name(_fields(material)):
+        if not material or not self._material_name(_fields(material)):
             raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "Choose one existing Costing-New master and one existing canonical Safari Material.")
-        return deepcopy(records[0]), material
+        return record, material
 
     @_serialized
-    def bind_material_master(self, part_id: str, *, source_master_id: Any, material_id: Any, actor: str, reason: str, request_key: str) -> dict[str, Any]:
-        """Record an approver-reviewed alias between an existing source master and Safari Material."""
+    def bind_material_master(self, part_id: str, *, source_master_id: Any, material_id: Any = None,
+            actor: str, reason: str, request_key: str, capture_canonical_identity: bool = False) -> dict[str, Any]:
+        """Record an approver-reviewed source binding, optionally capturing its canonical Safari identity."""
         self.registry._verify_writer()
         self._check_established(self._current_revision(part_id))
         if str(actor or "").strip().casefold() != os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold():
             raise PartIdentityError("PART_MATERIAL_BINDING_REVIEWER_REQUIRED", "A material master binding must be reviewed by the configured engineering approver.")
-        master_ref, safari_ref = _int_ref(source_master_id), _int_ref(material_id)
-        if not master_ref or not safari_ref or not str(reason or "").strip() or not str(request_key or "").strip():
-            raise PartIdentityError("PART_MATERIAL_BINDING_INPUT_REQUIRED", "Select existing source and Safari material identities and provide a review reason.")
-        record, material = self._material_binding_choice(master_ref, safari_ref)
-        catalog = self._material_weight_catalog()
+        master_ref = _int_ref(source_master_id)
+        safari_ref = _int_ref(material_id)
+        if (not master_ref or (capture_canonical_identity and safari_ref is not None)
+                or (not capture_canonical_identity and not safari_ref)
+                or not str(reason or "").strip() or not str(request_key or "").strip()):
+            raise PartIdentityError("PART_MATERIAL_BINDING_INPUT_REQUIRED", "Choose one source master and either its reviewed canonical capture or an existing Safari Material, then provide a review reason.")
+        request_key_value = request_key.strip()
+        prior = self.registry._find(self._rows("PartRegistryRequest"), "RequestKey", request_key_value)
+        record = None
+        material = None
+        catalog: dict[str, Any] = {}
+        recovered_capture = False
+        if capture_canonical_identity and prior:
+            prior_fields = _fields(prior)
+            if (prior_fields.get("RequestType") != "part_definition_material_binding"
+                    or str(prior_fields.get("EntityUUID") or "") != str(part_id)):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This material binding request key was already used for another operation.")
+
+            # A published request must be replayable during a Costing-New outage.
+            # Its signed alias binds the source identity, captured Safari row, reviewer,
+            # reason, request fingerprint and original request key together.
+            matching_aliases = [payload for _, payload in self._identity_alias_bindings()
+                if _int_ref(payload.get("sourceMasterMaterialId")) == master_ref
+                and str(payload.get("requestKey") or "") == request_key_value]
+            if len(matching_aliases) > 1:
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The saved request has more than one verified source identity; resolve it through reviewed data repair.")
+            if matching_aliases:
+                payload = matching_aliases[0]
+                source_document_id = str(payload.get("sourceDocumentId") or "")
+                canonical_name = str(payload.get("masterMaterialName") or "").strip()
+                material_id_saved = _int_ref(payload.get("safariMaterialId"))
+                material = self._material_row(material_id_saved)
+                material_fields = _fields(material) if material else {}
+                material_name = self._material_name(material_fields)
+                expected_fingerprint = request_fingerprint([part_id, source_document_id, master_ref,
+                    "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()])
+                valid_alias = (source_document_id and canonical_name and material_id_saved and material
+                    and payload.get("entityId") == f"material-weight:{source_document_id}:MasterMaterial:{master_ref}"
+                    and str(payload.get("sourceTable") or "") == "MasterMaterial"
+                    and str(payload.get("masterMaterialName") or "") == canonical_name
+                    and str(payload.get("reviewedBy") or "") == actor.strip()
+                    and str(payload.get("reason") or "") == reason.strip()
+                    and str(payload.get("requestFingerprint") or "") == expected_fingerprint
+                    and str(payload.get("requestKey") or "") == request_key_value
+                    and _int_ref(payload.get("sourceMasterMaterialId")) == master_ref
+                    and _int_ref(payload.get("safariMaterialId")) == material_id_saved
+                    and str(payload.get("safariMaterialName") or "") == material_name
+                    and material_name.casefold() == canonical_name.casefold()
+                    and str(prior_fields.get("RequestFingerprint") or "") == expected_fingerprint)
+                if not valid_alias:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The saved request does not match its signed canonical identity evidence.")
+                if str(prior_fields.get("Status") or "").casefold() == "published":
+                    try:
+                        saved_result = json.loads(str(prior_fields.get("Result") or "{}"))
+                    except (TypeError, ValueError):
+                        saved_result = None
+                    expected_identity_captured = str(material_fields.get("MappingStatus") or "") == "reviewed_source_master_capture"
+                    if (not isinstance(saved_result, dict) or saved_result.get("status") != "bound"
+                            or _int_ref(saved_result.get("masterMaterialId")) != master_ref
+                            or _int_ref(saved_result.get("materialId")) != material_id_saved
+                            or str(saved_result.get("masterName") or "") != canonical_name
+                            or str(saved_result.get("materialName") or "") != material_name
+                            or bool(saved_result.get("identityCaptured")) != expected_identity_captured):
+                        raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request result conflicts with its signed canonical identity evidence.")
+                    return saved_result
+                record = {"canonicalName": canonical_name, "masterMaterialId": master_ref,
+                    "sourceDocumentId": source_document_id}
+                catalog = {"status": "unavailable", "sourceDocumentId": source_document_id, "records": []}
+                recovered_capture = True
+            elif str(prior_fields.get("Status") or "").casefold() == "published":
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request has no verified signed canonical identity evidence.")
+            else:
+                # If the first response was lost after Grist created the keyed
+                # canonical Material but before the alias, recover only a unique
+                # deterministic row whose full request fingerprint matches.
+                suffix = f":MasterMaterial:{master_ref}"
+                candidates = []
+                for row in self._rows("Material"):
+                    fields = _fields(row)
+                    key = str(fields.get("MaterialKey") or "")
+                    canonical_name = self._material_name(fields)
+                    if (not key.startswith("material-master:") or not key.endswith(suffix)
+                            or str(fields.get("ODSDisplayName") or "") != canonical_name
+                            or str(fields.get("MappingStatus") or "") != "reviewed_source_master_capture"
+                            or not canonical_name):
+                        continue
+                    source_document_id = key[len("material-master:"):-len(suffix)]
+                    expected_fingerprint = request_fingerprint([part_id, source_document_id, master_ref,
+                        "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()])
+                    if expected_fingerprint == str(prior_fields.get("RequestFingerprint") or ""):
+                        candidates.append((row, source_document_id, canonical_name))
+                if len(candidates) > 1:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "More than one captured Material matches the interrupted request; resolve it through reviewed data repair.")
+                if candidates:
+                    material, source_document_id, canonical_name = candidates[0]
+                    record = {"canonicalName": canonical_name, "masterMaterialId": master_ref,
+                        "sourceDocumentId": source_document_id}
+                    catalog = {"status": "unavailable", "sourceDocumentId": source_document_id, "records": []}
+                    recovered_capture = True
+        if not recovered_capture:
+            record = self._material_source_master(master_ref) if capture_canonical_identity else None
+            catalog = self._material_weight_catalog()
+        if not capture_canonical_identity:
+            record, material = self._material_binding_choice(master_ref, safari_ref)
         source_document_id = str(record.get("sourceDocumentId") or self._material_catalog_document_id(catalog))
         if not source_document_id:
             raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "The source catalogue document identity is unavailable; no binding was written.")
+        canonical_name = str(record.get("canonicalName") or "").strip()
+        material_key = f"material-master:{source_document_id}:MasterMaterial:{master_ref}"
+        identity_captured = False
+        if capture_canonical_identity:
+            matching_materials = [row for row in self._rows("Material")
+                if self._material_name(_fields(row)).casefold() == canonical_name.casefold()]
+            if len(matching_materials) > 1:
+                raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "More than one Safari Material has this canonical name; resolve the duplicate identity before capture.")
+            material = matching_materials[0] if matching_materials else None
+            if material and str(_fields(material).get("MaterialKey") or "") == material_key:
+                material_fields = _fields(material)
+                if (self._material_name(material_fields).casefold() != canonical_name.casefold()
+                        or str(material_fields.get("ODSDisplayName") or "") != canonical_name
+                        or str(material_fields.get("MappingStatus") or "") != "reviewed_source_master_capture"):
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The source-derived Material key already belongs to another canonical identity.")
+            if material is None:
+                material = self.registry._find(self._rows("Material"), "MaterialKey", material_key)
+                if material:
+                    material_fields = _fields(material)
+                    if (str(material_fields.get("MaterialKey") or "") != material_key
+                            or self._material_name(material_fields).casefold() != canonical_name.casefold()
+                            or str(material_fields.get("ODSDisplayName") or "") != canonical_name
+                            or str(material_fields.get("MappingStatus") or "") != "reviewed_source_master_capture"):
+                        raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The source-derived Material key already belongs to another canonical identity.")
+            safari_ref = _int_ref(material.get("id")) if material else None
+            identity_captured = bool(material and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")
+        if capture_canonical_identity and not canonical_name:
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "The selected source master has no usable canonical name.")
         entity_id = f"material-weight:{source_document_id}:MasterMaterial:{master_ref}"
-        fingerprint = request_fingerprint([part_id, source_document_id, master_ref, safari_ref, actor.strip(), reason.strip()])
-        prior = self.registry._find(self._rows("PartRegistryRequest"), "RequestKey", request_key.strip())
+        fingerprint_payload = ([part_id, source_document_id, master_ref, "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()]
+            if capture_canonical_identity else [part_id, source_document_id, master_ref, safari_ref, actor.strip(), reason.strip()])
+        fingerprint = request_fingerprint(fingerprint_payload)
         if prior:
             prior_fields = _fields(prior)
             if prior_fields.get("RequestType") != "part_definition_material_binding" or prior_fields.get("RequestFingerprint") != fingerprint:
                 raise PartIdentityError("PART_REQUEST_CONFLICT", "This material binding request key was already used with different data.")
             if str(prior_fields.get("Status") or "").casefold() == "published":
+                if capture_canonical_identity:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request could not be verified through its signed canonical identity evidence.")
                 try:
                     return json.loads(str(prior_fields.get("Result") or "{}"))
                 except ValueError:
@@ -364,11 +501,14 @@ class GristPartDefinitionService:
             if (not existing_binding
                     or _int_ref(existing_binding.get("sourceMasterMaterialId")) != master_ref
                     or str(existing_binding.get("sourceDocumentId") or "") != source_document_id
-                    or _int_ref(existing_binding.get("safariMaterialId")) != safari_ref):
+                    or (safari_ref is not None and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref)
+                    or (capture_canonical_identity and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref)):
                 raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This Costing-New master already has a different or unverified Safari binding; resolve it through reviewed data repair.")
+            if capture_canonical_identity and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref:
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This source master is already bound to a different Safari Material; no identity was re-keyed.")
         bound_elsewhere = [payload for _, payload in self._identity_alias_bindings()
             if str(payload.get("sourceDocumentId") or "") == source_document_id
-            and _int_ref(payload.get("safariMaterialId")) == safari_ref
+            and safari_ref is not None and _int_ref(payload.get("safariMaterialId")) == safari_ref
             and _int_ref(payload.get("sourceMasterMaterialId")) != master_ref]
         if bound_elsewhere:
             raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This Safari Material already has a different Costing-New master binding; review the canonical identity before changing it.")
@@ -376,19 +516,29 @@ class GristPartDefinitionService:
         if not existing_binding and not self._material_signing_key():
             raise PartIdentityError("PART_MATERIAL_BINDING_SIGNING_UNAVAILABLE", "The server has no stable signing key for reviewed material bindings.")
 
-        # Do all identity and duplicate-binding checks before creating the
-        # request journal. A rejected review must not leave a false pending
-        # operation behind.
+        # Do all source, identity, duplicate-binding and signing checks before
+        # creating the request journal. A rejected review must not leave a
+        # false pending operation behind.
         request = prior or self.registry._begin_request(request_key.strip(), "part_definition_material_binding", fingerprint, part_id)
+        if capture_canonical_identity and material is None:
+            material = self.registry._ensure_keyed("Material", "MaterialKey", material_key, {
+                "MaterialKey": material_key, "CanonicalName": canonical_name, "ODSDisplayName": canonical_name,
+                "MappingStatus": "reviewed_source_master_capture"})
+            safari_ref = _int_ref(material.get("id"))
+            if not safari_ref or self._material_name(_fields(material)).casefold() != canonical_name.casefold():
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "Grist did not confirm the expected captured canonical Material identity.")
+            identity_captured = True
         if existing_binding:
             result = {"status": "bound", "idempotent": True, "materialId": safari_ref, "masterMaterialId": master_ref,
-                "masterName": record.get("canonicalName"), "materialName": self._material_name(_fields(material))}
+                "masterName": canonical_name, "materialName": self._material_name(_fields(material)),
+                "identityCaptured": bool(capture_canonical_identity and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")}
         else:
             source_payload = {"schema": "safari-material-master-binding-v1", "entityId": entity_id,
                 "sourceDocumentId": source_document_id, "sourceTable": "MasterMaterial", "sourceMasterMaterialId": master_ref,
-                "masterMaterialName": str(record.get("canonicalName") or ""), "safariMaterialId": safari_ref,
+                "masterMaterialName": canonical_name, "safariMaterialId": safari_ref,
                 "safariMaterialName": self._material_name(_fields(material)), "reviewedBy": actor.strip(), "reason": reason.strip(),
-                "createdAt": grist_datetime(utc_now()), "requestKey": request_key.strip(), "requestFingerprint": fingerprint}
+                "createdAt": grist_datetime(utc_now()), "requestKey": request_key.strip(), "requestFingerprint": fingerprint,
+                "identityAction": "captured" if identity_captured else "reused_or_existing"}
             fields = {"EntityType": "MaterialMasterBinding", "EntityId": entity_id, "Value": source_payload["masterMaterialName"],
                 "NormalizedValue": source_payload["masterMaterialName"].casefold(), "SourceRow": master_ref,
                 "Source": json.dumps({**source_payload, "signature": self._sign_material_payload(source_payload)}, sort_keys=True)}
@@ -405,9 +555,10 @@ class GristPartDefinitionService:
                     or _int_ref(saved_binding.get("safariMaterialId")) != safari_ref):
                 raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "Grist returned a conflicting material binding; no success was recorded.")
             result = {"status": "bound", "idempotent": False, "materialId": safari_ref, "masterMaterialId": master_ref,
-                "masterName": record.get("canonicalName"), "materialName": self._material_name(_fields(material))}
+                "masterName": canonical_name, "materialName": self._material_name(_fields(material)),
+                "identityCaptured": bool(capture_canonical_identity and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")}
         audit_key = f"material-binding:{request_key.strip()}"
-        self.registry._ensure_keyed("AuditEvent", "RequestKey", audit_key, {"EventType": "part_material_master_binding_reviewed",
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", audit_key, {"EventType": "part_material_master_canonical_capture_reviewed" if capture_canonical_identity else "part_material_master_binding_reviewed",
             "Actor": actor.strip(), "OccurredAt": grist_datetime(utc_now()), "EntityType": "MaterialMasterBinding",
             "EntityId": entity_id, "Reason": reason.strip(), "Payload": json.dumps(result, sort_keys=True),
             "RequestKey": audit_key, "RequestFingerprint": fingerprint})
@@ -648,28 +799,64 @@ class GristPartDefinitionService:
                 "Manufacturer part number": item.get("manufacturerPartNumber") or "—", "Description": item.get("description") or "—",
                 "Costing unit": item.get("costingUOM") or "—", "Currency": item.get("costingCurrency") or "—"}
 
-        def semantic_value(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {str(key): semantic_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
-            if isinstance(value, list):
-                return [semantic_value(item) for item in value]
-            if isinstance(value, bool) or value is None:
-                return value
-            candidate = value
-            unit = ""
-            if isinstance(value, str):
-                match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([^\d\s].*?)?\s*", value)
-                if not match:
-                    return value
-                candidate, unit = match.group(1), str(match.group(2) or "").strip().casefold()
+        numeric_display_fields = {
+            "Quantity per Part", "Dimension to Cut", "Calculated weight per piece",
+            "Calculated weight per parent Part", "Per Part Weight", "Plate length",
+            "Plate width", "Plate thickness", "Saved total weight", "Rate-basis consumption", "Quantity",
+            "Internal making cost", "External machining cost",
+        }
+        length_to_mm = {"mm": 1.0, "millimeter": 1.0, "millimeters": 1.0,
+            "cm": 10.0, "centimeter": 10.0, "centimeters": 10.0,
+            "m": 1000.0, "meter": 1000.0, "meters": 1000.0, "metre": 1000.0, "metres": 1000.0,
+            "in": 25.4, "inch": 25.4, "inches": 25.4}
+        mass_to_kg = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+            "g": 0.001, "gram": 0.001, "grams": 0.001}
+        count_units = {"no": "each", "nos": "each", "ea": "each", "each": "each",
+            "pc": "each", "pcs": "each", "piece": "each", "pieces": "each"}
+
+        def normalized_number(candidate: Any, unit: str = "") -> Any:
             numeric = _num(candidate)
             if numeric is None:
+                return None
+            unit_key = re.sub(r"\s+", " ", unit.strip().casefold())
+            if unit_key in length_to_mm:
+                numeric *= length_to_mm[unit_key]
+                unit_key = "mm"
+            elif unit_key in mass_to_kg:
+                numeric *= mass_to_kg[unit_key]
+                unit_key = "kg"
+            else:
+                unit_key = count_units.get(unit_key, unit_key)
+            # Decimal formatting is comparison-only; displayed before/after
+            # values retain their original human-readable representation.
+            return (format(numeric, ".12g"), unit_key)
+
+        def semantic_value(field: str, value: Any) -> Any:
+            # JSON attributes are typed data: object key order is irrelevant,
+            # numbers compare numerically, and numeric-looking strings remain
+            # text. This preserves values such as a specification "001".
+            if isinstance(value, dict):
+                return {str(key): semantic_value(field, item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+            if isinstance(value, list):
+                return [semantic_value(field, item) for item in value]
+            if isinstance(value, bool) or value is None:
                 return value
-            # Do not let display formatting such as 1 vs 1.0 create an edit.
-            normalized = format(numeric, ".12g")
-            if unit:
-                return f"{normalized} {unit}"
-            return normalized
+            if isinstance(value, (int, float)):
+                return normalized_number(value)
+            if not isinstance(value, str) or field not in numeric_display_fields:
+                return value
+
+            parts = value.split("/") if field == "Saved total weight" else [value]
+            normalized_parts = []
+            for part in parts:
+                match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([^\d\s].*?)?\s*", part)
+                if not match:
+                    return value
+                normalized = normalized_number(match.group(1), str(match.group(2) or ""))
+                if normalized is None:
+                    return value
+                normalized_parts.append(normalized)
+            return tuple(sorted(normalized_parts)) if field == "Saved total weight" else normalized_parts[0]
 
         changes: list[dict[str, Any]] = []
         for collection in ("requirements", "components", "purchases"):
@@ -695,7 +882,7 @@ class GristPartDefinitionService:
                 values_after = values(collection, new) if new else {}
                 for field in sorted(values_before.keys() | values_after.keys()):
                     left, right = values_before.get(field), values_after.get(field)
-                    if old and new and semantic_value(left) == semantic_value(right):
+                    if old and new and semantic_value(field, left) == semantic_value(field, right):
                         continue
                     changes.append({"kind": "added" if old is None else "removed" if new is None else "modified", "family": family,
                         "item": item_name(collection, sample), "occurrence": key, "field": field,

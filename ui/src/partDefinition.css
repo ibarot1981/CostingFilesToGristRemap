@@ -74,4 +74,10 @@
 .parts-definition-legacy,.parts-definition-purchases{margin:12px 0;padding:9px;border:1px solid #e2e7ed;border-radius:7px;background:#fafbfd}
 .parts-definition-changed-rows{margin-top:8px}
 .parts-definition-changed-rows .parts-definition-table{min-width:720px}
+.parts-definition-confirm-backdrop{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;padding:20px;background:rgba(18,27,39,.48)}
+.parts-definition-confirm-dialog{width:min(460px,100%);padding:18px;border:1px solid #cfd6df;border-radius:10px;background:#fff;box-shadow:0 18px 54px rgba(18,27,39,.24);color:#34435a}
+.parts-definition-confirm-dialog h3{margin:0 0 8px;font-size:16px}
+.parts-definition-confirm-dialog p{margin:0;color:#536176;font-size:12px;line-height:1.5}
+.parts-definition-confirm-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:18px}
+.parts-definition-confirm-dialog :focus-visible{outline:3px solid #3975ca;outline-offset:2px}
 @media(max-width:760px){.parts-definition-table{min-width:850px}.parts-definition-family{padding:7px}.parts-definition-table th,.parts-definition-table td{padding:6px}}

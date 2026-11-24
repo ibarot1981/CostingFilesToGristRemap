@@ -1413,7 +1413,8 @@ def bind_part_definition_material_master(part_id: str, request: Request, payload
     try:
         return _part_definition_service().bind_material_master(part_id,
             source_master_id=payload.get("sourceMasterMaterialId"), material_id=payload.get("materialId"),
-            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+            capture_canonical_identity=payload.get("captureCanonicalIdentity") is True)
     except PartIdentityError as exc:
         raise _part_http_error(exc)
 

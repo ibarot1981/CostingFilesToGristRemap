@@ -5,6 +5,7 @@ import {ApiError} from "../src/api";
 
 const apiMocks = vi.hoisted(() => ({
   partDefinition: vi.fn(), partDefinitionOptions: vi.fn(), savePartDefinitionDraft: vi.fn(),
+  bindPartDefinitionMaterial: vi.fn(),
   submitPartDefinitionChangeRequest: vi.fn(), reopenPartDefinitionChangeRequest: vi.fn(), approveAndPublishPartDefinition: vi.fn(),
 }));
 vi.mock("../src/api", () => ({api: apiMocks, ApiError: class ApiError extends Error {
@@ -34,6 +35,7 @@ beforeEach(() => {
   vi.stubGlobal("crypto", {randomUUID:() => `part-definition-${++counter}`});
   apiMocks.partDefinition.mockResolvedValue(accepted);
   apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"Steel"}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.bindPartDefinitionMaterial.mockResolvedValue({status:"bound",materialId:5,masterMaterialId:55,identityCaptured:false});
   apiMocks.savePartDefinitionDraft.mockResolvedValue({draftKey:"draft-1",saveVersion:1,contentFingerprint:"fp",content:{}});
   apiMocks.submitPartDefinitionChangeRequest.mockResolvedValue({changeRequestKey:"cr-1",status:"pending_approval",impact:{assemblies:[],modelCodeConfigurations:[]}});
   apiMocks.approveAndPublishPartDefinition.mockResolvedValue({status:"published",publishedRevisionLabel:"B",dependentPartCount:0,configurationCount:0});
@@ -324,17 +326,51 @@ it("adds exactly one focused row to the explicitly chosen MCL, Tool Shop, CNC an
   expect(container.querySelectorAll('[aria-label="Store requirements"] tbody tr')).toHaveLength(1);
 });
 
+it("captures a source-only canonical identity from CNC and selects the new local Material without deriving CNC weight", async () => {
+  const canonical = "Alang Cut Piece-Casting Template No. 83 - Round Plate";
+  const sourceOnly = {sourceKey:"costing-new-test:MasterMaterial:56",masterMaterialId:56,canonicalName:canonical,code:"PL-83",
+    bindingStatus:"unbound",materialId:null,factorStatus:"available",kgPerMeter:"5"};
+  const capturedMaterial = {id:99,name:canonical,kgPerMeter:5,weightEvidence:{status:"available",kgPerMeter:"5",factorUnit:"kg/m"}};
+  const beforeCapture = {parts:[],materials:[{id:5,name:"Steel"}],materialCatalog:[sourceOnly],
+    materialWeightSource:{status:"available",catalogCount:402},purchaseItems:[],families:["mcl","toolshop","cnc"]};
+  const afterCapture = {parts:[],materials:[{id:5,name:"Steel"},capturedMaterial],materialCatalog:[{...sourceOnly,bindingStatus:"bound",materialId:99}],
+    materialWeightSource:{status:"available",catalogCount:402},purchaseItems:[],families:["mcl","toolshop","cnc"]};
+  apiMocks.partDefinitionOptions.mockResolvedValueOnce(beforeCapture).mockResolvedValue(afterCapture);
+  apiMocks.bindPartDefinitionMaterial.mockResolvedValue({status:"bound",materialId:99,masterMaterialId:56,identityCaptured:true});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Add CNC row"}));
+  fireEvent.change(screen.getByLabelText("Per Part Weight (kg) — CNC row 1"),{target:{value:"0.25"}});
+  fireEvent.click(screen.getAllByText("Search and review a Costing-New material binding")[1]);
+  fireEvent.change(screen.getByLabelText("Costing-New material — CNC row 1"),{target:{value:"56"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Capture reviewed source identity"}});
+  fireEvent.click(screen.getByRole("button",{name:"Review and capture as canonical Material"}));
+  await screen.findByText(new RegExp(`${canonical} is now a canonical Safari Material`));
+  expect(apiMocks.bindPartDefinitionMaterial).toHaveBeenCalledWith("part-1",{
+    sourceMasterMaterialId:56,reason:"Capture reviewed source identity",captureCanonicalIdentity:true,
+  },expect.stringMatching(/^material-binding:/));
+  expect((screen.getByLabelText("Material To Use — CNC row 1") as HTMLSelectElement).value).toBe("99");
+  expect((screen.getByLabelText("Per Part Weight (kg) — CNC row 1") as HTMLInputElement).value).toBe("0.25");
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText(/Draft saved in Safari Grist/);
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements.at(-1).detail).toMatchObject({
+    Material:99,MaterialDisplayName:canonical,PartWeightKg:"0.25",
+  });
+});
+
 it("cancels then confirms row removal in the draft table", async () => {
-  const confirm = vi.spyOn(window,"confirm").mockReturnValue(false);
   const {container} = render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
   fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
   const firstRemove = () => screen.getAllByRole("button",{name:"Remove row"})[0];
   fireEvent.click(firstRemove());
+  expect(await screen.findByRole("alertdialog")).toBeTruthy();
   expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(1);
-  confirm.mockReturnValue(true);
+  fireEvent.click(screen.getByRole("button",{name:"Cancel removal"}));
+  expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(1);
   fireEvent.click(firstRemove());
+  fireEvent.click(screen.getByRole("button",{name:"Remove from draft"}));
   expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(0);
-  expect(confirm).toHaveBeenCalledTimes(2);
+  expect(accepted.requirements).toHaveLength(1); // accepted membership is untouched until publication
 });
 
 it("rejects malformed CNC Per Part Weight even when its costing unit is Nos", async () => {
