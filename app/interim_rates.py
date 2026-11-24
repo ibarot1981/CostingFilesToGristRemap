@@ -2,6 +2,8 @@
 from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
+import os
+from dotenv import load_dotenv
 from app.material_resolution import resolve_material
 from app.cost_dates import cost_date_evidence
 
@@ -62,3 +64,44 @@ def load_interim_rates(ods_rates: dict[str, Any]) -> dict[str, Any]:
     logs = client.fetch_table_records_with_ids('MaterialRateLog')
     return {"status": "available", "source": "Costing-New", "readAt": utc_now(), "readOnly": True,
             "processingBlocker": False, "rows": compare_interim_rates(ods_rates, load_material_mapping(), masters, logs)}
+
+
+def load_material_weight_catalog() -> dict[str, Any]:
+    """Read the governed Costing-New kg/m factors through the existing read-only boundary."""
+    from app.grist import GristClient
+    from app.grist_admin import GristAdminClient
+    from app.domain import utc_now
+
+    load_dotenv()
+    api_key = os.getenv("GRIST_API_KEY", "").strip()
+    source_doc_id = os.getenv("COSTING_NEW_GRIST_DOC_ID", "cPCjjr9oCzhWC7z8vJbcky").strip()
+    base_url = os.getenv("GRIST_BASE_URL", "https://docs.getgrist.com").strip()
+    if not api_key or not source_doc_id:
+        raise ValueError("The read-only Costing-New material-weight source is not configured.")
+    client = GristClient(api_key=api_key, doc_id=source_doc_id, base_url=base_url)
+    document = GristAdminClient(client.api_key, client.base_url).get_document(client.doc_id)
+    if document.name != "Costing-New":
+        raise ValueError("The material weight source must be named exactly Costing-New")
+    records = []
+    for record in client.fetch_table_records_with_ids("MasterMaterial"):
+        fields = record.get("fields", {})
+        name = str(fields.get("MasterMaterial") or "").strip()
+        if not name:
+            continue
+        factor = _number(fields.get("KGsPerMeter"))
+        records.append({
+            "canonicalName": name,
+            "masterMaterialId": int(record["id"]),
+            "code": str(fields.get("Code") or fields.get("MaterialCode") or "").strip(),
+            "inUse": fields.get("InUse"),
+            "kgPerMeter": str(factor) if factor is not None and factor > 0 else None,
+            "factorStatus": "available" if factor is not None and factor > 0 else "unavailable",
+            "sourceDate": fields.get("LatestKGsPerMeterDate"),
+            "source": "Costing-New",
+            "sourceDocumentId": client.doc_id,
+            "sourceTable": "MasterMaterial",
+            "sourceField": "KGsPerMeter",
+            "factorUnit": "kg/m",
+        })
+    return {"status": "available", "source": "Costing-New", "readOnly": True,
+            "sourceDocumentId": client.doc_id, "readAt": utc_now(), "records": records}

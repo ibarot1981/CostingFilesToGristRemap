@@ -345,10 +345,11 @@ def _part_features():
 def _part_definition_service():
     from app.grist_parts import GristPartRegistry
     from app.part_definition import GristPartDefinitionService
+    from app.interim_rates import load_material_weight_catalog
     registry = _part_registry()
     if not isinstance(registry, GristPartRegistry):
         raise _error(503, "PART_GRIST_REQUIRED", "Direct Part-definition maintenance requires the configured Safari Manufacturing Grist adapter.")
-    return GristPartDefinitionService(registry)
+    return GristPartDefinitionService(registry, material_weight_catalog_provider=load_material_weight_catalog)
 
 
 def _part_baseline_service():
@@ -1405,6 +1406,17 @@ def get_part_definition_publication_recovery(part_id: str, request: Request):
 @_part_registry_read_scope
 def get_part_definition_options(part_id: str):
     return _part_definition_service().options(part_id)
+
+
+@app.post("/api/parts/{part_id}/definition/material-bindings")
+def bind_part_definition_material_master(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    try:
+        return _part_definition_service().bind_material_master(part_id,
+            source_master_id=payload.get("sourceMasterMaterialId"), material_id=payload.get("materialId"),
+            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "",
+            capture_canonical_identity=payload.get("captureCanonicalIdentity") is True)
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
 
 
 @app.put("/api/parts/{part_id}/definition/draft")

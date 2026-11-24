@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import hmac
+import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -30,6 +34,7 @@ class MemoryCostGrist:
         self.fail_after_table = None
         self.fail_once = False
         self.doc_id = "isolated-cost-doc"
+        self.api_key = "isolated-test-grist-key"
         self.reads = []
 
     def validate_safari_write_target(self):
@@ -445,6 +450,96 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(by_description["Authored tool_shop"]["netCost"], created["tool_shop"])
         self.assertEqual(by_description["Authored cnc"]["netCost"], created["cnc"])
         self.assertTrue(all(item["rateAge"]["rateAgeStatus"] == "dated" for item in authored))
+
+    def test_mcl_cut_length_and_cnc_per_part_weight_drive_matching_rates_once(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-length-bar", "CanonicalName": "Length bar", "MappingStatus": "reviewed"}}])["records"][0]
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:length-bar", "ProcessType": "material_cut", "SourcePartName": "Length bar"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:length-bar", "LineMaster": master["id"],
+            "ProcessType": "material_cut", "PhysicalSignature": "length-bar-v1", "Status": "active"}}])["records"][0]
+        detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:length-bar", "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "Material": material["id"], "MaterialDisplayName": "Length bar", "ItemName": "Length bar cut", "Quantity": 25, "QuantityUOM": "cm",
+            "DimensionMM": 250, "DimensionInches": 250 / 25.4, "DimensionText": "250 mm", "DimensionUOM": "mm"}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:length-bar", "RequirementKey": "length-bar-occurrence",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 3, "QuantityExact": "3", "QuantityUOM": "Nos", "Status": "active"}}])
+        self.rate["Length bar"] = "2.5"
+        self.rate_metadata["Length bar"] = {"uom": "cm"}
+
+        first = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
+        self.assertEqual((first["quantity"], first["quantityUOM"], first["netCost"]), (150, "cm", 375.0))
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"Quantity": 30, "DimensionMM": 300,
+            "DimensionInches": 300 / 25.4, "DimensionText": "300 mm"}}])
+        changed = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
+        self.assertEqual((changed["quantity"], changed["quantityUOM"], changed["netCost"]), (180, "cm", 450.0))
+        self.rate_metadata["Length bar"] = {"uom": "kg"}
+        mismatch = self.service.live_cost(100)
+        self.assertIn("MATERIAL_RATE_BASIS_MISMATCH", {warning["code"] for warning in mismatch["warnings"]})
+        self.assertIsNone(next(line for line in mismatch["lines"] if line["description"] == "Length bar cut")["netCost"])
+
+        cnc_master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:weighted-cnc", "ProcessType": "cnc", "SourcePartName": "Weighted CNC"}}])["records"][0]
+        cnc_revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:weighted-cnc", "LineMaster": cnc_master["id"],
+            "ProcessType": "cnc", "PhysicalSignature": "weighted-cnc-v1", "Status": "active"}}])["records"][0]
+        cnc_detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:weighted-cnc", "LineRevision": cnc_revision["id"], "ProcessType": "cnc",
+            "ItemName": "Weighted CNC", "PartWeightKg": 0.5, "Quantity": 0.5, "QuantityUOM": "kg"}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:weighted-cnc", "RequirementKey": "weighted-cnc-occurrence",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": cnc_master["id"], "LineRevision": cnc_revision["id"], "ProcessType": "cnc",
+            "QuantityPerPart": 3, "QuantityExact": "3", "QuantityUOM": "Nos", "Status": "active"}}])
+        self.service.record_process_rate(cnc_master["id"], {"rate": 4, "uom": "kg", "currency": "INR", "effectiveAt": "2026-11-20T00:00:00Z",
+            "sourceReference": "approved kg-basis fixture", "reason": "unit-tested CNC physical basis"}, actor="reviewer", request_key="weighted-cnc-rate")
+
+        cnc_first = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Weighted CNC")
+        self.assertEqual((cnc_first["quantity"], cnc_first["quantityUOM"], cnc_first["netCost"]), (3, "kg", 12.0))
+        self.client.update_table_records("LineDetail", [{"id": cnc_detail["id"], "fields": {"PartWeightKg": 0.75, "Quantity": 0.75, "ExactWeightKgText": "0.75", "ExactQuantityText": "0.75"}}])
+        cnc_changed = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Weighted CNC")
+        self.assertEqual((cnc_changed["quantity"], cnc_changed["quantityUOM"], cnc_changed["netCost"]), (4.5, "kg", 18.0))
+
+    def test_live_cost_blocks_duplicate_legacy_count_and_forged_mass_conversion(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-review-steel", "CanonicalName": "Review steel"}}])["records"][0]
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:legacy-four", "ProcessType": "material_cut", "SourcePartName": "Review steel"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:legacy-four", "LineMaster": master["id"],
+            "ProcessType": "material_cut", "PhysicalSignature": "legacy-four-v1", "Status": "active"}}])["records"][0]
+        detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:legacy-four", "LineRevision": revision["id"],
+            "ProcessType": "material_cut", "Material": material["id"], "MaterialDisplayName": "Forged source label", "ItemName": "Legacy four pieces",
+            "Quantity": 4, "QuantityUOM": "Nos", "DimensionMM": 200, "DimensionInches": 200 / 25.4,
+            "DimensionText": "200 mm", "DimensionUOM": "mm", "EngineeringAttributes": {}}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:legacy-four", "RequirementKey": "legacy-four-occurrence",
+            "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 4, "QuantityExact": "4", "QuantityUOM": "Nos", "Status": "active", "ProvenanceType": "ods_baseline"}}])
+        duplicate = self.service.live_cost(100)
+        self.assertIn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED", {warning["code"] for warning in duplicate["warnings"]})
+        self.assertNotIn("Legacy four pieces", {line["description"] for line in duplicate["lines"]})
+        self.assertEqual(duplicate["status"], "incomplete")
+
+        fake_evidence = {"schema": "safari-material-weight-evidence-v1", "materialRef": material["id"],
+            "materialCanonicalName": "Review steel", "canonicalName": "Review steel", "masterMaterialId": 55,
+            "kgPerMeter": "999", "sourceDate": "2099-12-31", "source": "Costing-New",
+            "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+            "factorUnit": "kg/m", "factorStatus": "available", "signature": "forged"}
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"Quantity": 278.721, "QuantityUOM": "kg",
+            "DimensionMM": 279, "DimensionInches": 279 / 25.4, "DimensionText": "279 mm",
+            "EngineeringAttributes": {"materialWeightEvidence": fake_evidence}}}])
+        forged = self.service.live_cost(100)
+        self.assertIn("MATERIAL_CONVERSION_UNVERIFIED", {warning["code"] for warning in forged["warnings"]})
+        self.assertNotIn("Legacy four pieces", {line["description"] for line in forged["lines"]})
+        self.assertEqual(forged["status"], "incomplete")
+
+        self.rate["Review steel"] = "4"
+        payload = {"schema": "safari-material-weight-evidence-v1", "materialRef": material["id"],
+            "materialCanonicalName": "Review steel", "canonicalName": "Review steel", "masterMaterialId": 55,
+            "kgPerMeter": "1.58", "sourceDate": "2026-09-24", "source": "Costing-New",
+            "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+            "factorUnit": "kg/m", "factorStatus": "available"}
+        signature = hmac.new(self.client.api_key.encode("utf-8"), json.dumps(payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str, allow_nan=False).encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_evidence = {**payload, "signature": signature, "status": "available"}
+        expected_per_piece = 279 / 1000 * 1.58
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"Quantity": expected_per_piece,
+            "QuantityUOM": "kg", "EngineeringAttributes": {"materialWeightEvidence": signed_evidence}}}])
+        with patch.dict(os.environ, {"COSTING_NEW_GRIST_DOC_ID": "costing-new-test"}):
+            trusted = self.service.live_cost(100)
+        self.assertNotIn("MATERIAL_CONVERSION_UNVERIFIED", {warning["code"] for warning in trusted["warnings"]})
+        trusted_line = next(line for line in trusted["lines"] if line["description"] == "Legacy four pieces")
+        self.assertAlmostEqual(trusted_line["quantity"], expected_per_piece * 4 * 2)
 
     def test_rate_age_uses_kolkata_calendar_and_aggregates_unknown_and_future_inputs(self):
         now = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)

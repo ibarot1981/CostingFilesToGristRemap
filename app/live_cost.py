@@ -4,16 +4,19 @@ from __future__ import annotations
 from copy import deepcopy
 from calendar import monthrange
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import json
 import math
 import os
+import re
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.domain import utc_now
 from app.cost_dates import cost_date_evidence
-from app.grist_types import datetime_text, grist_datetime
+from app.grist_types import datetime_text, decode_grist_any_object, grist_datetime
 from app.part_identity import PartIdentityError, request_fingerprint
 
 
@@ -99,6 +102,28 @@ def _num(value: Any) -> float | None:
         return None
 
 
+def _cut_length_mm(detail: dict[str, Any]) -> float | None:
+    mm = _num(detail.get("DimensionMM"))
+    inches = _num(detail.get("DimensionInches"))
+    if mm is not None and mm > 0 and inches is not None and inches > 0:
+        converted = inches * 25.4
+        return mm if abs(mm - converted) <= max(0.01, abs(mm) * 1e-7) else None
+    if mm is not None and mm > 0:
+        return mm
+    if inches is not None and inches > 0:
+        return inches * 25.4
+    text = str(detail.get("DimensionText") or "").strip()
+    match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", text, re.IGNORECASE)
+    if not match:
+        return None
+    amount = _num(match.group(1))
+    if amount is None:
+        return None
+    unit = match.group(2).casefold()
+    factor = 25.4 if unit in {"in", "inch", "inches"} else 10 if unit in {"cm", "centimeter", "centimeters"} else 1000 if unit in {"m", "meter", "meters", "metre", "metres"} else 1
+    return amount * factor
+
+
 def _fields(row: dict[str, Any] | None) -> dict[str, Any]:
     if not row:
         return {}
@@ -123,6 +148,31 @@ class GristLiveCostService:
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.registry._rows(table)
+
+    def _trusted_material_weight_evidence(self, detail: dict[str, Any], material_id: int | None) -> dict[str, Any] | None:
+        attributes = decode_grist_any_object(detail.get("EngineeringAttributes")) or {}
+        evidence = attributes.get("materialWeightEvidence")
+        if not isinstance(evidence, dict) or evidence.get("schema") != "safari-material-weight-evidence-v1":
+            return None
+        payload = {key: value for key, value in evidence.items() if key not in {"signature", "status"}}
+        material = next((row for row in self._rows("Material") if ref_id(row.get("id")) == material_id), None)
+        material_fields = _fields(material)
+        canonical_name = str(material_fields.get("CanonicalName") or material_fields.get("Name") or material_fields.get("CanonicalMaterialName") or "").strip()
+        key = os.getenv("SAFARI_MATERIAL_EVIDENCE_HMAC_KEY", "").strip() or str(getattr(self.client, "api_key", "") or "")
+        expected = hmac.new(key.encode("utf-8"), json.dumps(payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str, allow_nan=False).encode("utf-8"), hashlib.sha256).hexdigest() if key else ""
+        source_document_id = os.getenv("COSTING_NEW_GRIST_DOC_ID", "cPCjjr9oCzhWC7z8vJbcky").strip()
+        if (not expected or not isinstance(evidence.get("signature"), str)
+                or not hmac.compare_digest(expected, evidence["signature"])
+                or ref_id(payload.get("materialRef")) != material_id or not canonical_name
+                or str(payload.get("materialCanonicalName") or "") != canonical_name
+                or payload.get("source") != "Costing-New" or payload.get("sourceTable") != "MasterMaterial"
+                or payload.get("sourceField") != "KGsPerMeter" or payload.get("factorUnit") != "kg/m"
+                or payload.get("factorStatus") != "available" or str(payload.get("sourceDocumentId") or "") != source_document_id
+                or ref_id(payload.get("masterMaterialId")) is None or _num(payload.get("kgPerMeter")) is None
+                or _num(payload.get("kgPerMeter")) <= 0):
+            return None
+        return payload
 
     def _read_inputs(self) -> dict[str, list[dict[str, Any]]]:
         return {table: self._rows(table) for table in INPUT_TABLES}
@@ -467,9 +517,35 @@ class GristLiveCostService:
                 for detail in details:
                     detail_fields = _fields(detail)
                     material_id = ref_id(detail_fields.get("Material"))
-                    material_name = str(detail_fields.get("MaterialDisplayName") or material_by_id.get(material_id or -1, {}).get("CanonicalName") or "").strip()
+                    canonical_material = material_by_id.get(material_id or -1, {})
+                    material_name = str(canonical_material.get("CanonicalName") or canonical_material.get("Name")
+                        or detail_fields.get("MaterialDisplayName") or "").strip()
                     amount_per_line = _num(detail_fields.get("Quantity"))
                     link_quantity = _num(link_fields.get("QuantityPerPart"))
+                    process_key = process.strip().casefold()
+                    is_material_process = process_key in {"mcl", "material", "material cut list", "material_cut"}
+                    detail_unit = str(detail_fields.get("QuantityUOM") or "").strip().casefold()
+                    link_unit = str(link_fields.get("QuantityUOM") or "").strip().casefold()
+                    piece_units = {"nos", "no", "each", "ea", "pcs", "piece", "pieces"}
+                    attributes = decode_grist_any_object(detail_fields.get("EngineeringAttributes")) or {}
+                    consumption_basis = str(attributes.get("materialConsumptionBasis") or "").strip().casefold()
+                    if (is_material_process and not consumption_basis and detail_unit in piece_units and link_unit in piece_units
+                            and amount_per_line is not None and link_quantity is not None and amount_per_line > 1
+                            and math.isclose(amount_per_line, link_quantity, rel_tol=0, abs_tol=1e-12)):
+                        warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED",
+                            f"Legacy MCL consumption stores {amount_per_line:g} {detail_unit} per occurrence and Qty per Part is also {link_quantity:g} {link_unit}; review the basis before costing.", path)
+                        continue
+                    cut_mm = _cut_length_mm(detail_fields) if is_material_process else None
+                    if is_material_process and detail_unit in {"kg", "kilogram", "kilograms", "g", "gram", "grams"} and cut_mm:
+                        trusted_evidence = self._trusted_material_weight_evidence(detail_fields, material_id)
+                        if not trusted_evidence:
+                            warn("MATERIAL_CONVERSION_UNVERIFIED", "This MCL mass consumption has a cut length but no server-verified material conversion evidence.", path)
+                            continue
+                        mass_factor = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0, "g": 0.001, "gram": 0.001, "grams": 0.001}[detail_unit]
+                        expected_quantity = (cut_mm / 1000.0 * float(_num(trusted_evidence.get("kgPerMeter")))) / mass_factor
+                        if amount_per_line is None or not math.isclose(amount_per_line, expected_quantity, rel_tol=1e-9, abs_tol=1e-9):
+                            warn("MATERIAL_CONSUMPTION_DERIVATION_MISMATCH", "Saved MCL mass consumption does not match the verified cut-length conversion.", path)
+                            continue
                     if amount_per_line is None or link_quantity is None or amount_per_line < 0 or link_quantity <= 0:
                         warn("LINE_QUANTITY_INVALID", "A normalized line has missing or invalid quantity evidence.", path)
                         continue
@@ -634,6 +710,11 @@ class GristLiveCostService:
                 if rate.get("status") != "available" or _num(rate.get("costingNewRate")) is None:
                     warn("MATERIAL_RATE_UNAVAILABLE", f"Material rate is {rate.get('status') or material_response.get('status') or 'unavailable'} in read-only Costing-New.", candidate["occurrencePath"])
                     lines_out.append(self._unpriced_line(candidate, "Material rate is unavailable or unmapped.", "material"))
+                    continue
+                material_rate_uom = str(rate.get("uom") or rate.get("rateUOM") or rate.get("costingUOM") or "").strip()
+                if material_rate_uom and material_rate_uom.casefold() != str(candidate["uom"]).casefold():
+                    warn("MATERIAL_RATE_BASIS_MISMATCH", f"Material rate unit {material_rate_uom} does not match normalized consumption unit {candidate['uom']}.", candidate["occurrencePath"])
+                    lines_out.append(self._unpriced_line(candidate, "Material rate unit does not match saved normalized consumption; no conversion is available.", "material"))
                     continue
                 unit_rate = float(rate["costingNewRate"])
                 amount = candidate["quantity"] * unit_rate

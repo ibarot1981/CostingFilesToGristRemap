@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import timezone
+import hashlib
+import hmac
 import json
 import math
 import os
+import re
 from typing import Any
 
 from app.exceptions import GristError
@@ -23,6 +26,10 @@ from app.part_identity import PartIdentityError, request_fingerprint
 FAMILY_PROCESS = {"mcl": "material_cut", "toolshop": "tool_shop", "cnc": "cnc"}
 ACTIVE_STATUSES = {"active", "accepted", "published", "finalized"}
 REMOVED_STATUSES = {"void", "removed", "inactive", "retired"}
+LENGTH_TO_MM = {"mm": 1.0, "millimeter": 1.0, "millimeters": 1.0, "cm": 10.0, "centimeter": 10.0,
+    "centimeters": 10.0, "m": 1000.0, "meter": 1000.0, "meters": 1000.0, "metre": 1000.0,
+    "metres": 1000.0, "in": 25.4, "inch": 25.4, "inches": 25.4}
+MASS_TO_KG = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0, "g": 0.001, "gram": 0.001, "grams": 0.001}
 LINE_DETAIL_FIELDS = {
     "ProcessType", "Material", "PurchaseItem", "ProcessOperation", "WorkCenter", "SourceDepartment",
     "IssueRoute", "ActivityKind", "Quantity", "QuantityUOM", "DimensionMM", "DimensionInches",
@@ -53,6 +60,8 @@ def _stable(value: Any) -> str:
 
 
 def _num(value: Any, *, allow_blank: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
     if value in (None, "") and allow_blank:
         return None
     try:
@@ -80,10 +89,12 @@ def _next_revision_label(value: Any) -> str:
 class GristPartDefinitionService:
     """Read editable definitions, save drafts and publish approved successors."""
 
-    def __init__(self, registry: GristPartRegistry):
+    def __init__(self, registry: GristPartRegistry, *, material_weight_catalog_provider=None):
         self.registry = registry
         self.client = registry.client
         self.features = GristPartFeatures(registry)
+        self.material_weight_catalog_provider = material_weight_catalog_provider
+        self._material_weight_catalog_cache: dict[str, Any] | None = None
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.registry._rows(table)
@@ -100,6 +111,459 @@ class GristPartDefinitionService:
             if self._missing_table(exc, table):
                 return []
             raise
+
+    def _material_weight_catalog(self) -> dict[str, Any]:
+        if self._material_weight_catalog_cache is not None:
+            return self._material_weight_catalog_cache
+        if self.material_weight_catalog_provider is None:
+            self._material_weight_catalog_cache = {"status": "unavailable", "source": "Costing-New", "records": []}
+            return self._material_weight_catalog_cache
+        try:
+            result = self.material_weight_catalog_provider()
+            if not isinstance(result, dict) or result.get("status") != "available" or not isinstance(result.get("records"), list):
+                raise ValueError("The material weight source did not return a usable catalogue.")
+            self._material_weight_catalog_cache = result
+        except Exception as exc:
+            self._material_weight_catalog_cache = {"status": "unavailable", "source": "Costing-New", "records": [],
+                "message": str(exc)[:300]}
+        return self._material_weight_catalog_cache
+
+    @staticmethod
+    def _material_catalog_document_id(catalog: dict[str, Any]) -> str:
+        document_id = str(catalog.get("sourceDocumentId") or "").strip()
+        if document_id:
+            return document_id
+        candidates = {str(record.get("sourceDocumentId") or "").strip() for record in catalog.get("records", [])
+            if isinstance(record, dict) and str(record.get("sourceDocumentId") or "").strip()}
+        return next(iter(candidates)) if len(candidates) == 1 else ""
+
+    def _material_weight_evidence(self, saved_name: Any) -> dict[str, Any] | None:
+        """Resolve a display-only preview by a saved Safari identity's canonical name.
+
+        This compatibility helper deliberately does not use a client supplied
+        MaterialDisplayName. Writes call ``_material_weight_evidence_for_identity``
+        and bind the result to the Safari Material record ID.
+        """
+        name = str(saved_name or "").strip()
+        if not name:
+            return None
+        from app.config import load_material_mapping
+        from app.material_resolution import resolve_material
+        try:
+            resolved = resolve_material(name, load_material_mapping())
+        except Exception:
+            resolved = None
+        canonical = (resolved.canonical_name if resolved else None) or name
+        matches = [row for row in self._material_weight_catalog().get("records", [])
+            if str(row.get("canonicalName") or "").strip().casefold() == canonical.casefold()]
+        if len(matches) != 1:
+            return {"status": "ambiguous" if len(matches) > 1 else "unavailable", "canonicalName": canonical,
+                "source": "Costing-New", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+        return deepcopy(matches[0])
+
+    def _material_signing_key(self) -> bytes:
+        # The configured Safari Grist API key is already a stable server-only
+        # secret across app workers. Deployments may provide a dedicated stable
+        # key to make Grist-token rotation independent of saved evidence.
+        dedicated = os.getenv("SAFARI_MATERIAL_EVIDENCE_HMAC_KEY", "").strip()
+        key = dedicated or str(getattr(self.client, "api_key", "") or "")
+        return key.encode("utf-8")
+
+    def _sign_material_payload(self, payload: dict[str, Any]) -> str:
+        key = self._material_signing_key()
+        if not key:
+            return ""
+        return hmac.new(key, _stable(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _verify_material_payload(self, payload: dict[str, Any], signature: Any) -> bool:
+        expected = self._sign_material_payload(payload)
+        return bool(expected and isinstance(signature, str) and hmac.compare_digest(expected, signature))
+
+    @staticmethod
+    def _material_name(fields: dict[str, Any]) -> str:
+        return str(fields.get("CanonicalName") or fields.get("Name") or fields.get("CanonicalMaterialName") or "").strip()
+
+    def _material_row(self, material_id: int | None) -> dict[str, Any] | None:
+        if material_id is None:
+            return None
+        return next((row for row in self._rows("Material") if int(row.get("id", -1)) == material_id), None)
+
+    def _identity_alias_bindings(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        result = []
+        for row in self._optional_rows("IdentityAlias"):
+            fields = _fields(row)
+            if str(fields.get("EntityType") or "") != "MaterialMasterBinding":
+                continue
+            try:
+                payload = json.loads(str(fields.get("Source") or ""))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            signature = payload.pop("signature", None)
+            valid = (payload.get("schema") == "safari-material-master-binding-v1"
+                and self._verify_material_payload(payload, signature)
+                and str(fields.get("EntityId") or "") == str(payload.get("entityId") or "")
+                and str(fields.get("Value") or "") == str(payload.get("masterMaterialName") or "")
+                and str(fields.get("NormalizedValue") or "") == str(payload.get("masterMaterialName") or "").casefold()
+                and _int_ref(fields.get("SourceRow")) == _int_ref(payload.get("sourceMasterMaterialId"))
+                and _int_ref(payload.get("safariMaterialId")) is not None
+                and bool(str(payload.get("reason") or "").strip())
+                and bool(str(payload.get("reviewedBy") or "").strip()))
+            if valid:
+                result.append((row, payload))
+        return result
+
+    def _material_master_for_identity(self, material_id: int | None, *, saved_evidence: Any = None) -> tuple[dict[str, Any] | None, str, str]:
+        """Resolve one source master from canonical Safari identity or a reviewed binding."""
+        material = self._material_row(material_id)
+        material_name = self._material_name(_fields(material)) if material else ""
+        if not material_id or not material or not material_name:
+            return None, "unavailable", material_name
+
+        catalog = self._material_weight_catalog()
+        records = catalog.get("records", []) if catalog.get("status") == "available" else []
+        source_document_id = self._material_catalog_document_id(catalog)
+        explicit = [payload for _, payload in self._identity_alias_bindings()
+            if _int_ref(payload.get("safariMaterialId")) == material_id
+            and str(payload.get("sourceDocumentId") or "") == source_document_id]
+        explicit_ids = {int(payload["sourceMasterMaterialId"]) for payload in explicit
+            if _int_ref(payload.get("sourceMasterMaterialId")) is not None}
+        if len(explicit_ids) > 1:
+            return None, "ambiguous", material_name
+        if explicit_ids:
+            matches = [record for record in records if _int_ref(record.get("masterMaterialId")) in explicit_ids
+                and str(record.get("sourceDocumentId") or source_document_id) == source_document_id
+                and str(record.get("canonicalName") or "") == str(next(p["masterMaterialName"] for p in explicit if int(p["sourceMasterMaterialId"]) in explicit_ids))]
+        else:
+            from app.config import load_material_mapping
+            from app.material_resolution import resolve_material
+            try:
+                resolved = resolve_material(material_name, load_material_mapping())
+                canonical = resolved.canonical_name or material_name
+            except Exception:
+                canonical = material_name
+            matches = [record for record in records
+                if str(record.get("canonicalName") or "").strip().casefold() == canonical.strip().casefold()
+                and str(record.get("sourceDocumentId") or source_document_id) == source_document_id]
+        if len(matches) != 1:
+            return None, "ambiguous" if len(matches) > 1 else ("unavailable" if catalog.get("status") != "available" else "unbound"), material_name
+        record = matches[0]
+        factor = _num(record.get("kgPerMeter"))
+        if (factor is None or factor <= 0 or str(record.get("source") or "") != "Costing-New"
+                or str(record.get("sourceTable") or "") != "MasterMaterial"
+                or str(record.get("sourceField") or "") != "KGsPerMeter"
+                or str(record.get("factorUnit") or "") != "kg/m"):
+            return None, "unavailable", material_name
+        resolved_record = deepcopy(record)
+        resolved_record["sourceDocumentId"] = str(resolved_record.get("sourceDocumentId") or source_document_id)
+        return resolved_record, "available", material_name
+
+    def _signed_material_evidence(self, material_id: int, material_name: str, record: dict[str, Any]) -> dict[str, Any]:
+        payload = {"schema": "safari-material-weight-evidence-v1", "materialRef": int(material_id),
+            "materialCanonicalName": material_name, "canonicalName": str(record.get("canonicalName") or ""),
+            "masterMaterialId": _int_ref(record.get("masterMaterialId")), "kgPerMeter": str(record.get("kgPerMeter")),
+            "sourceDate": record.get("sourceDate"), "source": "Costing-New", "sourceDocumentId": str(record.get("sourceDocumentId") or ""),
+            "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}
+        return {**payload, "signature": self._sign_material_payload(payload), "status": "available"}
+
+    def _verified_saved_material_evidence(self, evidence: Any, material_id: int | None) -> dict[str, Any] | None:
+        if not isinstance(evidence, dict) or evidence.get("schema") != "safari-material-weight-evidence-v1":
+            return None
+        payload = {key: value for key, value in evidence.items() if key not in {"signature", "status"}}
+        material = self._material_row(material_id)
+        canonical = self._material_name(_fields(material)) if material else ""
+        if (_int_ref(payload.get("materialRef")) != material_id or not canonical
+                or str(payload.get("materialCanonicalName") or "") != canonical
+                or payload.get("factorStatus") != "available" or payload.get("source") != "Costing-New"
+                or payload.get("sourceTable") != "MasterMaterial" or payload.get("sourceField") != "KGsPerMeter"
+                or payload.get("factorUnit") != "kg/m" or not str(payload.get("sourceDocumentId") or "")
+                or _num(payload.get("kgPerMeter")) is None or _num(payload.get("kgPerMeter")) <= 0
+                or _int_ref(payload.get("masterMaterialId")) is None
+                or not self._verify_material_payload(payload, evidence.get("signature"))):
+            return None
+        return {**payload, "signature": evidence["signature"], "status": "available"}
+
+    def _material_weight_evidence_for_identity(self, material_id: int | None, *, saved_evidence: Any = None) -> dict[str, Any]:
+        trusted_saved = self._verified_saved_material_evidence(saved_evidence, material_id)
+        if trusted_saved:
+            return trusted_saved
+        record, status, material_name = self._material_master_for_identity(material_id, saved_evidence=saved_evidence)
+        if record and material_id is not None:
+            return self._signed_material_evidence(material_id, material_name, record)
+        return {"status": status, "canonicalName": material_name, "source": "Costing-New", "sourceTable": "MasterMaterial",
+            "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+
+    @staticmethod
+    def _legacy_duplicate_material_basis(item: dict[str, Any]) -> bool:
+        """Spot the old imported MCL shape where piece count appears twice.
+
+        Tool Shop rows remain process-rate quantities; equal piece counts there
+        are not reclassified as material consumption.
+        """
+        if str(item.get("family") or "").casefold() != "mcl":
+            return False
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+        attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+        if isinstance(attributes, dict) and attributes.get("materialConsumptionBasis"):
+            return False
+        provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+        if str(provenance.get("type") or "").casefold() in {"safari_authored", "safari_edited"}:
+            return False
+        detail_unit = str(detail.get("QuantityUOM") or "").strip().casefold()
+        row_unit = str(item.get("uom") or "").strip().casefold()
+        piece_units = {"nos", "no", "each", "ea", "pcs", "piece", "pieces"}
+        detail_quantity = _num(detail.get("Quantity"), allow_blank=True)
+        occurrence_quantity = _num(item.get("quantity"), allow_blank=True)
+        return (detail_unit in piece_units and row_unit in piece_units and detail_quantity is not None
+            and occurrence_quantity is not None and math.isclose(detail_quantity, occurrence_quantity, rel_tol=0, abs_tol=1e-12))
+
+    def _material_source_master(self, source_master_id: int) -> dict[str, Any]:
+        catalog = self._material_weight_catalog()
+        if catalog.get("status") != "available":
+            raise PartIdentityError("PART_MATERIAL_CATALOG_UNAVAILABLE", "Costing-New is unavailable; a new material binding cannot be reviewed right now.")
+        records = [record for record in catalog.get("records", [])
+            if _int_ref(record.get("masterMaterialId")) == source_master_id]
+        if len(records) != 1 or not str(records[0].get("canonicalName") or "").strip():
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "Choose one existing Costing-New master with a canonical name.")
+        return deepcopy(records[0])
+
+    def _material_binding_choice(self, source_master_id: int, material_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        record = self._material_source_master(source_master_id)
+        material = self._material_row(material_id)
+        if not material or not self._material_name(_fields(material)):
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "Choose one existing Costing-New master and one existing canonical Safari Material.")
+        return record, material
+
+    @_serialized
+    def bind_material_master(self, part_id: str, *, source_master_id: Any, material_id: Any = None,
+            actor: str, reason: str, request_key: str, capture_canonical_identity: bool = False) -> dict[str, Any]:
+        """Record an approver-reviewed source binding, optionally capturing its canonical Safari identity."""
+        self.registry._verify_writer()
+        self._check_established(self._current_revision(part_id))
+        if str(actor or "").strip().casefold() != os.getenv("SAFARI_ENGINEERING_APPROVER_USERNAME", "Irshad").strip().casefold():
+            raise PartIdentityError("PART_MATERIAL_BINDING_REVIEWER_REQUIRED", "A material master binding must be reviewed by the configured engineering approver.")
+        master_ref = _int_ref(source_master_id)
+        safari_ref = _int_ref(material_id)
+        if (not master_ref or (capture_canonical_identity and safari_ref is not None)
+                or (not capture_canonical_identity and not safari_ref)
+                or not str(reason or "").strip() or not str(request_key or "").strip()):
+            raise PartIdentityError("PART_MATERIAL_BINDING_INPUT_REQUIRED", "Choose one source master and either its reviewed canonical capture or an existing Safari Material, then provide a review reason.")
+        request_key_value = request_key.strip()
+        prior = self.registry._find(self._rows("PartRegistryRequest"), "RequestKey", request_key_value)
+        record = None
+        material = None
+        catalog: dict[str, Any] = {}
+        recovered_capture = False
+        if capture_canonical_identity and prior:
+            prior_fields = _fields(prior)
+            if (prior_fields.get("RequestType") != "part_definition_material_binding"
+                    or str(prior_fields.get("EntityUUID") or "") != str(part_id)):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This material binding request key was already used for another operation.")
+
+            # A published request must be replayable during a Costing-New outage.
+            # Its signed alias binds the source identity, captured Safari row, reviewer,
+            # reason, request fingerprint and original request key together.
+            matching_aliases = [payload for _, payload in self._identity_alias_bindings()
+                if _int_ref(payload.get("sourceMasterMaterialId")) == master_ref
+                and str(payload.get("requestKey") or "") == request_key_value]
+            if len(matching_aliases) > 1:
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The saved request has more than one verified source identity; resolve it through reviewed data repair.")
+            if matching_aliases:
+                payload = matching_aliases[0]
+                source_document_id = str(payload.get("sourceDocumentId") or "")
+                canonical_name = str(payload.get("masterMaterialName") or "").strip()
+                material_id_saved = _int_ref(payload.get("safariMaterialId"))
+                material = self._material_row(material_id_saved)
+                material_fields = _fields(material) if material else {}
+                material_name = self._material_name(material_fields)
+                expected_fingerprint = request_fingerprint([part_id, source_document_id, master_ref,
+                    "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()])
+                valid_alias = (source_document_id and canonical_name and material_id_saved and material
+                    and payload.get("entityId") == f"material-weight:{source_document_id}:MasterMaterial:{master_ref}"
+                    and str(payload.get("sourceTable") or "") == "MasterMaterial"
+                    and str(payload.get("masterMaterialName") or "") == canonical_name
+                    and str(payload.get("reviewedBy") or "") == actor.strip()
+                    and str(payload.get("reason") or "") == reason.strip()
+                    and str(payload.get("requestFingerprint") or "") == expected_fingerprint
+                    and str(payload.get("requestKey") or "") == request_key_value
+                    and _int_ref(payload.get("sourceMasterMaterialId")) == master_ref
+                    and _int_ref(payload.get("safariMaterialId")) == material_id_saved
+                    and str(payload.get("safariMaterialName") or "") == material_name
+                    and material_name.casefold() == canonical_name.casefold()
+                    and str(prior_fields.get("RequestFingerprint") or "") == expected_fingerprint)
+                if not valid_alias:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The saved request does not match its signed canonical identity evidence.")
+                if str(prior_fields.get("Status") or "").casefold() == "published":
+                    try:
+                        saved_result = json.loads(str(prior_fields.get("Result") or "{}"))
+                    except (TypeError, ValueError):
+                        saved_result = None
+                    expected_identity_captured = str(material_fields.get("MappingStatus") or "") == "reviewed_source_master_capture"
+                    if (not isinstance(saved_result, dict) or saved_result.get("status") != "bound"
+                            or _int_ref(saved_result.get("masterMaterialId")) != master_ref
+                            or _int_ref(saved_result.get("materialId")) != material_id_saved
+                            or str(saved_result.get("masterName") or "") != canonical_name
+                            or str(saved_result.get("materialName") or "") != material_name
+                            or bool(saved_result.get("identityCaptured")) != expected_identity_captured):
+                        raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request result conflicts with its signed canonical identity evidence.")
+                    return saved_result
+                record = {"canonicalName": canonical_name, "masterMaterialId": master_ref,
+                    "sourceDocumentId": source_document_id}
+                catalog = {"status": "unavailable", "sourceDocumentId": source_document_id, "records": []}
+                recovered_capture = True
+            elif str(prior_fields.get("Status") or "").casefold() == "published":
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request has no verified signed canonical identity evidence.")
+            else:
+                # If the first response was lost after Grist created the keyed
+                # canonical Material but before the alias, recover only a unique
+                # deterministic row whose full request fingerprint matches.
+                suffix = f":MasterMaterial:{master_ref}"
+                candidates = []
+                for row in self._rows("Material"):
+                    fields = _fields(row)
+                    key = str(fields.get("MaterialKey") or "")
+                    canonical_name = self._material_name(fields)
+                    if (not key.startswith("material-master:") or not key.endswith(suffix)
+                            or str(fields.get("ODSDisplayName") or "") != canonical_name
+                            or str(fields.get("MappingStatus") or "") != "reviewed_source_master_capture"
+                            or not canonical_name):
+                        continue
+                    source_document_id = key[len("material-master:"):-len(suffix)]
+                    expected_fingerprint = request_fingerprint([part_id, source_document_id, master_ref,
+                        "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()])
+                    if expected_fingerprint == str(prior_fields.get("RequestFingerprint") or ""):
+                        candidates.append((row, source_document_id, canonical_name))
+                if len(candidates) > 1:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "More than one captured Material matches the interrupted request; resolve it through reviewed data repair.")
+                if candidates:
+                    material, source_document_id, canonical_name = candidates[0]
+                    record = {"canonicalName": canonical_name, "masterMaterialId": master_ref,
+                        "sourceDocumentId": source_document_id}
+                    catalog = {"status": "unavailable", "sourceDocumentId": source_document_id, "records": []}
+                    recovered_capture = True
+        if not recovered_capture:
+            record = self._material_source_master(master_ref) if capture_canonical_identity else None
+            catalog = self._material_weight_catalog()
+        if not capture_canonical_identity:
+            record, material = self._material_binding_choice(master_ref, safari_ref)
+        source_document_id = str(record.get("sourceDocumentId") or self._material_catalog_document_id(catalog))
+        if not source_document_id:
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "The source catalogue document identity is unavailable; no binding was written.")
+        canonical_name = str(record.get("canonicalName") or "").strip()
+        material_key = f"material-master:{source_document_id}:MasterMaterial:{master_ref}"
+        identity_captured = False
+        if capture_canonical_identity:
+            matching_materials = [row for row in self._rows("Material")
+                if self._material_name(_fields(row)).casefold() == canonical_name.casefold()]
+            if len(matching_materials) > 1:
+                raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "More than one Safari Material has this canonical name; resolve the duplicate identity before capture.")
+            material = matching_materials[0] if matching_materials else None
+            if material and str(_fields(material).get("MaterialKey") or "") == material_key:
+                material_fields = _fields(material)
+                if (self._material_name(material_fields).casefold() != canonical_name.casefold()
+                        or str(material_fields.get("ODSDisplayName") or "") != canonical_name
+                        or str(material_fields.get("MappingStatus") or "") != "reviewed_source_master_capture"):
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The source-derived Material key already belongs to another canonical identity.")
+            if material is None:
+                material = self.registry._find(self._rows("Material"), "MaterialKey", material_key)
+                if material:
+                    material_fields = _fields(material)
+                    if (str(material_fields.get("MaterialKey") or "") != material_key
+                            or self._material_name(material_fields).casefold() != canonical_name.casefold()
+                            or str(material_fields.get("ODSDisplayName") or "") != canonical_name
+                            or str(material_fields.get("MappingStatus") or "") != "reviewed_source_master_capture"):
+                        raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The source-derived Material key already belongs to another canonical identity.")
+            safari_ref = _int_ref(material.get("id")) if material else None
+            identity_captured = bool(material and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")
+        if capture_canonical_identity and not canonical_name:
+            raise PartIdentityError("PART_MATERIAL_BINDING_IDENTITY_INVALID", "The selected source master has no usable canonical name.")
+        entity_id = f"material-weight:{source_document_id}:MasterMaterial:{master_ref}"
+        fingerprint_payload = ([part_id, source_document_id, master_ref, "capture-canonical", canonical_name.casefold(), actor.strip(), reason.strip()]
+            if capture_canonical_identity else [part_id, source_document_id, master_ref, safari_ref, actor.strip(), reason.strip()])
+        fingerprint = request_fingerprint(fingerprint_payload)
+        if prior:
+            prior_fields = _fields(prior)
+            if prior_fields.get("RequestType") != "part_definition_material_binding" or prior_fields.get("RequestFingerprint") != fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This material binding request key was already used with different data.")
+            if str(prior_fields.get("Status") or "").casefold() == "published":
+                if capture_canonical_identity:
+                    raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "The published request could not be verified through its signed canonical identity evidence.")
+                try:
+                    return json.loads(str(prior_fields.get("Result") or "{}"))
+                except ValueError:
+                    pass
+        existing = self.registry._find(self._rows("IdentityAlias"), "EntityId", entity_id)
+        existing_binding = None
+        if existing:
+            bound = self._identity_alias_bindings()
+            existing_binding = next((payload for row, payload in bound if int(row.get("id", -1)) == int(existing.get("id", -2))), None)
+            if (not existing_binding
+                    or _int_ref(existing_binding.get("sourceMasterMaterialId")) != master_ref
+                    or str(existing_binding.get("sourceDocumentId") or "") != source_document_id
+                    or (safari_ref is not None and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref)
+                    or (capture_canonical_identity and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref)):
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This Costing-New master already has a different or unverified Safari binding; resolve it through reviewed data repair.")
+            if capture_canonical_identity and _int_ref(existing_binding.get("safariMaterialId")) != safari_ref:
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This source master is already bound to a different Safari Material; no identity was re-keyed.")
+        bound_elsewhere = [payload for _, payload in self._identity_alias_bindings()
+            if str(payload.get("sourceDocumentId") or "") == source_document_id
+            and safari_ref is not None and _int_ref(payload.get("safariMaterialId")) == safari_ref
+            and _int_ref(payload.get("sourceMasterMaterialId")) != master_ref]
+        if bound_elsewhere:
+            raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "This Safari Material already has a different Costing-New master binding; review the canonical identity before changing it.")
+
+        if not existing_binding and not self._material_signing_key():
+            raise PartIdentityError("PART_MATERIAL_BINDING_SIGNING_UNAVAILABLE", "The server has no stable signing key for reviewed material bindings.")
+
+        # Do all source, identity, duplicate-binding and signing checks before
+        # creating the request journal. A rejected review must not leave a
+        # false pending operation behind.
+        request = prior or self.registry._begin_request(request_key.strip(), "part_definition_material_binding", fingerprint, part_id)
+        if capture_canonical_identity and material is None:
+            material = self.registry._ensure_keyed("Material", "MaterialKey", material_key, {
+                "MaterialKey": material_key, "CanonicalName": canonical_name, "ODSDisplayName": canonical_name,
+                "MappingStatus": "reviewed_source_master_capture"})
+            safari_ref = _int_ref(material.get("id"))
+            if not safari_ref or self._material_name(_fields(material)).casefold() != canonical_name.casefold():
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "Grist did not confirm the expected captured canonical Material identity.")
+            identity_captured = True
+        if existing_binding:
+            result = {"status": "bound", "idempotent": True, "materialId": safari_ref, "masterMaterialId": master_ref,
+                "masterName": canonical_name, "materialName": self._material_name(_fields(material)),
+                "identityCaptured": bool(capture_canonical_identity and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")}
+        else:
+            source_payload = {"schema": "safari-material-master-binding-v1", "entityId": entity_id,
+                "sourceDocumentId": source_document_id, "sourceTable": "MasterMaterial", "sourceMasterMaterialId": master_ref,
+                "masterMaterialName": canonical_name, "safariMaterialId": safari_ref,
+                "safariMaterialName": self._material_name(_fields(material)), "reviewedBy": actor.strip(), "reason": reason.strip(),
+                "createdAt": grist_datetime(utc_now()), "requestKey": request_key.strip(), "requestFingerprint": fingerprint,
+                "identityAction": "captured" if identity_captured else "reused_or_existing"}
+            fields = {"EntityType": "MaterialMasterBinding", "EntityId": entity_id, "Value": source_payload["masterMaterialName"],
+                "NormalizedValue": source_payload["masterMaterialName"].casefold(), "SourceRow": master_ref,
+                "Source": json.dumps({**source_payload, "signature": self._sign_material_payload(source_payload)}, sort_keys=True)}
+            binding_signature = json.loads(fields["Source"]).get("signature")
+            if not binding_signature:
+                raise PartIdentityError("PART_MATERIAL_BINDING_SIGNING_UNAVAILABLE", "The server has no stable signing key for reviewed material bindings.")
+            self.registry._ensure_keyed("IdentityAlias", "EntityId", entity_id, fields)
+            saved_binding_row = self.registry._find(self._rows("IdentityAlias"), "EntityId", entity_id)
+            saved_binding = next((payload for row, payload in self._identity_alias_bindings()
+                if saved_binding_row and int(row.get("id", -1)) == int(saved_binding_row.get("id", -2))), None)
+            if (not saved_binding
+                    or _int_ref(saved_binding.get("sourceMasterMaterialId")) != master_ref
+                    or str(saved_binding.get("sourceDocumentId") or "") != source_document_id
+                    or _int_ref(saved_binding.get("safariMaterialId")) != safari_ref):
+                raise PartIdentityError("PART_MATERIAL_BINDING_CONFLICT", "Grist returned a conflicting material binding; no success was recorded.")
+            result = {"status": "bound", "idempotent": False, "materialId": safari_ref, "masterMaterialId": master_ref,
+                "masterName": canonical_name, "materialName": self._material_name(_fields(material)),
+                "identityCaptured": bool(capture_canonical_identity and _fields(material).get("MappingStatus") == "reviewed_source_master_capture")}
+        audit_key = f"material-binding:{request_key.strip()}"
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", audit_key, {"EventType": "part_material_master_canonical_capture_reviewed" if capture_canonical_identity else "part_material_master_binding_reviewed",
+            "Actor": actor.strip(), "OccurredAt": grist_datetime(utc_now()), "EntityType": "MaterialMasterBinding",
+            "EntityId": entity_id, "Reason": reason.strip(), "Payload": json.dumps(result, sort_keys=True),
+            "RequestKey": audit_key, "RequestFingerprint": fingerprint})
+        self.registry._complete_request(request, result)
+        return result
 
     def _require_publication_schema(self) -> None:
         missing = []
@@ -171,6 +635,259 @@ class GristPartDefinitionService:
             "actor": _fields(row).get("FinalizedBy") or _fields(row).get("Actor"), "occurredAt": _fields(row).get("FinalizedAt") or _fields(row).get("OccurredAt"),
             "previousRevisionId": _int_ref(_fields(row).get("PreviousRevision")), "publicationCause": _fields(row).get("PublicationCause"),
             "current": int(row["id"]) == current_id} for row in revisions]
+
+    def _definition_changes(self, before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+        """Project immutable before/after snapshots as readable row and field changes."""
+        family_label = {"mcl": "MCL", "toolshop": "Tool Shop", "cnc": "CNC", "other": "Other process"}
+        material_by_id = {int(row["id"]): str(_fields(row).get("CanonicalName") or _fields(row).get("Name") or _fields(row).get("MaterialDisplayName") or "")
+            for row in self._optional_rows("Material")}
+
+        def identity(collection: str, item: dict[str, Any]) -> str:
+            if collection == "requirements":
+                if str(item.get("identityStatus") or "") in {"stable", "safari_authored"}:
+                    return str(item.get("requirementKey") or "")
+                return f"legacy-line:{item.get('lineMasterId')}:{item.get('lineRevisionId')}:{item.get('family')}"
+            return str((item.get("componentIdentity") if collection == "components" else item.get("specificationIdentity")) or "")
+
+        def item_name(collection: str, item: dict[str, Any]) -> str:
+            detail = item.get("detail") or {}
+            if collection == "requirements":
+                return str(detail.get("ItemName") or detail.get("PlatePart") or detail.get("MaterialDisplayName") or item.get("sourcePartName") or "Requirement")
+            if collection == "components":
+                return str(item.get("childPartNumber") or item.get("childName") or item.get("childPartId") or "Unresolved child Part")
+            return str(item.get("code") or item.get("description") or item.get("manufacturerPartNumber") or "Purchase specification")
+
+        def values(collection: str, item: dict[str, Any]) -> dict[str, Any]:
+            detail = item.get("detail") or {}
+            if collection == "requirements":
+                family = str(item.get("family") or "other").casefold()
+                status = item.get("fieldStatus") if isinstance(item.get("fieldStatus"), dict) else {}
+
+                def recorded(name: str, value: Any) -> Any:
+                    state = str(status.get(name) or "").casefold()
+                    if state == "missing":
+                        return None
+                    if state == "blank":
+                        return "Blank in source"
+                    if value in (None, ""):
+                        return None
+                    # Legacy Grist rows can have default zeroes without evidence
+                    # that the source or editor recorded them. Preserve explicit
+                    # zero only where the saved field-status proves it.
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0 and state != "value":
+                        return None
+                    return value
+
+                def number(name: str, unit: str) -> str | None:
+                    value = recorded(name, detail.get(name))
+                    if value is None:
+                        return None
+                    return value if isinstance(value, str) else f"{value} {unit}"
+
+                def flatten_attributes(prefix: str, value: Any) -> None:
+                    if isinstance(value, dict):
+                        for key in sorted(value):
+                            if str(key) in {"fieldStatus", "materialWeightEvidence"}:
+                                continue
+                            flatten_attributes(f"{prefix}.{key}" if prefix else str(key), value[key])
+                    elif prefix:
+                        result[f"Engineering attribute · {prefix}"] = value
+
+                result: dict[str, Any] = {}
+                quantity = item.get("quantity")
+                if quantity not in (None, ""):
+                    result["Quantity per Part"] = f"{quantity} {item.get('uom') or ''}".strip()
+                item_name_value = detail.get("ItemName") or item.get("sourcePartName")
+                if item_name_value:
+                    result["Item name"] = item_name_value
+                material = material_by_id.get(_int_ref(detail.get("Material")) or -1) or detail.get("MaterialDisplayName")
+                if material:
+                    result["Material"] = material
+
+                if family in {"mcl", "toolshop"}:
+                    cut_length = str(detail.get("DimensionText") or "").strip() or None
+                    if cut_length:
+                        numeric_text = re.match(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", cut_length)
+                        if numeric_text and _num(numeric_text.group(1)) == 0:
+                            cut_length = None
+                    if not cut_length:
+                        mm = recorded("DimensionMM", detail.get("DimensionMM"))
+                        inches = recorded("DimensionInches", detail.get("DimensionInches"))
+                        if mm is not None:
+                            cut_length = f"{mm} mm"
+                        elif inches is not None:
+                            cut_length = f"{inches} in"
+                    if cut_length:
+                        text_match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", cut_length, re.IGNORECASE)
+                        if text_match:
+                            unit = text_match.group(2).casefold()
+                            factor_mm = next((LENGTH_TO_MM[key] for key in (unit, unit.rstrip("s")) if key in LENGTH_TO_MM), None)
+                            numeric = _num(text_match.group(1))
+                            result["Dimension to Cut"] = f"{numeric * factor_mm:g} mm" if numeric is not None and factor_mm else cut_length
+                        else:
+                            result["Dimension to Cut"] = cut_length
+                    weight_evidence = item.get("materialWeightEvidence")
+                    factor = _num(weight_evidence.get("kgPerMeter")) if isinstance(weight_evidence, dict) else None
+                    length_mm = _num(detail.get("DimensionMM"))
+                    if length_mm is None and _num(detail.get("DimensionInches")) is not None:
+                        length_mm = _num(detail.get("DimensionInches")) * LENGTH_TO_MM["in"]
+                    if length_mm is None and cut_length:
+                        match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", cut_length, re.IGNORECASE)
+                        if match:
+                            unit = match.group(2).casefold()
+                            factor_mm = next((LENGTH_TO_MM[key] for key in (unit, unit.rstrip("s")) if key in LENGTH_TO_MM), None)
+                            amount = _num(match.group(1))
+                            length_mm = amount * factor_mm if amount is not None and factor_mm else None
+                    if factor is not None and factor > 0 and length_mm is not None and length_mm > 0:
+                        per_piece_kg = length_mm / 1000.0 * factor
+                        result["Calculated weight per piece"] = f"{format(per_piece_kg, '.12g')} kg"
+                        parent_quantity = _num(item.get("quantity"))
+                        if parent_quantity is not None and parent_quantity > 0:
+                            result["Calculated weight per parent Part"] = f"{format(per_piece_kg * parent_quantity, '.12g')} kg"
+                    elif isinstance(weight_evidence, dict):
+                        result["Material conversion evidence"] = str(weight_evidence.get("status") or "unavailable").replace("_", " ")
+                    if item.get("materialConsumptionStatus") == "legacy_duplicate_ambiguous":
+                        result["Legacy consumption basis"] = "Review required: saved piece count appears both as rate consumption and Qty per Part"
+                    elif item.get("materialConsumptionResolution"):
+                        result["Legacy consumption basis"] = str(item["materialConsumptionResolution"]).replace("_", " ")
+                if family == "cnc":
+                    part_weight = number("PartWeightKg", "kg")
+                    saved_kg = recorded("WeightKg", detail.get("WeightKg"))
+                    saved_g = recorded("WeightGrams", detail.get("WeightGrams"))
+                    if part_weight is not None:
+                        result["Per Part Weight"] = part_weight
+                    saved_total = [f"{saved_kg} kg" if saved_kg is not None and not isinstance(saved_kg, str) else saved_kg,
+                        f"{saved_g} g" if saved_g is not None and not isinstance(saved_g, str) else saved_g]
+                    saved_total = [value for value in saved_total if value is not None]
+                    if saved_total:
+                        result["Saved total weight"] = " / ".join(saved_total)
+                    for name, label in (("Length", "Plate length"), ("Width", "Plate width"), ("Thickness", "Plate thickness")):
+                        dimension = number(name, str(detail.get("DimensionUOM") or ""))
+                        if dimension is not None:
+                            result[label] = dimension
+
+                rate_quantity = recorded("Quantity", detail.get("Quantity"))
+                if rate_quantity is not None and detail.get("QuantityUOM"):
+                    result["Rate-basis consumption"] = rate_quantity if isinstance(rate_quantity, str) else f"{rate_quantity} {detail.get('QuantityUOM')}"
+                remarks = recorded("ToolShopRemarks", detail.get("ToolShopRemarks"))
+                if remarks is not None:
+                    result["Remarks"] = remarks
+                plate_part = recorded("PlatePart", detail.get("PlatePart"))
+                if plate_part is not None:
+                    result["Plate part to cut"] = plate_part
+                field_labels = {
+                    "IssueRoute": "Issue route", "ActivityKind": "Activity kind", "SourceDepartment": "Source department",
+                    "ItemCode": "Item code", "PartCategory": "Part category", "OptionGroup": "Option group",
+                    "ProcessType": "Process type", "InternalMakingCost": "Internal making cost",
+                    "ExternalMachiningCost": "External machining cost", "WeightUOM": "Weight unit",
+                    "WeightKg": "Saved total weight", "WeightGrams": "Saved total weight",
+                }
+                for source_name, label in field_labels.items():
+                    if label in result:
+                        continue
+                    value = recorded(source_name, detail.get(source_name))
+                    if value is not None:
+                        unit = "kg" if source_name == "WeightKg" else "g" if source_name == "WeightGrams" else ""
+                        result[label] = f"{value} {unit}".strip() if unit and not isinstance(value, str) else value
+                attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+                flatten_attributes("", attributes)
+                return result
+            if collection == "components":
+                return {"Canonical child Part": item_name(collection, item), "Quantity": f"{item.get('quantity') if item.get('quantity') is not None else '—'} {item.get('uom') or ''}".strip(),
+                    "Sourcing route": item.get("sourcingRoute") or "auto", "Pinned child revision": item.get("childRevisionLabel") or item.get("childRevisionId") or "current accepted"}
+            return {"Specification code": item.get("code") or "—", "Manufacturer": item.get("manufacturer") or "—",
+                "Manufacturer part number": item.get("manufacturerPartNumber") or "—", "Description": item.get("description") or "—",
+                "Costing unit": item.get("costingUOM") or "—", "Currency": item.get("costingCurrency") or "—"}
+
+        numeric_display_fields = {
+            "Quantity per Part", "Dimension to Cut", "Calculated weight per piece",
+            "Calculated weight per parent Part", "Per Part Weight", "Plate length",
+            "Plate width", "Plate thickness", "Saved total weight", "Rate-basis consumption", "Quantity",
+            "Internal making cost", "External machining cost",
+        }
+        length_to_mm = {"mm": 1.0, "millimeter": 1.0, "millimeters": 1.0,
+            "cm": 10.0, "centimeter": 10.0, "centimeters": 10.0,
+            "m": 1000.0, "meter": 1000.0, "meters": 1000.0, "metre": 1000.0, "metres": 1000.0,
+            "in": 25.4, "inch": 25.4, "inches": 25.4}
+        mass_to_kg = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+            "g": 0.001, "gram": 0.001, "grams": 0.001}
+        count_units = {"no": "each", "nos": "each", "ea": "each", "each": "each",
+            "pc": "each", "pcs": "each", "piece": "each", "pieces": "each"}
+
+        def normalized_number(candidate: Any, unit: str = "") -> Any:
+            numeric = _num(candidate)
+            if numeric is None:
+                return None
+            unit_key = re.sub(r"\s+", " ", unit.strip().casefold())
+            if unit_key in length_to_mm:
+                numeric *= length_to_mm[unit_key]
+                unit_key = "mm"
+            elif unit_key in mass_to_kg:
+                numeric *= mass_to_kg[unit_key]
+                unit_key = "kg"
+            else:
+                unit_key = count_units.get(unit_key, unit_key)
+            # Decimal formatting is comparison-only; displayed before/after
+            # values retain their original human-readable representation.
+            return (format(numeric, ".12g"), unit_key)
+
+        def semantic_value(field: str, value: Any) -> Any:
+            # JSON attributes are typed data: object key order is irrelevant,
+            # numbers compare numerically, and numeric-looking strings remain
+            # text. This preserves values such as a specification "001".
+            if isinstance(value, dict):
+                return {str(key): semantic_value(field, item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+            if isinstance(value, list):
+                return [semantic_value(field, item) for item in value]
+            if isinstance(value, bool) or value is None:
+                return value
+            if isinstance(value, (int, float)):
+                return normalized_number(value)
+            if not isinstance(value, str) or field not in numeric_display_fields:
+                return value
+
+            parts = value.split("/") if field == "Saved total weight" else [value]
+            normalized_parts = []
+            for part in parts:
+                match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([^\d\s].*?)?\s*", part)
+                if not match:
+                    return value
+                normalized = normalized_number(match.group(1), str(match.group(2) or ""))
+                if normalized is None:
+                    return value
+                normalized_parts.append(normalized)
+            return tuple(sorted(normalized_parts)) if field == "Saved total weight" else normalized_parts[0]
+
+        changes: list[dict[str, Any]] = []
+        for collection in ("requirements", "components", "purchases"):
+            old_rows = [item for item in before.get(collection, []) if isinstance(item, dict)]
+            new_rows = [item for item in after.get(collection, []) if isinstance(item, dict)]
+            old_counts: dict[str, int] = {}
+            new_counts: dict[str, int] = {}
+            for item in old_rows: old_counts[identity(collection, item)] = old_counts.get(identity(collection, item), 0) + 1
+            for item in new_rows: new_counts[identity(collection, item)] = new_counts.get(identity(collection, item), 0) + 1
+            ambiguous = {key for key, count in (old_counts | new_counts).items() if count > 1 or not key or key.startswith("legacy-line:None:None")}
+            old_by_id = {identity(collection, item): item for item in old_rows if identity(collection, item) not in ambiguous}
+            new_by_id = {identity(collection, item): item for item in new_rows if identity(collection, item) not in ambiguous}
+            for key in sorted(ambiguous):
+                sample = next((item for item in new_rows + old_rows if identity(collection, item) == key), {})
+                changes.append({"kind": "unavailable", "family": family_label.get(str(sample.get("family") or ""), "Store" if collection == "components" else "Purchase"),
+                    "item": item_name(collection, sample), "occurrence": key or "unclassified", "field": "Legacy row identity",
+                    "before": "Unavailable", "after": "Legacy evidence preserved; no inferred match was made"})
+            for key in sorted(old_by_id.keys() | new_by_id.keys()):
+                old, new = old_by_id.get(key), new_by_id.get(key)
+                sample = new or old or {}
+                family = family_label.get(str(sample.get("family") or ""), "Store" if collection == "components" else "Purchase")
+                values_before = values(collection, old) if old else {}
+                values_after = values(collection, new) if new else {}
+                for field in sorted(values_before.keys() | values_after.keys()):
+                    left, right = values_before.get(field), values_after.get(field)
+                    if old and new and semantic_value(field, left) == semantic_value(field, right):
+                        continue
+                    changes.append({"kind": "added" if old is None else "removed" if new is None else "modified", "family": family,
+                        "item": item_name(collection, sample), "occurrence": key, "field": field,
+                        "before": left if old else "Not present", "after": right if new else "Not present"})
+        return changes
 
     def publication_recovery(self, part_id: str, *, actor: str = "") -> dict[str, Any]:
         """Expose only durable retry identity while normal reads are generation-blocked."""
@@ -323,6 +1040,24 @@ class GristPartDefinitionService:
             provenance = {"type": link.get("ProvenanceType") or ("ods_baseline" if _int_ref(link.get("SourceLineObservation")) else "legacy_unclassified"),
                 "sourceObservationId": _int_ref(link.get("SourceLineObservation")), "evidence": _json_cell(link.get("ProvenanceEvidence")) or {}}
             field_status = deepcopy((engineering or {}).get("fieldStatus", {}))
+            for weight_field in ("WeightKg", "WeightGrams"):
+                if weight_field in field_status:
+                    continue
+                saved_weight = detail.get(weight_field)
+                if saved_weight in (None, ""):
+                    field_status[weight_field] = "missing" if saved_weight is None else "blank"
+                    continue
+                numeric_weight = _num(saved_weight, allow_blank=True)
+                if numeric_weight is not None and numeric_weight > 0:
+                    field_status[weight_field] = "value"
+                elif str(provenance.get("type") or "").casefold() in {"safari_authored", "safari_edited"}:
+                    # Older Safari-authored rows predate explicit status cells;
+                    # their editor-created zeroes are Grist defaults, not saved totals.
+                    field_status[weight_field] = "missing"
+                else:
+                    # Preserve uncertainty for ambiguous legacy/source rows rather
+                    # than presenting a default zero as a recorded weight.
+                    field_status[weight_field] = "unknown"
             observation = source_observations.get(_int_ref(link.get("SourceLineObservation")) or -1, {})
             observed = _json_cell(observation.get("ObservedFields")) or {}
             cells = _json_cell(observation.get("Cells")) or {}
@@ -338,7 +1073,7 @@ class GristPartDefinitionService:
                     field_status[field_name] = "blank" if source_value is None or not str(source_value).strip() else "value"
                 elif field_name not in field_status:
                     field_status[field_name] = "missing"
-            requirements.append({"requirementKey": key, "legacyRequirementKey": legacy_requirement_key,
+            item = {"requirementKey": key, "legacyRequirementKey": legacy_requirement_key,
                 "identityStatus": identity_status, "family": family,
                 "lineMasterId": line_master_id, "lineRevisionId": line_revision_id,
                 "lineIdentityStatus": "resolved" if master and line_revision and _int_ref(line_revision.get("LineMaster")) == line_master_id else "unresolved",
@@ -346,7 +1081,23 @@ class GristPartDefinitionService:
                 "quantity": link.get("QuantityExact") if link.get("QuantityExact") not in (None, "") else link.get("QuantityPerPart"),
                 "uom": link.get("QuantityUOM") or "", "sourcePartName": master.get("SourcePartName") or "",
                 "physicalSignature": line_revision.get("PhysicalSignature") or "", "detail": detail,
-                "fieldStatus": field_status, "provenance": provenance})
+                "fieldStatus": field_status, "provenance": provenance}
+            if family in {"mcl", "toolshop"}:
+                attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+                saved_evidence = attributes.get("materialWeightEvidence") if isinstance(attributes, dict) else None
+                item["materialWeightEvidence"] = self._verified_saved_material_evidence(saved_evidence, _int_ref(detail.get("Material")))
+                if item["materialWeightEvidence"] is None:
+                    material = self._material_row(_int_ref(detail.get("Material")))
+                    item["materialWeightEvidence"] = {"status": "unverified" if saved_evidence else "unavailable",
+                        "canonicalName": self._material_name(_fields(material)) if material else ""}
+                if self._legacy_duplicate_material_basis(item):
+                    item["materialConsumptionStatus"] = "legacy_duplicate_ambiguous"
+                    item["materialConsumptionResolution"] = None
+                else:
+                    item["materialConsumptionStatus"] = "resolved"
+                    item["materialConsumptionResolution"] = (attributes.get("materialConsumptionBasis")
+                        if isinstance(attributes, dict) else None)
+            requirements.append(item)
 
         components = []
         part_by_record = {int(row["id"]): _fields(row) for row in self._rows("ProductPart")}
@@ -408,6 +1159,18 @@ class GristPartDefinitionService:
         revision = self._current_revision(part_id)
         self._check_established(revision)
         definition = self._definition_from_rows(part_id, int(revision["id"]))
+        history = definition.get("revisionHistory") or []
+        revision_labels = {int(item["id"]): str(item.get("revisionLabel") or item["id"]) for item in history}
+        for item in history:
+            previous_id = _int_ref(item.get("previousRevisionId"))
+            if previous_id and previous_id in revision_labels:
+                before = self._definition_from_rows(part_id, previous_id)
+                after = definition if int(item["id"]) == int(revision["id"]) else self._definition_from_rows(part_id, int(item["id"]))
+                item["beforeRevisionLabel"] = revision_labels[previous_id]
+                item["changedRows"] = self._definition_changes(before, after)
+            else:
+                item["beforeRevisionLabel"] = None
+                item["changedRows"] = None
         draft_rows = self._optional_rows("PartDefinitionDraft")
         cr_rows = self._optional_rows("PartEngineeringChangeRequest")
         publication_schema_available = self._publication_schema_available()
@@ -457,12 +1220,89 @@ class GristPartDefinitionService:
         self._check_established(self._current_revision(part_id))
         parts = [{"id": _fields(row).get("StablePartId"), "partNumber": _fields(row).get("PartNumber"), "name": _fields(row).get("DisplayName") or ""}
             for row in self._rows("ProductPart") if _fields(row).get("StablePartId") and str(_fields(row).get("Status") or "active").casefold() == "active"]
-        materials = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("MaterialDisplayName") or "", "code": _fields(row).get("Code") or ""}
-            for row in self._rows("Material")]
+        materials = []
+        material_rows = self._rows("Material")
+        catalog = self._material_weight_catalog()
+        source_document_id = self._material_catalog_document_id(catalog)
+        verified_bindings = [payload for _, payload in self._identity_alias_bindings()]
+        explicit_material_ids_by_master: dict[int, set[int]] = {}
+        for payload in verified_bindings:
+            master_id = _int_ref(payload.get("sourceMasterMaterialId"))
+            material_id = _int_ref(payload.get("safariMaterialId"))
+            if (master_id is not None and material_id is not None
+                    and str(payload.get("sourceDocumentId") or "") == source_document_id):
+                explicit_material_ids_by_master.setdefault(master_id, set()).add(material_id)
+
+        from app.config import load_material_mapping
+        from app.material_resolution import resolve_material
+        try:
+            material_mappings = load_material_mapping()
+        except Exception:
+            material_mappings = {}
+        material_ids_by_canonical_name: dict[str, set[int]] = {}
+        for local in material_rows:
+            local_id = _int_ref(local.get("id"))
+            local_name = self._material_name(_fields(local))
+            if local_id is None or not local_name:
+                continue
+            try:
+                resolved = resolve_material(local_name, material_mappings)
+                resolved_name = resolved.canonical_name or local_name
+            except Exception:
+                resolved_name = local_name
+            material_ids_by_canonical_name.setdefault(resolved_name.strip().casefold(), set()).add(local_id)
+
+        material_ids_by_master: dict[int, set[int]] = {}
+        for record in catalog.get("records", []) if catalog.get("status") == "available" else []:
+            master_id = _int_ref(record.get("masterMaterialId"))
+            if master_id is None:
+                continue
+            exact_ids = set(explicit_material_ids_by_master.get(master_id, set()))
+            if not exact_ids:
+                canonical_name = str(record.get("canonicalName") or "").strip()
+                exact_ids.update(material_ids_by_canonical_name.get(canonical_name.casefold(), set()))
+            material_ids_by_master[master_id] = exact_ids
+
+        for row in material_rows:
+            fields = _fields(row)
+            name = self._material_name(fields) or fields.get("MaterialDisplayName") or fields.get("Description") or f"Material {row['id']}"
+            evidence = self._material_weight_evidence_for_identity(int(row["id"]))
+            source_aliases = [str(record.get("canonicalName") or "") for record in catalog.get("records", [])
+                if _int_ref(record.get("masterMaterialId")) is not None
+                and material_ids_by_master.get(int(record["masterMaterialId"]), set()) == {int(row["id"])}]
+            materials.append({"id": int(row["id"]), "name": name, "code": fields.get("Code") or fields.get("MaterialCode") or "",
+                "sourceAliases": sorted(set(source_aliases), key=str.casefold),
+                "weightEvidence": evidence, "kgPerMeter": evidence.get("kgPerMeter") if evidence else None,
+                "weightStatus": evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
+        material_catalog = []
+        if catalog.get("status") == "available":
+            for record in catalog.get("records", []):
+                master_id = _int_ref(record.get("masterMaterialId"))
+                if master_id is None:
+                    continue
+                bound_ids = material_ids_by_master.get(master_id, set())
+                material_catalog.append({"sourceKey": f"{source_document_id}:MasterMaterial:{master_id}",
+                    "masterMaterialId": master_id, "canonicalName": str(record.get("canonicalName") or ""),
+                    "code": str(record.get("code") or ""), "kgPerMeter": record.get("kgPerMeter"),
+                    "factorStatus": record.get("factorStatus") or "unavailable", "sourceDate": record.get("sourceDate"),
+                    "materialId": next(iter(bound_ids)) if len(bound_ids) == 1 else None,
+                    "bindingStatus": "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
         purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
             for row in self._rows("PurchaseItem")]
+        units = {"Nos", "each", "pcs", "kg", "g", "mm", "cm", "m", "in", "inch"}
+        for table, field_names in (("LineDetail", ("QuantityUOM", "DimensionUOM", "WeightUOM")),
+                                   ("PartRevisionLine", ("QuantityUOM",)), ("CostingProcessRate", ("RateUOM",))):
+            for row in self._optional_rows(table):
+                fields = _fields(row)
+                units.update(str(fields.get(name) or "").strip() for name in field_names if str(fields.get(name) or "").strip())
         return {"parts": sorted(parts, key=lambda item: str(item["partNumber"])), "materials": sorted(materials, key=lambda item: str(item["name"]).casefold()),
-            "purchaseItems": sorted(purchase_items, key=lambda item: str(item["name"]).casefold()), "families": list(FAMILY_PROCESS)}
+            "purchaseItems": sorted(purchase_items, key=lambda item: str(item["name"]).casefold()), "families": list(FAMILY_PROCESS),
+            "units": sorted(units, key=lambda item: item.casefold()),
+            "materialWeightSource": {"status": catalog.get("status", "unavailable"), "source": "Costing-New",
+                "readAt": catalog.get("readAt"), "readOnly": True, "catalogCount": len(catalog.get("records", [])),
+                "selectableCount": sum(1 for item in material_catalog if item["bindingStatus"] == "bound"),
+                "unboundCount": sum(1 for item in material_catalog if item["bindingStatus"] == "unbound")},
+            "materialCatalog": sorted(material_catalog, key=lambda item: str(item["canonicalName"]).casefold())}
 
     def _requirement_line_identity(self, raw: dict[str, Any], existing: dict[str, Any] | None,
                                    base_requirements: list[dict[str, Any]]) -> tuple[int | None, int | None]:
@@ -549,6 +1389,16 @@ class GristPartDefinitionService:
         if not isinstance(raw_requirements, list) or not isinstance(raw_components, list) or not isinstance(raw_purchases, list):
             raise PartIdentityError("PART_DEFINITION_INPUT_INVALID", "Requirements, components and purchase specifications must be lists.")
         existing_by_key = {str(item.get("requirementKey")): item for item in current["requirements"]}
+        known_uoms = {"nos", "no", "each", "ea", "pcs", "piece", "pieces", "kg", "kilogram", "kilograms",
+            "g", "gram", "grams", "mm", "millimeter", "millimeters", "cm", "centimeter", "centimeters",
+            "m", "meter", "meters", "metre", "metres", "in", "inch", "inches", "sec", "second", "seconds",
+            "min", "minute", "minutes", "hr", "hour", "hours", "day", "days"}
+        for table, fields_to_read in (("LineDetail", ("QuantityUOM", "DimensionUOM", "WeightUOM")),
+                                      ("PartRevisionLine", ("QuantityUOM",)), ("PartComponentRevision", ("QuantityUOM",)),
+                                      ("CostingProcessRate", ("RateUOM",))):
+            for row in self._optional_rows(table):
+                fields = _fields(row)
+                known_uoms.update(str(fields.get(name) or "").strip().casefold() for name in fields_to_read if str(fields.get(name) or "").strip())
         seen_requirements: set[str] = set()
         requirements = []
         for index, raw in enumerate(raw_requirements):
@@ -575,6 +1425,26 @@ class GristPartDefinitionService:
             detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
             detail = {str(name): deepcopy(value) for name, value in detail.items() if str(name) in LINE_DETAIL_FIELDS}
             unchanged_legacy_line = bool(existing and self._same_requirement_physical_content(raw, existing, detail))
+            old_detail = (existing or {}).get("detail") if isinstance((existing or {}).get("detail"), dict) else {}
+            submitted_field_status = raw.get("fieldStatus") if isinstance(raw.get("fieldStatus"), dict) else {}
+            old_field_status = (existing or {}).get("fieldStatus") if isinstance((existing or {}).get("fieldStatus"), dict) else {}
+
+            def unchanged_raw_detail_value(name: str) -> bool:
+                if not existing:
+                    return False
+                was_present, is_present = name in old_detail, name in detail
+                if was_present != is_present:
+                    return False
+                if not was_present:
+                    return True
+                previous, submitted = old_detail.get(name), detail.get(name)
+                if name in {"QuantityUOM", "DimensionUOM", "WeightUOM"}:
+                    return str(previous or "").strip().casefold() == str(submitted or "").strip().casefold()
+                previous_number, submitted_number = _num(previous, allow_blank=True), _num(submitted, allow_blank=True)
+                if previous_number is not None and submitted_number is not None:
+                    return previous_number == submitted_number
+                return previous == submitted
+
             quantity = _num(raw.get("quantity"), allow_blank=True)
             uom = str(raw.get("uom") or "").strip()
             if quantity is None and not unchanged_legacy_line:
@@ -583,6 +1453,8 @@ class GristPartDefinitionService:
                 raise PartIdentityError("PART_DEFINITION_QUANTITY_INVALID", "Requirement quantities must be finite and greater than zero.")
             if not uom and not existing:
                 raise PartIdentityError("PART_DEFINITION_UOM_REQUIRED", "New requirements need a quantity unit.")
+            if uom and uom.casefold() not in known_uoms and not unchanged_legacy_line:
+                raise PartIdentityError("PART_DEFINITION_UOM_UNSUPPORTED", "Choose a saved or supported quantity unit.")
             for name in ("Material", "PurchaseItem", "ProcessOperation", "WorkCenter"):
                 submitted_ref = detail.get(name)
                 if submitted_ref in (None, ""):
@@ -600,26 +1472,223 @@ class GristPartDefinitionService:
                 detail[name] = ref
             dimension_uom = str(detail.get("DimensionUOM") or "").strip().casefold()
             dimensions = [_num(detail.get(name), allow_blank=True) for name in ("Length", "Width", "Thickness")]
-            # Numeric Grist columns can read back an omitted value as zero. Preserve
-            # an existing zero, but never allow a new zero to be introduced.
-            old_detail = (existing or {}).get("detail") or {}
+            legacy_unknown_numeric_fields: set[str] = set()
+            for name in ("DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"):
+                submitted_value = detail.get(name)
+                if submitted_value in (None, ""):
+                    continue
+                number = _num(submitted_value)
+                if number is None:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
+                        continue
+                    raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite numeric value where supplied.")
+                if name in {"DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"} and number <= 0:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
+                        continue
+                    if name == "PartWeightKg":
+                        raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_INVALID", "Per Part Weight must be a finite positive kg value.")
+                    if name in {"DimensionMM", "DimensionInches"}:
+                        raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
+                    raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be greater than zero where supplied.")
             preserved_zero_dimensions = {
                 name for name, value in zip(("Length", "Width", "Thickness"), dimensions)
-                if existing and value == 0 and _num(old_detail.get(name), allow_blank=True) == 0
+                if unchanged_raw_detail_value(name) and value == 0
             }
             effective_dimensions = [None if name in preserved_zero_dimensions else value
                                     for name, value in zip(("Length", "Width", "Thickness"), dimensions)]
-            if any(value is not None and value <= 0 for value in effective_dimensions) and not unchanged_legacy_line:
-                raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
-            if any(value is not None for value in effective_dimensions) and (not all(value is not None for value in effective_dimensions) or dimension_uom not in {"mm", "millimeter", "millimeters", "in", "inch", "inches"}) and not unchanged_legacy_line:
-                raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "Length, width and thickness must be supplied together with a supported mm or inch unit.")
+            dimension_group_unchanged = bool(existing and all(unchanged_raw_detail_value(name)
+                for name in ("Length", "Width", "Thickness", "DimensionUOM")))
+            if family == "cnc":
+                if any(value is not None and value <= 0 for value in effective_dimensions) and not dimension_group_unchanged:
+                    raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered CNC plate dimensions must be finite and positive.")
+                if any(value is not None for value in effective_dimensions) and (not all(value is not None for value in effective_dimensions) or dimension_uom not in LENGTH_TO_MM) and not dimension_group_unchanged:
+                    raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "CNC length, width and thickness must be supplied together with a supported unit.")
+            elif any(value is not None for value in effective_dimensions):
+                if any(value is not None and value <= 0 for value in effective_dimensions) and not dimension_group_unchanged:
+                    raise PartIdentityError("PART_DEFINITION_DIMENSION_INVALID", "Entered dimensions must be finite and positive.")
+                if dimension_uom not in LENGTH_TO_MM and not dimension_group_unchanged:
+                    raise PartIdentityError("PART_DEFINITION_DIMENSION_UOM_INVALID", "Entered dimensions need a supported unit.")
+
+            dimension_mm = _num(detail.get("DimensionMM"), allow_blank=True)
+            dimension_inches = _num(detail.get("DimensionInches"), allow_blank=True)
+            old_dimension_mm = _num(old_detail.get("DimensionMM"), allow_blank=True)
+            old_dimension_inches = _num(old_detail.get("DimensionInches"), allow_blank=True)
+            dimension_text = str(detail.get("DimensionText") or "")
+            dimension_changed = any(not unchanged_raw_detail_value(name)
+                for name in ("DimensionMM", "DimensionInches", "DimensionText", "DimensionUOM"))
+            value_mm = dimension_mm if dimension_mm is not None else dimension_inches * LENGTH_TO_MM["in"] if dimension_inches is not None else None
+            parsed_text = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(mm|millimeters?|cm|centimeters?|m|meters?|metres?|in|inches?)\s*", dimension_text, re.IGNORECASE) if dimension_text.strip() else None
+            if dimension_text.strip() and not parsed_text and not unchanged_raw_detail_value("DimensionText"):
+                raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite number followed by a supported length unit.")
+            if dimension_changed and (dimension_mm is not None or dimension_inches is not None):
+                if any(value is not None and value <= 0 for value in (dimension_mm, dimension_inches)):
+                    raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
+                if dimension_uom not in LENGTH_TO_MM:
+                    raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_UOM_INVALID", "Dimension to Cut needs an explicit supported unit.")
+                if dimension_mm is not None and dimension_inches is not None:
+                    equivalent_mm = dimension_inches * LENGTH_TO_MM["in"]
+                    if abs(dimension_mm - equivalent_mm) > max(0.01, abs(dimension_mm) * 1e-7):
+                        raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INCONSISTENT", "The saved mm and inch cut-length values do not agree.")
+                if parsed_text:
+                    text_mm = float(parsed_text.group(1)) * LENGTH_TO_MM[parsed_text.group(2).casefold()]
+                    if abs((dimension_mm if dimension_mm is not None else value_mm) - text_mm) > max(0.01, abs(value_mm) * 1e-7):
+                        raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INCONSISTENT", "Dimension to Cut text and numeric values do not agree.")
+
+            part_weight = _num(detail.get("PartWeightKg"), allow_blank=True)
+            old_part_weight = _num(old_detail.get("PartWeightKg"), allow_blank=True)
+            weight_changed = not unchanged_raw_detail_value("PartWeightKg")
+            if weight_changed and part_weight is not None and part_weight <= 0:
+                raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_INVALID", "Per Part Weight must be a finite positive kg value.")
+            if weight_changed and part_weight is not None:
+                detail["ExactWeightKgText"] = format(part_weight, ".15g")
+            if dimension_changed and (dimension_mm is not None or dimension_inches is not None) and family in {"mcl", "toolshop"} and (value_mm is None or value_mm <= 0):
+                raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_INVALID", "Dimension to Cut must be a finite positive value.")
+
+            material_changed = not unchanged_raw_detail_value("Material")
+            saved_attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
+            old_attributes = _json_cell(old_detail.get("EngineeringAttributes")) or {}
+            old_weight_evidence = old_attributes.get("materialWeightEvidence") if isinstance(old_attributes, dict) else None
+            material_id = _int_ref(detail.get("Material"))
+            material_row = self._material_row(material_id)
+            canonical_material_name = self._material_name(_fields(material_row)) if material_row else ""
+            if canonical_material_name:
+                # A submitted label is display text, never the binding authority.
+                detail["MaterialDisplayName"] = canonical_material_name
+            material_weight_evidence = self._material_weight_evidence_for_identity(
+                material_id, saved_evidence=old_weight_evidence)
+            detail_attributes = deepcopy(saved_attributes) if isinstance(saved_attributes, dict) else {}
+            # Ignore all client-supplied factors, IDs, dates and provenance. Only
+            # the server-resolved canonical identity or a verified saved capture
+            # can survive this boundary.
+            detail_attributes["materialWeightEvidence"] = deepcopy(material_weight_evidence)
+
+            saved_material_basis = str(old_attributes.get("materialConsumptionBasis") or "").strip().casefold()
+            submitted_material_basis = str(raw.get("materialConsumptionResolution") or "").strip().casefold()
+            legacy_basis_review = bool(existing and self._legacy_duplicate_material_basis(existing))
+            material_basis = submitted_material_basis if legacy_basis_review else (submitted_material_basis or saved_material_basis)
+            if legacy_basis_review and material_basis not in {"weight_per_piece", "one_item_per_occurrence"}:
+                raise PartIdentityError("PART_MATERIAL_BASIS_REVIEW_REQUIRED",
+                    "This legacy MCL/Tool Shop row stores the same piece count in normalized consumption and Qty per Part. Review the per-piece material basis before saving.")
+            if material_basis and material_basis not in {"weight_per_piece", "one_item_per_occurrence"}:
+                raise PartIdentityError("PART_MATERIAL_BASIS_INVALID", "Choose physical weight per piece or one stock item per occurrence.")
+            detail_attributes.pop("materialConsumptionBasis", None)
+            if material_basis:
+                detail_attributes["materialConsumptionBasis"] = material_basis
+            if family in {"mcl", "toolshop"}:
+                detail["EngineeringAttributes"] = detail_attributes
+            weight_factor = _num(material_weight_evidence.get("kgPerMeter")) if isinstance(material_weight_evidence, dict) else None
+            calculated_material_weight_kg = (value_mm / 1000.0 * weight_factor
+                if family in {"mcl", "toolshop"} and value_mm is not None and value_mm > 0 and weight_factor is not None and weight_factor > 0 else None)
+
+            rate_uom = str(detail.get("QuantityUOM") or "").strip()
+            if material_basis == "weight_per_piece":
+                if family not in {"mcl", "toolshop"} or calculated_material_weight_kg is None:
+                    raise PartIdentityError("PART_MATERIAL_WEIGHT_REQUIRED", "A trusted material conversion and positive Dimension to Cut are required for per-piece weight resolution.")
+                rate_uom = "kg"
+                detail["QuantityUOM"] = rate_uom
+            elif material_basis == "one_item_per_occurrence":
+                if family not in {"mcl", "toolshop"}:
+                    raise PartIdentityError("PART_MATERIAL_BASIS_INVALID", "One stock item per occurrence applies only to MCL or Tool Shop rows.")
+                rate_uom = str(old_detail.get("QuantityUOM") or detail.get("QuantityUOM") or "Nos").strip() or "Nos"
+                if rate_uom.casefold() not in {"nos", "no", "each", "ea", "pcs", "piece", "pieces"}:
+                    raise PartIdentityError("PART_MATERIAL_BASIS_INVALID", "One stock item per occurrence requires a piece-count unit.")
+                detail["QuantityUOM"] = rate_uom
+            if rate_uom and rate_uom.casefold() not in known_uoms and not unchanged_legacy_line:
+                raise PartIdentityError("PART_DEFINITION_RATE_UOM_UNSUPPORTED", "Choose a saved or supported consumption unit.")
+            rate_unit = rate_uom.casefold()
+            rate_unit_changed = not unchanged_raw_detail_value("QuantityUOM")
+            quantity_changed = not unchanged_raw_detail_value("Quantity")
+            rate_quantity_value = _num(detail.get("Quantity"), allow_blank=True)
+            if detail.get("Quantity") not in (None, "") and rate_quantity_value is None and quantity_changed:
+                raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", "Normalized consumption must be a finite numeric value where supplied.")
+            consumption_derived = False
+            missing_cross_dimension_conversion = False
+            if material_basis == "weight_per_piece":
+                detail["Quantity"] = calculated_material_weight_kg
+                detail["ExactQuantityText"] = format(calculated_material_weight_kg, ".15g")
+                rate_quantity_value = detail["Quantity"]
+                consumption_derived = True
+            elif material_basis == "one_item_per_occurrence":
+                detail["Quantity"] = 1
+                detail["ExactQuantityText"] = "1"
+                rate_quantity_value = 1
+                consumption_derived = True
+            elif family in {"mcl", "toolshop"} and rate_unit in LENGTH_TO_MM:
+                if value_mm is not None and value_mm > 0:
+                    detail["Quantity"] = value_mm / LENGTH_TO_MM[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                elif not existing or dimension_changed or rate_unit_changed:
+                    raise PartIdentityError("PART_DEFINITION_CUT_LENGTH_REQUIRED", "A length-based consumption row needs a positive Dimension to Cut.")
+            elif family in {"mcl", "toolshop"} and rate_unit in MASS_TO_KG:
+                if calculated_material_weight_kg is not None:
+                    detail["Quantity"] = calculated_material_weight_kg / MASS_TO_KG[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                else:
+                    # Existing rows may retain a truly unchanged legacy basis,
+                    # but a changed/new material or cut length cannot reuse it.
+                    unchanged_basis = bool(existing and not dimension_changed and not material_changed and not rate_unit_changed
+                        and not quantity_changed and (value_mm is None or value_mm <= 0 or
+                            material_weight_evidence.get("status") == "available"
+                            and self._verified_saved_material_evidence(material_weight_evidence, material_id)))
+                    if not unchanged_basis:
+                        detail["Quantity"] = None
+                        detail["ExactQuantityText"] = None
+                        rate_quantity_value = None
+                    has_physical_measure = value_mm is not None and value_mm > 0
+                    missing_cross_dimension_conversion = has_physical_measure and not unchanged_basis
+            elif family == "cnc" and rate_unit in MASS_TO_KG:
+                if part_weight is not None and part_weight > 0:
+                    detail["Quantity"] = part_weight / MASS_TO_KG[rate_unit]
+                    detail["ExactQuantityText"] = format(detail["Quantity"], ".15g")
+                    rate_quantity_value = detail["Quantity"]
+                    consumption_derived = True
+                elif not existing or weight_changed or rate_unit_changed:
+                    raise PartIdentityError("PART_DEFINITION_PART_WEIGHT_REQUIRED", "A kg-based CNC consumption row needs a positive Per Part Weight.")
+            else:
+                needs_cross_dimension_conversion = (
+                    family in {"mcl", "toolshop"} and rate_unit in MASS_TO_KG
+                    or family == "cnc" and rate_unit in LENGTH_TO_MM)
+                physical_basis_changed = dimension_changed if family in {"mcl", "toolshop"} else weight_changed
+                explicitly_reaffirmed_manual = submitted_field_status.get("Quantity") == "manual-reaffirmed"
+                if needs_cross_dimension_conversion and (physical_basis_changed or rate_unit_changed) and existing \
+                        and not quantity_changed and not explicitly_reaffirmed_manual:
+                    # A cut length cannot keep an old mass quantity, or a per-part
+                    # weight keep an old length quantity, without conversion evidence.
+                    detail["Quantity"] = None
+                    detail["ExactQuantityText"] = None
+                    rate_quantity_value = None
+                    missing_cross_dimension_conversion = (value_mm is not None and value_mm > 0) if family in {"mcl", "toolshop"} else (part_weight is not None and part_weight > 0)
+                elif needs_cross_dimension_conversion and rate_quantity_value in (None, ""):
+                    missing_cross_dimension_conversion = (value_mm is not None and value_mm > 0) if family in {"mcl", "toolshop"} else (part_weight is not None and part_weight > 0)
+                if rate_quantity_value is not None:
+                    numeric_quantity = _num(rate_quantity_value)
+                    if numeric_quantity is not None:
+                        detail["Quantity"] = numeric_quantity
+                        detail["ExactQuantityText"] = format(numeric_quantity, ".15g")
+
+            if dimension_changed and (dimension_mm is not None or dimension_inches is not None) and family in {"mcl", "toolshop"}:
+                if dimension_mm is None:
+                    detail["DimensionMM"] = value_mm
+                if dimension_inches is None:
+                    detail["DimensionInches"] = value_mm / LENGTH_TO_MM["in"]
+                if not dimension_text:
+                    unit_label = "in" if dimension_uom in {"in", "inch", "inches"} else "mm"
+                    source_value = dimension_inches if unit_label == "in" else dimension_mm
+                    detail["DimensionText"] = f"{source_value} {unit_label}"
             for name in ("Quantity", "DimensionMM", "DimensionInches", "WeightGrams", "WeightKg", "PartWeightKg",
                          "Length", "Width", "Thickness", "InternalMakingCost", "ExternalMachiningCost", "RateCached", "CostCached"):
                 if name not in detail or detail[name] in (None, ""):
                     continue
                 numeric = _num(detail[name])
                 if numeric is None or (name in {"Quantity", "Length", "Width", "Thickness"} and numeric <= 0 and name not in preserved_zero_dimensions):
-                    if unchanged_legacy_line:
+                    if unchanged_raw_detail_value(name):
+                        legacy_unknown_numeric_fields.add(name)
                         continue
                     raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", f"{name} must be a finite positive number where supplied.")
                 detail[name] = numeric
@@ -628,11 +1697,35 @@ class GristPartDefinitionService:
                 detail["ProcessType"] = process_type
                 rate_quantity = _num(detail.get("Quantity"), allow_blank=True)
                 rate_uom = str(detail.get("QuantityUOM") or "").strip()
-                if not unchanged_legacy_line and (rate_quantity is None or rate_quantity <= 0 or not rate_uom):
+                if not unchanged_legacy_line and (rate_quantity is None or rate_quantity <= 0 or not rate_uom) \
+                        and not (missing_cross_dimension_conversion and rate_uom):
                     raise PartIdentityError("PART_DEFINITION_RATE_BASIS_INVALID", "New or changed manufacturing requirements need a finite positive rate quantity and its unit.")
-                if family == "mcl" and not unchanged_legacy_line and not (_int_ref(detail.get("Material")) or str(detail.get("MaterialDisplayName") or "").strip()):
-                    raise PartIdentityError("PART_DEFINITION_MATERIAL_REQUIRED", "A new or changed MCL requirement needs a canonical Material or an exact material display name.")
-            field_status = deepcopy(raw.get("fieldStatus") or {})
+                if family in {"mcl", "toolshop"} and not unchanged_legacy_line and not _int_ref(detail.get("Material")):
+                    raise PartIdentityError("PART_DEFINITION_MATERIAL_REQUIRED", "Choose the canonical Material To Use for a new or changed MCL or Tool Shop requirement.")
+            field_status = deepcopy(submitted_field_status)
+            if legacy_unknown_numeric_fields:
+                for name in legacy_unknown_numeric_fields:
+                    field_status.setdefault(name, "unknown")
+            if consumption_derived:
+                field_status["Quantity"] = "derived"
+            elif missing_cross_dimension_conversion or detail.get("Quantity") in (None, ""):
+                field_status["Quantity"] = "missing"
+            else:
+                field_status["Quantity"] = "manual"
+            if not existing:
+                for name in ("WeightKg", "WeightGrams"):
+                    prior_status = str(field_status.get(name) or "").casefold()
+                    if name not in detail:
+                        field_status[name] = "missing"
+                    elif detail[name] in (None, ""):
+                        field_status[name] = "blank"
+                    elif _num(detail[name], allow_blank=True) == 0 and prior_status != "value":
+                        # Grist returns zero for several physically empty numeric
+                        # cells. Treat it as an absent saved total unless the
+                        # editor/source supplied explicit value evidence.
+                        field_status[name] = "missing"
+                    else:
+                        field_status[name] = "value"
             for name in ("ToolShopRemarks", "PlatePart", "DimensionText", "ItemCode", "ItemName", "MaterialDisplayName"):
                 if name in detail:
                     if detail[name] in (None, ""):
@@ -646,7 +1739,10 @@ class GristPartDefinitionService:
                 "family": family, "lineMasterId": line_master_id, "lineRevisionId": line_revision_id,
                 "processType": process_type, "quantity": quantity, "quantityExact": str(raw.get("quantityExact") or ("" if quantity is None else str(raw.get("quantity")))),
                 "uom": uom, "detail": detail, "provenance": deepcopy(raw.get("provenance") or {"type": "safari_authored", "evidence": {}}),
-                "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status})
+                "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status,
+                "materialWeightEvidence": deepcopy(material_weight_evidence) if family in {"mcl", "toolshop"} else None,
+                "materialConsumptionStatus": "resolved",
+                "materialConsumptionResolution": material_basis or None})
 
         parts_by_stable = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
         current_parts = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
@@ -1476,6 +2572,17 @@ class GristPartDefinitionService:
         impact = _json_cell(fields.get("ImpactPreview"))
         if not after or not impact or impact.get("fingerprint") != fields.get("ImpactFingerprint"):
             raise PartIdentityError("PART_CHANGE_REQUEST_INTEGRITY", "The approved Change Request does not match its saved definition or reviewed impact.")
+        validated_after = self._normalize_content(part_id, int(current["id"]), after, f"publication-validation:{fields.get('ChangeRequestKey')}")
+        comparable_after = deepcopy(after)
+        normalized_by_key = {str(item.get("requirementKey")): item for item in validated_after.get("requirements", [])}
+        for item in comparable_after.get("requirements", []):
+            normalized = normalized_by_key.get(str(item.get("requirementKey"))) or {}
+            for name in ("lineMasterId", "lineRevisionId"):
+                if item.get(name) in (None, "") and normalized.get(name) is not None:
+                    item[name] = normalized[name]
+        if request_fingerprint(validated_after) != request_fingerprint(comparable_after):
+            raise PartIdentityError("PART_CHANGE_REQUEST_DEFINITION_INVALID", "The approved saved definition no longer satisfies current physical-consumption and numeric invariants. Reopen it, save a corrected draft and request approval again.")
+        after = validated_after
         current_impact = self.impact_preview(part_id, after)
         if current_impact.get("fingerprint") != impact.get("fingerprint"):
             raise PartIdentityError("PART_DEPENDENCY_CLOSURE_STALE", "Current assemblies or Model Code configurations changed after the dependency preview. Reopen the definition, review the new impact and submit a new Change Request.")

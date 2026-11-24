@@ -5,6 +5,7 @@ import {ApiError} from "../src/api";
 
 const apiMocks = vi.hoisted(() => ({
   partDefinition: vi.fn(), partDefinitionOptions: vi.fn(), savePartDefinitionDraft: vi.fn(),
+  bindPartDefinitionMaterial: vi.fn(),
   submitPartDefinitionChangeRequest: vi.fn(), reopenPartDefinitionChangeRequest: vi.fn(), approveAndPublishPartDefinition: vi.fn(),
 }));
 vi.mock("../src/api", () => ({api: apiMocks, ApiError: class ApiError extends Error {
@@ -34,6 +35,7 @@ beforeEach(() => {
   vi.stubGlobal("crypto", {randomUUID:() => `part-definition-${++counter}`});
   apiMocks.partDefinition.mockResolvedValue(accepted);
   apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"Steel"}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.bindPartDefinitionMaterial.mockResolvedValue({status:"bound",materialId:5,masterMaterialId:55,identityCaptured:false});
   apiMocks.savePartDefinitionDraft.mockResolvedValue({draftKey:"draft-1",saveVersion:1,contentFingerprint:"fp",content:{}});
   apiMocks.submitPartDefinitionChangeRequest.mockResolvedValue({changeRequestKey:"cr-1",status:"pending_approval",impact:{assemblies:[],modelCodeConfigurations:[]}});
   apiMocks.approveAndPublishPartDefinition.mockResolvedValue({status:"published",publishedRevisionLabel:"B",dependentPartCount:0,configurationCount:0});
@@ -103,7 +105,7 @@ it("saves a direct edit as a Grist draft and reloads the persisted reason before
 
   fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
   expect((screen.getByLabelText("Engineering change reason") as HTMLInputElement).value).toBe("Initial test edit");
-  fireEvent.change(screen.getByLabelText("Quantity"),{target:{value:"2"}});
+  fireEvent.change(screen.getByLabelText("Quantity — MCL row 1"),{target:{value:"2"}});
   fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Increase blank allowance"}});
   fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
   await screen.findByText(/Draft saved in Safari Grist/);
@@ -142,20 +144,24 @@ it("locks an uncertain draft save across reload and retries the original key and
   expect(localStorage.getItem("safari.part-definition:part-1:draft-save")).toBeNull();
 });
 
-it("collects an explicit MCL rate quantity and unit for a newly authored requirement", async () => {
+it("derives MCL mass consumption from piece count, cut length and the selected material factor", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"Steel",kgPerMeter:1.58,
+    weightEvidence:{kgPerMeter:"1.58",factorUnit:"kg/m",source:"Costing-New",sourceDate:"2026-09-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
   render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
   fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
-  fireEvent.click(screen.getByRole("button",{name:"Add requirement"}));
-  const quantities = screen.getAllByLabelText("Rate-basis quantity") as HTMLInputElement[];
-  const units = screen.getAllByLabelText("Rate-basis unit") as HTMLInputElement[];
-  fireEvent.change(quantities[quantities.length - 1],{target:{value:"2"}});
-  fireEvent.change(units[units.length - 1],{target:{value:"kg"}});
-  fireEvent.change(screen.getAllByLabelText("Material identity")[1],{target:{value:"5"}});
-  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Add measured MCL"}});
+  fireEvent.click(screen.getByRole("button",{name:"Add MCL row"}));
+  fireEvent.change(screen.getByLabelText("Material To Use — MCL row 2"),{target:{value:"5"}});
+  fireEvent.change(screen.getByLabelText("Quantity — MCL row 2"),{target:{value:"4"}});
+  fireEvent.change(screen.getByLabelText("Dimension to Cut — MCL row 2"),{target:{value:"200"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Add measured MCL stock"}});
+  expect(screen.queryByLabelText("Rate-basis quantity — MCL row 2")).toBeNull();
+  expect(screen.getByText("1.264 kg per parent Part")).toBeTruthy();
   fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
   await screen.findByText(/Draft saved in Safari Grist/);
   const authored = apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements.at(-1);
-  expect(authored.detail).toMatchObject({Material:"5",Quantity:"2",QuantityUOM:"kg"});
+  expect(authored).toMatchObject({quantity:"4",uom:"Nos"});
+  expect(authored.detail).toMatchObject({Material:5,QuantityUOM:"kg",MaterialDisplayName:"Steel",DimensionMM:200,DimensionText:"200 mm"});
+  expect(authored.detail.Quantity).toBeCloseTo(0.316,12);
 });
 
 it("retries an uncertain approved publication with the same durable request key", async () => {
@@ -232,7 +238,7 @@ it("offers explicit classification for duplicate legacy occurrences and shows bl
   fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
   expect(screen.getAllByText("missing in source")).toHaveLength(1);
   expect(screen.getAllByText("blank in source")).toHaveLength(1);
-  fireEvent.click(screen.getAllByRole("button",{name:"Assign reviewed requirement identity"})[0]);
+  fireEvent.click(screen.getAllByRole("button",{name:"Assign reviewed occurrence identity"})[0]);
   fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Classify duplicate line"}});
   fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
 
@@ -267,11 +273,12 @@ it("shows the immutable submitted definition diff in a fresh approver session", 
   }]});
   render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
 
-  expect(await screen.findByText("requirements[req-1].quantity")).toBeTruthy();
-  expect(screen.getByText("components[component-1]")).toBeTruthy();
+  expect((await screen.findAllByText("Quantity per Part")).length).toBeGreaterThan(0);
+  expect(screen.getByText("Store · child-1")).toBeTruthy();
+  expect(screen.getByText("component-1")).toBeTruthy();
   expect(screen.getByText("removed")).toBeTruthy();
-  expect(screen.getByText("1")).toBeTruthy();
-  expect(screen.getByText("2")).toBeTruthy();
+  expect(screen.getAllByText("1 Nos").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("2 Nos").length).toBeGreaterThan(0);
 });
 
 it("reopens preserved stale changes through a new saved draft", async () => {
@@ -286,12 +293,142 @@ it("reopens preserved stale changes through a new saved draft", async () => {
   render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
 
   fireEvent.click(await screen.findByText("Review the preserved submitted definition"));
-  expect(screen.getByText("requirements[req-1].quantity")).toBeTruthy();
+  expect(screen.getAllByText("Quantity per Part").length).toBeGreaterThan(0);
   fireEvent.change(screen.getByLabelText("Reason for reopening this saved change"),{target:{value:"Review closure"}});
   fireEvent.click(screen.getByRole("button",{name:"Reopen saved changes as a new draft"}));
 
   await screen.findByText(/Saved changes reopened as draft v1/);
   expect(apiMocks.reopenPartDefinitionChangeRequest).toHaveBeenCalledWith("part-1","cr-stale",{reason:"Review closure"},expect.any(String));
-  expect((screen.getByLabelText("Quantity") as HTMLInputElement).value).toBe("2");
+  expect((screen.getByLabelText("Quantity — MCL row 1") as HTMLInputElement).value).toBe("2");
   expect(screen.getByLabelText("Engineering change reason")).toBeTruthy();
+});
+
+it("adds exactly one focused row to the explicitly chosen MCL, Tool Shop, CNC and Store tables", async () => {
+  const {container} = render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Add MCL row"}));
+  expect(screen.getByLabelText("Material To Use — MCL row 2")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"Add MCL row"}));
+  expect(screen.getByLabelText("Material To Use — MCL row 3")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"Add Tool Shop row"}));
+  const toolItem = screen.getByLabelText("Material To Use — Tool Shop row 1");
+  expect(document.activeElement).toBe(toolItem);
+  expect(screen.getByText(/Tool Shop marked applicable in this draft/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"Add CNC row"}));
+  fireEvent.click(screen.getByRole("button",{name:"Add Store row"}));
+
+  const keys = [...container.querySelectorAll<HTMLTableRowElement>("tr[data-requirement-key]")].map(row => row.dataset.requirementKey);
+  expect(keys).toHaveLength(5); // one accepted row plus four deliberate manufacturing additions
+  expect(new Set(keys).size).toBe(5);
+  expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(3);
+  expect(container.querySelectorAll('[aria-label="Tool Shop requirements"] tbody tr')).toHaveLength(1);
+  expect(container.querySelectorAll('[aria-label="CNC requirements"] tbody tr')).toHaveLength(1);
+  expect(container.querySelectorAll('[aria-label="Store requirements"] tbody tr')).toHaveLength(1);
+});
+
+it("captures a source-only canonical identity from CNC and selects the new local Material without deriving CNC weight", async () => {
+  const canonical = "Alang Cut Piece-Casting Template No. 83 - Round Plate";
+  const sourceOnly = {sourceKey:"costing-new-test:MasterMaterial:56",masterMaterialId:56,canonicalName:canonical,code:"PL-83",
+    bindingStatus:"unbound",materialId:null,factorStatus:"available",kgPerMeter:"5"};
+  const capturedMaterial = {id:99,name:canonical,kgPerMeter:5,weightEvidence:{status:"available",kgPerMeter:"5",factorUnit:"kg/m"}};
+  const beforeCapture = {parts:[],materials:[{id:5,name:"Steel"}],materialCatalog:[sourceOnly],
+    materialWeightSource:{status:"available",catalogCount:402},purchaseItems:[],families:["mcl","toolshop","cnc"]};
+  const afterCapture = {parts:[],materials:[{id:5,name:"Steel"},capturedMaterial],materialCatalog:[{...sourceOnly,bindingStatus:"bound",materialId:99}],
+    materialWeightSource:{status:"available",catalogCount:402},purchaseItems:[],families:["mcl","toolshop","cnc"]};
+  apiMocks.partDefinitionOptions.mockResolvedValueOnce(beforeCapture).mockResolvedValue(afterCapture);
+  apiMocks.bindPartDefinitionMaterial.mockResolvedValue({status:"bound",materialId:99,masterMaterialId:56,identityCaptured:true});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.click(screen.getByRole("button",{name:"Add CNC row"}));
+  fireEvent.change(screen.getByLabelText("Per Part Weight (kg) — CNC row 1"),{target:{value:"0.25"}});
+  fireEvent.click(screen.getAllByText("Search and review a Costing-New material binding")[1]);
+  fireEvent.change(screen.getByLabelText("Costing-New material — CNC row 1"),{target:{value:"56"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Capture reviewed source identity"}});
+  fireEvent.click(screen.getByRole("button",{name:"Review and capture as canonical Material"}));
+  await screen.findByText(new RegExp(`${canonical} is now a canonical Safari Material`));
+  expect(apiMocks.bindPartDefinitionMaterial).toHaveBeenCalledWith("part-1",{
+    sourceMasterMaterialId:56,reason:"Capture reviewed source identity",captureCanonicalIdentity:true,
+  },expect.stringMatching(/^material-binding:/));
+  expect((screen.getByLabelText("Material To Use — CNC row 1") as HTMLSelectElement).value).toBe("99");
+  expect((screen.getByLabelText("Per Part Weight (kg) — CNC row 1") as HTMLInputElement).value).toBe("0.25");
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText(/Draft saved in Safari Grist/);
+  expect(apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements.at(-1).detail).toMatchObject({
+    Material:99,MaterialDisplayName:canonical,PartWeightKg:"0.25",
+  });
+});
+
+it("cancels then confirms row removal in the draft table", async () => {
+  const {container} = render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  const firstRemove = () => screen.getAllByRole("button",{name:"Remove row"})[0];
+  fireEvent.click(firstRemove());
+  expect(await screen.findByRole("alertdialog")).toBeTruthy();
+  expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button",{name:"Cancel removal"}));
+  expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(1);
+  fireEvent.click(firstRemove());
+  fireEvent.click(screen.getByRole("button",{name:"Remove from draft"}));
+  expect(container.querySelectorAll('[aria-label="MCL requirements"] tbody tr')).toHaveLength(0);
+  expect(accepted.requirements).toHaveLength(1); // accepted membership is untouched until publication
+});
+
+it("rejects malformed CNC Per Part Weight even when its costing unit is Nos", async () => {
+  apiMocks.partDefinition.mockResolvedValue({...accepted,
+    applicability:{...accepted.applicability,cnc:{applicable:true,status:"applicable"}},
+    requirements:[...accepted.requirements,{requirementKey:"cnc-row",identityStatus:"stable",family:"cnc",quantity:2,uom:"Nos",processType:"cnc",
+      detail:{PartWeightKg:0.25,Quantity:1,QuantityUOM:"Nos",PlatePart:"Mounting plate"}}],
+  });
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  fireEvent.change(screen.getByLabelText("Per Part Weight (kg) — CNC row 1"),{target:{value:"BAD123"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Reject malformed CNC weight"}});
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+
+  expect(await screen.findByText("PartWeightKg must be a finite number greater than zero.")).toBeTruthy();
+  expect(apiMocks.savePartDefinitionDraft).not.toHaveBeenCalled();
+});
+
+it("shows saved MCL cut length and CNC per-part weight without conflating total weight", async () => {
+  apiMocks.partDefinition.mockResolvedValue({...accepted,applicability:{...accepted.applicability,cnc:{applicable:true,status:"applicable"}},requirements:[
+    {...accepted.requirements[0],detail:{...accepted.requirements[0].detail,DimensionMM:250,DimensionInches:250/25.4,DimensionText:"250 mm",DimensionUOM:"mm"}},
+    {requirementKey:"cnc-row",identityStatus:"stable",family:"cnc",quantity:3,uom:"Nos",processType:"cnc",detail:{ItemName:"Cut plate",PartWeightKg:0.5,WeightKg:1,WeightGrams:1000,Quantity:0.5,QuantityUOM:"kg",PlatePart:"Mounting plate"}},
+  ]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  expect(await screen.findByText("250 mm")).toBeTruthy();
+  expect(screen.getAllByText("0.5 kg").length).toBeGreaterThan(0);
+  expect(screen.getByText("1.5 kg")).toBeTruthy();
+  fireEvent.click(screen.getAllByText("Saved calculation and identity")[1]);
+  expect(screen.getByText(/Saved total weight fields: WeightKg 1 kg/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"Edit Part"}));
+  expect((screen.getByLabelText("Dimension to Cut — MCL row 1") as HTMLInputElement).value).toBe("250");
+  fireEvent.change(screen.getByLabelText("Per Part Weight (kg) — CNC row 1"),{target:{value:"0.6"}});
+  expect(screen.getByText("1.8 kg")).toBeTruthy();
+  expect((screen.getByLabelText("Per Part Weight (kg) — CNC row 1") as HTMLInputElement).value).toBe("0.6");
+});
+
+it("distinguishes a missing saved CNC total from a zero weight", async () => {
+  apiMocks.partDefinition.mockResolvedValue({...accepted,applicability:{...accepted.applicability,cnc:{applicable:true,status:"applicable"}},requirements:[
+    {requirementKey:"cnc-missing-total",identityStatus:"safari_authored",family:"cnc",quantity:2,uom:"Nos",processType:"cnc",fieldStatus:{WeightKg:"missing",WeightGrams:"missing"},detail:{ItemName:"New plate",PartWeightKg:0.25,WeightKg:0,WeightGrams:0,Quantity:0.25,QuantityUOM:"kg",PlatePart:"New plate"}},
+  ]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  expect(await screen.findByText("0.5 kg")).toBeTruthy();
+  fireEvent.click(screen.getByText("Saved calculation and identity"));
+  expect(screen.getByText("Saved total weight: not recorded")).toBeTruthy();
+  expect(screen.queryByText(/Saved total weight fields:.*0 kg/)).toBeNull();
+});
+
+it("renders persisted field history with family, item, before/after values and units", async () => {
+  apiMocks.partDefinition.mockResolvedValue({...accepted,revisionHistory:[{id:20,revisionLabel:"A",status:"accepted",current:false,actor:"Irshad",reason:"Reviewed",occurredAt:"2026-11-22",changedRows:[]},
+    {id:21,revisionLabel:"B",status:"accepted",current:true,actor:"Irshad",reason:"Cut update",occurredAt:"2026-11-23",beforeRevisionLabel:"A",changedRows:[
+      {kind:"modified",family:"MCL",item:"Bracket blank",occurrence:"req-1",field:"Dimension to Cut",before:"250 mm",after:"300 mm"},
+      {kind:"removed",family:"CNC",item:"Mounting plate",occurrence:"cnc-1",field:"Per Part Weight",before:"0.25 kg",after:"Not present"},
+    ]}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByText("Engineering revision history"));
+  fireEvent.click(screen.getByText("Changed rows · 2"));
+  expect(screen.getAllByText("Dimension to Cut").length).toBeGreaterThan(0);
+  expect(screen.getByText("250 mm")).toBeTruthy();
+  expect(screen.getByText("300 mm")).toBeTruthy();
+  expect(screen.getByText("Irshad · 2026-11-23")).toBeTruthy();
 });

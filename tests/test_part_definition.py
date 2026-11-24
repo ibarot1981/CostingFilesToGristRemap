@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -36,7 +37,10 @@ class DefinitionMemoryGrist:
             "ConfigurationPartSelection": [{"id": 102, "fields": {"SelectionKey": "sel:1", "SelectionIdentity": "selection:p-1", "ConfigurationRevision": 101, "ProductPart": 10, "StablePartId": "p-1", "PartRevision": 20, "Quantity": 2, "QuantityUOM": "each", "SourcingRoute": "make", "OccurrenceLabel": "main", "OptionGroup": "", "Status": "active"}}],
             "PartDefinitionDraft": [], "PartEngineeringChangeRequest": [], "PartDefinitionVersion": [], "PartDefinitionPublication": [],
             "PartRegistryRequest": [], "AuditEvent": [], "PartNameAlias": [], "PartDrawing": [],
+            "IdentityAlias": [],
         }
+        self.api_key = "isolated-test-grist-key"
+        self.doc_id = "isolated-safari-test"
         self.next_id = 200
         self.lock = threading.Lock()
         self.lose_after_update_table = ""
@@ -80,10 +84,10 @@ class DefinitionMemoryGrist:
 
 
 class PartDefinitionMaintenanceTests(unittest.TestCase):
-    def make_service(self, client, path):
+    def make_service(self, client, path, *, material_weight_catalog_provider=None):
         registry = GristPartRegistry(client, path=path)
         registry._verify_writer = lambda: None
-        return GristPartDefinitionService(registry)
+        return GristPartDefinitionService(registry, material_weight_catalog_provider=material_weight_catalog_provider)
 
     def draft_and_submit(self, service, *, request_suffix="normal"):
         definition = service.get_definition("p-1")
@@ -182,11 +186,17 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             client = DefinitionMemoryGrist()
             path = Path(temp) / "coordinator.sqlite3"
-            service = self.make_service(client, path)
+            provider = lambda: {"status": "available", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, path, material_weight_catalog_provider=provider)
             definition = service.get_definition("p-1")
             new = deepcopy(definition["requirements"][0])
             new.update({"requirementKey": "authored-new-line", "identityStatus": "safari_authored", "lineMasterId": None, "lineRevisionId": None})
             new["detail"]["ItemName"] = "New independent blank"
+            new["detail"].update({"MaterialDisplayName": "Steel", "DimensionMM": 100, "DimensionInches": 100 / 25.4,
+                "DimensionText": "100 mm", "DimensionUOM": "mm"})
             content = {"baseRevisionId": 20, "expectedSaveVersion": 0, "applicability": definition["applicability"],
                 "requirements": [deepcopy(definition["requirements"][0]), new], "components": [], "purchases": [], "finalizeOnPublication": False}
             saved = service.save_draft("p-1", content, actor="operator", reason="new line", request_key="new-line-draft")
@@ -253,6 +263,11 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertEqual(published_part_revision["fields"]["ManufacturingBaselineStatus"], "established")
             self.assertEqual(published_part_revision["fields"]["ManufacturingBaselineSourceHash"], "source-hash")
             self.assertEqual(service.get_definition("p-1")["baselineStatus"], "established")
+            published_view = service.get_definition("p-1")
+            published_history = next(item for item in published_view["revisionHistory"] if item["id"] == published["publishedRevisionId"])
+            self.assertEqual(published_history["beforeRevisionLabel"], "A")
+            self.assertTrue(any(change["kind"] == "modified" and change["field"] == "Quantity per Part"
+                and change["before"] == "1 Nos" and change["after"] == "2 Nos" for change in published_history["changedRows"]))
             self.assertEqual(client.tables["LineDetail"][0], original_line)
             self.assertEqual(client.tables["PartRevisionLine"][0], original_membership)
             self.assertEqual(client.tables["ConfigurationPartSelection"][0], original_selection)
@@ -264,6 +279,360 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             new_selection = next(row for row in client.tables["ConfigurationPartSelection"] if row["fields"].get("ConfigurationRevision") == new_revision)
             self.assertEqual(new_selection["fields"]["PartRevision"], published["publishedRevisionId"])
             self.assertEqual(service.approve_and_publish(request["changeRequestKey"], actor="Irshad", request_key="approval-normal")["idempotent"], False)
+
+    def test_published_history_omits_family_irrelevant_defaults_but_keeps_recorded_zero_weights(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
+            authored_cnc = {"requirementKey": "requirement:p-1:added-cnc", "identityStatus": "safari_authored", "family": "cnc", "quantity": 2,
+                "uom": "Nos", "fieldStatus": {"WeightKg": "missing", "WeightGrams": "missing"},
+                "detail": {"ItemName": "QA plate", "PartWeightKg": 0.25, "Quantity": 0.5, "QuantityUOM": "kg",
+                    "WeightKg": 0, "WeightGrams": 0, "DimensionMM": 0, "Length": 0, "Width": 0, "Thickness": 0}}
+            changes = service._definition_changes({"requirements": [], "components": [], "purchases": []},
+                {"requirements": [authored_cnc], "components": [], "purchases": []})
+            fields = {change["field"] for change in changes}
+            self.assertEqual(fields, {"Quantity per Part", "Item name", "Per Part Weight", "Rate-basis consumption"})
+            self.assertFalse(any("0 kg" in str(change["after"]) or "Plate length" in change["field"] for change in changes))
+
+            recorded_zero = deepcopy(authored_cnc)
+            recorded_zero["fieldStatus"] = {"WeightKg": "value", "WeightGrams": "value"}
+            recorded_zero["detail"].update({"WeightKg": 0, "WeightGrams": 0})
+            recorded_changes = service._definition_changes({"requirements": [], "components": [], "purchases": []},
+                {"requirements": [recorded_zero], "components": [], "purchases": []})
+            saved_weight = next(change for change in recorded_changes if change["field"] == "Saved total weight")
+            self.assertEqual(saved_weight["after"], "0 kg / 0 g")
+
+    def test_mcl_cut_length_uses_verified_master_kg_per_meter_and_rederives_client_tampering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            provider = lambda: {"status": "available", "readAt": "2026-11-23T00:00:00Z", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            definition = service.get_definition("p-1")
+            content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": definition["applicability"], "requirements": deepcopy(definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            item = content["requirements"][0]
+            item["quantity"] = "4"
+            forged_attributes = deepcopy(item["detail"].get("EngineeringAttributes") or {})
+            forged_attributes["materialWeightEvidence"] = {"status": "available", "factorStatus": "available", "source": "Costing-New",
+                "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                "masterMaterialId": 55, "canonicalName": "Steel", "kgPerMeter": "999", "sourceDate": "2099-12-31", "factorUnit": "kg/m"}
+            item["detail"].update({"Material": 5, "MaterialDisplayName": "Forged alternate label", "Quantity": "999", "QuantityUOM": "kg",
+                "EngineeringAttributes": forged_attributes,
+                "DimensionMM": "200", "DimensionInches": str(200 / 25.4), "DimensionText": "200 mm", "DimensionUOM": "mm"})
+
+            saved = service.save_draft("p-1", content, actor="operator", reason="Set cut length", request_key="mcl-factor-save")
+            normalized = saved["content"]["requirements"][0]
+            self.assertAlmostEqual(normalized["detail"]["Quantity"], 0.316)
+            self.assertEqual(normalized["detail"]["QuantityUOM"], "kg")
+            self.assertEqual(normalized["fieldStatus"]["Quantity"], "derived")
+            self.assertEqual(normalized["detail"]["MaterialDisplayName"], "Steel")
+            saved_attributes = json.loads(normalized["detail"]["EngineeringAttributes"])
+            self.assertEqual(saved_attributes["materialWeightEvidence"]["masterMaterialId"], 55)
+            self.assertEqual(saved_attributes["materialWeightEvidence"]["sourceTable"], "MasterMaterial")
+            self.assertNotEqual(saved_attributes["materialWeightEvidence"]["kgPerMeter"], "999")
+            self.assertTrue(saved_attributes["materialWeightEvidence"]["signature"])
+            self.assertAlmostEqual(normalized["quantity"] * normalized["detail"]["Quantity"], 1.264)
+
+            tampered = deepcopy(saved["content"])
+            tampered["expectedSaveVersion"] = saved["saveVersion"]
+            tampered["requirements"][0]["detail"]["Quantity"] = "999"
+            tampered["requirements"][0]["detail"]["MaterialDisplayName"] = "Wrong label after save"
+            attributes = json.loads(tampered["requirements"][0]["detail"]["EngineeringAttributes"])
+            attributes["materialWeightEvidence"].update({"kgPerMeter": "999", "masterMaterialId": 999, "sourceDate": "2099-12-31"})
+            tampered["requirements"][0]["detail"]["EngineeringAttributes"] = attributes
+            resaved = service.save_draft("p-1", tampered, actor="operator", reason="Retest derived value", request_key="mcl-factor-retamper")
+            self.assertAlmostEqual(resaved["content"]["requirements"][0]["detail"]["Quantity"], 0.316)
+            self.assertEqual(resaved["content"]["requirements"][0]["fieldStatus"]["Quantity"], "derived")
+            self.assertEqual(resaved["content"]["requirements"][0]["detail"]["MaterialDisplayName"], "Steel")
+
+            change = service.submit_change_request("p-1", {"draftKey": resaved["draftKey"]}, actor="operator",
+                reason="Publish trusted physical consumption", request_key="mcl-factor-cr")
+            service.approve_and_publish(change["changeRequestKey"], actor="Irshad", request_key="mcl-factor-publish")
+            accepted = service.get_definition("p-1")["requirements"][0]
+            self.assertAlmostEqual(accepted["detail"]["Quantity"], 0.316)
+            self.assertEqual(accepted["materialWeightEvidence"]["status"], "available")
+
+            offline = self.make_service(client, Path(temp) / "offline-coordinator.sqlite3",
+                material_weight_catalog_provider=lambda: (_ for _ in ()).throw(OSError("Costing-New offline")))
+            offline_definition = offline.get_definition("p-1")
+            self.assertEqual(offline_definition["requirements"][0]["materialWeightEvidence"]["status"], "available")
+            offline_content = {"baseRevisionId": offline_definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": offline_definition["applicability"], "requirements": deepcopy(offline_definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            offline_content["requirements"][0]["detail"]["ToolShopRemarks"] = "Preserve offline"
+            saved_offline = offline.save_draft("p-1", offline_content, actor="operator", reason="Remark while source unavailable",
+                request_key="mcl-factor-offline-draft")
+            self.assertAlmostEqual(saved_offline["content"]["requirements"][0]["detail"]["Quantity"], 0.316)
+
+    def test_legacy_mcl_piece_count_requires_resolution_and_is_applied_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["LineDetail"][0]["fields"].update({"Material": 5, "MaterialDisplayName": "Steel", "Quantity": 4,
+                "QuantityUOM": "Nos", "DimensionMM": 200, "DimensionInches": 200 / 25.4, "DimensionText": "200 mm", "DimensionUOM": "mm"})
+            client.tables["PartRevisionLine"][0]["fields"].update({"QuantityPerPart": 4, "QuantityExact": "4", "QuantityUOM": "Nos"})
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            definition = service.get_definition("p-1")
+            self.assertEqual(definition["requirements"][0]["materialConsumptionStatus"], "legacy_duplicate_ambiguous")
+            content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": definition["applicability"], "requirements": deepcopy(definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", content, actor="operator", reason="remark only", request_key="ambiguous-mcl-no-review")
+            self.assertEqual(error.exception.code, "PART_MATERIAL_BASIS_REVIEW_REQUIRED")
+            self.assertEqual(client.tables, before)
+
+            content["requirements"][0]["materialConsumptionResolution"] = "weight_per_piece"
+            saved = service.save_draft("p-1", content, actor="operator", reason="Resolve imported MCL consumption", request_key="ambiguous-mcl-review")
+            resolved = saved["content"]["requirements"][0]
+            self.assertEqual((resolved["quantity"], resolved["uom"]), (4, "Nos"))
+            self.assertEqual(resolved["detail"]["QuantityUOM"], "kg")
+            self.assertAlmostEqual(resolved["detail"]["Quantity"], 0.316)
+            self.assertEqual(resolved["materialConsumptionResolution"], "weight_per_piece")
+            self.assertAlmostEqual(resolved["quantity"] * resolved["detail"]["Quantity"], 1.264)
+
+    def test_master_catalogue_is_searchable_and_binding_uses_reviewed_namespaced_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["Material"].append({"id": 6, "fields": {"CanonicalName": "QA alloy identity"}})
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"},
+                {"canonicalName": "QA alloy stock size", "masterMaterialId": 56, "kgPerMeter": "2.5", "factorStatus": "available",
+                 "source": "Costing-New", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-10-01"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            options = service.options("p-1")
+            self.assertEqual(options["materialWeightSource"]["catalogCount"], 2)
+            self.assertEqual(options["materialWeightSource"]["selectableCount"], 1)
+            source_only = next(item for item in options["materialCatalog"] if item["masterMaterialId"] == 56)
+            self.assertEqual((source_only["bindingStatus"], source_only["materialId"]), ("unbound", None))
+            self.assertEqual(next(item for item in options["materialCatalog"] if item["masterMaterialId"] == 55)["materialId"], 5)
+
+            with self.assertRaises(PartIdentityError) as error:
+                service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="operator",
+                    reason="review binding", request_key="material-bind-denied")
+            self.assertEqual(error.exception.code, "PART_MATERIAL_BINDING_REVIEWER_REQUIRED")
+            result = service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-approved")
+            self.assertEqual((result["status"], result["materialId"], result["masterMaterialId"]), ("bound", 6, 56))
+            self.assertEqual(service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-approved"), result)
+            idempotent = service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-repeat")
+            self.assertTrue(idempotent["idempotent"])
+
+            with self.assertRaises(PartIdentityError) as conflict:
+                service.bind_material_master("p-1", source_master_id=56, material_id=5, actor="Irshad",
+                    reason="Conflicting QA alias", request_key="material-bind-conflict")
+            self.assertEqual(conflict.exception.code, "PART_MATERIAL_BINDING_CONFLICT")
+            self.assertIsNone(service.registry._find(service._rows("PartRegistryRequest"), "RequestKey", "material-bind-conflict"))
+
+            refreshed = service.options("p-1")
+            bound = next(item for item in refreshed["materialCatalog"] if item["masterMaterialId"] == 56)
+            self.assertEqual((bound["bindingStatus"], bound["materialId"]), ("bound", 6))
+            evidence = next(item for item in refreshed["materials"] if item["id"] == 6)["weightEvidence"]
+            self.assertEqual((evidence["masterMaterialId"], evidence["kgPerMeter"], evidence["sourceDate"]), (56, "2.5", "2026-10-01"))
+            alias = next(row["fields"] for row in client.tables["IdentityAlias"] if row["fields"].get("EntityType") == "MaterialMasterBinding")
+            self.assertEqual((alias["EntityId"], alias["SourceRow"]), ("material-weight:costing-new-test:MasterMaterial:56", 56))
+            self.assertNotEqual(alias["EntityId"], str(alias["SourceRow"]))
+
+    def test_source_only_master_capture_is_reviewed_idempotent_and_recovers_after_lost_response(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                    "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                    "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"},
+                {"canonicalName": "Alang Cut Piece-Casting Template No. 83 - Round Plate", "masterMaterialId": 56,
+                    "kgPerMeter": "5", "factorStatus": "available", "source": "Costing-New",
+                    "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                    "factorUnit": "kg/m", "sourceDate": "2026-11-10"},
+                {"canonicalName": "Concurrent QA casting stock", "masterMaterialId": 57,
+                    "kgPerMeter": "3.25", "factorStatus": "available", "source": "Costing-New",
+                    "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                    "factorUnit": "kg/m", "sourceDate": "2026-11-11"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            self.assertEqual(next(item for item in service.options("p-1")["materialCatalog"] if item["masterMaterialId"] == 56)["bindingStatus"], "unbound")
+            client.lose_after_create_table = "Material"
+            with self.assertRaises(TimeoutError):
+                service.bind_material_master("p-1", source_master_id=56, actor="Irshad", reason="Capture reviewed source-only material identity",
+                    request_key="capture-source-master-original", capture_canonical_identity=True)
+
+            captured_rows = [row for row in client.tables["Material"] if row["fields"].get("MaterialKey") == "material-master:costing-new-test:MasterMaterial:56"]
+            self.assertEqual(len(captured_rows), 1)
+            safari_id = captured_rows[0]["id"]
+            self.assertNotEqual(safari_id, 56)
+            self.assertEqual(captured_rows[0]["fields"], {"MaterialKey": "material-master:costing-new-test:MasterMaterial:56",
+                "CanonicalName": "Alang Cut Piece-Casting Template No. 83 - Round Plate",
+                "ODSDisplayName": "Alang Cut Piece-Casting Template No. 83 - Round Plate",
+                "MappingStatus": "reviewed_source_master_capture"})
+
+            offline_provider = lambda: (_ for _ in ()).throw(OSError("Costing-New unavailable during same-key recovery"))
+            restarted = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=offline_provider)
+            result = restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad", reason="Capture reviewed source-only material identity",
+                request_key="capture-source-master-original", capture_canonical_identity=True)
+            self.assertEqual((result["status"], result["materialId"], result["identityCaptured"]), ("bound", safari_id, True))
+            self.assertEqual(restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad",
+                reason="Capture reviewed source-only material identity", request_key="capture-source-master-original",
+                capture_canonical_identity=True), result)
+            available_restarted = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            replay = available_restarted.bind_material_master("p-1", source_master_id=56, actor="Irshad",
+                reason="Capture reviewed source-only material identity", request_key="capture-source-master-repeat",
+                capture_canonical_identity=True)
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(len([row for row in client.tables["Material"]
+                if row["fields"].get("MaterialKey") == "material-master:costing-new-test:MasterMaterial:56"]), 1)
+
+            refreshed = available_restarted.options("p-1")
+            source = next(item for item in refreshed["materialCatalog"] if item["masterMaterialId"] == 56)
+            material = next(item for item in refreshed["materials"] if item["id"] == safari_id)
+            self.assertEqual((source["bindingStatus"], source["materialId"]), ("bound", safari_id))
+            self.assertEqual((material["name"], material["kgPerMeter"], material["weightEvidence"]["sourceDate"]),
+                ("Alang Cut Piece-Casting Template No. 83 - Round Plate", "5", "2026-11-10"))
+            audit = [row for row in client.tables["AuditEvent"] if row["fields"].get("EventType") == "part_material_master_canonical_capture_reviewed"]
+            self.assertEqual(len(audit), 2)
+
+            concurrent_service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                attempts = [pool.submit(candidate.bind_material_master, "p-1", source_master_id=57, actor="Irshad",
+                    reason="Capture concurrent QA identity", request_key="capture-source-master-concurrent", capture_canonical_identity=True)
+                    for candidate in (available_restarted, concurrent_service)]
+                concurrent_results = [attempt.result(timeout=10) for attempt in attempts]
+            self.assertEqual(concurrent_results[0], concurrent_results[1])
+            concurrent_key = "material-master:costing-new-test:MasterMaterial:57"
+            self.assertEqual(len([row for row in client.tables["Material"] if row["fields"].get("MaterialKey") == concurrent_key]), 1)
+            self.assertEqual(len([row for row in client.tables["IdentityAlias"]
+                if row["fields"].get("EntityId") == "material-weight:costing-new-test:MasterMaterial:57"]), 1)
+
+    def test_history_includes_route_and_advanced_attributes_without_format_only_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
+            before_row = {"requirementKey": "stable:mcl:1", "identityStatus": "stable", "family": "mcl", "quantity": 1,
+                "uom": "Nos", "detail": {"ItemName": "Bar", "MaterialDisplayName": "Steel", "DimensionMM": 200,
+                    "DimensionText": "200 mm", "Quantity": 1, "QuantityUOM": "kg", "EngineeringAttributes": {"grain": "along_length", "process": {"setting": 1}}}}
+            after_row = deepcopy(before_row)
+            after_row["quantity"] = 1.0
+            after_row["detail"]["Quantity"] = 1.0
+            after_row["detail"]["IssueRoute"] = "Stores"
+            after_row["detail"]["EngineeringAttributes"] = {"process": {"setting": 1.0}, "grain": "across_width"}
+            changes = service._definition_changes({"requirements": [before_row], "components": [], "purchases": []},
+                {"requirements": [after_row], "components": [], "purchases": []})
+            fields = {change["field"] for change in changes}
+            self.assertIn("Issue route", fields)
+            self.assertIn("Engineering attribute · grain", fields)
+            self.assertNotIn("Quantity per Part", fields)
+            self.assertNotIn("Rate-basis consumption", fields)
+
+    def test_history_compares_text_exactly_and_normalizes_only_typed_numbers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = self.make_service(DefinitionMemoryGrist(), Path(temp) / "coordinator.sqlite3")
+            before_row = {"requirementKey": "stable:mcl:typed-history", "identityStatus": "stable", "family": "mcl",
+                "quantity": 1, "uom": "Nos", "detail": {"ItemName": "Bar", "MaterialDisplayName": "Steel",
+                    "DimensionMM": 10, "DimensionText": "10 mm", "Quantity": 1, "QuantityUOM": "kg",
+                    "ToolShopRemarks": "001", "ItemCode": "001",
+                    "EngineeringAttributes": {"numeric": 1, "text": "001", "nested": {"code": "0007"}}}}
+            after_row = deepcopy(before_row)
+            after_row["quantity"] = 1.0
+            after_row["uom"] = "each"
+            after_row["detail"].update({"DimensionMM": 10.0, "DimensionText": "1 cm", "Quantity": 1000,
+                "QuantityUOM": "g", "ToolShopRemarks": "1", "ItemCode": "1",
+                "EngineeringAttributes": {"nested": {"code": "0007"}, "text": "1", "numeric": 1.0}})
+            before_purchase = {"specificationIdentity": "purchase:typed-history", "code": "001", "manufacturer": "QA",
+                "manufacturerPartNumber": "001", "description": "Numeric-looking engineering identifier", "costingUOM": "each", "costingCurrency": "INR"}
+            after_purchase = {**before_purchase, "code": "1", "manufacturerPartNumber": "1"}
+            changes = service._definition_changes({"requirements": [before_row], "components": [], "purchases": [before_purchase]},
+                {"requirements": [after_row], "components": [], "purchases": [after_purchase]})
+            changed = {(change["field"], change["before"], change["after"]) for change in changes if change["kind"] == "modified"}
+            self.assertEqual(changed, {
+                ("Remarks", "001", "1"),
+                ("Item code", "001", "1"),
+                ("Engineering attribute · text", "001", "1"),
+                ("Specification code", "001", "1"),
+                ("Manufacturer part number", "001", "1"),
+            })
+
+    def test_approval_revalidates_frozen_change_request_consumption_before_publication_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            provider = lambda: {"status": "available", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            definition = service.get_definition("p-1")
+            content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": definition["applicability"], "requirements": deepcopy(definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            requirement = content["requirements"][0]
+            requirement["detail"].update({"DimensionMM": 100, "DimensionInches": 100 / 25.4, "DimensionText": "100 mm",
+                "DimensionUOM": "mm", "QuantityUOM": "mm", "Quantity": 100})
+            draft = service.save_draft("p-1", content, actor="operator", reason="Cut length", request_key="publish-check-draft")
+            cr = service.submit_change_request("p-1", {"draftKey": draft["draftKey"]}, actor="operator",
+                reason="Cut length", request_key="publish-check-submit")
+            saved_cr = next(row for row in client.tables["PartEngineeringChangeRequest"] if row["fields"].get("ChangeRequestKey") == cr["changeRequestKey"])
+            after = json.loads(saved_cr["fields"]["AfterDefinition"])
+            after["requirements"][0]["detail"]["Quantity"] = 999
+            saved_cr["fields"]["AfterDefinition"] = json.dumps(after)
+            before_revisions = len(client.tables["PartRevision"])
+            before_journals = len(client.tables["PartDefinitionPublication"])
+
+            with self.assertRaises(PartIdentityError) as error:
+                service.approve_and_publish(cr["changeRequestKey"], actor="Irshad", request_key="publish-check-approval")
+
+            self.assertEqual(error.exception.code, "PART_CHANGE_REQUEST_DEFINITION_INVALID")
+            self.assertEqual(len(client.tables["PartRevision"]), before_revisions)
+            self.assertEqual(len(client.tables["PartDefinitionPublication"]), before_journals)
+
+    def test_malformed_cnc_weight_is_rejected_even_with_nos_costing_basis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            applicability = deepcopy(definition["applicability"])
+            applicability["cnc"] = {"applicable": True, "status": "applicable"}
+            cnc = {"requirementKey": "safari-authored-requirement:bad-weight", "identityStatus": "safari_authored",
+                "family": "cnc", "quantity": 1, "uom": "Nos", "processType": "cnc",
+                "detail": {"PartWeightKg": "BAD123", "Quantity": 1, "QuantityUOM": "Nos"},
+                "provenance": {"type": "safari_authored", "evidence": {}}}
+            payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": applicability, "requirements": [cnc], "components": [], "purchases": [],
+                "finalizeOnPublication": False}
+            before = deepcopy(client.tables)
+
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", payload, actor="operator", reason="Invalid weight", request_key="bad-weight-nos")
+
+            self.assertEqual(error.exception.code, "PART_DEFINITION_DETAIL_NUMBER_INVALID")
+            self.assertEqual(client.tables, before)
+
+    def test_definition_reads_editor_default_zero_weights_as_missing_and_legacy_zero_as_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["PartRevisionLine"][0]["fields"]["ProvenanceType"] = "safari_edited"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 0, "WeightGrams": 0})
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+
+            authored = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((authored["fieldStatus"]["WeightKg"], authored["fieldStatus"]["WeightGrams"]), ("missing", "missing"))
+
+            client.tables["LineRevision"][0]["fields"]["Status"] = "accepted"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 1, "WeightGrams": 1000})
+            recorded = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((recorded["fieldStatus"]["WeightKg"], recorded["fieldStatus"]["WeightGrams"]), ("value", "value"))
+
+            client.tables["PartRevisionLine"][0]["fields"]["ProvenanceType"] = "ods_baseline"
+            client.tables["LineDetail"][0]["fields"].update({"WeightKg": 0, "WeightGrams": 0})
+            ambiguous_legacy = service.get_definition("p-1")["requirements"][0]
+            self.assertEqual((ambiguous_legacy["fieldStatus"]["WeightKg"], ambiguous_legacy["fieldStatus"]["WeightGrams"]), ("unknown", "unknown"))
 
     def test_partial_pointer_commit_recovers_from_durable_plan_without_duplicate_successors(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -585,6 +954,7 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                 "requirements": deepcopy(definition["requirements"]), "components": [], "purchases": [], "finalizeOnPublication": False, "expectedSaveVersion": 0}
             content["requirements"][0]["requirementKey"] = "safari-authored-requirement:reviewed-1"
             content["requirements"][0]["identityStatus"] = "safari_authored"
+            content["requirements"][0]["detail"].update({"Quantity": 1, "QuantityUOM": "Nos"})
 
             saved = service.save_draft("p-1", content, actor="operator", reason="Classify duplicate legacy occurrence", request_key="draft-legacy-duplicate")
 
@@ -679,21 +1049,26 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
     def test_new_and_changed_process_requirements_need_real_rate_basis(self):
         with tempfile.TemporaryDirectory() as temp:
             client = DefinitionMemoryGrist()
-            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            provider = lambda: {"status": "available", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
             definition = service.get_definition("p-1")
             requirement = {"requirementKey": "safari-authored-requirement:new-mcl", "identityStatus": "safari_authored",
                 "family": "mcl", "quantity": "1", "uom": "Nos", "processType": "material_cut",
-                "detail": {"Material": 5, "Quantity": "2", "QuantityUOM": "kg", "ItemName": "Steel blank"},
+                "detail": {"Material": 5, "MaterialDisplayName": "Steel", "Quantity": "2", "QuantityUOM": "kg", "ItemName": "Steel blank",
+                    "DimensionMM": 200, "DimensionInches": 200 / 25.4, "DimensionText": "200 mm", "DimensionUOM": "mm"},
                 "provenance": {"type": "safari_authored", "evidence": {}}}
             content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
                 "applicability": definition["applicability"], "requirements": [requirement],
                 "components": [], "purchases": [], "finalizeOnPublication": False}
             saved = service.save_draft("p-1", content, actor="operator", reason="add measured MCL", request_key="draft-new-mcl")
-            self.assertEqual((saved["content"]["requirements"][0]["detail"]["Quantity"],
-                saved["content"]["requirements"][0]["detail"]["QuantityUOM"]), (2.0, "kg"))
+            self.assertAlmostEqual(saved["content"]["requirements"][0]["detail"]["Quantity"], 0.316)
+            self.assertEqual(saved["content"]["requirements"][0]["detail"]["QuantityUOM"], "kg")
 
             content["expectedSaveVersion"] = 1
-            content["requirements"][0]["detail"]["Quantity"] = ""
+            content["requirements"][0]["detail"]["QuantityUOM"] = ""
             with self.assertRaises(PartIdentityError) as error:
                 service.save_draft("p-1", content, actor="operator", reason="remove MCL basis", request_key="draft-new-mcl-invalid")
             self.assertEqual(error.exception.code, "PART_DEFINITION_RATE_BASIS_INVALID")
@@ -708,7 +1083,7 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                 applicability[family] = {"applicable": True, "status": "applicable"}
                 requirement = {"requirementKey": f"safari-authored-requirement:new-{family}", "identityStatus": "safari_authored",
                     "family": family, "quantity": "1", "uom": "Nos", "processType": process_type,
-                    "detail": {"Quantity": "2.5", "QuantityUOM": uom, "ItemName": f"New {family} operation"},
+                    "detail": {"Material": 5 if family == "toolshop" else None, "Quantity": "2.5", "QuantityUOM": uom, "ItemName": f"New {family} operation"},
                     "provenance": {"type": "safari_authored", "evidence": {}}}
                 payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
                     "applicability": applicability, "requirements": [requirement], "components": [], "purchases": [], "finalizeOnPublication": False}
@@ -717,6 +1092,86 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
 
                 normalized = saved["content"]["requirements"][0]
                 self.assertEqual((normalized["processType"], normalized["detail"]["Quantity"], normalized["detail"]["QuantityUOM"]), (process_type, 2.5, uom))
+
+    def test_mcl_cut_length_is_scalar_and_drives_only_an_existing_length_basis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            requirement = {"requirementKey": "safari-authored-requirement:cut-mcl", "identityStatus": "safari_authored",
+                "family": "mcl", "quantity": "2", "uom": "Nos", "processType": "material_cut",
+                "detail": {"Material": 5, "ItemName": "Flat blank", "Quantity": "", "QuantityUOM": "cm",
+                    "DimensionMM": "250", "DimensionInches": str(250 / 25.4), "DimensionText": "250 mm", "DimensionUOM": "mm"},
+                "provenance": {"type": "safari_authored", "evidence": {}}}
+            payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0, "applicability": definition["applicability"],
+                "requirements": [requirement], "components": [], "purchases": [], "finalizeOnPublication": False}
+
+            saved = service.save_draft("p-1", payload, actor="operator", reason="add measured cut", request_key="draft-cut-mcl")
+
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual((normalized["DimensionMM"], normalized["DimensionText"], normalized["Quantity"], normalized["QuantityUOM"]), (250.0, "250 mm", 25.0, "cm"))
+            self.assertAlmostEqual(normalized["DimensionInches"], 250 / 25.4)
+            self.assertEqual(normalized["ExactQuantityText"], "25")
+            self.assertNotIn("Length", normalized)
+            self.assertNotIn("Width", normalized)
+            self.assertNotIn("Thickness", normalized)
+
+            payload["expectedSaveVersion"] = 1
+            payload["requirements"][0]["detail"].update({"DimensionMM": "300", "DimensionInches": str(300 / 25.4), "DimensionText": "300 mm"})
+            saved = service.save_draft("p-1", payload, actor="operator", reason="increase cut", request_key="draft-cut-mcl-v2")
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual(normalized["Quantity"], 30.0)
+
+            inconsistent = deepcopy(payload)
+            inconsistent["expectedSaveVersion"] = 2
+            inconsistent["requirements"][0]["detail"]["DimensionInches"] = "1"
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", inconsistent, actor="operator", reason="conflicting cut evidence", request_key="draft-cut-mcl-conflict")
+            self.assertEqual(error.exception.code, "PART_DEFINITION_CUT_LENGTH_INCONSISTENT")
+
+    def test_cnc_kg_basis_uses_per_part_weight_and_rejects_nonpositive_weight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3")
+            definition = service.get_definition("p-1")
+            applicability = deepcopy(definition["applicability"])
+            applicability["cnc"] = {"applicable": True, "status": "applicable"}
+            requirement = {"requirementKey": "safari-authored-requirement:cnc-weight", "identityStatus": "safari_authored",
+                "family": "cnc", "quantity": "3", "uom": "Nos", "processType": "cnc",
+                "detail": {"ItemName": "CNC plate", "PartWeightKg": "0.25", "WeightKg": "1", "WeightGrams": "1000", "Quantity": "", "QuantityUOM": "kg"},
+                "provenance": {"type": "safari_authored", "evidence": {}}}
+            payload = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0, "applicability": applicability,
+                "requirements": [requirement], "components": [], "purchases": [], "finalizeOnPublication": False}
+
+            saved = service.save_draft("p-1", payload, actor="operator", reason="add CNC weight", request_key="draft-cnc-weight")
+            normalized = saved["content"]["requirements"][0]["detail"]
+            self.assertEqual((normalized["PartWeightKg"], normalized["Quantity"], normalized["QuantityUOM"], normalized["WeightKg"], normalized["WeightGrams"]),
+                (0.25, 0.25, "kg", 1.0, 1000.0))
+            self.assertEqual(normalized["ExactWeightKgText"], "0.25")
+            self.assertEqual(saved["content"]["requirements"][0]["fieldStatus"]["WeightKg"], "value")
+            self.assertEqual(saved["content"]["requirements"][0]["fieldStatus"]["WeightGrams"], "value")
+
+            missing_saved_weight = deepcopy(payload)
+            missing_saved_weight["expectedSaveVersion"] = 1
+            missing_saved_weight["requirements"][0]["detail"]["WeightKg"] = 0
+            missing_saved_weight["requirements"][0]["detail"]["WeightGrams"] = 0
+            saved = service.save_draft("p-1", missing_saved_weight, actor="operator", reason="do not invent a saved total from default zero cells", request_key="draft-cnc-weight-default-zero")
+            field_status = saved["content"]["requirements"][0]["fieldStatus"]
+            self.assertEqual((field_status["WeightKg"], field_status["WeightGrams"]), ("missing", "missing"))
+
+            missing_saved_weight["expectedSaveVersion"] = 2
+            missing_saved_weight["requirements"][0]["detail"].pop("WeightKg")
+            missing_saved_weight["requirements"][0]["detail"].pop("WeightGrams")
+            saved = service.save_draft("p-1", missing_saved_weight, actor="operator", reason="leave total weight unrecorded", request_key="draft-cnc-weight-unrecorded")
+            field_status = saved["content"]["requirements"][0]["fieldStatus"]
+            self.assertEqual((field_status["WeightKg"], field_status["WeightGrams"]), ("missing", "missing"))
+
+            invalid = deepcopy(payload)
+            invalid["expectedSaveVersion"] = 2
+            invalid["requirements"][0]["detail"]["PartWeightKg"] = "-0.3"
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", invalid, actor="operator", reason="invalid CNC weight", request_key="draft-cnc-weight-invalid")
+            self.assertEqual(error.exception.code, "PART_DEFINITION_PART_WEIGHT_INVALID")
 
     def test_draft_save_versions_reject_stale_edit_and_superseded_replay(self):
         with tempfile.TemporaryDirectory() as temp:
