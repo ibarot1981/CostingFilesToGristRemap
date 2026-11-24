@@ -1408,6 +1408,16 @@ def get_part_definition_options(part_id: str):
     return _part_definition_service().options(part_id)
 
 
+@app.post("/api/parts/{part_id}/definition/material-bindings")
+def bind_part_definition_material_master(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    try:
+        return _part_definition_service().bind_material_master(part_id,
+            source_master_id=payload.get("sourceMasterMaterialId"), material_id=payload.get("materialId"),
+            actor=_request_actor(request), reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
+    except PartIdentityError as exc:
+        raise _part_http_error(exc)
+
+
 @app.put("/api/parts/{part_id}/definition/draft")
 def save_part_definition_draft(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     return _part_definition_service().save_draft(part_id, payload, actor=_request_actor(request),

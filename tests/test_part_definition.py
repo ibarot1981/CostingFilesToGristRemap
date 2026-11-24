@@ -36,7 +36,10 @@ class DefinitionMemoryGrist:
             "ConfigurationPartSelection": [{"id": 102, "fields": {"SelectionKey": "sel:1", "SelectionIdentity": "selection:p-1", "ConfigurationRevision": 101, "ProductPart": 10, "StablePartId": "p-1", "PartRevision": 20, "Quantity": 2, "QuantityUOM": "each", "SourcingRoute": "make", "OccurrenceLabel": "main", "OptionGroup": "", "Status": "active"}}],
             "PartDefinitionDraft": [], "PartEngineeringChangeRequest": [], "PartDefinitionVersion": [], "PartDefinitionPublication": [],
             "PartRegistryRequest": [], "AuditEvent": [], "PartNameAlias": [], "PartDrawing": [],
+            "IdentityAlias": [],
         }
+        self.api_key = "isolated-test-grist-key"
+        self.doc_id = "isolated-safari-test"
         self.next_id = 200
         self.lock = threading.Lock()
         self.lose_after_update_table = ""
@@ -311,7 +314,12 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                 "components": [], "purchases": [], "finalizeOnPublication": False}
             item = content["requirements"][0]
             item["quantity"] = "4"
-            item["detail"].update({"Material": 5, "MaterialDisplayName": "Steel", "Quantity": "999", "QuantityUOM": "kg",
+            forged_attributes = deepcopy(item["detail"].get("EngineeringAttributes") or {})
+            forged_attributes["materialWeightEvidence"] = {"status": "available", "factorStatus": "available", "source": "Costing-New",
+                "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                "masterMaterialId": 55, "canonicalName": "Steel", "kgPerMeter": "999", "sourceDate": "2099-12-31", "factorUnit": "kg/m"}
+            item["detail"].update({"Material": 5, "MaterialDisplayName": "Forged alternate label", "Quantity": "999", "QuantityUOM": "kg",
+                "EngineeringAttributes": forged_attributes,
                 "DimensionMM": "200", "DimensionInches": str(200 / 25.4), "DimensionText": "200 mm", "DimensionUOM": "mm"})
 
             saved = service.save_draft("p-1", content, actor="operator", reason="Set cut length", request_key="mcl-factor-save")
@@ -319,17 +327,122 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
             self.assertAlmostEqual(normalized["detail"]["Quantity"], 0.316)
             self.assertEqual(normalized["detail"]["QuantityUOM"], "kg")
             self.assertEqual(normalized["fieldStatus"]["Quantity"], "derived")
+            self.assertEqual(normalized["detail"]["MaterialDisplayName"], "Steel")
             saved_attributes = json.loads(normalized["detail"]["EngineeringAttributes"])
             self.assertEqual(saved_attributes["materialWeightEvidence"]["masterMaterialId"], 55)
             self.assertEqual(saved_attributes["materialWeightEvidence"]["sourceTable"], "MasterMaterial")
+            self.assertNotEqual(saved_attributes["materialWeightEvidence"]["kgPerMeter"], "999")
+            self.assertTrue(saved_attributes["materialWeightEvidence"]["signature"])
             self.assertAlmostEqual(normalized["quantity"] * normalized["detail"]["Quantity"], 1.264)
 
             tampered = deepcopy(saved["content"])
             tampered["expectedSaveVersion"] = saved["saveVersion"]
             tampered["requirements"][0]["detail"]["Quantity"] = "999"
+            tampered["requirements"][0]["detail"]["MaterialDisplayName"] = "Wrong label after save"
+            attributes = json.loads(tampered["requirements"][0]["detail"]["EngineeringAttributes"])
+            attributes["materialWeightEvidence"].update({"kgPerMeter": "999", "masterMaterialId": 999, "sourceDate": "2099-12-31"})
+            tampered["requirements"][0]["detail"]["EngineeringAttributes"] = attributes
             resaved = service.save_draft("p-1", tampered, actor="operator", reason="Retest derived value", request_key="mcl-factor-retamper")
             self.assertAlmostEqual(resaved["content"]["requirements"][0]["detail"]["Quantity"], 0.316)
             self.assertEqual(resaved["content"]["requirements"][0]["fieldStatus"]["Quantity"], "derived")
+            self.assertEqual(resaved["content"]["requirements"][0]["detail"]["MaterialDisplayName"], "Steel")
+
+            change = service.submit_change_request("p-1", {"draftKey": resaved["draftKey"]}, actor="operator",
+                reason="Publish trusted physical consumption", request_key="mcl-factor-cr")
+            service.approve_and_publish(change["changeRequestKey"], actor="Irshad", request_key="mcl-factor-publish")
+            accepted = service.get_definition("p-1")["requirements"][0]
+            self.assertAlmostEqual(accepted["detail"]["Quantity"], 0.316)
+            self.assertEqual(accepted["materialWeightEvidence"]["status"], "available")
+
+            offline = self.make_service(client, Path(temp) / "offline-coordinator.sqlite3",
+                material_weight_catalog_provider=lambda: (_ for _ in ()).throw(OSError("Costing-New offline")))
+            offline_definition = offline.get_definition("p-1")
+            self.assertEqual(offline_definition["requirements"][0]["materialWeightEvidence"]["status"], "available")
+            offline_content = {"baseRevisionId": offline_definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": offline_definition["applicability"], "requirements": deepcopy(offline_definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            offline_content["requirements"][0]["detail"]["ToolShopRemarks"] = "Preserve offline"
+            saved_offline = offline.save_draft("p-1", offline_content, actor="operator", reason="Remark while source unavailable",
+                request_key="mcl-factor-offline-draft")
+            self.assertAlmostEqual(saved_offline["content"]["requirements"][0]["detail"]["Quantity"], 0.316)
+
+    def test_legacy_mcl_piece_count_requires_resolution_and_is_applied_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["LineDetail"][0]["fields"].update({"Material": 5, "MaterialDisplayName": "Steel", "Quantity": 4,
+                "QuantityUOM": "Nos", "DimensionMM": 200, "DimensionInches": 200 / 25.4, "DimensionText": "200 mm", "DimensionUOM": "mm"})
+            client.tables["PartRevisionLine"][0]["fields"].update({"QuantityPerPart": 4, "QuantityExact": "4", "QuantityUOM": "Nos"})
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            definition = service.get_definition("p-1")
+            self.assertEqual(definition["requirements"][0]["materialConsumptionStatus"], "legacy_duplicate_ambiguous")
+            content = {"baseRevisionId": definition["revisionId"], "expectedSaveVersion": 0,
+                "applicability": definition["applicability"], "requirements": deepcopy(definition["requirements"]),
+                "components": [], "purchases": [], "finalizeOnPublication": False}
+            before = deepcopy(client.tables)
+            with self.assertRaises(PartIdentityError) as error:
+                service.save_draft("p-1", content, actor="operator", reason="remark only", request_key="ambiguous-mcl-no-review")
+            self.assertEqual(error.exception.code, "PART_MATERIAL_BASIS_REVIEW_REQUIRED")
+            self.assertEqual(client.tables, before)
+
+            content["requirements"][0]["materialConsumptionResolution"] = "weight_per_piece"
+            saved = service.save_draft("p-1", content, actor="operator", reason="Resolve imported MCL consumption", request_key="ambiguous-mcl-review")
+            resolved = saved["content"]["requirements"][0]
+            self.assertEqual((resolved["quantity"], resolved["uom"]), (4, "Nos"))
+            self.assertEqual(resolved["detail"]["QuantityUOM"], "kg")
+            self.assertAlmostEqual(resolved["detail"]["Quantity"], 0.316)
+            self.assertEqual(resolved["materialConsumptionResolution"], "weight_per_piece")
+            self.assertAlmostEqual(resolved["quantity"] * resolved["detail"]["Quantity"], 1.264)
+
+    def test_master_catalogue_is_searchable_and_binding_uses_reviewed_namespaced_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = DefinitionMemoryGrist()
+            client.tables["Material"].append({"id": 6, "fields": {"CanonicalName": "QA alloy identity"}})
+            provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
+                {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
+                 "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-09-24"},
+                {"canonicalName": "QA alloy stock size", "masterMaterialId": 56, "kgPerMeter": "2.5", "factorStatus": "available",
+                 "source": "Costing-New", "sourceTable": "MasterMaterial",
+                 "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-10-01"}]}
+            service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
+            options = service.options("p-1")
+            self.assertEqual(options["materialWeightSource"]["catalogCount"], 2)
+            self.assertEqual(options["materialWeightSource"]["selectableCount"], 1)
+            source_only = next(item for item in options["materialCatalog"] if item["masterMaterialId"] == 56)
+            self.assertEqual((source_only["bindingStatus"], source_only["materialId"]), ("unbound", None))
+            self.assertEqual(next(item for item in options["materialCatalog"] if item["masterMaterialId"] == 55)["materialId"], 5)
+
+            with self.assertRaises(PartIdentityError) as error:
+                service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="operator",
+                    reason="review binding", request_key="material-bind-denied")
+            self.assertEqual(error.exception.code, "PART_MATERIAL_BINDING_REVIEWER_REQUIRED")
+            result = service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-approved")
+            self.assertEqual((result["status"], result["materialId"], result["masterMaterialId"]), ("bound", 6, 56))
+            self.assertEqual(service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-approved"), result)
+            idempotent = service.bind_material_master("p-1", source_master_id=56, material_id=6, actor="Irshad",
+                reason="Reviewed QA catalog alias", request_key="material-bind-repeat")
+            self.assertTrue(idempotent["idempotent"])
+
+            with self.assertRaises(PartIdentityError) as conflict:
+                service.bind_material_master("p-1", source_master_id=56, material_id=5, actor="Irshad",
+                    reason="Conflicting QA alias", request_key="material-bind-conflict")
+            self.assertEqual(conflict.exception.code, "PART_MATERIAL_BINDING_CONFLICT")
+            self.assertIsNone(service.registry._find(service._rows("PartRegistryRequest"), "RequestKey", "material-bind-conflict"))
+
+            refreshed = service.options("p-1")
+            bound = next(item for item in refreshed["materialCatalog"] if item["masterMaterialId"] == 56)
+            self.assertEqual((bound["bindingStatus"], bound["materialId"]), ("bound", 6))
+            evidence = next(item for item in refreshed["materials"] if item["id"] == 6)["weightEvidence"]
+            self.assertEqual((evidence["masterMaterialId"], evidence["kgPerMeter"], evidence["sourceDate"]), (56, "2.5", "2026-10-01"))
+            alias = next(row["fields"] for row in client.tables["IdentityAlias"] if row["fields"].get("EntityType") == "MaterialMasterBinding")
+            self.assertEqual((alias["EntityId"], alias["SourceRow"]), ("material-weight:costing-new-test:MasterMaterial:56", 56))
+            self.assertNotEqual(alias["EntityId"], str(alias["SourceRow"]))
 
     def test_history_includes_route_and_advanced_attributes_without_format_only_changes(self):
         with tempfile.TemporaryDirectory() as temp:

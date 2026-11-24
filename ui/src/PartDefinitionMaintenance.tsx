@@ -255,18 +255,23 @@ function engineeringAttributes(detail: any) {
   }
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
+function editableEngineeringAttributes(detail: any) {
+  const editable = { ...engineeringAttributes(detail) };
+  delete editable.materialWeightEvidence;
+  return editable;
+}
 function kgText(value: number | null) {
   if (value == null || !Number.isFinite(value) || value <= 0) return null;
   return Number(value.toPrecision(10)).toString();
 }
 function cutWeight(item: any, materials: any[] = []) {
   const detail = item?.detail || {};
-  const saved = engineeringAttributes(detail).materialWeightEvidence;
   const selected = materials.find(material => String(material.id) === String(detail.Material));
+  const saved = item?.materialWeightEvidence;
   const savedFactor = Number(saved?.kgPerMeter);
   const currentFactor = Number(selected?.kgPerMeter);
-  const evidence = Number.isFinite(savedFactor) && savedFactor > 0 ? saved
-    : Number.isFinite(currentFactor) && currentFactor > 0 ? selected?.weightEvidence : saved || selected?.weightEvidence;
+  const evidence = saved?.status === "available" && Number.isFinite(savedFactor) && savedFactor > 0
+    ? saved : Number.isFinite(currentFactor) && currentFactor > 0 ? selected?.weightEvidence : saved || selected?.weightEvidence;
   const factor = Number(evidence?.kgPerMeter ?? selected?.kgPerMeter);
   const mm = Number(cutLengthValue(detail));
   const quantity = Number(item?.quantity);
@@ -382,6 +387,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
   const [pendingSubmit, setPendingSubmit] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
   const [pendingApproval, setPendingApproval] = useState<{ key: string; storageKey: string; payload: string } | null>(null);
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
+  const [materialMasterSearch, setMaterialMasterSearch] = useState<Record<string, string>>({});
+  const [materialMasterSelection, setMaterialMasterSelection] = useState<Record<string, string>>({});
   const [focusRequirementKey, setFocusRequirementKey] = useState<string | null>(null);
   const [focusComponentIdentity, setFocusComponentIdentity] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -460,9 +467,31 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       detail.Quantity = derived == null ? "" : derived;
       detail.ExactQuantityText = derived == null ? "" : String(derived);
     }
-    rows[index] = { ...current, detail, fieldStatus: { ...(current.fieldStatus || {}),
+    rows[index] = { ...current, detail, materialWeightEvidence: material?.weightEvidence || { status: "unavailable" }, fieldStatus: { ...(current.fieldStatus || {}),
       ...(usesPhysicalConsumptionBasis(current.family, unit) ? { Quantity: derived == null ? "missing" : "derived" } : {}) } };
     patchContent({ requirements: rows });
+  }
+
+  async function reviewAndBindMaterial(index: number) {
+    const item = content?.requirements?.[index];
+    const materialId = Number(item?.detail?.Material);
+    const sourceMasterMaterialId = Number(materialMasterSelection[item?.requirementKey || ""]);
+    if (!Number.isInteger(materialId) || materialId <= 0 || !Number.isInteger(sourceMasterMaterialId) || sourceMasterMaterialId <= 0 || !reason.trim()) {
+      setError("Choose an existing Safari Material, a Costing-New master, and enter the review reason before binding.");
+      return;
+    }
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await api.bindPartDefinitionMaterial(partId, { materialId, sourceMasterMaterialId, reason: reason.trim() }, `material-binding:${crypto.randomUUID()}`);
+      const nextOptions = await api.partDefinitionOptions(partId);
+      setOptions(nextOptions);
+      const trustedMaterial = (nextOptions.materials || []).find((candidate: any) => String(candidate.id) === String(materialId));
+      setContent((old: any) => ({ ...old, requirements: (old?.requirements || []).map((row: any, rowIndex: number) =>
+        rowIndex === index ? { ...row, materialWeightEvidence: trustedMaterial?.weightEvidence || { status: "unavailable" } } : row) }));
+      setNotice(`Reviewed ${nextOptions.materialCatalog?.find((candidate: any) => candidate.masterMaterialId === sourceMasterMaterialId)?.canonicalName || "Costing-New material"} binding is saved. The selected Safari Material identity remains ${trustedMaterial?.name || materialId}.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The material binding could not be saved.");
+    } finally { setBusy(false); }
   }
 
   function addRequirement(family: typeof EDITABLE_FAMILIES[number]) {
@@ -520,6 +549,30 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     patchContent({ requirements: rows });
   }
 
+  function updateMaterialConsumptionResolution(index: number, resolution: string) {
+    const rows = [...(content?.requirements || [])];
+    const current = rows[index] || {};
+    const detail = { ...(current.detail || {}) };
+    if (resolution === "weight_per_piece") {
+      const amount = derivedConsumptionForPhysicalBasis(current.family, detail, "kg", options?.materials || []);
+      detail.QuantityUOM = "kg";
+      detail.Quantity = amount == null ? "" : amount;
+      detail.ExactQuantityText = amount == null ? "" : String(amount);
+      rows[index] = { ...current, materialConsumptionResolution: resolution, detail,
+        fieldStatus: { ...(current.fieldStatus || {}), Quantity: amount == null ? "missing" : "derived" } };
+    } else if (resolution === "one_item_per_occurrence") {
+      detail.QuantityUOM = ["nos", "no", "each", "ea", "pcs", "piece", "pieces"].includes(String(detail.QuantityUOM || "").toLowerCase())
+        ? detail.QuantityUOM : "Nos";
+      detail.Quantity = 1;
+      detail.ExactQuantityText = "1";
+      rows[index] = { ...current, materialConsumptionResolution: resolution, detail,
+        fieldStatus: { ...(current.fieldStatus || {}), Quantity: "derived" } };
+    } else {
+      rows[index] = { ...current, materialConsumptionResolution: "", detail };
+    }
+    patchContent({ requirements: rows });
+  }
+
   function validateDraftContent() {
     const errors: Record<string, string> = {};
     const oldRequirements = new Map((definition?.requirements || []).map((item: any) => [item.requirementKey, item]));
@@ -532,6 +585,9 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       if (changed("quantity") && !positiveNumber(row.quantity)) error("quantity", "Enter a finite quantity greater than zero.");
       if (changed("uom") && !String(row.uom || "").trim()) error("uom", "Choose a quantity unit.");
       const detail = row.detail || {}, oldDetail = old?.detail || {};
+      if (row.materialConsumptionStatus === "legacy_duplicate_ambiguous"
+          && !["weight_per_piece", "one_item_per_occurrence"].includes(row.materialConsumptionResolution))
+        error("materialBasis", "Review the duplicate legacy piece count before saving.");
       for (const name of ["DimensionMM", "DimensionInches", "PartWeightKg", "Length", "Width", "Thickness"]) {
         if (!physicalNumberChanged(detail[name], oldDetail[name], fresh) || detail[name] == null || String(detail[name]).trim() === "") continue;
         if (!positiveNumber(detail[name])) error(name === "PartWeightKg" ? "partWeight" : name === "DimensionMM" || name === "DimensionInches" ? "cutLength" : "dimensions",
@@ -755,8 +811,15 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           const index = (content?.requirements || []).indexOf(item);
           const rowName = `${familyLabel} row ${rowPosition + 1}`;
           const detail = item.detail || {};
+          const editableAttributes = editableEngineeringAttributes(detail);
           const materialValue = String(detail.Material ?? "");
           const materialFound = (options?.materials || []).some((material: any) => String(material.id) === materialValue);
+          const masterSearch = String(materialMasterSearch[item.requirementKey] || "").trim().toLowerCase();
+          const masterChoices = (options?.materialCatalog || []).filter((master: any) => !masterSearch
+            || String(master.canonicalName || "").toLowerCase().includes(masterSearch)
+            || String(master.code || "").toLowerCase().includes(masterSearch)).slice(0, 40);
+          const selectedMasterId = String(materialMasterSelection[item.requirementKey] || "");
+          const selectedMaster = (options?.materialCatalog || []).find((master: any) => String(master.masterMaterialId) === selectedMasterId);
           const oldRateUnit = String(detail.QuantityUOM || "");
           const cutUnit = String(detail.DimensionUOM || cutLengthUnit(detail));
           const cutValue = cutLengthValue(detail);
@@ -770,6 +833,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
           const rateUnitError = validationErrors[`${item.requirementKey}:rateUnit`];
           const cutError = validationErrors[`${item.requirementKey}:cutLength`];
           const weightError = validationErrors[`${item.requirementKey}:partWeight`];
+          const materialBasisError = validationErrors[`${item.requirementKey}:materialBasis`];
           const dimensionsError = validationErrors[`${item.requirementKey}:dimensions`];
           return <tr key={item.requirementKey} data-requirement-key={item.requirementKey}>
             {family === "cnc" && <td><label>Plate part to cut<input aria-label={`Plate part to cut — ${rowName}`} value={detail.PlatePart ?? ""} onChange={event => updateRequirementDetail(index, "PlatePart", event.target.value)}/></label>
@@ -782,6 +846,30 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
               </select>{itemError && <small className="parts-definition-error-text">{itemError}</small>}</label>
               {!materialValue && detail.MaterialDisplayName && <small role="status">Saved label: {detail.MaterialDisplayName} · material identity unresolved</small>}
               {(detail.identityStatus === "legacy_unclassified" || item.identityStatus?.startsWith("legacy")) && <small>Saved legacy identity is retained for review.</small>}
+              {family !== "cnc" && <details className="parts-definition-material-binding"><summary>Search and review a Costing-New material binding</summary>
+                {options?.materialWeightSource?.status === "available" ? <>
+                  <label>Search source catalogue<input aria-label={`Search Costing-New materials — ${rowName}`} value={materialMasterSearch[item.requirementKey] || ""}
+                    onChange={event => setMaterialMasterSearch(old => ({ ...old, [item.requirementKey]: event.target.value }))}/></label>
+                  <label>Costing-New material<select aria-label={`Costing-New material — ${rowName}`} value={selectedMasterId}
+                    onChange={event => setMaterialMasterSelection(old => ({ ...old, [item.requirementKey]: event.target.value }))}>
+                    <option value="">Choose from {options.materialCatalog?.length || 0} source rows</option>
+                    {masterChoices.map((master: any) => <option key={master.sourceKey} value={String(master.masterMaterialId)}>
+                      {master.canonicalName}{master.code ? ` · ${master.code}` : ""} · {master.bindingStatus === "bound" ? `bound to Safari Material ${master.materialId}` : master.bindingStatus}
+                    </option>)}
+                  </select></label>
+                  {masterSearch && masterChoices.length === 0 && <small>No Costing-New materials match this search.</small>}
+                  {masterChoices.length === 40 && <small>Showing the first 40 matches; refine the search to narrow the catalogue.</small>}
+                  {selectedMaster?.bindingStatus === "unbound" && <>
+                    {!materialValue && <small>First choose the Safari Material identity that this source material should represent.</small>}
+                    <button type="button" className="button" disabled={busy || !materialValue || !reason.trim()} onClick={() => void reviewAndBindMaterial(index)}>
+                      Review and bind to selected Safari Material
+                    </button>
+                    <small>This records an approver-reviewed, signed alias. It does not create or re-key either master identity.</small>
+                  </>}
+                  {selectedMaster?.bindingStatus === "bound" && <small>Already bound to Safari Material {selectedMaster.materialId}; changing it requires reviewed data repair.</small>}
+                  {selectedMaster?.bindingStatus === "ambiguous" && <small>This source identity has conflicting Safari bindings and cannot be selected.</small>}
+                </> : <small role="status">Costing-New is unavailable. Existing saved material selections and verified factor evidence remain available offline.</small>}
+              </details>}
             </td>
             <td><div className="parts-definition-inline-fields">
               <label>Quantity<input aria-label={`Quantity — ${rowName}`} inputMode="decimal" value={item.quantity ?? ""} aria-invalid={Boolean(quantityError)} onChange={event => updateRequirement(index, { quantity: event.target.value })}/>{quantityError && <small className="parts-definition-error-text">{quantityError}</small>}</label>
@@ -799,6 +887,17 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
               : <><strong>{weight.perPiece == null ? "Unavailable" : `${kgText(weight.perPiece)} kg / piece`}</strong><small>{weight.total == null ? "Total per parent Part is unavailable." : `${kgText(weight.total)} kg per parent Part`}</small>
                 {weight.evidence?.kgPerMeter && <small>{weight.evidence.kgPerMeter} kg/m · {weight.evidence.source || "Costing-New"}{weight.evidence.sourceDate ? ` · ${weight.evidence.sourceDate}` : " · source date unavailable"}</small>}
                 {!weight.evidence?.kgPerMeter && <small role="status">No verified kg/m factor; calculated weight and mass-based cost are incomplete.</small>}</>}
+              {family !== "cnc" && item.materialConsumptionStatus === "legacy_duplicate_ambiguous" && <div className="parts-definition-basis-review" role="group" aria-label={`Legacy consumption review — ${rowName}`}>
+                <strong>Legacy consumption needs review</strong>
+                <small>The saved {detail.Quantity ?? "unknown"} {detail.QuantityUOM || "unit"} matches Qty per Part {item.quantity ?? "unknown"} {item.uom || "unit"}. Leaving both unchanged would multiply the same piece count twice.</small>
+                <label>Resolve material consumption<select aria-label={`Resolve material consumption — ${rowName}`} value={item.materialConsumptionResolution || ""}
+                  aria-invalid={Boolean(materialBasisError)} onChange={event => updateMaterialConsumptionResolution(index, event.target.value)}>
+                  <option value="">Choose a per-piece basis</option>
+                  <option value="weight_per_piece" disabled={weight.perPiece == null}>Use trusted cut length × kg/m as kg per piece</option>
+                  <option value="one_item_per_occurrence">Use one stock item per Qty per Part occurrence</option>
+                </select></label>
+                {materialBasisError && <small className="parts-definition-error-text">{materialBasisError}</small>}
+              </div>}
               <details><summary>Calculation and costing details</summary>
                 <p className="parts-help">Normalized consumption is stored per requirement occurrence. Qty per Part and any parent assembly quantity are applied separately, once each.</p>
                 <label>Existing costing unit<select aria-label={`Existing costing unit — ${rowName}`} value={oldRateUnit} aria-invalid={Boolean(rateUnitError)} onChange={event => updateRateBasisUnit(index, event.target.value)}>
@@ -809,7 +908,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
                 {!missingCrossDimensionConsumption(item) && isCrossDimensionConsumption(family, oldRateUnit) && item.fieldStatus?.Quantity === "manual" && <small role="status">Legacy manual consumption is retained. No physical conversion was inferred.</small>}
                 {dimensionsError && <small className="parts-definition-error-text">{dimensionsError}</small>}
                 <small>{derivedTotal === null ? "Total normalized consumption: not available" : `Total normalized consumption: ${derivedTotal} ${oldRateUnit}`}</small>
-                {weight.evidence && <small>Material factor evidence: {JSON.stringify(weight.evidence)}</small>}
+                {weight.evidence && <small>Material conversion: {weight.evidence.status || "available"}{weight.evidence.sourceDate ? ` · factor date ${weight.evidence.sourceDate}` : " · factor date unavailable"}</small>}
               </details>
             </td>
             <td><label>Remarks<input aria-label={`Remarks — ${rowName}`} value={detail.ToolShopRemarks ?? ""} onChange={event => updateRequirementDetail(index, "ToolShopRemarks", event.target.value)}/></label><small>{fieldStatusText(item.fieldStatus?.ToolShopRemarks)}</small></td>
@@ -821,11 +920,11 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
                 {item.lineIdentityStatus === "unresolved" && <p className="parts-definition-error" role="status">Physical line identity is unresolved and remains blocked from publication until reviewed.</p>}
                 <p className="parts-help">Provenance: {item.provenance?.type || "legacy / unclassified"}. A Stores issue route records routing only; it does not create a purchase.</p>
                 <label>Issue route<input aria-label={`Issue route — ${rowName}`} value={detail.IssueRoute ?? ""} onChange={event => updateRequirementDetail(index, "IssueRoute", event.target.value)}/></label>
-                <label>Engineering attributes (JSON)<textarea aria-label={`Engineering attributes (JSON) — ${rowName}`} value={attributeText[`requirement:${item.requirementKey}`] ?? JSON.stringify(detail.EngineeringAttributes || {}, null, 2)} onChange={event => {
+                <label>Engineering attributes (JSON)<textarea aria-label={`Engineering attributes (JSON) — ${rowName}`} value={attributeText[`requirement:${item.requirementKey}`] ?? JSON.stringify(editableAttributes, null, 2)} onChange={event => {
                   const text = event.target.value; setAttributeText(old => ({ ...old, [`requirement:${item.requirementKey}`]: text }));
                   try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) updateRequirementDetail(index, "EngineeringAttributes", parsed); else setDirty(true); }
                   catch { setDirty(true); }
-                }}/></label>
+                 }}/></label><small>Verified material conversion evidence is managed by the server and cannot be edited here.</small>
               </details>
             </td>
           </tr>;

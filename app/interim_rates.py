@@ -92,6 +92,7 @@ def load_material_weight_catalog() -> dict[str, Any]:
         records.append({
             "canonicalName": name,
             "masterMaterialId": int(record["id"]),
+            "code": str(fields.get("Code") or fields.get("MaterialCode") or "").strip(),
             "inUse": fields.get("InUse"),
             "kgPerMeter": str(factor) if factor is not None and factor > 0 else None,
             "factorStatus": "available" if factor is not None and factor > 0 else "unavailable",

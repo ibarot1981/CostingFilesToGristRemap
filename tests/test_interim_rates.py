@@ -16,7 +16,7 @@ class InterimRatesTests(unittest.TestCase):
         fetch.assert_called_once_with("MasterMaterial")
         self.assertEqual(catalog["sourceDocumentId"], "costing-new-doc")
         self.assertEqual(catalog["records"][0], {
-            "canonicalName": "MS-Round Bar 16 mm", "masterMaterialId": 55, "inUse": True,
+            "canonicalName": "MS-Round Bar 16 mm", "masterMaterialId": 55, "code": "", "inUse": True,
             "kgPerMeter": "1.58", "factorStatus": "available", "sourceDate": "2026-09-24",
             "source": "Costing-New", "sourceDocumentId": "costing-new-doc", "sourceTable": "MasterMaterial",
             "sourceField": "KGsPerMeter", "factorUnit": "kg/m"})

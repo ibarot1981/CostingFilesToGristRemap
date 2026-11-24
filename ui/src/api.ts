@@ -62,6 +62,7 @@ export const api = {
   partDefinition: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition`),
   partDefinitionRecovery: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/recovery`),
   partDefinitionOptions: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/definition/options`),
+  bindPartDefinitionMaterial: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/material-bindings`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
   savePartDefinitionDraft: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/draft`, payload, { "Idempotency-Key": key }, "PUT", PART_DEFINITION_WRITE_TIMEOUT_MS),
   submitPartDefinitionChangeRequest: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/change-requests`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
   reopenPartDefinitionChangeRequest: (id: string, changeRequestKey: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/definition/change-requests/${encodeURIComponent(changeRequestKey)}/reopen`, payload, { "Idempotency-Key": key }, "POST", PART_DEFINITION_WRITE_TIMEOUT_MS),
