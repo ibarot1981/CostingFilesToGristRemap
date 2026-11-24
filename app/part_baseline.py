@@ -302,6 +302,10 @@ def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) ->
         "plate_part": _normal_text(plate_part), "toolshop_detail": _normal_text(toolshop_detail),
         "item_group": _normal_text(group_value),
     }
+    dimension_mm = _decimal(fields.get("dimension_to_cut_mm"))
+    if dimension_mm is None and fields.get("dimension_to_cut_inches") not in (None, ""):
+        dimension_inches = _decimal(fields.get("dimension_to_cut_inches"))
+        dimension_mm = dimension_inches * Decimal("25.4") if dimension_inches is not None else None
     return {
         "family": family, "processType": FAMILIES[family]["process"], "sheet": sheet,
         "row": int(row.get("row") or 0), "source": row, "group": group,
@@ -311,7 +315,7 @@ def _raw_requirement(row: dict[str, Any], family: str, group: dict[str, Any]) ->
         "mappingGroupFingerprint": str(group.get("evidenceFingerprint") or ""),
         "quantity": quantity, "weightKg": weight_kg, "weightGrams": weight_grams,
         "dimension": str(dimension) if dimension not in (None, "") else None,
-        "dimensionMM": _decimal(dimension) if physical["dimension_uom"] == "mm" else None,
+        "dimensionMM": dimension_mm,
         "itemName": str(item_name or ""), "itemCode": str(item_code or ""),
         "material": str(material or ""), "platePart": _source_text(plate_part),
         "toolshopRemarks": _source_text(toolshop_remarks),
@@ -414,9 +418,311 @@ def _candidate_similarity(left: dict[str, Any], right: dict[str, Any]) -> int:
 
 
 class PartBaselineService:
-    def __init__(self, registry: GristPartRegistry):
+    def __init__(self, registry: GristPartRegistry, *, material_weight_catalog_provider: Callable[[], dict[str, Any]] | None = None):
         self.registry = registry
         self.client = registry.client
+        self.material_weight_catalog_provider = material_weight_catalog_provider
+
+    def _normalize_baseline_materials(self, requirements: list[dict[str, Any]]) -> dict[str, Any]:
+        """Resolve approved identities once and freeze per-piece basis for one baseline operation."""
+        from app.config import load_material_mapping
+        from app.material_resolution import resolve_material
+
+        try:
+            mappings = load_material_mapping()
+        except Exception:
+            mappings = {}
+        material_rows = self.registry._rows("Material")
+        local_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        approved_source_aliases: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in material_rows:
+            fields = _row_fields(row)
+            for field in ("CanonicalName", "Name", "CanonicalMaterialName"):
+                value = str(fields.get(field) or "").strip()
+                if value and row not in local_by_name[value.casefold()]:
+                    local_by_name[value.casefold()].append(row)
+            source_alias = str(fields.get("ODSDisplayName") or "").strip()
+            if source_alias and str(fields.get("MappingStatus") or "").strip().casefold() == "reviewed_alias":
+                approved_source_aliases[source_alias.casefold()].append(row)
+
+        catalog: dict[str, Any] = {"status": "unavailable", "records": []}
+        provider = self.material_weight_catalog_provider
+        if provider is not None:
+            try:
+                candidate = provider()
+                if isinstance(candidate, dict):
+                    catalog = candidate
+            except Exception:
+                pass
+        source_records = catalog.get("records", []) if catalog.get("status") == "available" else []
+        try:
+            from app.part_definition import GristPartDefinitionService
+            evidence_service = GristPartDefinitionService(self.registry, material_weight_catalog_provider=lambda: catalog)
+        except Exception:
+            evidence_service = None
+
+        exceptions = []
+        for item in requirements:
+            family = item["family"]
+            source_label = str(item.get("material") or "").strip()
+            match = resolve_material(source_label, mappings)
+            canonical = str(match.canonical_name or "").strip()
+            candidates = local_by_name.get(canonical.casefold(), []) if canonical else []
+            if not candidates and source_label:
+                exact_canonical = local_by_name.get(source_label.casefold(), []) if not canonical else []
+                if exact_canonical:
+                    canonical = str(_row_fields(exact_canonical[0]).get("CanonicalName") or source_label).strip()
+                    candidates = exact_canonical
+                else:
+                    # A source display alias is usable only when the local row
+                    # explicitly records that its alias was reviewed.
+                    candidates = [row for row in approved_source_aliases.get(source_label.casefold(), [])
+                        if not canonical or str(_row_fields(row).get("CanonicalName") or "").strip().casefold() == canonical.casefold()]
+                if candidates:
+                    canonical = str(_row_fields(candidates[0]).get("CanonicalName") or "").strip()
+                    canonical_candidates = local_by_name.get(canonical.casefold(), [])
+                    if len(canonical_candidates) == 1:
+                        candidates = canonical_candidates
+            material_id = int(candidates[0]["id"]) if len(candidates) == 1 else None
+            material_status = "resolved" if material_id else "ambiguous" if len(candidates) > 1 else "unmatched"
+            if material_status != "resolved" and source_label:
+                message = ("More than one Safari Material matches the reviewed canonical identity." if material_status == "ambiguous"
+                    else "No exact approved material alias and local Safari Material match this source label.")
+                exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
+                    "canonicalName": canonical or None, "status": material_status, "message": message})
+
+            factor_records = [record for record in source_records
+                if canonical and str(record.get("canonicalName") or "").strip().casefold() == canonical.casefold()]
+            factor = None
+            evidence = {"status": "unavailable", "canonicalName": canonical or source_label,
+                "source": "Costing-New", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}
+            if len(factor_records) == 1:
+                record = factor_records[0]
+                try:
+                    value = Decimal(str(record.get("kgPerMeter")))
+                    if (value.is_finite() and value > 0 and int(record.get("masterMaterialId") or 0) > 0
+                            and str(record.get("sourceDocumentId") or catalog.get("sourceDocumentId") or "").strip()
+                            and record.get("source") == "Costing-New" and record.get("sourceTable") == "MasterMaterial"
+                            and record.get("sourceField") == "KGsPerMeter" and record.get("factorUnit") == "kg/m"
+                            and record.get("factorStatus", "available") == "available"):
+                        if material_id and evidence_service:
+                            signed = evidence_service._signed_material_evidence(material_id,
+                                str(_row_fields(candidates[0]).get("CanonicalName") or canonical), record)
+                            if signed.get("signature"):
+                                factor, evidence = value, signed
+                except (InvalidOperation, TypeError, ValueError):
+                    pass
+            if family == "mcl":
+                length_mm = item.get("dimensionMM")
+                per_piece = (length_mm / Decimal(1000) * factor) if length_mm is not None and factor is not None else None
+                item["normalizedRateQuantity"] = per_piece
+                item["normalizedRateUnit"] = "kg"
+                item["materialWeightEvidence"] = evidence
+                if source_label and factor is None:
+                    exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
+                        "canonicalName": canonical or None, "status": "factor_unavailable",
+                        "message": "A unique validated Costing-New kg/m factor is unavailable; weight and cost remain incomplete."})
+            elif family == "cnc":
+                per_piece = _decimal(item["rawFields"].get("part_weight_kg"))
+                item["normalizedRateQuantity"] = per_piece
+                item["normalizedRateUnit"] = "kg"
+            else:
+                # Tool Shop rates are per-piece/process operations; Qty belongs only on the link.
+                item["normalizedRateQuantity"] = Decimal(1)
+                item["normalizedRateUnit"] = "Nos"
+            item["resolvedMaterialId"] = material_id if material_status == "resolved" else None
+            item["materialResolution"] = {"status": material_status, "sourceLabel": source_label,
+                "canonicalName": canonical or None, "message": next((row["message"] for row in exceptions
+                    if row["family"] == family and row["sourceRow"] == item["row"]), None)}
+        return {"catalog": catalog, "exceptions": exceptions}
+
+    def _freeze_material_normalization(self, request: dict[str, Any], requirements: list[dict[str, Any]], exceptions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Freeze trusted factor and per-piece values before any baseline rows are written."""
+        existing = _unjson(_row_fields(request).get("Payload"))
+        fingerprints = [_digest([item["physical"], item["rawFields"], item["family"], item["row"]]) for item in requirements]
+        if isinstance(existing, dict) and existing.get("schema") == "part-baseline-normalization-v1":
+            values = existing.get("requirements")
+            if (existing.get("requirementFingerprints") != fingerprints or not isinstance(values, list)
+                    or len(values) != len(requirements)
+                    or existing.get("normalizationFingerprint") != _digest([fingerprints, values, existing.get("exceptions") or []])):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "The saved baseline request contains different or incomplete material normalization evidence.")
+            for item, frozen in zip(requirements, values):
+                item["resolvedMaterialId"] = frozen.get("resolvedMaterialId")
+                item["normalizedRateQuantity"] = _decimal(frozen.get("normalizedRateQuantity"))
+                item["normalizedRateUnit"] = frozen.get("normalizedRateUnit")
+                item["materialWeightEvidence"] = frozen.get("materialWeightEvidence")
+                item["materialResolution"] = frozen.get("materialResolution") or {}
+            return existing.get("exceptions") if isinstance(existing.get("exceptions"), list) else []
+        values = [{"resolvedMaterialId": item.get("resolvedMaterialId"),
+            "normalizedRateQuantity": _decimal_text(item.get("normalizedRateQuantity")),
+            "normalizedRateUnit": item.get("normalizedRateUnit"),
+            "materialWeightEvidence": item.get("materialWeightEvidence"),
+            "materialResolution": item.get("materialResolution")} for item in requirements]
+        payload = {"schema": "part-baseline-normalization-v1", "requirementFingerprints": fingerprints,
+            "requirements": values, "exceptions": exceptions,
+            "normalizationFingerprint": _digest([fingerprints, values, exceptions])}
+        self.client.update_table_records("PartRegistryRequest", [{"id": int(request["id"]), "fields": {"Payload": _json(payload)}}])
+        persisted = self.registry._find(self.registry._rows("PartRegistryRequest"), "RequestKey", str(_row_fields(request).get("RequestKey") or ""))
+        if not persisted or _unjson(_row_fields(persisted).get("Payload")) != payload:
+            raise PartIdentityError("PART_WRITE_UNCONFIRMED", "Grist did not confirm the frozen material normalization evidence for this baseline request.")
+        return exceptions
+
+    def preview_existing_normalization(self, part_id: str) -> dict[str, Any]:
+        """Build a read-only technical correction plan for the current accepted baseline."""
+        from app.part_identity import request_fingerprint
+
+        part = self.registry.get_part(str(part_id))
+        if not part or part.get("legacy") or part.get("status") == "retired" or part.get("publishStatus") != "published":
+            raise PartIdentityError("PART_SELECTION_INVALID", "Choose an active published canonical Part.")
+        revision = self.registry.current_revision(str(part_id))
+        revision_id = int(revision.get("id") or revision.get("gristRecordId") or 0)
+        revision_row = next((row for row in self.registry._rows("PartRevision") if int(row.get("id", -1)) == revision_id), None)
+        if not revision_row:
+            raise PartIdentityError("PART_REVISION_UNAVAILABLE", "The current accepted Part revision is unavailable.")
+        revision_fields = _row_fields(revision_row)
+        baseline_id = _ref_id(revision_fields.get("ManufacturingBaseline"))
+        baseline = next((row for row in self.registry._rows("PartBaselineProcessing") if int(row.get("id", -1)) == baseline_id), None)
+        if not baseline or str(_row_fields(baseline).get("Status") or "").casefold() != "established":
+            raise PartIdentityError("PART_BASELINE_REQUIRED", "Technical normalization is available only for an established current baseline.")
+        from app.baseline_bindings import apply_effective_baseline_override, effective_baseline_overrides
+        existing_overrides = effective_baseline_overrides(self.registry._rows("PartRegistryRequest"), str(part_id), revision_id)
+
+        links = [row for row in self.registry._rows("PartRevisionLine")
+            if _ref_id(_row_fields(row).get("PartRevision")) == revision_id
+            and _ref_id(_row_fields(row).get("BaselineProcessing")) == baseline_id
+            and str(_row_fields(row).get("Status") or "active").casefold() not in {"removed", "deleted", "inactive"}]
+        observations = {int(row["id"]): _row_fields(row) for row in self.registry._rows("SourceLineObservation")}
+        line_revisions = {int(row["id"]): _row_fields(row) for row in self.registry._rows("LineRevision")}
+        details_by_revision: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for detail in self.registry._rows("LineDetail"):
+            detail_fields = _row_fields(detail)
+            details_by_revision.setdefault(_ref_id(detail_fields.get("LineRevision")) or -1, []).append(detail)
+        masters = {int(row["id"]): _row_fields(row) for row in self.registry._rows("LineMaster")}
+        candidates = []
+        for link in links:
+            link_fields = _row_fields(link)
+            observation = observations.get(_ref_id(link_fields.get("SourceLineObservation")) or -1, {})
+            if not observation or _ref_id(observation.get("BaselineProcessing")) != baseline_id:
+                candidates.append({"lineId": int(link["id"]), "status": "baseline_observation_unavailable",
+                    "message": "This current line is not tied to the accepted baseline's immutable source observation."})
+                continue
+            line_revision_id = _ref_id(link_fields.get("LineRevision"))
+            line_revision = line_revisions.get(line_revision_id or -1, {})
+            line_master_id = _ref_id(link_fields.get("LineMaster")) or _ref_id(line_revision.get("LineMaster"))
+            master = masters.get(line_master_id or -1, {})
+            process = str(link_fields.get("ProcessType") or master.get("ProcessType") or "").casefold()
+            family = "mcl" if process in {"material_cut", "material", "material cut list", "mcl"} else "cnc" if process == "cnc" else "toolshop" if process in {"tool_shop", "tool shop", "toolshop"} else ""
+            if not family:
+                continue
+            matching_details = details_by_revision.get(line_revision_id or -1, [])
+            if len(matching_details) != 1:
+                candidates.append({"lineId": int(link["id"]), "status": "ambiguous_detail", "message": "Current baseline line does not have exactly one saved detail row."})
+                continue
+            detail_row = matching_details[0]
+            detail_row = apply_effective_baseline_override(detail_row, existing_overrides)
+            detail = _row_fields(detail_row)
+            attributes = _unjson(detail.get("EngineeringAttributes"))
+            attributes = attributes if isinstance(attributes, dict) else {}
+            if (family == "mcl" and attributes.get("materialConsumptionBasis") == "mcl_kg_per_piece"
+                    and _ref_id(detail.get("Material")) and self.registry._rows("Material")):
+                # Still include rows with a legacy duplicate shape only if the explicit basis is absent.
+                continue
+            quantity = _decimal(link_fields.get("QuantityExact") or link_fields.get("QuantityPerPart"))
+            source_fields = _unjson(observation.get("ObservedFields"))
+            source_fields = source_fields if isinstance(source_fields, dict) else {}
+            source_label = str(detail.get("MaterialDisplayName") or source_fields.get("material_to_cut") or source_fields.get("material_used") or "").strip()
+            length_mm = _decimal(detail.get("DimensionMM"))
+            if length_mm is None and detail.get("DimensionInches") not in (None, ""):
+                inches = _decimal(detail.get("DimensionInches"))
+                length_mm = inches * Decimal("25.4") if inches is not None else None
+            if length_mm is None:
+                length_mm = _decimal(source_fields.get("dimension_to_cut_mm"))
+            if length_mm is None:
+                inches = _decimal(source_fields.get("dimension_to_cut_inches"))
+                length_mm = inches * Decimal("25.4") if inches is not None else None
+            item = {"family": family, "row": int(link["id"]), "material": source_label,
+                "dimensionMM": length_mm, "rawFields": {**source_fields,
+                    "part_weight_kg": detail.get("PartWeightKg") or source_fields.get("part_weight_kg") or detail.get("WeightKg")},
+                "quantity": quantity}
+            candidates.append({"lineId": int(link["id"]), "lineRevisionId": line_revision_id,
+                "detailId": int(detail_row["id"]), "detail": detail, "item": item})
+        actionable = [item for item in candidates if item.get("item")]
+        normalization = self._normalize_baseline_materials([item["item"] for item in actionable])
+        binding_rows = []
+        for candidate in actionable:
+            item = candidate["item"]
+            detail = candidate["detail"]
+            status = item.get("materialResolution", {}).get("status")
+            if status != "resolved":
+                continue
+            attrs = _unjson(detail.get("EngineeringAttributes"))
+            attrs = attrs if isinstance(attrs, dict) else {}
+            attrs.update({"baselineMaterialResolution": item.get("materialResolution"),
+                "baselineRateBasis": "per_piece", "baselineSourceQuantity": _decimal_text(item.get("quantity"))})
+            if item["family"] == "mcl":
+                attrs["materialConsumptionBasis"] = "mcl_kg_per_piece"
+                attrs["materialWeightEvidence"] = item.get("materialWeightEvidence")
+            binding_fields = {"Material": item["resolvedMaterialId"],
+                "Quantity": _number(item.get("normalizedRateQuantity")),
+                "QuantityUOM": item.get("normalizedRateUnit"),
+                "ExactQuantityText": _decimal_text(item.get("normalizedRateQuantity")),
+                "EngineeringAttributes": _json(attrs)}
+            if all(detail.get(key) == value for key, value in binding_fields.items()):
+                continue
+            binding_rows.append({"detailId": candidate["detailId"], "lineId": candidate["lineId"],
+                "lineRevisionId": candidate["lineRevisionId"], "revisionId": revision_id,
+                "beforeFingerprint": _digest({key: detail.get(key) for key in binding_fields}), "fields": binding_fields})
+        exceptions = normalization["exceptions"] + [item for item in candidates if not item.get("item")]
+        preview = {"partId": str(part_id), "revisionId": revision_id, "baselineId": baseline_id,
+            "status": "ready" if binding_rows else "no_changes", "bindings": binding_rows,
+            "exceptions": exceptions, "preservesAcceptedRows": True, "writesOnRead": False}
+        preview["previewFingerprint"] = request_fingerprint(preview)
+        return preview
+
+    @_serialized
+    def apply_existing_normalization(self, *, part_id: str, preview_fingerprint: str, actor: str,
+            reason: str, request_key: str) -> dict[str, Any]:
+        from app.part_identity import request_fingerprint
+        from app.domain import utc_now
+        from app.grist_types import grist_datetime
+
+        self.registry._verify_writer()
+        if not actor.strip() or not reason.strip() or not request_key.strip():
+            raise PartIdentityError("PART_BASELINE_NORMALIZATION_INPUT_REQUIRED", "A trusted actor, correction reason and idempotency key are required.")
+        operation_fingerprint = request_fingerprint([part_id, str(preview_fingerprint), actor.strip(), reason.strip()])
+        existing_request = self.registry._find(self.registry._rows("PartRegistryRequest"), "RequestKey", str(request_key))
+        if existing_request:
+            fields = _row_fields(existing_request)
+            if (fields.get("RequestType") != "part_baseline_effective_binding"
+                    or fields.get("RequestFingerprint") != operation_fingerprint):
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "This request key was already used with different correction evidence.")
+            saved = _unjson(fields.get("Result"))
+            if (str(fields.get("Status") or "").casefold() == "published" and isinstance(saved, dict)
+                    and saved.get("schema") == "part-baseline-effective-binding-v1"):
+                return {**saved, "idempotent": True}
+        preview = self.preview_existing_normalization(part_id)
+        if preview.get("previewFingerprint") != str(preview_fingerprint):
+            raise PartIdentityError("PART_BASELINE_NORMALIZATION_STALE", "The accepted baseline or its current effective correction plan changed. Refresh preview before applying.")
+        if not preview["bindings"]:
+            return {**preview, "applied": False, "idempotent": False}
+        request = self.registry._begin_request(str(request_key), "part_baseline_effective_binding", operation_fingerprint, str(part_id))
+        saved = _unjson(_row_fields(request).get("Result"))
+        if isinstance(saved, dict) and saved.get("schema") == "part-baseline-effective-binding-v1":
+            if saved.get("previewFingerprint") != preview_fingerprint:
+                raise PartIdentityError("PART_REQUEST_CONFLICT", "The original normalization request key belongs to different preview evidence.")
+            return {**saved, "idempotent": True}
+        result = {"schema": "part-baseline-effective-binding-v1", "partId": str(part_id),
+            "revisionId": preview["revisionId"], "baselineId": preview["baselineId"],
+            "previewFingerprint": preview_fingerprint, "bindings": preview["bindings"],
+            "actor": actor.strip(), "reason": reason.strip(), "applied": True, "idempotent": False}
+        event_key = f"{request_key}:audit"
+        self.registry._ensure_keyed("AuditEvent", "RequestKey", event_key, {"EventType": "part_baseline_effective_binding_applied",
+            "Actor": actor.strip(), "OccurredAt": grist_datetime(utc_now()), "EntityType": "ProductPart",
+            "EntityId": str(part_id), "Reason": reason.strip(), "Payload": _json({"previewFingerprint": preview_fingerprint,
+                "revisionId": preview["revisionId"], "baselineId": preview["baselineId"], "bindingCount": len(preview["bindings"])}),
+            "RequestKey": event_key, "RequestFingerprint": operation_fingerprint})
+        self.registry._complete_request(request, result)
+        return result
 
     def workbook_confirmation_active(self, batch_request_key: str) -> bool:
         with _ACTIVE_WORKBOOK_CONFIRMATIONS_LOCK:
@@ -1125,6 +1431,7 @@ class PartBaselineService:
         requirement_errors = _validate_requirements(requirements)
         if requirement_errors:
             raise PartIdentityError("PART_BASELINE_REQUIREMENTS_INCOMPLETE", "Cannot establish the Part baseline: " + " ".join(requirement_errors))
+        material_normalization = self._normalize_baseline_materials(requirements)
         request_fingerprint_value = _digest([part_id, file_id, workbook_name, workbook_path, source_hash,
             association.id, association.version, mapping.get("version"), mapping.get("mappingPolicyVersion"), source_families,
             append_existing, actor, reason.strip()])
@@ -1157,6 +1464,8 @@ class PartBaselineService:
             saved = next((row for row in self.registry._rows("PartBaselineProcessing") if _row_fields(row).get("RequestKey") == request_key), None)
             if saved:
                 return self._recover_established(saved, revision, part)
+        material_normalization["exceptions"] = self._freeze_material_normalization(request, requirements,
+            material_normalization["exceptions"])
         baseline_key = str((pending[0].get("fields", {}) if pending else {}).get("BaselineKey") or f"part-baseline:{_digest([part_id, request_key])}")
         baseline_fingerprint = _digest([baseline_key, request_fingerprint_value, [item["physical"] for item in requirements]])
         current_time = (pending[0].get("fields", {}) if pending else {}).get("OccurredAt") or grist_datetime(utc_now())
@@ -1262,12 +1571,23 @@ class PartBaselineService:
             observation_id = int(observation_row["id"])
             fields = item["rawFields"]
             line_detail_key = f"part-baseline-detail:{item['lineRevisionKey']}"
-            detail_fp = _digest([line_detail_key, item["physical"], item["rawFields"], request_fingerprint_value])
-            weight_value = item["weightKg"] if item["weightKg"] is not None else item["weightGrams"]
+            detail_fp = _digest([line_detail_key, item["physical"], item["rawFields"], item.get("resolvedMaterialId"),
+                _decimal_text(item.get("normalizedRateQuantity")), item.get("normalizedRateUnit"),
+                item.get("materialWeightEvidence"), item.get("materialResolution"), request_fingerprint_value])
+            attributes = {"comparisonFields": item["physical"], "optionalItemGroup1": fields.get("optional_item_group_1"),
+                "sourcePartLabel": item["description"], "sourceSheet": item["sheet"],
+                "sourceMappingLineKey": item.get("mappingLineKey"),
+                "sourceMappingLineFingerprint": item.get("mappingLineFingerprint"), "canonicalPartId": part_id,
+                "baselineMaterialResolution": item.get("materialResolution"),
+                "baselineSourceQuantity": _decimal_text(item.get("quantity")), "baselineRateBasis": "per_piece"}
+            if item.get("materialWeightEvidence"):
+                attributes["materialWeightEvidence"] = item["materialWeightEvidence"]
+            if item["family"] == "mcl":
+                attributes["materialConsumptionBasis"] = "mcl_kg_per_piece"
             detail_rows.append({"DetailKey": line_detail_key, "LineRevision": line_revision_id,
-                "ProcessType": item["processType"], "Material": None, "PurchaseItem": None,
-                "ProcessOperation": None, "WorkCenter": None, "Quantity": _number(item["quantity"]),
-                "QuantityUOM": "Nos", "DimensionMM": _number(item["dimensionMM"]), "DimensionInches": _number(fields.get("dimension_to_cut_inches")),
+                "ProcessType": item["processType"], "Material": item.get("resolvedMaterialId"), "PurchaseItem": None,
+                "ProcessOperation": None, "WorkCenter": None, "Quantity": _number(item.get("normalizedRateQuantity")),
+                "QuantityUOM": item.get("normalizedRateUnit") or "Nos", "DimensionMM": _number(item["dimensionMM"]), "DimensionInches": _number(fields.get("dimension_to_cut_inches")),
                 "DimensionText": item["dimension"], "DimensionUOM": item["physical"]["dimension_uom"],
                 "WeightGrams": _number(item["weightGrams"]), "WeightKg": _number(item["weightKg"]),
                 "PartWeightKg": _number(fields.get("part_weight_kg")), "Length": _number(item["length"]),
@@ -1275,12 +1595,9 @@ class PartBaselineService:
                 "ItemName": item["itemName"], "ItemCode": item["itemCode"], "PlatePart": item["platePart"],
                 "ToolShopRemarks": item["toolshopRemarks"] if "toolshop_remarks" in fields else None,
                 "PartCategory": item["partCategory"], "MaterialDisplayName": item["material"],
-                "ExactQuantityText": _decimal_text(item["quantity"]), "ExactWeightKgText": _decimal_text(item["weightKg"]),
+                "ExactQuantityText": _decimal_text(item.get("normalizedRateQuantity")), "ExactWeightKgText": _decimal_text(item["weightKg"]),
                 "WeightUOM": "kg" if item["weightKg"] is not None else "g" if item["weightGrams"] is not None else "",
-                "EngineeringAttributes": _json({"comparisonFields": item["physical"], "optionalItemGroup1": fields.get("optional_item_group_1"),
-                    "sourcePartLabel": item["description"], "sourceSheet": item["sheet"],
-                    "sourceMappingLineKey": item.get("mappingLineKey"),
-                    "sourceMappingLineFingerprint": item.get("mappingLineFingerprint"), "canonicalPartId": part_id}),
+                "EngineeringAttributes": _json(attributes),
                 "RequestKey": request_key, "RequestFingerprint": detail_fp})
             source_mapping_key = f"part-baseline-source-map:{_digest([item['observationKey'], item['lineKey']])}"
             source_mapping_rows.append({"MappingKey": source_mapping_key, "Observation": observation_id, "LineMaster": master_id,
@@ -1309,6 +1626,7 @@ class PartBaselineService:
         result = {"baselineKey": baseline_key, "baselineStatus": "established", "partId": part_id,
             "partNumber": part.get("partNumber"), "engineeringRevision": "A", "revisionLifecycle": revision_fields.get("BaselineStatus") or "draft",
             "sourceHash": source_hash, "requirementCount": len(requirements), "families": families,
+            "materialResolutionExceptions": material_normalization["exceptions"],
             "baselineRecordId": int(completed["id"]), "revisionRecordId": int(committed_revision["id"]), "idempotent": bool(pending),
             "finalizationRequired": True}
         self.registry._complete_request(request, result)
@@ -1325,9 +1643,12 @@ class PartBaselineService:
         if str(fields.get("Status") or "") != "established":
             self._update_confirmed("PartBaselineProcessing", baseline, "BaselineKey", str(fields["BaselineKey"]),
                 {"Status": "established", "EstablishedAt": grist_datetime(utc_now()), "EstablishedBy": fields.get("Actor") or ""})
+        request = self.registry._find(self.registry._rows("PartRegistryRequest"), "RequestKey", str(fields.get("RequestKey") or ""))
+        frozen = _unjson(_row_fields(request or {}).get("Payload"))
         return {"baselineKey": fields.get("BaselineKey"), "baselineStatus": "established", "partId": part.get("id"),
             "partNumber": part.get("partNumber"), "engineeringRevision": "A", "revisionLifecycle": revision_fields.get("BaselineStatus") or "draft",
             "sourceHash": fields.get("SourceHash"), "requirementCount": fields.get("RequirementCount") or 0,
+            "materialResolutionExceptions": frozen.get("exceptions", []) if isinstance(frozen, dict) else [],
             "baselineRecordId": baseline_id, "revisionRecordId": int(revision["id"]), "idempotent": True,
             "finalizationRequired": True}
 

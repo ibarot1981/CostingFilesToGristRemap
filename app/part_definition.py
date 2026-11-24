@@ -969,6 +969,8 @@ class GristPartDefinitionService:
         return key
 
     def _definition_from_rows(self, part_id: str, revision_id: int) -> dict[str, Any]:
+        from app.baseline_bindings import apply_effective_baseline_override, effective_baseline_overrides
+
         part_row = self._part_row(part_id)
         part_fields = _fields(part_row)
         revision = next((row for row in self._rows("PartRevision") if int(row.get("id", -1)) == revision_id), None)
@@ -993,12 +995,13 @@ class GristPartDefinitionService:
 
         revisions = {int(row["id"]): _fields(row) for row in self._rows("LineRevision")}
         masters = {int(row["id"]): _fields(row) for row in self._rows("LineMaster")}
+        effective_overrides = effective_baseline_overrides(self._optional_rows("PartRegistryRequest"), part_id, revision_id)
         details_by_revision: dict[int, list[dict[str, Any]]] = {}
         for row in self._rows("LineDetail"):
             fields = _fields(row)
             line_revision_id = _int_ref(fields.get("LineRevision"))
             if line_revision_id:
-                details_by_revision.setdefault(line_revision_id, []).append(fields)
+                details_by_revision.setdefault(line_revision_id, []).append({**fields, "_effectiveDetailId": int(row["id"])})
         source_observations = {int(row["id"]): _fields(row) for row in self._rows("SourceLineObservation")}
         requirement_key_counts: dict[str, int] = {}
         active_links = []
@@ -1016,6 +1019,9 @@ class GristPartDefinitionService:
             master, line_revision = masters.get(line_master_id or -1, {}), revisions.get(line_revision_id or -1, {})
             details = details_by_revision.get(line_revision_id or -1, [])
             detail = deepcopy(details[0]) if len(details) == 1 else {}
+            detail_row_id = detail.pop("_effectiveDetailId", None)
+            if detail_row_id is not None:
+                detail = _fields(apply_effective_baseline_override({"id": detail_row_id, "fields": detail}, effective_overrides))
             family = {"material_cut": "mcl", "tool_shop": "toolshop", "cnc": "cnc"}.get(str(link.get("ProcessType") or master.get("ProcessType") or detail.get("ProcessType") or "").casefold(), "other")
             raw_key = str(link.get("RequirementKey") or "")
             key = raw_key
@@ -1082,6 +1088,7 @@ class GristPartDefinitionService:
                 "uom": link.get("QuantityUOM") or "", "sourcePartName": master.get("SourcePartName") or "",
                 "physicalSignature": line_revision.get("PhysicalSignature") or "", "detail": detail,
                 "fieldStatus": field_status, "provenance": provenance}
+            item["baselineMaterialResolution"] = (engineering or {}).get("baselineMaterialResolution")
             if family in {"mcl", "toolshop"}:
                 attributes = _json_cell(detail.get("EngineeringAttributes")) or {}
                 saved_evidence = attributes.get("materialWeightEvidence") if isinstance(attributes, dict) else None

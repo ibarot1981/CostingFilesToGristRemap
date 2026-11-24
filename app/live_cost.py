@@ -25,7 +25,7 @@ INPUT_TABLES = (
     "ConfigurationPartSelection", "ProductPart", "PartRevision", "PartMetadataVersion",
     "PartComponentRevision", "PartRevisionLine", "LineMaster", "LineRevision", "LineDetail",
     "PartPurchaseSpecification", "VendorPartMapping", "PartPurchaseRecord", "PartPurchaseUnitConversion",
-    "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate",
+    "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate", "PartRegistryRequest",
 )
 POLICY_VERSION = "live-cost-v1"
 SNAPSHOT_CHECKSUM_V1_COLUMNS = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus",
@@ -514,7 +514,11 @@ class GristLiveCostService:
                 details = details_by_revision.get(line_revision_id or -1, [])
                 if not details:
                     warn("PROCESS_DETAIL_REQUIRED", f"{process} line has no normalized detail/rate basis.", path)
+                from app.baseline_bindings import apply_effective_baseline_override, effective_baseline_overrides
+                effective_overrides = effective_baseline_overrides(tables.get("PartRegistryRequest", []),
+                    str(part_fields.get("StablePartId") or ""), revision_id)
                 for detail in details:
+                    detail = apply_effective_baseline_override(detail, effective_overrides)
                     detail_fields = _fields(detail)
                     material_id = ref_id(detail_fields.get("Material"))
                     canonical_material = material_by_id.get(material_id or -1, {})

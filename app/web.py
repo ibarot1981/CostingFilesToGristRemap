@@ -354,7 +354,8 @@ def _part_definition_service():
 
 def _part_baseline_service():
     from app.part_baseline import PartBaselineService
-    return PartBaselineService(_part_registry())
+    from app.interim_rates import load_material_weight_catalog
+    return PartBaselineService(_part_registry(), material_weight_catalog_provider=load_material_weight_catalog)
 
 
 def _live_cost_service():
@@ -1344,6 +1345,19 @@ def establish_part_manufacturing_baseline(part_id: str, request: Request, payloa
 @app.post("/api/parts/{part_id}/manufacturing-baseline/compare")
 def compare_part_manufacturing_baseline(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     return _baseline_write_context(part_id, request, payload, "compare", idempotency_key)
+
+
+@app.get("/api/parts/{part_id}/manufacturing-baseline/normalization-preview")
+@_part_registry_read_scope
+def preview_part_manufacturing_baseline_normalization(part_id: str):
+    return _part_baseline_service().preview_existing_normalization(part_id)
+
+
+@app.post("/api/parts/{part_id}/manufacturing-baseline/normalize")
+def apply_part_manufacturing_baseline_normalization(part_id: str, request: Request, payload: dict[str, Any] = Body(...), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    return _part_baseline_service().apply_existing_normalization(part_id=part_id,
+        preview_fingerprint=str(payload.get("previewFingerprint") or ""), actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""), request_key=idempotency_key or "")
 
 
 @app.get("/api/parts/manufacturing-comparisons/{comparison_key}")

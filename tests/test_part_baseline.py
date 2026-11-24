@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 import json
 from threading import Barrier
 from unittest.mock import patch
@@ -624,6 +625,157 @@ class PartBaselineIntegrationTests(unittest.TestCase):
                 expected_association_version=self.association.version, expected_mapping_version=saved["version"])
         self.assertEqual(blocked.exception.code, "PART_BASELINE_INCOMPLETE")
 
+    def test_baseline_material_normalization_resolves_reviewed_alias_and_applies_quantity_once(self):
+        self.client.api_key = "isolated-test-signing-key"
+        material = self.client.create_table_records("Material", [{"fields": {
+            "MaterialKey": "material:angles-65", "CanonicalName": "MS-Angles 65 x 65 x 6",
+            "ODSDisplayName": "Angles65x65x6", "MappingStatus": "reviewed_alias"}}])["records"][0]
+        calls = []
+        catalog = {"status": "available", "source": "Costing-New", "sourceDocumentId": "qa-source",
+            "records": [{"canonicalName": "MS-Angles 65 x 65 x 6", "masterMaterialId": 8,
+                "kgPerMeter": "5.8", "sourceDate": "2026-11-24", "source": "Costing-New",
+                "sourceDocumentId": "qa-source", "sourceTable": "MasterMaterial",
+                "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}]}
+        self.service.material_weight_catalog_provider = lambda: calls.append("catalog") or catalog
+        requirements = [
+            {"family": "mcl", "row": 7, "material": "Angles 65 x 65 x 6", "dimensionMM": Decimal("75"),
+                "quantity": Decimal("2"), "rawFields": {}},
+            {"family": "cnc", "row": 8, "material": "Angles 65 x 65 x 6", "dimensionMM": None,
+                "quantity": Decimal("2"), "rawFields": {"part_weight_kg": "0.21"}},
+            {"family": "toolshop", "row": 9, "material": "Angles 65 x 65 x 6", "dimensionMM": None,
+                "quantity": Decimal("2"), "rawFields": {}},
+        ]
+        outcome = self.service._normalize_baseline_materials(requirements)
+        self.assertEqual(calls, ["catalog"])
+        self.assertEqual(requirements[0]["resolvedMaterialId"], material["id"])
+        self.assertEqual(requirements[0]["normalizedRateQuantity"], Decimal("0.435"))
+        self.assertEqual(requirements[0]["normalizedRateUnit"], "kg")
+        self.assertTrue(requirements[0]["materialWeightEvidence"].get("signature"))
+        self.assertEqual((requirements[1]["normalizedRateQuantity"], requirements[1]["normalizedRateUnit"]), (Decimal("0.21"), "kg"))
+        self.assertEqual((requirements[2]["normalizedRateQuantity"], requirements[2]["normalizedRateUnit"]), (Decimal("1"), "Nos"))
+        self.assertFalse(outcome["exceptions"])
+
+    def test_establish_persists_canonical_material_and_separate_piece_multiplicity(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:angles-65",
+            "CanonicalName": "MS-Angles 65 x 65 x 6", "ODSDisplayName": "Angles65x65x6", "MappingStatus": "reviewed_alias"}}])["records"][0]
+        catalog = {"status": "available", "source": "Costing-New", "sourceDocumentId": "qa-source",
+            "records": [{"canonicalName": "MS-Angles 65 x 65 x 6", "masterMaterialId": 8, "kgPerMeter": "5.8",
+                "sourceDate": "2026-11-24", "source": "Costing-New", "sourceDocumentId": "qa-source",
+                "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}]}
+        self.service.material_weight_catalog_provider = lambda: catalog
+        with patch.dict("os.environ", {"SAFARI_MATERIAL_EVIDENCE_HMAC_KEY": "isolated-test-signing-key"}):
+            result = self.establish([source_row(77, material="Angles 65 x 65 x 6", dimension="75", quantity="2")],
+                source_hash="owner-material-baseline", request_key="owner-material-baseline")
+        detail = self.client.tables["LineDetail"][0]["fields"]
+        link = self.client.tables["PartRevisionLine"][0]["fields"]
+        self.assertEqual(detail["Material"], material["id"])
+        self.assertEqual(detail["MaterialDisplayName"], "Angles 65 x 65 x 6")
+        self.assertEqual((detail["Quantity"], detail["QuantityUOM"], link["QuantityPerPart"]), (0.435, "kg", 2))
+        self.assertEqual(result["materialResolutionExceptions"], [])
+        self.assertEqual(result["baselineStatus"], "established")
+
+    def test_establish_normalizes_duplicate_mcl_cnc_and_toolshop_occurrences_once(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:angles-65",
+            "CanonicalName": "MS-Angles 65 x 65 x 6", "ODSDisplayName": "Angles65x65x6", "MappingStatus": "reviewed_alias"}}])["records"][0]
+        catalog = {"status": "available", "source": "Costing-New", "sourceDocumentId": "qa-source",
+            "records": [{"canonicalName": "MS-Angles 65 x 65 x 6", "masterMaterialId": 8, "kgPerMeter": "5.8",
+                "sourceDate": "2026-11-24", "source": "Costing-New", "sourceDocumentId": "qa-source",
+                "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}]}
+        mcl = self.family_group("mcl", 90, description="Frame Angle")
+        mcl["rows"] = [source_row(90, material="Angles 65 x 65 x 6", dimension="75", quantity="2"),
+            source_row(91, material="Angles 65 x 65 x 6", dimension="75", quantity="2")]
+        cnc = self.family_group("cnc", 92, description="Frame Plate", part_category="Frame Plate",
+            product_part_name="Plate to cut", material_to_cut="Angles 65 x 65 x 6", part_weight_kg="0.21", qty="2")
+        toolshop = self.family_group("toolshop", 93, description="Drill operation", toolshop_part_name="Drill operation",
+            material_to_cut="Angles 65 x 65 x 6", qty="3")
+        groups = PartSourceGroups([mcl, cnc, toolshop], all_source_diagnostics())
+        saved = self.save_group_set(groups, "family-quantity-once")
+        self.service.material_weight_catalog_provider = lambda: catalog
+
+        with patch.dict("os.environ", {"SAFARI_MATERIAL_EVIDENCE_HMAC_KEY": "isolated-test-signing-key"}):
+            result = self.service.establish(part_id=self.part["id"], file_id="pilot.ods", workbook_name="families.ods",
+                workbook_path="C:/isolated/families.ods", source_hash="family-quantity-once", association=self.association,
+                groups=groups, mapping_store=self.mapping_store, source_families=self.family_choices_for({"mcl", "cnc", "toolshop"}),
+                actor="baseline reviewer", reason="Verify family-specific per-piece normalization", request_key="family-quantity-once",
+                expected_hash="family-quantity-once", expected_association=self.association.id,
+                expected_association_version=self.association.version, expected_mapping_version=saved["version"])
+
+        from app.part_baseline import _ref_id
+        links = self.client.tables["PartRevisionLine"]
+        details = {_ref_id(row["fields"]["LineRevision"]): row["fields"] for row in self.client.tables["LineDetail"]}
+        masters = {row["id"]: row["fields"] for row in self.client.tables["LineMaster"]}
+        lines = [(masters[_ref_id(link["fields"]["LineMaster"])]["ProcessType"], link["fields"],
+            details[_ref_id(link["fields"]["LineRevision"])]) for link in links]
+        mcl_lines = [line for line in lines if line[0] == "material_cut"]
+        cnc_line = next(line for line in lines if line[0] == "cnc")
+        toolshop_line = next(line for line in lines if line[0] == "tool_shop")
+        self.assertEqual(len(mcl_lines), 2, "identical material occurrences remain distinct requirement lines")
+        self.assertTrue(all(_ref_id(line[2]["Material"]) == material["id"] and line[2]["Quantity"] == 0.435
+            and line[2]["QuantityUOM"] == "kg" and line[1]["QuantityPerPart"] == 2 for line in mcl_lines), repr(mcl_lines))
+        self.assertEqual((_ref_id(cnc_line[2]["Material"]), cnc_line[2]["Quantity"], cnc_line[2]["QuantityUOM"], cnc_line[1]["QuantityPerPart"]),
+            (material["id"], 0.21, "kg", 2))
+        self.assertEqual((toolshop_line[2]["Quantity"], toolshop_line[2]["QuantityUOM"], toolshop_line[1]["QuantityPerPart"]),
+            (1, "Nos", 3))
+        self.assertEqual(result["materialResolutionExceptions"], [])
+
+    def test_baseline_missing_factor_and_ambiguous_identity_fail_closed(self):
+        self.client.create_table_records("Material", [{"fields": {"MaterialKey": "a", "CanonicalName": "MS-Angles 65 x 65 x 6"}},
+            {"fields": {"MaterialKey": "b", "CanonicalName": "MS-Angles 65 x 65 x 6"}}])
+        self.service.material_weight_catalog_provider = lambda: {"status": "available", "sourceDocumentId": "qa-source", "records": []}
+        item = {"family": "mcl", "row": 11, "material": "Angles 65 x 65 x 6", "dimensionMM": Decimal("75"), "rawFields": {}}
+        result = self.service._normalize_baseline_materials([item])
+        self.assertIsNone(item["resolvedMaterialId"])
+        self.assertIsNone(item["normalizedRateQuantity"])
+        self.assertEqual(item["materialResolution"]["status"], "ambiguous")
+        self.assertEqual({row["status"] for row in result["exceptions"]}, {"ambiguous", "factor_unavailable"})
+
+    def test_existing_normalization_apply_is_audited_idempotent_and_read_overlay_preserves_rows(self):
+        self.establish([source_row(10, material="MS Plate", dimension="75", quantity="2")])
+        self.client.api_key = "isolated-test-signing-key"
+        detail_row = self.client.tables["LineDetail"][0]
+        before = json.loads(json.dumps(detail_row["fields"], default=str))
+        detail_row["fields"].update({"Material": None, "Quantity": 2, "QuantityUOM": "Nos", "ExactQuantityText": "2"})
+        attributes = json.loads(detail_row["fields"].get("EngineeringAttributes") or "{}")
+        attributes.pop("materialConsumptionBasis", None)
+        detail_row["fields"]["EngineeringAttributes"] = json.dumps(attributes)
+        self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:ms-plate",
+            "CanonicalName": "MS Plate", "ODSDisplayName": "MS Plate", "MappingStatus": "exact_canonical"}}])
+        self.service.material_weight_catalog_provider = lambda: {"status": "available", "source": "Costing-New",
+            "sourceDocumentId": "qa-source", "records": [{"canonicalName": "MS Plate", "masterMaterialId": 21,
+                "kgPerMeter": "5.8", "sourceDate": "2026-11-24", "source": "Costing-New",
+                "sourceDocumentId": "qa-source", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+                "factorUnit": "kg/m", "factorStatus": "available"}]}
+        preview = self.service.preview_existing_normalization(self.part["id"])
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["bindings"][0]["fields"]["Quantity"], 0.435)
+        saved = self.service.apply_existing_normalization(part_id=self.part["id"], preview_fingerprint=preview["previewFingerprint"],
+            actor="qa reviewer", reason="Apply reviewed baseline reference normalization", request_key="baseline-effective-repair-1")
+        replay = self.service.apply_existing_normalization(part_id=self.part["id"], preview_fingerprint=preview["previewFingerprint"],
+            actor="qa reviewer", reason="Apply reviewed baseline reference normalization", request_key="baseline-effective-repair-1")
+        self.assertTrue(saved["applied"])
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(self.service.preview_existing_normalization(self.part["id"])["status"], "no_changes")
+        self.assertEqual(detail_row["fields"]["Material"], before["Material"])
+        self.assertEqual(detail_row["fields"]["Quantity"], 2)
+        from app.baseline_bindings import apply_effective_baseline_override, effective_baseline_overrides
+        request_rows = self.registry._rows("PartRegistryRequest")
+        overrides = effective_baseline_overrides(request_rows, self.part["id"], preview["revisionId"])
+        effective = apply_effective_baseline_override(detail_row, overrides)
+        self.assertEqual(effective["fields"]["Quantity"], 0.435)
+        self.assertEqual(effective["fields"]["Material"], self.client.tables["Material"][0]["id"])
+        self.assertTrue(any(row["fields"].get("EventType") == "part_baseline_effective_binding_applied" for row in self.client.tables["AuditEvent"]))
+        from app.part_definition import GristPartDefinitionService
+        projected = GristPartDefinitionService(self.registry)._definition_from_rows(self.part["id"], preview["revisionId"])
+        projected_line = projected["requirements"][0]
+        self.assertEqual(projected_line["detail"]["Material"], self.client.tables["Material"][0]["id"])
+        self.assertEqual(projected_line["detail"]["Quantity"], 0.435)
+        self.assertNotEqual(projected_line.get("materialConsumptionStatus"), "legacy_duplicate_ambiguous")
+        forged = next(row for row in request_rows if row["fields"].get("RequestType") == "part_baseline_effective_binding")
+        forged = json.loads(json.dumps(forged))
+        forged["fields"]["RequestFingerprint"] = "forged-fingerprint"
+        self.assertEqual(effective_baseline_overrides([forged], self.part["id"], preview["revisionId"]), {},
+            "read overlays accept only exact keyed corrections with a verified request fingerprint")
+
     def compare_rows(self, rows, *, source_hash, request_key):
         groups, mapped = self.save_rows(rows, source_hash, request_key=f"map:{source_hash}")
         result = self.service.compare(part_id=self.part["id"], file_id="pilot.ods", workbook_name=f"{source_hash}.ods",
@@ -990,7 +1142,14 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             "the incomplete legacy removal must not start normalized baseline writes")
 
     def test_grist_commit_response_loss_recovers_the_same_initial_baseline(self):
-        rows = [source_row(10)]
+        self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:ms-plate",
+            "CanonicalName": "MS Plate", "ODSDisplayName": "MS Plate", "MappingStatus": "exact_canonical"}}])
+        catalog = {"status": "available", "source": "Costing-New", "sourceDocumentId": "qa-source",
+            "records": [{"canonicalName": "MS Plate", "masterMaterialId": 21, "kgPerMeter": "5.8",
+                "sourceDate": "2026-11-24", "source": "Costing-New", "sourceDocumentId": "qa-source",
+                "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}]}
+        self.service.material_weight_catalog_provider = lambda: catalog
+        rows = [source_row(10, dimension="75")]
         groups, mapping_result = self.save_rows(rows, "hash-recovery", request_key="map:recovery")
         kwargs = {"part_id": self.part["id"], "file_id": "pilot.ods", "workbook_name": "pilot.ods",
             "workbook_path": "C:/isolated/pilot.ods", "source_hash": "hash-recovery", "association": self.association,
@@ -998,19 +1157,22 @@ class PartBaselineIntegrationTests(unittest.TestCase):
             "actor": "baseline reviewer", "reason": "Retry exact write", "request_key": "baseline-recovery",
             "expected_hash": "hash-recovery", "expected_association": self.association.id,
             "expected_association_version": self.association.version, "expected_mapping_version": mapping_result["version"]}
-        self.client.lose_after_create_table = "PartRevisionLine"
-        with self.assertRaises(TimeoutError):
-            self.service.establish(**kwargs)
-        changed_context = {**kwargs, "source_hash": "hash-changed-after-partial-write"}
-        with self.assertRaises(PartIdentityError) as recovery_required:
-            self.service.establish(**changed_context)
-        self.assertEqual(recovery_required.exception.code, "PART_BASELINE_RECOVERY_REQUIRED")
-        review = self.service.review(part_id=self.part["id"], file_id="pilot.ods", workbook_path=kwargs["workbook_path"],
-            source_hash="hash-recovery", association=self.association, groups=groups, mapping_store=self.mapping_store)
-        self.assertEqual(review["baselineStatus"], "recovery_required")
-        recovered = PartBaselineService(self.registry).establish(**kwargs)
+        with patch.dict("os.environ", {"SAFARI_MATERIAL_EVIDENCE_HMAC_KEY": "isolated-test-signing-key"}):
+            self.client.lose_after_create_table = "PartRevisionLine"
+            with self.assertRaises(TimeoutError):
+                self.service.establish(**kwargs)
+            catalog["records"][0]["kgPerMeter"] = "6.1"
+            changed_context = {**kwargs, "source_hash": "hash-changed-after-partial-write"}
+            with self.assertRaises(PartIdentityError) as recovery_required:
+                self.service.establish(**changed_context)
+            self.assertEqual(recovery_required.exception.code, "PART_BASELINE_RECOVERY_REQUIRED")
+            review = self.service.review(part_id=self.part["id"], file_id="pilot.ods", workbook_path=kwargs["workbook_path"],
+                source_hash="hash-recovery", association=self.association, groups=groups, mapping_store=self.mapping_store)
+            self.assertEqual(review["baselineStatus"], "recovery_required")
+            recovered = PartBaselineService(self.registry).establish(**kwargs)
         self.assertEqual(recovered["baselineStatus"], "established")
         self.assertTrue(recovered["idempotent"])
+        self.assertEqual(self.client.tables["LineDetail"][0]["fields"]["Quantity"], 0.435)
         self.assertEqual(len(self.client.tables["PartRevisionLine"]), 1)
         self.assertEqual(len(self.client.tables["SourceLineObservation"]), 1)
 
