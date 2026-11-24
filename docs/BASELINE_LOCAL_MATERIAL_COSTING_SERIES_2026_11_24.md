@@ -1,0 +1,48 @@
+# Baseline, one-time local master/rate sync and simple Part editing
+
+Owner authorized implementation through Luna High on24November2026 and asked that all packages be implemented and independently reviewed. This supersedes the planning hold. Model for this series: `gpt-6-luna` / `high`, including correction rounds; the older xhigh routing remains historical. Sol owns architecture, requirements and independent review. No Terra or subagents.
+
+## Final owner decisions
+
+- Resolve existing reviewed material mappings automatically during baseline establishment. Ask for selection/approval only for missing, ambiguous or conflicting mappings. Do not ask for approval again for a known match.
+- There is one operator Qty per material row. MCL total kg = piece quantity x per-piece cut length in metres x current approved local kg/m; multiply by current local price/kg and apply established overheads once. Fix the internal duplicated piece count, rather than expose a second quantity question.
+- Current weight calculations follow the local approved master automatically; historical snapshots retain captured facts. Operator-entered CNC per-part weight remains an engineering input. Tool Shop process charges retain their actual eligible basis.
+- MasterMaterial.InUse is the reliable current active/phased-out indicator; preserve old references and history.
+- Do a ONE-TIME Costing-New -> Safari sync now, including material identities/status/kg/m AND current steel and purchased-item prices. Owner answered: "Include current prices; automatic price sync comes later".
+- Do not implement/configure webhooks, continuous workers, periodic source polling/reconciliation, automatic price refresh or server performance monitoring in this series. Those are a separate future requirement. After this import, later upstream changes are not automatically visible; Safari uses the last explicitly imported local version.
+- Ordinary viewing, editing, material searching and current costing must use saved Safari facts. No full Costing-New table loads at screen open, keystroke or ordinary costing. No ODS dependency after baseline establishment.
+
+## Sequential packages and review gates
+
+One active helper task at a time, maximum5 rounds per package. Use a common integration branch/PR; after each exact-SHA acceptance, the owner has authorized dispatching the next listed package. Do not move HEAD/edit source while a submitted phase is under review. No unlisted next package, automatic merge or application deployment. Entire series is finished only after A/B/C and the integrated final acceptance pass, not when A passes.
+
+### A — baseline-reference-normalization-20261124
+
+Fix future baseline material references and internal per-piece consumption semantics, using existing approved mappings. Provide a safe, explicit, audited/idempotent path for existing affected current baselines or effective binding metadata. Preserve historical physical rows and snapshots. Match original source labels and canonical identities, never fuzzy size guesses. Genuine material substitutions still use the normal Part revision workflow. Detailed immutable requirement and seven criteria are recorded in the task inputs.
+
+Independent proof must start from an actual baseline established by the normal application path, not a hand-constructed already-correct Part. Owner regression: Angles65x65x6,2pieces,75mm,existing mapping to MS-Angles65x65x6 with5.8kg/m ->0.435kg/piece,0.870kg total, no redundant mapping/basis question.
+
+### B — one-time-safari-master-rates (freeze immutable task after A acceptance)
+
+1. Implement a guarded preview/apply import and durable original-key recovery, not a running synchronization service. Source reads only; explicit target-ID/workspace validation, native backups, before/after row counts/checksums and audit. QA in a fresh disposable document first; never restore PR10's trashed QA.
+2. Capture a coherent source observation: document/table/record identities, chosen formula outputs, source record/rate evidence, source timestamps and content fingerprints. Recheck drift or restart the capture rather than mix inconsistent source generations. A resumed original request applies the originally captured facts exactly once; a deliberate new import has a new key/version.
+3. Reconcile all source materials with existing Safari identities and reviewed aliases. Reuse existing IDs; create missing distinct identities; report conflicts without guessing, destructive merging or relabelling unrelated stock. Retain names/aliases, InUse, kg/m, original weight-source date and source-version identity. Soft-retire phased-out materials for new selections, retaining existing requirements and history.
+4. Steel rates: preserve the existing MaterialLatestRate/default rule and selected MaterialRateLog provenance. Purchased rates: capture the authoritative PurchasePartsMaster current base rate, Unit, Nos_Per_KG/conversion, source-date/log references, freight/handling and total breakdown from PurchasePartsRateLog/master outputs. Preserve existing cost-basis and charge inclusion rules. Do not mistake formula Bill_Verify_Status for a new approval workflow or create fabricated purchase transactions. Do not add freight/handling twice.
+5. Keep local current-master/rate versions and immutable import observations separate from engineering Part revisions and monetary CostSnapshots. Bind source purchased-item identities to existing reviewed Safari purchase mappings/specifications; do not infer Part/Spare identity from similar descriptions or implement B2 spare composition.
+6. Make ordinary material options and eligible current material/purchased costing read the local Safari data, with batched lookups/cache invalidation by local data version. No per-line N+1 reads and no silent fallback to Costing-New. Unmapped items, missing/invalid units/conversions/rates remain explicit/incomplete, never zero or a made-up complete total.
+7. Recalculate MCL consumption from accepted pieces/cut length and current local master kg/m, not a stale cached per-piece Quantity or old signed conversion. Preserve accepted engineering choices/dimensions; master and rate changes do not require Part approval. Use one consistent local input-version manifest per calculation; reject stale snapshot Save and preserve completed snapshot facts/checksums/source ages. CNC uses entered per-part kg; TS process pricing remains distinct.
+8. Independently verify duplicate/restart/partial-write recovery, source-unavailable operation after import, known material and purchased arithmetic, phased-out records, alias/identity preservation, no upstream calls from normal UI/costing and source-date aging. Then prepare the exact production preview/backup/apply procedure. The owner authorized the one-time Safari data import; the implementor must not write production during coding/QA. Operational application of the verified import is separate from code review and must use the reviewed tool/manifest and exact configured target, with exceptions surfaced before apply. No upstream writes, background automation or application deployment.
+
+### C — simple-local-part-editor (freeze immutable task after B acceptance)
+
+1. One prefilled editable Material To Use combobox, filtering local canonical names and reviewed aliases as the user types. Keep the original saved material value visible; maintain hidden stable canonical IDs. No scrolling through a long select as the primary flow and no source-catalogue/binding panel in routine row editing.
+2. Compact applicable columns only: material, one piece quantity/unit, cut length/unit or CNC per-part kg, read-only calculated weight, optional remarks, Add/Remove actions. Preserve accessible Cancel/Confirm and row focus. Keep advanced facts behind a deliberate details action.
+3. No legacy-consumption questionnaire where the baseline/source contract supplies a known meaning. True unresolved mapping exceptions get one concise actionable selection flow; unrelated editing must preserve saved values.
+4. Existing accepted screen stays read-only by default. Draft/save/reload/controlled actual engineering revision/publication, dependency propagation, readable field history, recovery and snapshots remain intact. No ODS or upstream requests during ordinary usage.
+5. Final independent browser/API/Grist proof must create a fresh baseline using real importer behavior, open it untouched, edit existing values, add/remove all applicable row types, use local typeahead, publish, reopen in a new session, calculate material/purchased costs using the one-time local copy while Costing-New and ODS are unavailable, and verify historical snapshots. Include the owner's actual Angles example and at least one alias and unmapped material, not only prepared synthetic corrected rows.
+
+## Common boundaries
+
+Preserve all existing tracked/untracked changes, metadata, coordinator ownership, PR9/PR10 immutable tasks and source workbooks. Production Safari: bAPdkEDn7brbqTrfVsRmXZ/workspace3; read-only source Costing-New: cPCjjr9oCzhWC7z8vJbcky. Owner4320/4321 remain protected. Reviewer never edits application source. New disposable QA targets require recorded exact IDs/workspace/purpose, integrity-checked native backups and recoverable cleanup only after final verification.
+
+Each task retains full Python/UI/Node24 build, actual isolated persistence/recovery, actual browser, arithmetic/date/history and exact-SHA/protected-file gates. Unverified is not pass. No server webhook configuration, live source writes, production testing, auto merge/deploy, automatic snapshots, full Model Code costing cutover or unlisted scope.
