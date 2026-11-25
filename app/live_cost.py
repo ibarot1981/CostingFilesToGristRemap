@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.domain import utc_now
 from app.cost_dates import cost_date_evidence
 from app.grist_types import datetime_text, decode_grist_any_object, grist_datetime
+from app.material_basis import MCL_KG_PER_PIECE, ONE_ITEM_PER_OCCURRENCE, WEIGHT_PER_PIECE
 from app.part_identity import PartIdentityError, request_fingerprint
 
 
@@ -25,7 +26,7 @@ INPUT_TABLES = (
     "ConfigurationPartSelection", "ProductPart", "PartRevision", "PartMetadataVersion",
     "PartComponentRevision", "PartRevisionLine", "LineMaster", "LineRevision", "LineDetail",
     "PartPurchaseSpecification", "VendorPartMapping", "PartPurchaseRecord", "PartPurchaseUnitConversion",
-    "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate",
+    "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate", "PartRegistryRequest",
 )
 POLICY_VERSION = "live-cost-v1"
 SNAPSHOT_CHECKSUM_V1_COLUMNS = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus",
@@ -514,7 +515,11 @@ class GristLiveCostService:
                 details = details_by_revision.get(line_revision_id or -1, [])
                 if not details:
                     warn("PROCESS_DETAIL_REQUIRED", f"{process} line has no normalized detail/rate basis.", path)
+                from app.baseline_bindings import apply_effective_baseline_override, effective_baseline_overrides
+                effective_overrides = effective_baseline_overrides(tables.get("PartRegistryRequest", []),
+                    str(part_fields.get("StablePartId") or ""), revision_id)
                 for detail in details:
+                    detail = apply_effective_baseline_override(detail, effective_overrides)
                     detail_fields = _fields(detail)
                     material_id = ref_id(detail_fields.get("Material"))
                     canonical_material = material_by_id.get(material_id or -1, {})
@@ -529,6 +534,14 @@ class GristLiveCostService:
                     piece_units = {"nos", "no", "each", "ea", "pcs", "piece", "pieces"}
                     attributes = decode_grist_any_object(detail_fields.get("EngineeringAttributes")) or {}
                     consumption_basis = str(attributes.get("materialConsumptionBasis") or "").strip().casefold()
+                    supported_basis = ((is_material_process and consumption_basis in {
+                        MCL_KG_PER_PIECE, WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE})
+                        or (process_key in {"tool_shop", "tool shop", "toolshop"}
+                            and consumption_basis in {WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE}))
+                    if consumption_basis and not supported_basis:
+                        warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED",
+                            "The saved material consumption basis is not recognized for this process; review it before costing.", path)
+                        continue
                     if (is_material_process and not consumption_basis and detail_unit in piece_units and link_unit in piece_units
                             and amount_per_line is not None and link_quantity is not None and amount_per_line > 1
                             and math.isclose(amount_per_line, link_quantity, rel_tol=0, abs_tol=1e-12)):

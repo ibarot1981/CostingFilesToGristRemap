@@ -746,7 +746,8 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       setError("Finish each attributes field with a valid JSON object before saving the draft."); return;
     }
     setBusy(true); setError(""); setNotice("");
-    const payload = { ...content, baseRevisionId: definition.revisionId, draftKey: definition.draft?.draftKey,
+    const authoredContent = JSON.parse(JSON.stringify(content));
+    const payload = { ...authoredContent, baseRevisionId: definition.revisionId, draftKey: definition.draft?.draftKey,
       expectedSaveVersion: definition.draft?.saveVersion || 0, reason };
     const attempt = operationKey(partId, "draft-save", payload);
     if ("conflict" in attempt && attempt.conflict) { setPendingSave(savedDraftAttempt(partId)); setError("A previous draft save is still unresolved. Retry its original saved request first."); setBusy(false); return; }
@@ -762,6 +763,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
       if (cause instanceof ApiError && cause.status < 500) {
         clearOperationKey(attempt.storageKey); setPendingSave(null);
         if (["PART_DEFINITION_DRAFT_STALE", "PART_DEFINITION_DRAFT_REPLAY_SUPERSEDED"].includes(cause.code)) await reload();
+        else { setContent(authoredContent); setDirty(true); }
       }
       setError(cause instanceof Error ? cause.message : "The draft could not be saved.");
     }

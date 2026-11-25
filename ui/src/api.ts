@@ -115,6 +115,8 @@ export const api = {
   reconcileWorkbookPartBaselines: (payload: unknown, key: string) => send<any>("/api/parts/manufacturing-baselines/workbook-confirm-status", payload, {"Idempotency-Key": key}),
   establishPartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/establish`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   comparePartBaseline: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/compare`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
+  previewPartBaselineNormalization: (id: string) => get<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/normalization-preview`),
+  applyPartBaselineNormalization: (id: string, payload: unknown, key: string) => send<any>(`/api/parts/${encodeURIComponent(id)}/manufacturing-baseline/normalize`, payload, {"Idempotency-Key": key}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   partManufacturingComparison: (key: string) => get<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}`),
   decidePartManufacturingComparison: (key: string, payload: unknown, requestKey: string) => send<any>(`/api/parts/manufacturing-comparisons/${encodeURIComponent(key)}/decisions`, payload, {"Idempotency-Key": requestKey}, "POST", PART_BASELINE_WRITE_TIMEOUT_MS),
   processingState: (path: string) => get<any>(`/api/processing/state?path=${encodeURIComponent(path)}`),

@@ -88,6 +88,23 @@ it("blocks initial baseline submission and explains every missing confirmation",
   expect(apiMocks.establishPartBaseline).not.toHaveBeenCalled();
 });
 
+it("shows row-specific material resolution exceptions and the existing exact-alias path", async () => {
+  apiMocks.partBaselineReview.mockResolvedValueOnce(review()).mockResolvedValueOnce(review("established"));
+  apiMocks.establishPartBaseline.mockResolvedValue({baselineStatus:"established",materialResolutionExceptions:[{
+    family:"mcl",sourceRow:9,sourceLabel:"Unmapped QA Steel",status:"unmatched",
+    message:"No exact approved material alias and local Safari Material match this source label.",
+  }]});
+  renderPanel();
+  await openAndReview();
+  completeFamilyConfirmations();
+  fireEvent.click(screen.getByRole("button", {name:"Establish Part baseline"}));
+
+  const exception = await screen.findByText(/MCL row 9 · Unmapped QA Steel/);
+  expect(exception.textContent).toContain("No exact approved material alias");
+  expect(exception.textContent).toContain("existing Materials command");
+  expect(exception.textContent).toContain("controlled Change Request workflow");
+});
+
 it("keeps a removed mapped line visible and blocks baseline completeness until its removal is reviewed", async () => {
   const baseReview = review();
   const pendingRemoval = {...baseReview, families:{...baseReview.families,

@@ -118,6 +118,20 @@ it("saves a direct edit as a Grist draft and reloads the persisted reason before
   expect(onSaved).not.toHaveBeenCalled();
 });
 
+it("retains typed form values after a terminal draft validation rejection", async () => {
+  apiMocks.savePartDefinitionDraft.mockRejectedValueOnce(new ApiError(
+    "The saved material basis needs correction.", 422, "PART_MATERIAL_BASIS_INVALID", "safe_to_edit"));
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button", {name:"Edit Part"}));
+  fireEvent.change(screen.getByLabelText("Remarks — MCL row 1"), {target:{value:"Keep this authored remark"}});
+  fireEvent.change(screen.getByLabelText("Engineering change reason"), {target:{value:"Preserve failed-save edits"}});
+  fireEvent.click(screen.getByRole("button", {name:"Save draft"}));
+  await screen.findByText("The saved material basis needs correction.");
+  expect((screen.getByLabelText("Remarks — MCL row 1") as HTMLInputElement).value).toBe("Keep this authored remark");
+  expect((screen.getByLabelText("Engineering change reason") as HTMLInputElement).value).toBe("Preserve failed-save edits");
+  expect(localStorage.getItem("safari.part-definition:part-1:draft-save")).toBeNull();
+});
+
 it("locks an uncertain draft save across reload and retries the original key and payload", async () => {
   apiMocks.savePartDefinitionDraft.mockRejectedValueOnce(new Error("connection lost after save"));
   const props = {partId:"part-1",onSaved:vi.fn(),onCompare:vi.fn()};
@@ -405,6 +419,24 @@ it("shows saved MCL cut length and CNC per-part weight without conflating total 
   fireEvent.change(screen.getByLabelText("Per Part Weight (kg) — CNC row 1"),{target:{value:"0.6"}});
   expect(screen.getByText("1.8 kg")).toBeTruthy();
   expect((screen.getByLabelText("Per Part Weight (kg) — CNC row 1") as HTMLInputElement).value).toBe("0.6");
+});
+
+it("opens a normalized known MCL baseline with its material selected and no duplicate-basis prompt", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",kgPerMeter:5.8,
+    weightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",source:"Costing-New",sourceDate:"2026-11-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,requirements:[{requirementKey:"known-mcl",identityStatus:"stable",family:"mcl",
+    quantity:2,uom:"Nos",processType:"material_cut",materialConsumptionStatus:"resolved",
+    detail:{Material:5,MaterialDisplayName:"Angles 65 x 65 x 6",Quantity:0.435,QuantityUOM:"kg",DimensionMM:75,
+      DimensionText:"75",DimensionUOM:"mm",WeightKg:0.87,EngineeringAttributes:{materialConsumptionBasis:"mcl_kg_per_piece",
+        materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",source:"Costing-New",sourceDate:"2026-11-24"}}},
+    provenance:{type:"ods_baseline",evidence:{sourceRow:7}}}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  expect(await screen.findByText("0.435 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.87 kg per parent Part")).toBeTruthy();
+  expect(screen.queryByRole("group",{name:/Legacy consumption review/})).toBeNull();
+  fireEvent.click(screen.getByRole("button",{name:"Edit Part"}));
+  expect((screen.getByLabelText("Material To Use — MCL row 1") as HTMLSelectElement).value).toBe("5");
+  expect(screen.queryByLabelText("Resolve material consumption — MCL row 1")).toBeNull();
 });
 
 it("distinguishes a missing saved CNC total from a zero weight", async () => {

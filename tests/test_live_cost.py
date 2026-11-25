@@ -425,6 +425,47 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual((authored["sourceType"], authored["quantity"], authored["quantityUOM"], authored["rate"], authored["netCost"]), ("material", 4, "kg", 5.0, 20.0))
         self.assertNotIn("PROCESS_RATE_UNAVAILABLE", {warning["code"] for warning in live["warnings"]})
 
+    def test_mcl_baseline_basis_keeps_weight_per_piece_quantity_and_blocks_unknown_basis(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-mcl-marker",
+            "CanonicalName": "MCL marker steel", "MappingStatus": "reviewed"}}])["records"][0]
+        master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:mcl-marker",
+            "ProcessType": "material_cut", "SourcePartName": "MCL marker steel"}}])["records"][0]
+        revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:mcl-marker",
+            "LineMaster": master["id"], "ProcessType": "material_cut", "PhysicalSignature": "mcl-marker-v1", "Status": "active"}}])["records"][0]
+        detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:mcl-marker",
+            "LineRevision": revision["id"], "ProcessType": "material_cut", "Material": material["id"],
+            "MaterialDisplayName": "MCL marker steel", "ItemName": "MCL marker steel cut", "Quantity": 0.435,
+            "ExactQuantityText": "0.435", "QuantityUOM": "kg", "DimensionMM": 75,
+            "EngineeringAttributes": json.dumps({"materialConsumptionBasis": "mcl_kg_per_piece"})}}])["records"][0]
+        self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:mcl-marker",
+            "RequirementKey": "mcl-marker-occurrence", "PartRevision": self.parent["revisionRecordId"],
+            "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
+            "QuantityPerPart": 2, "QuantityExact": "2", "QuantityUOM": "Nos", "Status": "active"}}])
+        self.rate["MCL marker steel"] = "5"
+        self.rate_metadata["MCL marker steel"] = {"uom": "kg", "sourceDate": "2026-11-20"}
+        evidence = {"schema": "safari-material-weight-evidence-v1", "materialRef": material["id"],
+            "materialCanonicalName": "MCL marker steel", "canonicalName": "MCL marker steel", "masterMaterialId": 55,
+            "kgPerMeter": "5.8", "sourceDate": "2026-11-24", "source": "Costing-New",
+            "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+            "factorUnit": "kg/m", "factorStatus": "available"}
+        evidence["signature"] = hmac.new(self.client.api_key.encode("utf-8"), json.dumps(evidence, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), default=str, allow_nan=False).encode("utf-8"), hashlib.sha256).hexdigest()
+        attributes = {"materialConsumptionBasis": "mcl_kg_per_piece", "materialWeightEvidence": evidence}
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"EngineeringAttributes": json.dumps(attributes)}}])
+
+        with patch.dict(os.environ, {"COSTING_NEW_GRIST_DOC_ID": "costing-new-test"}):
+            live = self.service.live_cost(100)
+        line = next((item for item in live["lines"] if item["description"] == "MCL marker steel cut"), None)
+        self.assertIsNotNone(line, live["lines"])
+        self.assertEqual((line["quantity"], line["quantityUOM"], line["rate"], line["netCost"]), (1.74, "kg", 5.0, 8.7))
+
+        attrs = {"materialConsumptionBasis": "unrecognized_mcl_basis"}
+        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"EngineeringAttributes": json.dumps(attrs)}}])
+        with patch.dict(os.environ, {"COSTING_NEW_GRIST_DOC_ID": "costing-new-test"}):
+            unresolved = self.service.live_cost(100)
+        self.assertIn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED", {warning["code"] for warning in unresolved["warnings"]})
+        self.assertNotIn("MCL marker steel cut", {item["description"] for item in unresolved["lines"]})
+
     def test_new_toolshop_and_cnc_requirements_cost_from_eligible_dated_rates(self):
         created = {}
         for process, quantity, rate in (("tool_shop", 3, 2), ("cnc", 4, 3)):

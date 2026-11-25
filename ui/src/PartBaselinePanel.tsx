@@ -44,6 +44,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart, ini
   const [oldData, setOldData] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [resolutionExceptions, setResolutionExceptions] = useState<Record<string, any>[]>([]);
   const [busy, setBusy] = useState(false);
   const autoLoadRequest = useRef("");
 
@@ -51,7 +52,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart, ini
     if (!choices.some(part => part.id === partId)) setPartId(choices[0]?.id || "");
   }, [choices, partId]);
   useEffect(() => {
-    setReview(null); setComparison(null); setError(""); setNotice("");
+    setReview(null); setComparison(null); setError(""); setNotice(""); setResolutionExceptions([]);
     setAttempt(null); setDecisionAttempt(null);
     if (!partId || !open) return;
     let restoredWrite: Attempt | null = null;
@@ -166,6 +167,7 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart, ini
       const result = operation === "establish"
         ? await api.establishPartBaseline(partId, current.payload, current.key)
         : await api.comparePartBaseline(partId, current.payload, current.key);
+      if (operation === "establish") setResolutionExceptions(Array.isArray((result as any).materialResolutionExceptions) ? (result as any).materialResolutionExceptions : []);
       setAttempt(null); localStorage.removeItem(attemptStorageKey(path, partId));
       if (operation === "compare") setComparison(result as Comparison);
       const completedNotice = operation === "establish"
@@ -283,6 +285,13 @@ export function PartBaselinePanel({ path, parts, groups, onUseDifferentPart, ini
           {review.baselineStatus !== "established" && <small>Compare is available after an accepted baseline exists.</small>}
           {attempt && <small>Outcome is unresolved. Retry uses the original request identity and exact payload before another operation can start.</small>}
         </div>
+        {!!resolutionExceptions.length && <div className="part-baseline-validation" role="status">
+          <strong>Material normalization needs review</strong>
+          <ul>{resolutionExceptions.map((item, index) => <li key={`${item.family}:${item.sourceRow}:${item.status}:${index}`}>
+            {String(item.family || "requirement").toUpperCase()} row {String(item.sourceRow ?? "?")} · {String(item.sourceLabel || "Material not supplied")} · {String(item.message || item.status || "Review mapping and source evidence.")}
+            {item.status !== "factor_unavailable" && <span> Add this exact alias with the existing Materials command, then refresh the audited normalization preview; genuine material changes continue through the controlled Change Request workflow.</span>}
+          </li>)}</ul>
+        </div>}
       </>}
       {comparison && <ComparisonReview comparison={comparison} path={path} groups={groups} onDecision={decide} onRetryDecision={() => decisionAttempt && void sendDecisionAttempt(decisionAttempt)} decisionAttempt={decisionAttempt} reason={decisionReason} setReason={setDecisionReason} oldData={oldData} setOldData={setOldData} busy={busy}/>}
       {decisionAttempt && !comparison && <div className="part-baseline-warning" role="status">A saved comparison decision has an unresolved outcome. The comparison is being restored so its original request can be retried.</div>}
