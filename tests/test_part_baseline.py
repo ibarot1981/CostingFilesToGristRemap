@@ -742,7 +742,7 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         cnc = self.family_group("cnc", 92, description="Frame Plate", part_category="Frame Plate",
             product_part_name="Plate to cut", material_to_cut="Angles 65 x 65 x 6", part_weight_kg="0.21", qty="2")
         toolshop = self.family_group("toolshop", 93, description="Drill operation", toolshop_part_name="Drill operation",
-            material_to_cut="Angles 65 x 65 x 6", qty="3")
+            material_to_cut="Angles 65 x 65 x 6", dimension_to_cut_mm="30", qty="3")
         groups = PartSourceGroups([mcl, cnc, toolshop], all_source_diagnostics())
         saved = self.save_group_set(groups, "family-quantity-once")
         self.service.material_weight_catalog_provider = lambda: catalog
@@ -770,7 +770,8 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual((_ref_id(cnc_line[2]["Material"]), cnc_line[2]["Quantity"], cnc_line[2]["QuantityUOM"], cnc_line[1]["QuantityPerPart"]),
             (material["id"], 0.21, "kg", 2))
         self.assertEqual((toolshop_line[2]["Quantity"], toolshop_line[2]["QuantityUOM"], toolshop_line[1]["QuantityPerPart"]),
-            (1, "Nos", 3))
+            (0.174, "kg", 3))
+        self.assertEqual(json.loads(toolshop_line[2]["EngineeringAttributes"])["materialConsumptionBasis"], "weight_per_piece")
         self.assertEqual(result["materialResolutionExceptions"], [])
 
     def test_baseline_missing_factor_and_ambiguous_identity_fail_closed(self):
@@ -783,6 +784,13 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertIsNone(item["normalizedRateQuantity"])
         self.assertEqual(item["materialResolution"]["status"], "ambiguous")
         self.assertEqual({row["status"] for row in result["exceptions"]}, {"ambiguous", "factor_unavailable"})
+        toolshop = {"family": "toolshop", "row": 12, "material": "Angles 65 x 65 x 6",
+            "dimensionMM": Decimal("30"), "rawFields": {}}
+        self.service.material_weight_catalog_provider = lambda: {"status": "available", "sourceDocumentId": "qa-source", "records": []}
+        toolshop_result = self.service._normalize_baseline_materials([toolshop])
+        self.assertIsNone(toolshop["normalizedRateQuantity"])
+        self.assertEqual(toolshop["normalizedRateUnit"], "kg")
+        self.assertIn("factor_unavailable", {row["status"] for row in toolshop_result["exceptions"]})
 
     def test_existing_normalization_apply_is_audited_idempotent_and_read_overlay_preserves_rows(self):
         self.establish([source_row(10, material="MS Plate", dimension="75", quantity="2")])

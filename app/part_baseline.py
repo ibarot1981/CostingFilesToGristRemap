@@ -16,7 +16,7 @@ from typing import Any, Callable
 from app.domain import utc_now
 from app.grist_parts import GristAdminClientShim, GristPartRegistry, _ref, _serialized
 from app.grist_types import grist_datetime
-from app.material_basis import MCL_KG_PER_PIECE
+from app.material_basis import MCL_KG_PER_PIECE, WEIGHT_PER_PIECE
 from app.part_identity import PartIdentityError, request_fingerprint
 from app.part_mapping import MAPPING_POLICY_VERSION, mapping_detail
 from app.utils import normalize_header
@@ -531,8 +531,23 @@ class PartBaselineService:
                     exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
                         "canonicalName": canonical or None, "status": "part_weight_unavailable",
                         "message": "Per Part Weight is missing from engineering evidence; generic total WeightKg was not treated as per-part consumption."})
+            elif family == "toolshop" and item.get("dimensionMM") is not None:
+                # A Tool Shop row with a material and cut length represents
+                # physical stock consumption. Normalize its mass per piece;
+                # the PartRevisionLine retains the source piece count once.
+                dimension_mm = item.get("dimensionMM")
+                per_piece = (dimension_mm / Decimal(1000) * factor
+                    if dimension_mm is not None and factor is not None else None)
+                item["normalizedRateQuantity"] = per_piece
+                item["normalizedRateUnit"] = "kg"
+                item["materialWeightEvidence"] = evidence
+                if source_label and per_piece is None:
+                    exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
+                        "canonicalName": canonical or None, "status": "factor_unavailable",
+                        "message": "A unique validated Costing-New kg/m factor is unavailable for this cut length; weight and cost remain incomplete."})
             else:
-                # Tool Shop rates are per-piece/process operations; Qty belongs only on the link.
+                # Tool Shop service-only operations without a cut length keep
+                # their per-piece/process basis; Qty belongs only on the link.
                 item["normalizedRateQuantity"] = Decimal(1)
                 item["normalizedRateUnit"] = "Nos"
             item["resolvedMaterialId"] = material_id if material_status == "resolved" else None
@@ -1597,6 +1612,8 @@ class PartBaselineService:
                 attributes["materialWeightEvidence"] = item["materialWeightEvidence"]
             if item["family"] == "mcl":
                 attributes["materialConsumptionBasis"] = MCL_KG_PER_PIECE
+            elif item["family"] == "toolshop" and item.get("normalizedRateUnit") == "kg":
+                attributes["materialConsumptionBasis"] = WEIGHT_PER_PIECE
             detail_rows.append({"DetailKey": line_detail_key, "LineRevision": line_revision_id,
                 "ProcessType": item["processType"], "Material": item.get("resolvedMaterialId"), "PurchaseItem": None,
                 "ProcessOperation": None, "WorkCenter": None, "Quantity": _number(item.get("normalizedRateQuantity")),
