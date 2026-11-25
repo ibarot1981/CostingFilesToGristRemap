@@ -20,6 +20,7 @@ from app.exceptions import GristError
 from app.domain import utc_now
 from app.grist_parts import GristPartFeatures, GristPartRegistry, _ref, _serialized
 from app.grist_types import canonical_grist_json_cell, decode_grist_any_object, grist_datetime
+from app.material_basis import MCL_KG_PER_PIECE, ONE_ITEM_PER_OCCURRENCE, WEIGHT_PER_PIECE, WEIGHT_PER_PIECE_BASES
 from app.part_identity import PartIdentityError, request_fingerprint
 
 
@@ -1575,10 +1576,13 @@ class GristPartDefinitionService:
             submitted_material_basis = str(raw.get("materialConsumptionResolution") or "").strip().casefold()
             legacy_basis_review = bool(existing and self._legacy_duplicate_material_basis(existing))
             material_basis = submitted_material_basis if legacy_basis_review else (submitted_material_basis or saved_material_basis)
-            if legacy_basis_review and material_basis not in {"weight_per_piece", "one_item_per_occurrence"}:
+            supported_material_bases = {WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE}
+            if family == "mcl":
+                supported_material_bases.add(MCL_KG_PER_PIECE)
+            if legacy_basis_review and material_basis not in supported_material_bases:
                 raise PartIdentityError("PART_MATERIAL_BASIS_REVIEW_REQUIRED",
                     "This legacy MCL/Tool Shop row stores the same piece count in normalized consumption and Qty per Part. Review the per-piece material basis before saving.")
-            if material_basis and material_basis not in {"weight_per_piece", "one_item_per_occurrence"}:
+            if material_basis and material_basis not in supported_material_bases:
                 raise PartIdentityError("PART_MATERIAL_BASIS_INVALID", "Choose physical weight per piece or one stock item per occurrence.")
             detail_attributes.pop("materialConsumptionBasis", None)
             if material_basis:
@@ -1590,7 +1594,7 @@ class GristPartDefinitionService:
                 if family in {"mcl", "toolshop"} and value_mm is not None and value_mm > 0 and weight_factor is not None and weight_factor > 0 else None)
 
             rate_uom = str(detail.get("QuantityUOM") or "").strip()
-            if material_basis == "weight_per_piece":
+            if material_basis in WEIGHT_PER_PIECE_BASES:
                 if family not in {"mcl", "toolshop"} or calculated_material_weight_kg is None:
                     raise PartIdentityError("PART_MATERIAL_WEIGHT_REQUIRED", "A trusted material conversion and positive Dimension to Cut are required for per-piece weight resolution.")
                 rate_uom = "kg"
@@ -1612,7 +1616,7 @@ class GristPartDefinitionService:
                 raise PartIdentityError("PART_DEFINITION_DETAIL_NUMBER_INVALID", "Normalized consumption must be a finite numeric value where supplied.")
             consumption_derived = False
             missing_cross_dimension_conversion = False
-            if material_basis == "weight_per_piece":
+            if material_basis in WEIGHT_PER_PIECE_BASES:
                 detail["Quantity"] = calculated_material_weight_kg
                 detail["ExactQuantityText"] = format(calculated_material_weight_kg, ".15g")
                 rate_quantity_value = detail["Quantity"]

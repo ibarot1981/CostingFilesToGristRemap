@@ -14,6 +14,7 @@ from app.grist_parts import GristPartRegistry
 from app.part_baseline import PartBaselineService
 from app.part_baseline import _family_confirmations, _family_review_rows, _raw_requirement, _requirements_for_part
 from app.part_identity import PartIdentityError
+from app.part_definition import GristPartDefinitionService
 from app.part_mapping import MemoryPartStore, PartConflict, PartRegistryMappingStore, PartSourceGroups, mapping_detail, save_mapping
 from test_grist_parts_recovery import MemoryGrist
 
@@ -673,6 +674,60 @@ class PartBaselineIntegrationTests(unittest.TestCase):
         self.assertEqual((detail["Quantity"], detail["QuantityUOM"], link["QuantityPerPart"]), (0.435, "kg", 2))
         self.assertEqual(result["materialResolutionExceptions"], [])
         self.assertEqual(result["baselineStatus"], "established")
+
+    def test_real_baseline_writer_output_passes_through_definition_draft_normalization(self):
+        material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:angles-65",
+            "CanonicalName": "MS-Angles 65 x 65 x 6", "ODSDisplayName": "Angles65x65x6", "MappingStatus": "reviewed_alias"}}])["records"][0]
+        catalog = {"status": "available", "source": "Costing-New", "sourceDocumentId": "qa-source",
+            "records": [{"canonicalName": "MS-Angles 65 x 65 x 6", "masterMaterialId": 8, "kgPerMeter": "5.8",
+                "sourceDate": "2026-11-24", "source": "Costing-New", "sourceDocumentId": "qa-source",
+                "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "factorStatus": "available"}]}
+        self.service.material_weight_catalog_provider = lambda: catalog
+        definitions = GristPartDefinitionService(self.registry, material_weight_catalog_provider=lambda: catalog)
+        with patch.dict("os.environ", {"SAFARI_MATERIAL_EVIDENCE_HMAC_KEY": "isolated-test-signing-key"}):
+            self.establish([source_row(78, material="Angles 65 x 65 x 6", dimension="75", quantity="2")],
+                source_hash="writer-to-editor-normalization", request_key="writer-to-editor-normalization")
+            before = definitions.get_definition(self.part["id"])
+            content = {"baseRevisionId": before["revisionId"], "applicability": before["applicability"],
+                "requirements": before["requirements"], "components": before["components"], "purchases": before["purchases"],
+                "finalizeOnPublication": False, "expectedSaveVersion": 0}
+            content["requirements"][0]["detail"]["ToolShopRemarks"] = "Remark survives draft normalization"
+            saved = definitions.save_draft(self.part["id"], content, actor="test operator",
+                reason="Save ordinary remark on a normalized baseline", request_key="writer-to-editor-draft")
+            reloaded = definitions.get_definition(self.part["id"])
+        saved_requirement = saved["content"]["requirements"][0]
+        attributes = saved_requirement["detail"]["EngineeringAttributes"]
+        attributes = json.loads(attributes) if isinstance(attributes, str) else attributes
+        self.assertEqual(saved["saveVersion"], 1)
+        self.assertEqual(attributes["materialConsumptionBasis"], "mcl_kg_per_piece")
+        self.assertEqual(saved_requirement["detail"]["Material"], material["id"])
+        self.assertAlmostEqual(float(saved_requirement["detail"]["Quantity"]), 0.435)
+        self.assertEqual(saved_requirement["detail"]["ToolShopRemarks"], "Remark survives draft normalization")
+        self.assertEqual(reloaded["draft"]["content"]["requirements"][0]["detail"]["ToolShopRemarks"],
+            "Remark survives draft normalization")
+
+    def test_cnc_normalization_does_not_treat_generic_weight_as_part_weight(self):
+        self.client.create_table_records("Material", [{"fields": {"MaterialKey": "plate", "CanonicalName": "MS Plate"}}])
+        self.service.material_weight_catalog_provider = lambda: {"status": "available", "sourceDocumentId": "qa-source", "records": []}
+        item = {"family": "cnc", "row": 12, "material": "MS Plate", "dimensionMM": None,
+            "quantity": Decimal("2"), "rawFields": {"WeightKg": "2"}}
+        result = self.service._normalize_baseline_materials([item])
+        self.assertIsNone(item["normalizedRateQuantity"])
+        self.assertEqual(item["normalizedRateUnit"], "kg")
+        self.assertIn("part_weight_unavailable", {row["status"] for row in result["exceptions"]})
+
+    def test_repair_does_not_substitute_a_conflicting_existing_material_reference(self):
+        self.establish([source_row(79, material="MS Plate", dimension="75", quantity="2")])
+        mapped = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mapped", "CanonicalName": "MS Plate"}}])["records"][0]
+        conflicting = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "conflict", "CanonicalName": "Other Plate"}}])["records"][0]
+        detail = self.client.tables["LineDetail"][0]
+        detail["fields"]["Material"] = conflicting["id"]
+        self.service.material_weight_catalog_provider = lambda: {"status": "available", "sourceDocumentId": "qa-source", "records": []}
+        preview = self.service.preview_existing_normalization(self.part["id"])
+        self.assertEqual(preview["bindings"], [])
+        conflict = next(row for row in preview["exceptions"] if row["status"] == "existing_material_conflict")
+        self.assertIn(str(conflicting["id"]), conflict["message"])
+        self.assertNotEqual(conflicting["id"], mapped["id"])
 
     def test_establish_normalizes_duplicate_mcl_cnc_and_toolshop_occurrences_once(self):
         material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "material:angles-65",

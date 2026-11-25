@@ -16,6 +16,7 @@ from typing import Any, Callable
 from app.domain import utc_now
 from app.grist_parts import GristAdminClientShim, GristPartRegistry, _ref, _serialized
 from app.grist_types import grist_datetime
+from app.material_basis import MCL_KG_PER_PIECE
 from app.part_identity import PartIdentityError, request_fingerprint
 from app.part_mapping import MAPPING_POLICY_VERSION, mapping_detail
 from app.utils import normalize_header
@@ -526,6 +527,10 @@ class PartBaselineService:
                 per_piece = _decimal(item["rawFields"].get("part_weight_kg"))
                 item["normalizedRateQuantity"] = per_piece
                 item["normalizedRateUnit"] = "kg"
+                if source_label and per_piece is None:
+                    exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
+                        "canonicalName": canonical or None, "status": "part_weight_unavailable",
+                        "message": "Per Part Weight is missing from engineering evidence; generic total WeightKg was not treated as per-part consumption."})
             else:
                 # Tool Shop rates are per-piece/process operations; Qty belongs only on the link.
                 item["normalizedRateQuantity"] = Decimal(1)
@@ -623,10 +628,6 @@ class PartBaselineService:
             detail = _row_fields(detail_row)
             attributes = _unjson(detail.get("EngineeringAttributes"))
             attributes = attributes if isinstance(attributes, dict) else {}
-            if (family == "mcl" and attributes.get("materialConsumptionBasis") == "mcl_kg_per_piece"
-                    and _ref_id(detail.get("Material")) and self.registry._rows("Material")):
-                # Still include rows with a legacy duplicate shape only if the explicit basis is absent.
-                continue
             quantity = _decimal(link_fields.get("QuantityExact") or link_fields.get("QuantityPerPart"))
             source_fields = _unjson(observation.get("ObservedFields"))
             source_fields = source_fields if isinstance(source_fields, dict) else {}
@@ -642,12 +643,13 @@ class PartBaselineService:
                 length_mm = inches * Decimal("25.4") if inches is not None else None
             item = {"family": family, "row": int(link["id"]), "material": source_label,
                 "dimensionMM": length_mm, "rawFields": {**source_fields,
-                    "part_weight_kg": detail.get("PartWeightKg") or source_fields.get("part_weight_kg") or detail.get("WeightKg")},
+                    "part_weight_kg": detail.get("PartWeightKg") or source_fields.get("part_weight_kg")},
                 "quantity": quantity}
             candidates.append({"lineId": int(link["id"]), "lineRevisionId": line_revision_id,
                 "detailId": int(detail_row["id"]), "detail": detail, "item": item})
         actionable = [item for item in candidates if item.get("item")]
         normalization = self._normalize_baseline_materials([item["item"] for item in actionable])
+        exceptions = list(normalization["exceptions"])
         binding_rows = []
         for candidate in actionable:
             item = candidate["item"]
@@ -655,12 +657,23 @@ class PartBaselineService:
             status = item.get("materialResolution", {}).get("status")
             if status != "resolved":
                 continue
+            existing_material_id = _ref_id(detail.get("Material"))
             attrs = _unjson(detail.get("EngineeringAttributes"))
             attrs = attrs if isinstance(attrs, dict) else {}
+            if existing_material_id is not None and existing_material_id != int(item["resolvedMaterialId"]):
+                exceptions.append({"family": item["family"], "sourceRow": item["row"],
+                    "sourceLabel": item.get("material"), "canonicalName": item.get("materialResolution", {}).get("canonicalName"),
+                    "status": "existing_material_conflict",
+                    "message": f"The current line is already bound to Safari Material {existing_material_id}; no different identity was substituted."})
+                continue
+            if (item["family"] == "mcl" and attrs.get("materialConsumptionBasis") == MCL_KG_PER_PIECE
+                    and existing_material_id == int(item["resolvedMaterialId"])):
+                # A valid typed MCL binding is already normalized; do not refresh its frozen factor.
+                continue
             attrs.update({"baselineMaterialResolution": item.get("materialResolution"),
                 "baselineRateBasis": "per_piece", "baselineSourceQuantity": _decimal_text(item.get("quantity"))})
             if item["family"] == "mcl":
-                attrs["materialConsumptionBasis"] = "mcl_kg_per_piece"
+                attrs["materialConsumptionBasis"] = MCL_KG_PER_PIECE
                 attrs["materialWeightEvidence"] = item.get("materialWeightEvidence")
             binding_fields = {"Material": item["resolvedMaterialId"],
                 "Quantity": _number(item.get("normalizedRateQuantity")),
@@ -672,7 +685,7 @@ class PartBaselineService:
             binding_rows.append({"detailId": candidate["detailId"], "lineId": candidate["lineId"],
                 "lineRevisionId": candidate["lineRevisionId"], "revisionId": revision_id,
                 "beforeFingerprint": _digest({key: detail.get(key) for key in binding_fields}), "fields": binding_fields})
-        exceptions = normalization["exceptions"] + [item for item in candidates if not item.get("item")]
+        exceptions.extend(item for item in candidates if not item.get("item"))
         preview = {"partId": str(part_id), "revisionId": revision_id, "baselineId": baseline_id,
             "status": "ready" if binding_rows else "no_changes", "bindings": binding_rows,
             "exceptions": exceptions, "preservesAcceptedRows": True, "writesOnRead": False}
@@ -1583,7 +1596,7 @@ class PartBaselineService:
             if item.get("materialWeightEvidence"):
                 attributes["materialWeightEvidence"] = item["materialWeightEvidence"]
             if item["family"] == "mcl":
-                attributes["materialConsumptionBasis"] = "mcl_kg_per_piece"
+                attributes["materialConsumptionBasis"] = MCL_KG_PER_PIECE
             detail_rows.append({"DetailKey": line_detail_key, "LineRevision": line_revision_id,
                 "ProcessType": item["processType"], "Material": item.get("resolvedMaterialId"), "PurchaseItem": None,
                 "ProcessOperation": None, "WorkCenter": None, "Quantity": _number(item.get("normalizedRateQuantity")),
