@@ -203,6 +203,8 @@ class Workflow:
             state['requests'][request_id] = {'fingerprint': fingerprint, 'result': result}
             if action == 'accept':
                 self.exact_commit(state, self.submitted(state))
+            elif action == 'accept-merged':
+                self.exact_merged(state, self.submitted(state), payload)
             self.commit(state)
             return result
 
@@ -284,12 +286,15 @@ class Workflow:
             self.exact_commit(state, report)
             self.artifact(state, f'implementation-reports/{number:03}.json', encoded(report))
             state.update(state='awaiting_review', claim=None)
-        elif action in ('request-round', 'accept'):
+        elif action in ('request-round', 'accept', 'accept-merged'):
             if current != 'reviewing':
                 raise WorkflowError('Review result requires reviewing state.')
             self.owner(state, p, 'reviewer')
             submitted = self.submitted(state)
-            self.exact_commit(state, submitted)
+            if action == 'accept-merged':
+                self.exact_merged(state, submitted, p)
+            else:
+                self.exact_commit(state, submitted)
             report = p['report']
             expected_ids = {c['id'] for c in state['criteria']}
             assessments = report.get('criteria', [])
@@ -300,11 +305,19 @@ class Workflow:
                     or any(item.get('status') not in {'pass', 'fail', 'unverified'} or not item.get('evidence') for item in assessments)
                     or not isinstance(report.get('findings'), list) or not isinstance(report.get('unverified_checks'), list)):
                 raise WorkflowError('Review must identify the submitted commit and assess every criterion with evidence.')
-            if action == 'accept':
-                checks = submitted['validation_results']
+            if action in ('accept', 'accept-merged'):
+                merged = action == 'accept-merged'
+                checks = report.get('validation_results', []) if merged else submitted['validation_results']
                 passed = {item.get('name') for item in checks if item.get('status') == 'pass' and item.get('verified') is True and item.get('evidence')}
+                pending = submitted['unverified_checks']
+                if merged:
+                    if (not p.get('owner_note', '').strip() or not p.get('verification_addendum', '').strip()
+                            or set(report.get('resolved_submission_checks', [])) != set(pending)
+                            or any(item.get('status') == 'fail' for item in submitted['validation_results'])):
+                        raise WorkflowError('Merged acceptance needs explicit owner authority, verification addendum, and evidence resolving every pending submitted check; failed implementation checks require correction.')
+                    pending = []
                 if (any(item['status'] != 'pass' or item.get('verified') is not True for item in assessments)
-                        or report['findings'] or report['unverified_checks'] or submitted['unverified_checks'] or submitted['blockers']
+                        or report['findings'] or report['unverified_checks'] or pending or submitted['blockers']
                         or any(item['status'] != 'pass' or item['verified'] is not True for item in checks)
                         or not set(state['required_checks']).issubset(passed)):
                     raise WorkflowError('Acceptance requires verified criteria, required checks, and no open findings/unverified checks/blockers.')
@@ -316,10 +329,15 @@ class Workflow:
             self.artifact(state, f'review-reports/{number:03}.json', encoded(report))
             if action == 'request-round':
                 self.artifact(state, f'correction-prompts/{number:03}.md', p['prompt'].encode())
-            if action == 'accept':
+            if action in ('accept', 'accept-merged'):
+                if action == 'accept-merged':
+                    self.artifact(state, f'merged-acceptances/{number:03}.json', encoded({
+                        'reviewed_commit': submitted['commit_sha'], 'merged_commit': p['merged_commit'],
+                        'owner_note': p['owner_note'], 'verification_addendum': p['verification_addendum'],
+                        'resolved_submission_checks': report['resolved_submission_checks']}))
                 self.artifact(state, 'SUCCESS.json', encoded({'task_id': state['task_id'], 'round': number,
                     'reviewed_commit': submitted['commit_sha'], 'review_report': f'review-reports/{number:03}.json',
-                    'pr_url': state['pr_url'], 'meaning': 'Verified acceptance only; merge/deployment/production writes are not authorized.'}))
+                    'pr_url': state['pr_url'], 'meaning': ('Verified owner-authorized prior merge with identical tested tree; deployment/production writes are not authorized.' if action == 'accept-merged' else 'Verified acceptance only; merge/deployment/production writes are not authorized.')}))
                 state.update(state='complete', claim=None)
             elif number >= state['max_rounds']:
                 self.block(state, f'Maximum {state["max_rounds"]} implementation rounds reached; owner intervention required.', 'awaiting_implementation')
@@ -363,6 +381,24 @@ class Workflow:
         else:
             raise WorkflowError('Unknown transition.')
 
+    def exact_merged(self, state, report, payload):
+        """Reconcile a human-authorized prior merge without rewriting submission history."""
+        worktree, merged = state['worktree'], str(payload.get('merged_commit') or '')
+        if (str(Path(report['worktree_path']).resolve()) != worktree
+                or not re.fullmatch(r'[0-9a-f]{40}', merged)
+                or git(worktree, 'rev-parse', 'HEAD') != merged
+                or git(worktree, 'branch', '--show-current') != 'main'
+                or git(worktree, 'rev-parse', 'origin/main') != merged
+                or git(worktree, 'rev-parse', report['commit_sha'] + '^{tree}') != git(worktree, 'rev-parse', merged + '^{tree}')):
+            raise WorkflowError('Merged acceptance requires synchronized main and an identical submitted/merged tree.')
+        now = dirty(worktree)
+        for name, value in state['preexisting_changes'].items():
+            if now.get(name) != value:
+                raise WorkflowError(f'Unrelated preexisting workspace change was modified: {name}')
+        for name, value in now.items():
+            if name.startswith(APPLICATION_DIRS) and state['preexisting_changes'].get(name) != value:
+                raise WorkflowError(f'Uncommitted application work cannot be accepted: {name}')
+
     def block(self, state, reason, resume_state):
         if not reason.strip():
             raise WorkflowError('Blocker reason required.')
@@ -382,7 +418,7 @@ def main():
     status = commands.add_parser('status')
     status.add_argument('--task-id')
     status.add_argument('--stale-seconds', type=int, default=3600)
-    for action in ('create', 'claim-implementation', 'claim-review', 'checkpoint', 'publish-implementation', 'request-round', 'accept', 'block', 'resume', 'authorize-recovery'):
+    for action in ('create', 'claim-implementation', 'claim-review', 'checkpoint', 'publish-implementation', 'request-round', 'accept', 'accept-merged', 'block', 'resume', 'authorize-recovery'):
         p = commands.add_parser(action)
         p.add_argument('--task-id', required=True)
         p.add_argument('--round', type=int, required=True)
@@ -404,8 +440,11 @@ def main():
                 p.add_argument('--goal-objective', required=True)
                 p.add_argument('--stage', required=True)
                 p.add_argument('--next-action', required=True)
-            if action in ('accept', 'request-round', 'publish-implementation'):
+            if action in ('accept', 'accept-merged', 'request-round', 'publish-implementation'):
                 p.add_argument('--report', type=Path, required=True)
+            if action == 'accept-merged':
+                p.add_argument('--merged-commit', required=True)
+                p.add_argument('--verification-addendum', type=Path, required=True)
             if action == 'request-round':
                 p.add_argument('--prompt', type=Path, required=True)
                 p.add_argument('--criterion-id', action='append', required=True)
@@ -413,7 +452,7 @@ def main():
                 p.add_argument('--prompt', type=Path, required=True)
                 p.add_argument('--criterion-id', action='append', required=True)
                 p.add_argument('--additional-rounds', type=int, required=True)
-            if action in ('block', 'resume', 'authorize-recovery'):
+            if action in ('block', 'resume', 'authorize-recovery', 'accept-merged'):
                 p.add_argument('--owner-note', default='')
             if action == 'block':
                 p.add_argument('--reason', required=True)
@@ -425,7 +464,7 @@ def main():
             result = flow.status(args['task_id'], args['stale_seconds'])
         else:
             task_id, round_no, expected_state, request_id = (args.pop(k) for k in ('task_id', 'round', 'expected_state', 'request_id'))
-            for key in ('requirement', 'prompt'):
+            for key in ('requirement', 'prompt', 'verification_addendum'):
                 if key in args:
                     args[key] = args[key].read_text(encoding='utf-8')
             for key in ('criteria', 'report'):
