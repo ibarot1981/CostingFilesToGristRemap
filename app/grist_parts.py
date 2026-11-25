@@ -46,6 +46,7 @@ MANAGED_TABLES = {
     "VendorPartMapping", "PartPurchaseRecord", "PurchasedPartCostEvidence", "AuditEvent", "PurchaseItem",
     "CostingConfiguration", "CostingConfigurationRevision", "ConfigurationPartSelection", "CostingProcessRate",
     "CostSnapshot", "CostSnapshotPart", "CostSnapshotLine", "CostSnapshotRateEvidence", "CostSnapshotPolicy", "CostSnapshotPublication",
+    "SafariMasterImport", "SafariMasterImportControl", "SafariMasterImportMaterial", "SafariMasterImportPurchase", "SafariMasterImportRequest",
 }
 
 

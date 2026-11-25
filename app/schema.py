@@ -9,7 +9,7 @@ from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-definition-maintenance-grist-2026-11-19.v17"
+SCHEMA_VERSION = "safari-one-time-master-rates-grist-2026-11-25.v21"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -86,6 +86,24 @@ def _merge_table_definitions(tables: tuple[dict[str, Any], ...]) -> tuple[dict[s
     return tuple(merged[table_id] for table_id in order)
 
 
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# Imported identities are created once using a deterministic source identity.
+FOUNDATION_TABLES += (
+    _table("Material", {"SourceImportKey": "Text"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# Package B: an explicit captured source observation is staged in immutable
+# version rows. A single control pointer publishes the complete generation.
+FOUNDATION_TABLES += (
+    _table("SafariMasterImport", {"ImportKey": "Text", "Version": "Numeric", "SourceDocumentId": "Text", "SourceWorkspaceId": "Text", "CapturedAt": "DateTime", "PublishedAt": "DateTime", "Fingerprint": "Text", "Status": "Text", "MasterCount": "Numeric", "SteelRateCount": "Numeric", "PurchaseRateCount": "Numeric", "ExceptionCount": "Numeric", "Actor": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("SafariMasterImportControl", {"ControlKey": "Text", "ActiveImport": "Ref:SafariMasterImport", "Version": "Numeric", "Fingerprint": "Text", "UpdatedAt": "DateTime", "RequestKey": "Text"}),
+    _table("SafariMasterImportMaterial", {"ImportRowKey": "Text", "Import": "Ref:SafariMasterImport", "SourceDocumentId": "Text", "SourceTable": "Text", "SourceRecordId": "Text", "CanonicalName": "Text", "Code": "Text", "InUse": "Bool", "KGsPerMeter": "Numeric", "LatestKGsPerMeterDate": "Any", "MaterialLatestRate": "Numeric", "DefaultMaterialRate": "Numeric", "TransportLatestRate": "Numeric", "TotalRate": "Numeric", "LatestRateDate": "Any", "RateBasis": "Text", "SelectedRateLogId": "Text", "RateLogEvidence": "Any", "Material": "Ref:Material", "Fingerprint": "Text"}),
+    _table("SafariMasterImportPurchase", {"ImportRowKey": "Text", "Import": "Ref:SafariMasterImport", "SourceDocumentId": "Text", "SourceTable": "Text", "SourceRecordId": "Text", "PartName": "Text", "PartCode": "Text", "MasterPartName": "Text", "Unit": "Text", "NosPerKG": "Numeric", "PerNosFromKg": "Numeric", "DefaultRate": "Numeric", "CurrentUnitRate": "Numeric", "Freight": "Numeric", "Handling": "Numeric", "TotalCurrentRate": "Numeric", "FreightIncluded": "Bool", "LastPurchaseDate": "Any", "SelectedRateLogId": "Text", "RateLogEvidence": "Any", "Vendor": "Text", "Currency": "Text", "CurrencyEvidence": "Text", "PurchaseItem": "Ref:PurchaseItem", "ResolutionStatus": "Text", "Fingerprint": "Text"}),
+    _table("SafariMasterImportCapture", {"CaptureChunkKey": "Text", "RequestKey": "Text", "ChunkIndex": "Numeric", "ChunkCount": "Numeric", "SourceFingerprint": "Text", "CaptureFingerprint": "Text", "PayloadEncoding": "Text", "PayloadChunk": "Text", "ChunkFingerprint": "Text"}),
+    _table("SafariMasterImportRequest", {"RequestKey": "Text", "Action": "Text", "RequestFingerprint": "Text", "Status": "Text", "Payload": "Any", "Result": "Any", "CreatedAt": "DateTime", "UpdatedAt": "DateTime", "Actor": "Text", "Reason": "Text"}),
+)
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 
 # v17 adds the durable B2-P1 Part-definition draft, approved change request,

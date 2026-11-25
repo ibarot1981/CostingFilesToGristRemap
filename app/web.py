@@ -345,17 +345,18 @@ def _part_features():
 def _part_definition_service():
     from app.grist_parts import GristPartRegistry
     from app.part_definition import GristPartDefinitionService
-    from app.interim_rates import load_material_weight_catalog
     registry = _part_registry()
     if not isinstance(registry, GristPartRegistry):
         raise _error(503, "PART_GRIST_REQUIRED", "Direct Part-definition maintenance requires the configured Safari Manufacturing Grist adapter.")
-    return GristPartDefinitionService(registry, material_weight_catalog_provider=load_material_weight_catalog)
+    from app.safari_master_import import load_local_material_weight_catalog
+    return GristPartDefinitionService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(registry.client))
 
 
 def _part_baseline_service():
     from app.part_baseline import PartBaselineService
-    from app.interim_rates import load_material_weight_catalog
-    return PartBaselineService(_part_registry(), material_weight_catalog_provider=load_material_weight_catalog)
+    from app.safari_master_import import load_local_material_weight_catalog
+    registry = _part_registry()
+    return PartBaselineService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(registry.client))
 
 
 def _live_cost_service():
@@ -1605,6 +1606,31 @@ def add_purchase_currency_conversion(part_id: str, specification_id: int, reques
 @app.get("/api/parts/{part_id}/purchase-rate")
 def part_purchase_rate(part_id: str, as_of: str = ""):
     return _part_features().purchase_detail(part_id, as_of=as_of or None)
+
+
+@app.post("/api/admin/safari-master-import/preview")
+def preview_safari_master_import(request: Request, payload: dict[str, Any] = Body(...),
+                                 idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.safari_master_import import SafariMasterImportService
+    return SafariMasterImportService(_part_registry()).preview(
+        request_key=idempotency_key or str(payload.get("requestKey") or ""), actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""))
+
+
+@app.post("/api/admin/safari-master-import/apply")
+def apply_safari_master_import(request: Request, payload: dict[str, Any] = Body(...),
+                               idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    from app.safari_master_import import SafariMasterImportService
+    return SafariMasterImportService(_part_registry()).apply(
+        request_key=idempotency_key or str(payload.get("requestKey") or ""),
+        expected_fingerprint=str(payload.get("previewFingerprint") or ""), actor=_request_actor(request),
+        reason=str(payload.get("reason") or ""))
+
+
+@app.get("/api/admin/safari-master-import/{request_key}/recovery")
+def recover_safari_master_import(request_key: str):
+    from app.safari_master_import import SafariMasterImportService
+    return SafariMasterImportService(_part_registry()).recover(request_key)
 
 
 @app.get("/api/model-codes/{code_id}/costing-configuration")

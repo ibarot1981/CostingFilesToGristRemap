@@ -322,7 +322,7 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
-    def test_schema_v17_plans_only_additive_identity_and_mapping_evidence_columns(self) -> None:
+    def test_current_schema_preserves_additive_identity_and_mapping_evidence_columns(self) -> None:
         client = _SchemaClient()
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
@@ -346,7 +346,7 @@ class Phase0Tests(unittest.TestCase):
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-part-definition-maintenance-grist-2026-11-19.v17")
+        self.assertEqual(SCHEMA_VERSION, "safari-one-time-master-rates-grist-2026-11-25.v21")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
         additions = {item["tableId"]: item["columns"] for item in plan.add_columns}

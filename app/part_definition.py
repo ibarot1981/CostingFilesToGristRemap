@@ -1271,8 +1271,22 @@ class GristPartDefinitionService:
                 exact_ids.update(material_ids_by_canonical_name.get(canonical_name.casefold(), set()))
             material_ids_by_master[master_id] = exact_ids
 
+        inactive_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId") and not bool(record.get("inUse", True))}
+        published_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId")}
         for row in material_rows:
+            local_material_id = _int_ref(row.get("id"))
+            if local_material_id in inactive_imported_ids:
+                # Saved requirements retain their Material refs; this list is
+                # only the source for new selections in the editor.
+                continue
             fields = _fields(row)
+            # Apply may have created a deterministic Material identity while
+            # staging a new import version. Until the active manifest includes
+            # that exact identity, it is not current/selectable data.
+            if fields.get("SourceImportKey") and local_material_id not in published_imported_ids:
+                continue
             name = self._material_name(fields) or fields.get("MaterialDisplayName") or fields.get("Description") or f"Material {row['id']}"
             evidence = self._material_weight_evidence_for_identity(int(row["id"]))
             source_aliases = [str(record.get("canonicalName") or "") for record in catalog.get("records", [])
@@ -1292,9 +1306,11 @@ class GristPartDefinitionService:
                 material_catalog.append({"sourceKey": f"{source_document_id}:MasterMaterial:{master_id}",
                     "masterMaterialId": master_id, "canonicalName": str(record.get("canonicalName") or ""),
                     "code": str(record.get("code") or ""), "kgPerMeter": record.get("kgPerMeter"),
+                    "inUse": bool(record.get("inUse", True)),
                     "factorStatus": record.get("factorStatus") or "unavailable", "sourceDate": record.get("sourceDate"),
                     "materialId": next(iter(bound_ids)) if len(bound_ids) == 1 else None,
                     "bindingStatus": "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
+            material_catalog = [item for item in material_catalog if item.get("inUse")]
         purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
             for row in self._rows("PurchaseItem")]
         units = {"Nos", "each", "pcs", "kg", "g", "mm", "cm", "m", "in", "inch"}

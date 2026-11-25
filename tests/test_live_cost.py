@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from app.grist_parts import GristPartFeatures, GristPartRegistry
 from app.grist_types import grist_datetime
-from app.live_cost import GristLiveCostService, SNAPSHOT_CHECKSUM_V1_COLUMNS, _cost_date_summary, _rate_age
+from app.live_cost import GristLiveCostService, SNAPSHOT_CHECKSUM_V1_COLUMNS, _cost_date_summary, _cut_length_mm, _rate_age
 from app.part_identity import PartIdentityError
 
 
@@ -28,6 +28,11 @@ class MemoryCostGrist:
             "ProductModelCode": [{"id": 100, "fields": {"ProductModel": 50, "Code": "S1KHF", "Description": "High frame", "Active": True}}],
             "PartScopeShortcode": [{"id": 1, "fields": {"ScopeKey": "product:5", "ScopeType": "product", "ScopeProduct": 5,
                 "ScopeTargetId": "5", "ScopeTargetLabel": "Safari 1000", "Shortcode": "S1K", "Version": 1}}],
+            "SafariMasterImport": [{"id": 900, "fields": {"ImportKey": "test-import-v1", "Version": 1,
+                "SourceDocumentId": "costing-new-test", "Fingerprint": "test-source-v1", "Status": "published",
+                "MasterCount": 0, "PurchaseRateCount": 0}}],
+            "SafariMasterImportControl": [{"id": 901, "fields": {"ControlKey": "active", "ActiveImport": ["R", "SafariMasterImport", 900],
+                "Version": 1, "Fingerprint": "test-manifest-v1"}}],
         }
         self.next_id = 101
         self.lock = threading.Lock()
@@ -54,6 +59,16 @@ class MemoryCostGrist:
                 self.next_id += 1
                 rows.append(row)
                 added.append(deepcopy(row))
+                if table == "Material":
+                    imported_id = self.next_id
+                    self.next_id += 1
+                    self.tables.setdefault("SafariMasterImportMaterial", []).append({"id": imported_id, "fields": {
+                        "ImportRowKey": f"test-import-v1:Material:{row['id']}", "Import": ["R", "SafariMasterImport", 900],
+                        "SourceDocumentId": "costing-new-test", "SourceTable": "MasterMaterial", "SourceRecordId": str(row["id"]),
+                        "CanonicalName": row["fields"].get("CanonicalName") or "", "Material": ["R", "Material", row["id"]],
+                        "InUse": True, "KGsPerMeter": 3.0, "MaterialLatestRate": 5.0, "DefaultMaterialRate": 5.0,
+                        "RateBasis": "Default_MaterialRate", "LatestRateDate": "2026-11-20", "Fingerprint": f"test-material:{row['id']}"}})
+                    self.tables["SafariMasterImport"][0]["fields"]["MasterCount"] += 1
             should_fail = self.fail_once and table == self.fail_after_table
             if should_fail:
                 self.fail_once = False
@@ -72,6 +87,8 @@ class MemoryCostGrist:
 class LiveCostTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.source_env = patch.dict(os.environ, {"COSTING_NEW_GRIST_DOC_ID": "costing-new-test"})
+        self.source_env.start()
         self.path = Path(self.temp.name) / "parts.sqlite3"
         self.client = MemoryCostGrist()
         self.registry = GristPartRegistry(self.client, path=self.path)
@@ -83,6 +100,7 @@ class LiveCostTests(unittest.TestCase):
         self._make_model()
 
     def tearDown(self):
+        self.source_env.stop()
         self.temp.cleanup()
 
     def load_rates(self, names):
@@ -114,7 +132,8 @@ class LiveCostTests(unittest.TestCase):
             "ProcessType": "MCL", "PhysicalSignature": "bolt-physical-v1", "Status": "active"}}])["records"][0]
         self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:bolt", "LineRevision": mcl_revision["id"],
             "ProcessType": "MCL", "Material": material["id"], "MaterialDisplayName": "Bolt", "ItemName": "Hex bolt",
-            "Quantity": 3, "QuantityUOM": "each"}}])
+            "Quantity": 3, "QuantityUOM": "kg", "DimensionMM": 1000, "DimensionUOM": "mm",
+            "EngineeringAttributes": {"materialConsumptionBasis": "mcl_kg_per_piece", "materialWeightEvidence": self._signed_material_evidence(material["id"], "Bolt", 3.0)}}}])
         self.features.link_process_line(part_id=self.parent["id"], line_master_id=mcl_master["id"], line_revision_id=mcl_revision["id"],
             quantity=1, uom="each", actor="reviewer", reason="reviewed assembly material requirement", request_key="parent-mcl")
         cnc_master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:cnc", "ProcessType": "CNC", "SourcePartName": "CNC finish"}}])["records"][0]
@@ -137,6 +156,22 @@ class LiveCostTests(unittest.TestCase):
         configured = self.service.save_configuration(100, self.initial_configuration_payload,
             actor="configurator", request_key="configuration-v1")
         self.assertEqual(configured["status"], "configured")
+
+    def _signed_material_evidence(self, material_id, name, kgm):
+        payload = {"schema": "safari-material-weight-evidence-v1", "materialRef": material_id,
+            "materialCanonicalName": name, "canonicalName": name, "masterMaterialId": 55,
+            "kgPerMeter": str(kgm), "sourceDate": "2026-11-20", "source": "Costing-New",
+            "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter",
+            "factorUnit": "kg/m", "factorStatus": "available"}
+        signature = hmac.new(self.client.api_key.encode("utf-8"), json.dumps(payload, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), default=str, allow_nan=False).encode("utf-8"), hashlib.sha256).hexdigest()
+        return {**payload, "signature": signature, "status": "available"}
+
+    def set_local_material_factor(self, material_id, kgm):
+        row = next(row for row in self.client.tables["SafariMasterImportMaterial"]
+            if row["fields"].get("Material") == ["R", "Material", material_id])
+        self.client.update_table_records("SafariMasterImportMaterial", [{"id": row["id"], "fields": {"KGsPerMeter": kgm,
+            "Fingerprint": f"test-material:{material_id}:kgm:{kgm}"}}])
 
     def purchase(self, tx, key, when, amount):
         return self.features.capture_purchase(part_id=self.purchased["id"], specification_id=self.spec_id, mapping_id=self.mapping_id,
@@ -414,7 +449,9 @@ class LiveCostTests(unittest.TestCase):
         revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:authored-material-cut", "LineMaster": master["id"],
             "ProcessType": "material_cut", "PhysicalSignature": "authored-material-v1", "Status": "active"}}])["records"][0]
         self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:authored-material-cut", "LineRevision": revision["id"],
-            "ProcessType": "material_cut", "Material": material["id"], "MaterialDisplayName": "Bolt", "ItemName": "Authored steel", "Quantity": 2, "QuantityUOM": "kg"}}])
+            "ProcessType": "material_cut", "Material": material["id"], "MaterialDisplayName": "Bolt", "ItemName": "Authored steel", "Quantity": 3, "QuantityUOM": "kg",
+            "DimensionMM": 1000, "EngineeringAttributes": {"materialConsumptionBasis": "mcl_kg_per_piece",
+                "materialWeightEvidence": self._signed_material_evidence(material["id"], "Bolt", 3.0)}}}])
         self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:authored-material-cut", "RequirementKey": "authored-material-cut",
             "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
             "QuantityPerPart": 1, "QuantityUOM": "each", "Status": "active"}}])
@@ -422,12 +459,13 @@ class LiveCostTests(unittest.TestCase):
         live = self.service.live_cost(100)
 
         authored = next(item for item in live["lines"] if item["description"] == "Authored steel")
-        self.assertEqual((authored["sourceType"], authored["quantity"], authored["quantityUOM"], authored["rate"], authored["netCost"]), ("material", 4, "kg", 5.0, 20.0))
+        self.assertEqual((authored["sourceType"], authored["quantity"], authored["quantityUOM"], authored["rate"], authored["netCost"]), ("material", 6, "kg", 5.0, 30.0))
         self.assertNotIn("PROCESS_RATE_UNAVAILABLE", {warning["code"] for warning in live["warnings"]})
 
     def test_mcl_baseline_basis_keeps_weight_per_piece_quantity_and_blocks_unknown_basis(self):
         material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-mcl-marker",
             "CanonicalName": "MCL marker steel", "MappingStatus": "reviewed"}}])["records"][0]
+        self.set_local_material_factor(material["id"], 5.8)
         master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:mcl-marker",
             "ProcessType": "material_cut", "SourcePartName": "MCL marker steel"}}])["records"][0]
         revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:mcl-marker",
@@ -492,30 +530,34 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(by_description["Authored cnc"]["netCost"], created["cnc"])
         self.assertTrue(all(item["rateAge"]["rateAgeStatus"] == "dated" for item in authored))
 
+    def test_cut_length_accepts_rounded_inches_but_rejects_real_conflicts(self):
+        self.assertEqual(_cut_length_mm({"DimensionMM": 75, "DimensionInches": 2.95}), 75)
+        self.assertIsNone(_cut_length_mm({"DimensionMM": 75, "DimensionInches": 2.9}))
+        self.assertEqual(_cut_length_mm({"DimensionMM": 75, "DimensionInches": 75 / 25.4}), 75)
+
     def test_mcl_cut_length_and_cnc_per_part_weight_drive_matching_rates_once(self):
         material = self.client.create_table_records("Material", [{"fields": {"MaterialKey": "mat-length-bar", "CanonicalName": "Length bar", "MappingStatus": "reviewed"}}])["records"][0]
         master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:length-bar", "ProcessType": "material_cut", "SourcePartName": "Length bar"}}])["records"][0]
         revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:length-bar", "LineMaster": master["id"],
             "ProcessType": "material_cut", "PhysicalSignature": "length-bar-v1", "Status": "active"}}])["records"][0]
         detail = self.client.create_table_records("LineDetail", [{"fields": {"DetailKey": "detail:length-bar", "LineRevision": revision["id"], "ProcessType": "material_cut",
-            "Material": material["id"], "MaterialDisplayName": "Length bar", "ItemName": "Length bar cut", "Quantity": 25, "QuantityUOM": "cm",
-            "DimensionMM": 250, "DimensionInches": 250 / 25.4, "DimensionText": "250 mm", "DimensionUOM": "mm"}}])["records"][0]
+            "Material": material["id"], "MaterialDisplayName": "Length bar", "ItemName": "Length bar cut", "Quantity": 0.75, "QuantityUOM": "kg",
+            "DimensionMM": 250, "DimensionInches": 250 / 25.4, "DimensionText": "250 mm", "DimensionUOM": "mm",
+            "EngineeringAttributes": {"materialConsumptionBasis": "mcl_kg_per_piece",
+                "materialWeightEvidence": self._signed_material_evidence(material["id"], "Length bar", 3.0)}}}])["records"][0]
         self.client.create_table_records("PartRevisionLine", [{"fields": {"RevisionLineKey": "membership:length-bar", "RequirementKey": "length-bar-occurrence",
             "PartRevision": self.parent["revisionRecordId"], "LineMaster": master["id"], "LineRevision": revision["id"], "ProcessType": "material_cut",
             "QuantityPerPart": 3, "QuantityExact": "3", "QuantityUOM": "Nos", "Status": "active"}}])
         self.rate["Length bar"] = "2.5"
-        self.rate_metadata["Length bar"] = {"uom": "cm"}
+        self.rate_metadata["Length bar"] = {"uom": "kg"}
 
         first = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
-        self.assertEqual((first["quantity"], first["quantityUOM"], first["netCost"]), (150, "cm", 375.0))
-        self.client.update_table_records("LineDetail", [{"id": detail["id"], "fields": {"Quantity": 30, "DimensionMM": 300,
-            "DimensionInches": 300 / 25.4, "DimensionText": "300 mm"}}])
+        self.assertEqual((first["quantity"], first["quantityUOM"], first["netCost"]), (4.5, "kg", 11.25))
+        self.set_local_material_factor(material["id"], 4.0)
         changed = next(line for line in self.service.live_cost(100)["lines"] if line["description"] == "Length bar cut")
-        self.assertEqual((changed["quantity"], changed["quantityUOM"], changed["netCost"]), (180, "cm", 450.0))
-        self.rate_metadata["Length bar"] = {"uom": "kg"}
+        self.assertEqual((changed["quantity"], changed["quantityUOM"], changed["netCost"]), (6.0, "kg", 15.0))
         mismatch = self.service.live_cost(100)
-        self.assertIn("MATERIAL_RATE_BASIS_MISMATCH", {warning["code"] for warning in mismatch["warnings"]})
-        self.assertIsNone(next(line for line in mismatch["lines"] if line["description"] == "Length bar cut")["netCost"])
+        self.assertEqual(mismatch["status"], "complete")
 
         cnc_master = self.client.create_table_records("LineMaster", [{"fields": {"LineKey": "line:weighted-cnc", "ProcessType": "cnc", "SourcePartName": "Weighted CNC"}}])["records"][0]
         cnc_revision = self.client.create_table_records("LineRevision", [{"fields": {"RevisionKey": "revision:weighted-cnc", "LineMaster": cnc_master["id"],
@@ -565,6 +607,7 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual(forged["status"], "incomplete")
 
         self.rate["Review steel"] = "4"
+        self.set_local_material_factor(material["id"], 1.58)
         payload = {"schema": "safari-material-weight-evidence-v1", "materialRef": material["id"],
             "materialCanonicalName": "Review steel", "canonicalName": "Review steel", "masterMaterialId": 55,
             "kgPerMeter": "1.58", "sourceDate": "2026-09-24", "source": "Costing-New",
@@ -593,6 +636,38 @@ class LiveCostTests(unittest.TestCase):
         self.assertEqual((future["rateAgeStatus"], future["rateAgeDaysUntil"]), ("future_date", 1))
         self.assertEqual(unknown["rateAgeStatus"], "unknown")
         self.assertEqual((summary["oldestKnownAgeDays"], summary["unknownInputCount"], summary["futureInputCount"]), (10, 1, 1))
+
+    def test_imported_purchase_master_prices_without_creating_or_linking_a_purchase_transaction(self):
+        # Invalidate the QA's actual posted transaction so the eligible
+        # PurchasePartsMaster fallback is exercised without fabricating a
+        # Safari PartPurchaseRecord.
+        transaction = self.client.tables["PartPurchaseRecord"][0]
+        self.client.update_table_records("PartPurchaseRecord", [{"id": transaction["id"],
+            "fields": {"Status": "draft"}}])
+        item = self.client.create_table_records("PurchaseItem", [{"fields": {"ItemKey": "qa-purchase-master-item",
+            "DisplayName": "012 Thrust", "Status": "source_candidate"}}])["records"][0]
+        self.client.update_table_records("PartPurchaseSpecification", [{"id": self.spec_id,
+            "fields": {"PurchaseItem": item["id"], "CostingUOM": "Nos", "CostingCurrency": "INR"}}])
+        self.client.create_table_records("SafariMasterImportPurchase", [{"fields": {
+            "ImportRowKey": "qa-import-v1:PurchasePartsMaster:4", "Import": ["R", "SafariMasterImport", 900],
+            "SourceDocumentId": "cPCjjr9oCzhWC7z8vJbcky", "SourceTable": "PurchasePartsMaster", "SourceRecordId": "4",
+            "PartName": "012 Thrust", "PartCode": "JKMX001", "Unit": "Per Nos", "NosPerKG": 0, "PerNosFromKg": 0,
+            "CurrentUnitRate": 90, "Freight": 2.25, "Handling": 0.45, "TotalCurrentRate": 92.7,
+            "FreightIncluded": True, "LastPurchaseDate": 1788998400, "SelectedRateLogId": "6364",
+            "Vendor": "70", "Currency": "INR", "CurrencyEvidence": "PurchasePartsMaster.SparesPartCostRs",
+            "PurchaseItem": ["R", "PurchaseItem", item["id"]], "ResolutionStatus": "bound", "Fingerprint": "qa-import-row-v1"}}])
+
+        live = self.service.live_cost(100)
+        self.assertEqual(live["status"], "complete")
+        purchased = next(line for line in live["lines"] if line.get("sourceType") == "purchased_part")
+        self.assertEqual((purchased["quantity"], purchased["quantityUOM"], purchased["rate"], purchased["rateUOM"], purchased["netCost"]),
+            (4.0, "each", 92.7, "Nos", 370.8))
+        evidence = next(row for row in live["rateEvidence"] if row.get("sourceType") == "purchased_part")
+        self.assertEqual((evidence["sourceDocumentId"], evidence["sourceTable"], evidence["sourceRecordId"],
+            evidence["sourceUOM"], evidence["normalizedUOM"], evidence["conversionFactor"]),
+            ("cPCjjr9oCzhWC7z8vJbcky", "PurchasePartsMaster", "4", "Per Nos", "Nos", 1.0))
+        self.assertIsNone(evidence["purchaseRecordId"])
+        self.assertIn("CurrencyBasis:PurchasePartsMaster.SparesPartCostRs", evidence["evidenceReference"])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ INPUT_TABLES = (
     "PartComponentRevision", "PartRevisionLine", "LineMaster", "LineRevision", "LineDetail",
     "PartPurchaseSpecification", "VendorPartMapping", "PartPurchaseRecord", "PartPurchaseUnitConversion",
     "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate", "PartRegistryRequest",
+    "SafariMasterImport", "SafariMasterImportControl", "SafariMasterImportMaterial", "SafariMasterImportPurchase",
 )
 POLICY_VERSION = "live-cost-v1"
 SNAPSHOT_CHECKSUM_V1_COLUMNS = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus",
@@ -108,7 +109,14 @@ def _cut_length_mm(detail: dict[str, Any]) -> float | None:
     inches = _num(detail.get("DimensionInches"))
     if mm is not None and mm > 0 and inches is not None and inches > 0:
         converted = inches * 25.4
-        return mm if abs(mm - converted) <= max(0.01, abs(mm) * 1e-7) else None
+        # Workbook inches are commonly rounded for display (for example
+        # 75 mm beside 2.95 in). Allow only the uncertainty implied by the
+        # stored decimal precision, while continuing to reject real conflicts.
+        raw_inches = str(detail.get("DimensionInches") or "").strip()
+        decimal_places = len(raw_inches.partition(".")[2]) if "." in raw_inches else 0
+        inch_rounding_mm = 0.5 * (10 ** -decimal_places) * 25.4
+        tolerance = max(0.01, abs(mm) * 1e-7, inch_rounding_mm)
+        return mm if abs(mm - converted) <= tolerance else None
     if mm is not None and mm > 0:
         return mm
     if inches is not None and inches > 0:
@@ -145,6 +153,7 @@ class GristLiveCostService:
     def __init__(self, registry: Any, material_rate_loader: Callable[[list[str]], dict[str, Any]] | None = None):
         self.registry = registry
         self.client = registry.client
+        self._default_local_material_rates = material_rate_loader is None
         self.material_rate_loader = material_rate_loader or self._load_material_rates
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
@@ -183,12 +192,8 @@ class GristLiveCostService:
         return request_fingerprint({name: rows for name, rows in tables.items()})
 
     def _load_material_rates(self, names: list[str]) -> dict[str, Any]:
-        if not names:
-            return {"status": "available", "source": "Costing-New", "readOnly": True, "rows": []}
-        from app.interim_rates import load_interim_rates
-        result = load_interim_rates({name: None for name in sorted(set(names))})
-        result["sourceDocumentId"] = os.getenv("GRIST_DOC_ID", "")
-        return result
+        from app.safari_master_import import load_local_interim_rates
+        return load_local_interim_rates(sorted(set(names)), client=self.client)
 
     def _code(self, tables: dict[str, list[dict[str, Any]]], code_id: str | int) -> dict[str, Any]:
         target = int(code_id)
@@ -397,14 +402,56 @@ class GristLiveCostService:
                 "RequestKey": request_key, "RequestFingerprint": fingerprint})
             return {"rate": _public(row), "idempotent": False}
 
-    def _rate_map(self, names: list[str]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    def _rate_map(self, names: list[str], *, tables: dict[str, list[dict[str, Any]]] | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         if not names:
-            return {}, {"status": "available", "rows": [], "sourceDocumentId": os.getenv("GRIST_DOC_ID", "")}
+            return {}, {"status": "available", "source": "Safari-local-import", "rows": []}
         try:
-            response = self.material_rate_loader(names)
+            if self._default_local_material_rates and tables is not None:
+                response = self._material_rates_from_inputs(names, tables)
+            else:
+                response = self.material_rate_loader(names)
         except Exception as exc:
-            return {}, {"status": "unavailable", "rows": [], "error": str(exc), "sourceDocumentId": os.getenv("GRIST_DOC_ID", "")}
+            return {}, {"status": "unavailable", "source": "Safari-local-import", "rows": [], "error": str(exc)}
         return {str(row.get("material") or ""): row for row in response.get("rows", [])}, response
+
+    @staticmethod
+    def _material_rates_from_inputs(names: list[str], tables: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        control = next((_fields(row) for row in tables.get("SafariMasterImportControl", [])
+            if str(_fields(row).get("ControlKey") or "") == "active"), {})
+        import_id = ref_id(control.get("ActiveImport"))
+        if not import_id:
+            return {"status": "unavailable", "source": "Safari-local-import", "rows": [], "sourceDocumentId": ""}
+        wanted = {str(name).strip().casefold() for name in names}
+        local = {int(row.get("id", -1)): _fields(row) for row in tables.get("Material", [])}
+        output = []
+        for row in tables.get("SafariMasterImportMaterial", []):
+            fields = _fields(row)
+            if ref_id(fields.get("Import")) != import_id:
+                continue
+            material = local.get(ref_id(fields.get("Material")) or -1, {})
+            local_name = str(material.get("CanonicalName") or fields.get("CanonicalName") or "").strip()
+            if not wanted.intersection({local_name.casefold(), str(fields.get("CanonicalName") or "").casefold()}):
+                continue
+            basis = str(fields.get("RateBasis") or "")
+            rate = _num(fields.get("MaterialLatestRate")) if basis == "MaterialLatestRate" else _num(fields.get("DefaultMaterialRate"))
+            from app.safari_master_import import _decode_json
+            rate_log_rows = _decode_json(fields.get("RateLogEvidence"), []) or []
+            selected = next((item.get("fields", {}) for item in rate_log_rows
+                if str(item.get("id")) == str(fields.get("SelectedRateLogId"))), {})
+            from app.cost_dates import cost_date_evidence
+            date_evidence = (cost_date_evidence(selected, source_kind="rate_log") if selected else
+                cost_date_evidence({"LatestRateDate": fields.get("LatestRateDate")}, source_kind="rate_master"))
+            output.append({"material": local_name, "canonicalMaterial": local_name,
+                "status": "available" if rate is not None else "rate_unavailable", "costingNewRate": str(rate) if rate is not None else None,
+                "basis": basis, "masterRecordId": ref_id(fields.get("SourceRecordId")),
+                "selectedRateLogId": fields.get("SelectedRateLogId"), "rateLogEvidence": rate_log_rows,
+                **date_evidence, "rateSourceDate": date_evidence.get("rateSourceDate") or fields.get("LatestRateDate"),
+                "effectiveAt": date_evidence.get("effectiveAt") or fields.get("LatestRateDate"), "uom": "kg",
+                "sourceDocumentId": fields.get("SourceDocumentId"), "localImportVersion": control.get("Version"),
+                "localImportFingerprint": control.get("Fingerprint"), "localMaterialId": ref_id(fields.get("Material"))})
+        return {"status": "available", "source": "Safari-local-import", "sourceDocumentId": "",
+            "localManifest": {"importId": import_id, "version": control.get("Version"), "fingerprint": control.get("Fingerprint")},
+            "rows": output}
 
     @staticmethod
     def _part_reference_map(tables: dict[str, list[dict[str, Any]]]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
@@ -415,6 +462,27 @@ class GristLiveCostService:
     def live_cost(self, code_id: str | int, *, check_consistency: bool = True) -> dict[str, Any]:
         tables = self._read_inputs()
         start_fingerprint = self._tables_fingerprint(tables)
+        import_control = next((_fields(row) for row in tables["SafariMasterImportControl"]
+            if str(_fields(row).get("ControlKey") or "") == "active"), {})
+        active_import_id = ref_id(import_control.get("ActiveImport"))
+        active_import_header = next((_fields(row) for row in tables["SafariMasterImport"]
+            if int(row.get("id", -1)) == active_import_id), None) if active_import_id else None
+        active_material_rows = [row for row in tables["SafariMasterImportMaterial"]
+            if ref_id(_fields(row).get("Import")) == active_import_id] if active_import_id else []
+        active_purchase_rows = [row for row in tables["SafariMasterImportPurchase"]
+            if ref_id(_fields(row).get("Import")) == active_import_id] if active_import_id else []
+        if (not active_import_header or str(active_import_header.get("Status") or "") != "published"
+                or int(active_import_header.get("MasterCount") or 0) != len(active_material_rows)
+                or int(active_import_header.get("PurchaseRateCount") or 0) > len(active_purchase_rows)):
+            active_import_id = None
+        current_material_factors = {}
+        if active_import_id:
+            current_material_factors = {ref_id(_fields(row).get("Material")): _fields(row)
+                for row in active_material_rows if ref_id(_fields(row).get("Material"))}
+        current_purchase_rates = {}
+        if active_import_id:
+            current_purchase_rates = {ref_id(_fields(row).get("PurchaseItem")): _fields(row)
+                for row in active_purchase_rows if ref_id(_fields(row).get("PurchaseItem"))}
         code = self._code(tables, code_id)
         config = self._configuration(tables, int(code["id"]))
         if not config or not config["selections"]:
@@ -549,6 +617,9 @@ class GristLiveCostService:
                             f"Legacy MCL consumption stores {amount_per_line:g} {detail_unit} per occurrence and Qty per Part is also {link_quantity:g} {link_unit}; review the basis before costing.", path)
                         continue
                     cut_mm = _cut_length_mm(detail_fields) if is_material_process else None
+                    if is_material_process and cut_mm is not None and detail_unit not in {"kg", "kilogram", "kilograms", "g", "gram", "grams"}:
+                        warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED", "A cut-length MCL requirement must retain its accepted per-piece mass basis; piece counts are stored on the Part link.", path)
+                        continue
                     if is_material_process and detail_unit in {"kg", "kilogram", "kilograms", "g", "gram", "grams"} and cut_mm:
                         trusted_evidence = self._trusted_material_weight_evidence(detail_fields, material_id)
                         if not trusted_evidence:
@@ -562,6 +633,17 @@ class GristLiveCostService:
                     if amount_per_line is None or link_quantity is None or amount_per_line < 0 or link_quantity <= 0:
                         warn("LINE_QUANTITY_INVALID", "A normalized line has missing or invalid quantity evidence.", path)
                         continue
+                    # MCL physical consumption follows the current published
+                    # Safari kg/m generation. The accepted detail quantity and
+                    # its signed evidence remain historical facts; they are not
+                    # silently rewritten when a local master factor changes.
+                    if is_material_process:
+                        imported = current_material_factors.get(material_id)
+                        kgm = _num(imported.get("KGsPerMeter")) if imported else None
+                        if not active_import_id or not imported or kgm is None or kgm <= 0 or cut_mm is None:
+                            warn("MATERIAL_FACTOR_UNAVAILABLE", "Current MCL consumption needs one published Safari master version, a valid local kg/m factor and a cut length.", path)
+                            continue
+                        amount_per_line = (cut_mm / 1000.0) * kgm
                     total_quantity = effective_quantity * link_quantity * amount_per_line
                     detail_candidates.append({"kind": "material" if process.casefold() in {"mcl", "material", "material cut list", "material_cut"} else "process",
                         "lineKey": f"{path}|{link_fields.get('RevisionLineKey') or link['id']}|{_fields(detail).get('DetailKey') or detail['id']}",
@@ -569,7 +651,9 @@ class GristLiveCostService:
                         "lineLink": link, "lineMasterId": master_id, "lineRevisionId": line_revision_id,
                         "detail": detail, "detailFields": detail_fields, "process": process, "materialId": material_id,
                         "materialName": material_name, "quantity": total_quantity,
-                        "uom": str(detail_fields.get("QuantityUOM") or link_fields.get("QuantityUOM") or "").strip(),
+                        "effectivePartQuantity": effective_quantity, "linkQuantity": link_quantity,
+                        "perOccurrenceQuantity": amount_per_line,
+                        "uom": "kg" if is_material_process else str(detail_fields.get("QuantityUOM") or link_fields.get("QuantityUOM") or "").strip(),
                         "description": str(detail_fields.get("ItemName") or detail_fields.get("MaterialDisplayName") or master.get("SourcePartName") or process).strip(),
                         "currency": str(_fields(config["revision"]).get("Currency") or "").upper(),
                         "physicalSignature": str(line_revision.get("PhysicalSignature") or "")})
@@ -635,7 +719,7 @@ class GristLiveCostService:
             expand(part_ref, rev_id, occurrence, qty, qty, uom, selection, None, str(sf.get("SourcingRoute") or "auto"))
 
         direct_material_names = [candidate.get("materialName") for candidate in candidates if candidate["kind"] == "material" and candidate.get("materialName")]
-        material_rates, material_response = self._rate_map(direct_material_names)
+        material_rates, material_response = self._rate_map(direct_material_names, tables=tables)
         evidence_rows: list[dict[str, Any]] = []
         lines_out: list[dict[str, Any]] = []
         code_currency = str(_fields(config["revision"]).get("Currency") or "").upper()
@@ -683,6 +767,15 @@ class GristLiveCostService:
                 from app.purchased_parts import resolve_purchased_part_rate
                 rate = resolve_purchased_part_rate({**sf, "ProductPart": specification_part, "recordId": str(specification_id)}, valid_records,
                     unit_conversions=unit_rows, currency_conversions=currency_rows)
+                imported_purchase = current_purchase_rates.get(ref_id(sf.get("PurchaseItem")))
+                if rate.get("status") == "unavailable" and imported_purchase:
+                    expected_uom = str(sf.get("CostingUOM") or "").strip()
+                    from app.safari_master_import import imported_purchase_rate
+                    rate = imported_purchase_rate(imported_purchase, expected_uom, code_currency)
+                    if rate.get("status") == "available":
+                        rate.update({"source": "safari_master_import", "selectedRateLogId": imported_purchase.get("SelectedRateLogId"),
+                            "localImportVersion": import_control.get("Version"),
+                            "localImportFingerprint": import_control.get("Fingerprint")})
                 if rate.get("status") != "available":
                     warn("PURCHASE_RATE_" + str(rate.get("status", "unavailable")).upper(), str(rate.get("reason") or "Purchased-Part rate is unavailable."), candidate["occurrencePath"])
                     lines_out.append(self._unpriced_line(candidate, rate.get("reason") or "Purchased-Part rate unavailable", "purchased_part"))
@@ -693,7 +786,13 @@ class GristLiveCostService:
                     continue
                 purchase_source = next((row for row in purchase_rows if str(row.get("id")) == str(rate.get("purchaseRecordId"))), {})
                 purchase_fields = _fields(purchase_source)
-                date_evidence = cost_date_evidence(purchase_fields, source_kind="purchase_record")
+                if rate.get("source") == "safari_master_import":
+                    purchase_fields = imported_purchase or {}
+                    date_evidence = cost_date_evidence({"SparesPartLastPurchaseDate": purchase_fields.get("LastPurchaseDate")}, source_kind="rate_master")
+                    date_evidence.update({"selectedRateLogId": purchase_fields.get("SelectedRateLogId"),
+                        "rateSourceDate": purchase_fields.get("LastPurchaseDate"), "rateDateBasis": "source_master"})
+                else:
+                    date_evidence = cost_date_evidence(purchase_fields, source_kind="purchase_record")
                 age = _rate_age(date_evidence.get("rateSourceDate"), as_of=current_time)
                 amount = candidate["quantity"] * float(rate["rate"])
                 line = {"lineKey": candidate["lineKey"], "stableOccurrencePath": candidate["occurrencePath"],
@@ -702,26 +801,38 @@ class GristLiveCostService:
                     "sourceRevisionId": str(candidate["partRevisionId"]), "description": candidate["description"], "costCategory": "purchased_part",
                     "quantity": candidate["quantity"], "quantityUOM": candidate["uom"], "rate": rate["rate"], "rateUOM": rate["uom"],
                     "currency": rate["currency"], "grossCost": amount, "recoveryCost": 0, "adjustmentCost": 0, "netCost": amount,
-                    "calculationBasis": "effective_part_quantity × latest eligible actual purchase rate", "costPolicy": RATE_POLICY,
+                    "calculationBasis": "effective Part quantity × current local imported purchase master rate" if rate.get("source") == "safari_master_import" else "effective_part_quantity × latest eligible actual purchase rate", "costPolicy": rate.get("ratePolicy") or RATE_POLICY,
                     "status": "available", "linear": True, "purchaseItemId": ref_id(sf.get("PurchaseItem")),
                     "rateAge": {**age, "rateDateBasis": date_evidence.get("rateDateBasis") or "unknown"}}
                 lines_out.append(line)
-                evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "purchased_part", "sourceTable": "PartPurchaseRecord",
-                    "sourceDocumentId": getattr(self.client, "doc_id", ""), "sourceRecordId": str(rate.get("purchaseRecordId") or ""),
-                    "sourceVersion": str(rate.get("transactionAt") or ""), **date_evidence, **age,
-                    "vendorId": ref_id(rate.get("vendorId")), "purchaseRecordId": ref_id(rate.get("purchaseRecordId")),
-                    "rawUnitRate": rate.get("rate"), "normalizedUnitRate": rate.get("rate"), "sourceCurrency": rate.get("sourceCurrency"),
-                    "sourceUOM": rate.get("purchaseUOM"), "normalizedCurrency": rate.get("currency"), "normalizedUOM": rate.get("uom"),
-                    "conversionFactor": None, "baseUnitPrice": rate.get("baseUnitPrice"), "discountPerUnit": rate.get("discountPerUnit"),
+                imported_evidence_reference = None
+                if rate.get("source") == "safari_master_import":
+                    imported_evidence_reference = "; ".join(value for value in (
+                        f"RateLog:{rate.get('selectedRateLogId')}" if rate.get("selectedRateLogId") else "",
+                        f"Vendor:{rate.get('vendor')}" if rate.get("vendor") else "",
+                        f"Base:{rate.get('sourceBaseRate')} Freight:{rate.get('sourceFreight')} Handling:{rate.get('sourceHandling')}",
+                        f"CurrencyBasis:{rate.get('currencyEvidence')}" if rate.get("currencyEvidence") else "",
+                        f"ImportFingerprint:{rate.get('localImportFingerprint')}" if rate.get("localImportFingerprint") else ""))
+                evidence_rows.append({"lineKey": candidate["lineKey"], "sourceType": "purchased_part",
+                    "sourceTable": rate.get("sourceTable") if rate.get("source") == "safari_master_import" else "PartPurchaseRecord",
+                    "sourceDocumentId": rate.get("sourceDocumentId") if rate.get("source") == "safari_master_import" else getattr(self.client, "doc_id", ""),
+                    "sourceRecordId": str(rate.get("purchaseRecordId") or ""),
+                    "sourceVersion": (f"{rate.get('localImportVersion')}:{rate.get('localImportFingerprint')}" if rate.get("source") == "safari_master_import"
+                        else str(rate.get("transactionAt") or "")), **date_evidence, **age,
+                    "vendorId": ref_id(rate.get("vendorId")),
+                    "purchaseRecordId": None if rate.get("source") == "safari_master_import" else ref_id(rate.get("purchaseRecordId")),
+                    "rawUnitRate": rate.get("sourceRate", rate.get("rate")), "normalizedUnitRate": rate.get("rate"), "sourceCurrency": rate.get("sourceCurrency"),
+                    "sourceUOM": rate.get("sourceUOM") or rate.get("purchaseUOM"), "normalizedCurrency": rate.get("currency"), "normalizedUOM": rate.get("uom"),
+                    "conversionFactor": rate.get("conversionFactor"), "baseUnitPrice": rate.get("baseUnitPrice"), "discountPerUnit": rate.get("discountPerUnit"),
                     "taxExcluded": rate.get("excludedCharges", {}).get("tax", 0), "freightExcluded": rate.get("excludedCharges", {}).get("freight", 0),
                     "otherChargesExcluded": rate.get("excludedCharges", {}).get("other", 0), "ratePolicy": rate.get("ratePolicy"),
-                    "evidenceReference": rate.get("purchaseRecordId"), "resolutionStatus": "available", "reason": rate.get("reason"),
+                    "evidenceReference": imported_evidence_reference or rate.get("purchaseRecordId"), "resolutionStatus": "available", "reason": rate.get("reason"),
                     "purchaseSpecificationId": int(candidate["specification"]["id"])})
                 continue
             if candidate["kind"] == "material":
                 rate = material_rates.get(candidate.get("materialName") or "", {})
                 if rate.get("status") != "available" or _num(rate.get("costingNewRate")) is None:
-                    warn("MATERIAL_RATE_UNAVAILABLE", f"Material rate is {rate.get('status') or material_response.get('status') or 'unavailable'} in read-only Costing-New.", candidate["occurrencePath"])
+                    warn("MATERIAL_RATE_UNAVAILABLE", f"Material rate is {rate.get('status') or material_response.get('status') or 'unavailable'} in the published Safari import.", candidate["occurrencePath"])
                     lines_out.append(self._unpriced_line(candidate, "Material rate is unavailable or unmapped.", "material"))
                     continue
                 material_rate_uom = str(rate.get("uom") or rate.get("rateUOM") or rate.get("costingUOM") or "").strip()
@@ -805,18 +916,14 @@ class GristLiveCostService:
         check_fingerprint = self._tables_fingerprint(self._read_inputs()) if check_consistency else start_fingerprint
         if check_fingerprint != start_fingerprint:
             warn("LIVE_INPUTS_CHANGED_DURING_READ", "A Grist costing input changed while this Live Cost was being assembled. Refresh before saving a snapshot.", "", blocker=True)
-        # Re-read the external material source once and reject a torn read if its
-        # selected rate facts changed during this calculation.
-        if check_consistency and direct_material_names:
-            verify_rates, verify_meta = self._rate_map(direct_material_names)
-            if request_fingerprint({"rates": material_rates, "source": material_response.get("source"), "document": material_response.get("sourceDocumentId")}) != request_fingerprint({"rates": verify_rates, "source": verify_meta.get("source"), "document": verify_meta.get("sourceDocumentId")}):
-                warn("LIVE_RATE_SOURCE_CHANGED_DURING_READ", "Costing-New material rates changed while this Live Cost was being assembled. Refresh before saving a snapshot.", "", blocker=True)
         available_lines = [line for line in lines_out if line.get("status") == "available"]
         subtotal = sum(float(line.get("netCost") or 0) for line in available_lines)
         blockers = [item for item in warnings if item.get("blocking", True)]
         manifest = {"configurationRevisionId": int(config["revision"]["id"]), "configurationRevisionKey": _fields(config["revision"]).get("ConfigurationRevisionKey"),
             "tableCounts": {name: len(rows) for name, rows in tables.items()}, "tableFingerprint": start_fingerprint,
-            "materialRateSource": material_response.get("source"), "policyVersion": POLICY_VERSION}
+            "materialRateSource": material_response.get("source"), "localMasterImport": {
+                "importId": active_import_id, "version": import_control.get("Version"),
+                "fingerprint": import_control.get("Fingerprint")}, "policyVersion": POLICY_VERSION}
         input_fingerprint = request_fingerprint({"manifest": manifest, "parts": parts_out, "lines": lines_out, "rateEvidence": evidence_rows,
             "currency": code_currency, "configurationSelections": [row.get("SelectionIdentity") for row in selections]})
         date_summary = _cost_date_summary(evidence_rows, as_of=current_time)

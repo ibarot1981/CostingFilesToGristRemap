@@ -402,6 +402,8 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             client = DefinitionMemoryGrist()
             client.tables["Material"].append({"id": 6, "fields": {"CanonicalName": "QA alloy identity"}})
+            client.tables["Material"].append({"id": 7, "fields": {"CanonicalName": "Unpublished QA import identity",
+                "MaterialKey": "costing-new:MasterMaterial:999", "SourceImportKey": "costing-new:MasterMaterial:999"}})
             provider = lambda: {"status": "available", "sourceDocumentId": "costing-new-test", "records": [
                 {"canonicalName": "Steel", "masterMaterialId": 55, "kgPerMeter": "1.58", "factorStatus": "available",
                  "source": "Costing-New", "sourceDocumentId": "costing-new-test", "sourceTable": "MasterMaterial",
@@ -411,6 +413,7 @@ class PartDefinitionMaintenanceTests(unittest.TestCase):
                  "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "sourceDate": "2026-10-01"}]}
             service = self.make_service(client, Path(temp) / "coordinator.sqlite3", material_weight_catalog_provider=provider)
             options = service.options("p-1")
+            self.assertNotIn(7, {item["id"] for item in options["materials"]})
             self.assertEqual(options["materialWeightSource"]["catalogCount"], 2)
             self.assertEqual(options["materialWeightSource"]["selectableCount"], 1)
             source_only = next(item for item in options["materialCatalog"] if item["masterMaterialId"] == 56)
