@@ -613,9 +613,12 @@ class GristLiveCostService:
                     piece_units = {"nos", "no", "each", "ea", "pcs", "piece", "pieces"}
                     attributes = decode_grist_any_object(detail_fields.get("EngineeringAttributes")) or {}
                     consumption_basis = str(attributes.get("materialConsumptionBasis") or "").strip().casefold()
+                    process_is_toolshop = process_key in {"tool_shop", "tool shop", "toolshop"}
+                    is_physical_toolshop_mass = process_is_toolshop and consumption_basis == WEIGHT_PER_PIECE
+                    uses_current_material_factor = is_material_process or is_physical_toolshop_mass
                     supported_basis = ((is_material_process and consumption_basis in {
                         MCL_KG_PER_PIECE, WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE})
-                        or (process_key in {"tool_shop", "tool shop", "toolshop"}
+                        or (process_is_toolshop
                             and consumption_basis in {WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE}))
                     if consumption_basis and not supported_basis:
                         warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED",
@@ -627,7 +630,7 @@ class GristLiveCostService:
                         warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED",
                             f"Legacy MCL consumption stores {amount_per_line:g} {detail_unit} per occurrence and Qty per Part is also {link_quantity:g} {link_unit}; review the basis before costing.", path)
                         continue
-                    cut_mm = _cut_length_mm(detail_fields) if is_material_process else None
+                    cut_mm = _cut_length_mm(detail_fields) if uses_current_material_factor else None
                     if is_material_process and cut_mm is not None and detail_unit not in {"kg", "kilogram", "kilograms", "g", "gram", "grams"}:
                         warn("MATERIAL_CONSUMPTION_BASIS_UNRESOLVED", "A cut-length MCL requirement must retain its accepted per-piece mass basis; piece counts are stored on the Part link.", path)
                         continue
@@ -641,6 +644,17 @@ class GristLiveCostService:
                         if amount_per_line is None or not math.isclose(amount_per_line, expected_quantity, rel_tol=1e-9, abs_tol=1e-9):
                             warn("MATERIAL_CONSUMPTION_DERIVATION_MISMATCH", "Saved MCL mass consumption does not match the verified cut-length conversion.", path)
                             continue
+                    if is_physical_toolshop_mass:
+                        mass_units = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+                            "g": 0.001, "gram": 0.001, "grams": 0.001}
+                        trusted_evidence = self._trusted_material_weight_evidence(detail_fields, material_id)
+                        if not trusted_evidence or cut_mm is None or detail_unit not in mass_units:
+                            warn("MATERIAL_CONVERSION_UNVERIFIED", "Physical Tool Shop mass consumption needs a valid cut length, mass unit and server-verified material evidence.", path)
+                            continue
+                        expected_quantity = (cut_mm / 1000.0 * float(_num(trusted_evidence.get("kgPerMeter")))) / mass_units[detail_unit]
+                        if amount_per_line is None or not math.isclose(amount_per_line, expected_quantity, rel_tol=1e-9, abs_tol=1e-9):
+                            warn("MATERIAL_CONSUMPTION_DERIVATION_MISMATCH", "Saved physical Tool Shop mass does not match its signed cut-length evidence.", path)
+                            continue
                     if amount_per_line is None or link_quantity is None or amount_per_line < 0 or link_quantity <= 0:
                         warn("LINE_QUANTITY_INVALID", "A normalized line has missing or invalid quantity evidence.", path)
                         continue
@@ -648,14 +662,15 @@ class GristLiveCostService:
                     # Safari kg/m generation. The accepted detail quantity and
                     # its signed evidence remain historical facts; they are not
                     # silently rewritten when a local master factor changes.
-                    if is_material_process:
+                    if uses_current_material_factor:
                         if material_id in current_material_conflicts:
                             warn("MATERIAL_MASTER_IDENTITY_CONFLICT", "Multiple current source masters map to this Safari Material with conflicting weight/rate facts; resolve the source identity before costing.", path)
                             continue
                         imported = current_material_factors.get(material_id)
                         kgm = _num(imported.get("KGsPerMeter")) if imported else None
                         if not active_import_id or not imported or kgm is None or kgm <= 0 or cut_mm is None:
-                            warn("MATERIAL_FACTOR_UNAVAILABLE", "Current MCL consumption needs one published Safari master version, a valid local kg/m factor and a cut length.", path)
+                            process_label = "MCL" if is_material_process else "physical Tool Shop"
+                            warn("MATERIAL_FACTOR_UNAVAILABLE", f"Current {process_label} consumption needs one published Safari master version, a valid local kg/m factor and a cut length.", path)
                             continue
                         amount_per_line = (cut_mm / 1000.0) * kgm
                     total_quantity = effective_quantity * link_quantity * amount_per_line
@@ -667,7 +682,7 @@ class GristLiveCostService:
                         "materialName": material_name, "quantity": total_quantity,
                         "effectivePartQuantity": effective_quantity, "linkQuantity": link_quantity,
                         "perOccurrenceQuantity": amount_per_line,
-                        "uom": "kg" if is_material_process else str(detail_fields.get("QuantityUOM") or link_fields.get("QuantityUOM") or "").strip(),
+                        "uom": "kg" if uses_current_material_factor else str(detail_fields.get("QuantityUOM") or link_fields.get("QuantityUOM") or "").strip(),
                         "description": str(detail_fields.get("ItemName") or detail_fields.get("MaterialDisplayName") or master.get("SourcePartName") or process).strip(),
                         "currency": str(_fields(config["revision"]).get("Currency") or "").upper(),
                         "physicalSignature": str(line_revision.get("PhysicalSignature") or "")})

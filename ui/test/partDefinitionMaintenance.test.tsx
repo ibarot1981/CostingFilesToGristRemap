@@ -546,6 +546,28 @@ it("uses current local mass factors while retaining historical evidence and alia
   expect(screen.getByText("0.45 kg / piece")).toBeTruthy();
 });
 
+it("shows physical Tool Shop weight from the current local master while retaining its saved factor evidence", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",kgPerMeter:6,
+    weightEvidence:{status:"available",kgPerMeter:"6",factorUnit:"kg/m",source:"Safari local master",sourceDate:"2026-11-28"}}],
+    purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,applicability:{...accepted.applicability,toolshop:{applicable:true,status:"applicable"}},
+    requirements:[{requirementKey:"physical-ts-stock",identityStatus:"stable",family:"toolshop",processType:"tool_shop",
+      quantity:2,uom:"Nos",materialConsumptionStatus:"resolved",
+      detail:{Material:5,MaterialDisplayName:"MS-Angles 65 x 65 x 6",Quantity:0.174,QuantityUOM:"kg",DimensionMM:30,
+        DimensionText:"30",DimensionUOM:"mm",EngineeringAttributes:{materialConsumptionBasis:"weight_per_piece",
+          materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-20"}}},
+      materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-20"},
+      provenance:{type:"ods_baseline"}}]});
+
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+
+  expect(await screen.findByText("0.18 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.36 kg per parent Part")).toBeTruthy();
+  fireEvent.click(screen.getAllByText("Saved calculation and identity")[0]);
+  fireEvent.click(screen.getByText("Historical factor evidence"));
+  expect(screen.getAllByText(/5.8/).length).toBeGreaterThan(0);
+});
+
 it("keeps a phased-out saved material visible with its current factor but excludes it from new choices", async () => {
   apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"Saved steel",selectable:false,kgPerMeter:7,
     weightEvidence:{status:"available",kgPerMeter:"7",factorUnit:"kg/m",source:"Safari local master",sourceDate:"2026-11-27"}}],
