@@ -494,6 +494,14 @@ class PartBaselineService:
 
             factor_records = [record for record in source_records
                 if canonical and str(record.get("canonicalName") or "").strip().casefold() == canonical.casefold()]
+            inactive_records = [record for record in factor_records if not bool(record.get("inUse", True))]
+            if inactive_records and len(factor_records) == 1:
+                material_id = None
+                material_status = "phased_out"
+                exceptions.append({"family": family, "sourceRow": item["row"], "sourceLabel": source_label,
+                    "canonicalName": canonical or None, "status": "material_phased_out",
+                    "message": "This source master is phased out and cannot be selected for a new baseline; historical references remain readable."})
+                factor_records = []
             factor = None
             evidence = {"status": "unavailable", "canonicalName": canonical or source_label,
                 "source": "Costing-New", "sourceTable": "MasterMaterial", "sourceField": "KGsPerMeter", "factorUnit": "kg/m"}

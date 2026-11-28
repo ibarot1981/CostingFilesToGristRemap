@@ -96,6 +96,16 @@ class GristPartDefinitionService:
         self.features = GristPartFeatures(registry)
         self.material_weight_catalog_provider = material_weight_catalog_provider
         self._material_weight_catalog_cache: dict[str, Any] | None = None
+        self._material_mapping_cache: dict[str, Any] | None = None
+
+    def _material_mapping(self) -> dict[str, Any]:
+        if self._material_mapping_cache is None:
+            from app.config import load_material_mapping
+            try:
+                self._material_mapping_cache = load_material_mapping()
+            except Exception:
+                self._material_mapping_cache = {}
+        return self._material_mapping_cache
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.registry._rows(table)
@@ -237,16 +247,25 @@ class GristPartDefinitionService:
                 and str(record.get("sourceDocumentId") or source_document_id) == source_document_id
                 and str(record.get("canonicalName") or "") == str(next(p["masterMaterialName"] for p in explicit if int(p["sourceMasterMaterialId"]) in explicit_ids))]
         else:
-            from app.config import load_material_mapping
-            from app.material_resolution import resolve_material
-            try:
-                resolved = resolve_material(material_name, load_material_mapping())
-                canonical = resolved.canonical_name or material_name
-            except Exception:
-                canonical = material_name
+            # The published Safari-local import already contains the reviewed
+            # source-to-local Material reference. Resolve through that stable
+            # identity instead of reparsing the source-name YAML once per row.
             matches = [record for record in records
-                if str(record.get("canonicalName") or "").strip().casefold() == canonical.strip().casefold()
+                if _int_ref(record.get("localMaterialId")) == material_id
                 and str(record.get("sourceDocumentId") or source_document_id) == source_document_id]
+            if not matches and not any(record.get("localMaterialId") is not None for record in records):
+                # Older injected providers do not expose the persisted local
+                # identity. Keep their established reviewed-name behavior,
+                # with the mapping parsed at most once per service/request.
+                from app.material_resolution import resolve_material
+                try:
+                    resolved = resolve_material(material_name, self._material_mapping())
+                    canonical = resolved.canonical_name or material_name
+                except Exception:
+                    canonical = material_name
+                matches = [record for record in records
+                    if str(record.get("canonicalName") or "").strip().casefold() == canonical.strip().casefold()
+                    and str(record.get("sourceDocumentId") or source_document_id) == source_document_id]
         if len(matches) != 1:
             return None, "ambiguous" if len(matches) > 1 else ("unavailable" if catalog.get("status") != "available" else "unbound"), material_name
         record = matches[0]
@@ -1271,17 +1290,32 @@ class GristPartDefinitionService:
                 exact_ids.update(material_ids_by_canonical_name.get(canonical_name.casefold(), set()))
             material_ids_by_master[master_id] = exact_ids
 
+        inactive_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId") and not bool(record.get("inUse", True))}
+        published_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId")}
+        conflicting_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId") and str(record.get("factorStatus") or "").casefold() == "identity_conflict"}
         for row in material_rows:
+            local_material_id = _int_ref(row.get("id"))
             fields = _fields(row)
+            # Apply may have created a deterministic Material identity while
+            # staging a new import version. Until the active manifest includes
+            # that exact identity, it is not current/selectable data.
+            if fields.get("SourceImportKey") and local_material_id not in published_imported_ids:
+                continue
             name = self._material_name(fields) or fields.get("MaterialDisplayName") or fields.get("Description") or f"Material {row['id']}"
-            evidence = self._material_weight_evidence_for_identity(int(row["id"]))
+            evidence = (None if local_material_id in conflicting_imported_ids
+                else self._material_weight_evidence_for_identity(int(row["id"])))
             source_aliases = [str(record.get("canonicalName") or "") for record in catalog.get("records", [])
                 if _int_ref(record.get("masterMaterialId")) is not None
                 and material_ids_by_master.get(int(record["masterMaterialId"]), set()) == {int(row["id"])}]
             materials.append({"id": int(row["id"]), "name": name, "code": fields.get("Code") or fields.get("MaterialCode") or "",
                 "sourceAliases": sorted(set(source_aliases), key=str.casefold),
                 "weightEvidence": evidence, "kgPerMeter": evidence.get("kgPerMeter") if evidence else None,
-                "weightStatus": evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
+                "selectable": local_material_id not in inactive_imported_ids,
+                "weightStatus": "identity_conflict" if local_material_id in conflicting_imported_ids else
+                    evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
         material_catalog = []
         if catalog.get("status") == "available":
             for record in catalog.get("records", []):
@@ -1289,12 +1323,16 @@ class GristPartDefinitionService:
                 if master_id is None:
                     continue
                 bound_ids = material_ids_by_master.get(master_id, set())
+                local_id = next(iter(bound_ids)) if len(bound_ids) == 1 else None
+                fact_conflict = str(record.get("factorStatus") or "").casefold() == "identity_conflict"
                 material_catalog.append({"sourceKey": f"{source_document_id}:MasterMaterial:{master_id}",
                     "masterMaterialId": master_id, "canonicalName": str(record.get("canonicalName") or ""),
                     "code": str(record.get("code") or ""), "kgPerMeter": record.get("kgPerMeter"),
+                    "inUse": bool(record.get("inUse", True)),
                     "factorStatus": record.get("factorStatus") or "unavailable", "sourceDate": record.get("sourceDate"),
-                    "materialId": next(iter(bound_ids)) if len(bound_ids) == 1 else None,
-                    "bindingStatus": "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
+                    "materialId": local_id,
+                    "bindingStatus": "conflict" if fact_conflict else "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
+            material_catalog = [item for item in material_catalog if item.get("inUse")]
         purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
             for row in self._rows("PurchaseItem")]
         units = {"Nos", "each", "pcs", "kg", "g", "mm", "cm", "m", "in", "inch"}
@@ -1576,10 +1614,20 @@ class GristPartDefinitionService:
             submitted_material_basis = str(raw.get("materialConsumptionResolution") or "").strip().casefold()
             legacy_basis_review = bool(existing and self._legacy_duplicate_material_basis(existing))
             material_basis = submitted_material_basis if legacy_basis_review else (submitted_material_basis or saved_material_basis)
+            preserve_unresolved_legacy_basis = bool(legacy_basis_review and not submitted_material_basis
+                and unchanged_raw_detail_value("Quantity")
+                and unchanged_raw_detail_value("QuantityUOM")
+                and unchanged_raw_detail_value("Material")
+                and unchanged_raw_detail_value("DimensionMM")
+                and unchanged_raw_detail_value("DimensionInches")
+                and unchanged_raw_detail_value("DimensionText")
+                and unchanged_raw_detail_value("DimensionUOM")
+                and _num(raw.get("quantity"), allow_blank=True) == _num(existing.get("quantity"), allow_blank=True)
+                and str(raw.get("uom") or "").strip().casefold() == str(existing.get("uom") or "").strip().casefold())
             supported_material_bases = {WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE}
             if family == "mcl":
                 supported_material_bases.add(MCL_KG_PER_PIECE)
-            if legacy_basis_review and material_basis not in supported_material_bases:
+            if legacy_basis_review and material_basis not in supported_material_bases and not preserve_unresolved_legacy_basis:
                 raise PartIdentityError("PART_MATERIAL_BASIS_REVIEW_REQUIRED",
                     "This legacy MCL/Tool Shop row stores the same piece count in normalized consumption and Qty per Part. Review the per-piece material basis before saving.")
             if material_basis and material_basis not in supported_material_bases:
@@ -1752,8 +1800,8 @@ class GristPartDefinitionService:
                 "uom": uom, "detail": detail, "provenance": deepcopy(raw.get("provenance") or {"type": "safari_authored", "evidence": {}}),
                 "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status,
                 "materialWeightEvidence": deepcopy(material_weight_evidence) if family in {"mcl", "toolshop"} else None,
-                "materialConsumptionStatus": "resolved",
-                "materialConsumptionResolution": material_basis or None})
+                "materialConsumptionStatus": "legacy_duplicate_ambiguous" if preserve_unresolved_legacy_basis else "resolved",
+                "materialConsumptionResolution": None if preserve_unresolved_legacy_basis else material_basis or None})
 
         parts_by_stable = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
         current_parts = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}

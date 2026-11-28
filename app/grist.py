@@ -7,6 +7,7 @@ before enabling this against live costing data.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 from pathlib import Path
 
@@ -72,7 +73,13 @@ class GristClient:
         if not any(item.id == workspace_id for item in writable):
             raise GristValidationError("The configured Safari Manufacturing workspace is not accessible and writable.")
         document = admin.get_document(self.doc_id)
-        validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id)
+        qa_document_id = os.getenv("SAFARI_QA_TARGET_DOC_ID", "").strip()
+        qa_workspace_id = os.getenv("SAFARI_QA_TARGET_WORKSPACE_ID", "").strip()
+        qa_label = os.getenv("SAFARI_QA_TARGET_LABEL", "").strip()
+        explicit_qa = (qa_document_id == self.doc_id and qa_workspace_id == workspace_id
+            and bool(qa_label) and self.doc_id not in {"bAPdkEDn7brbqTrfVsRmXZ", "cPCjjr9oCzhWC7z8vJbcky"})
+        validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id,
+            qa_document_id=qa_document_id if explicit_qa else None, qa_label=qa_label if explicit_qa else None)
 
     def fetch_table_records(self, table_id: str) -> list[dict[str, Any]]:
         """Fetch records from a Grist table and return the record fields."""
@@ -96,6 +103,47 @@ class GristClient:
 
         payload = response.json()
         return payload.get("records", [])
+
+    def fetch_table_projection(self, table_id: str, columns: list[str], filters: dict[str, list[Any]], *,
+                               timeout_ms: int = 8000) -> list[dict[str, Any]]:
+        """Read only selected columns and matching rows through Grist's read-only SQL API.
+
+        This is used for immutable, version-filtered local import rows. Table and
+        column identifiers must be static application identifiers; all values
+        are parameterized. The caller must supply a filter so this cannot turn
+        into an unbounded table scan by omission.
+        """
+        identifiers = [table_id, *columns, *filters.keys()]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or "") for value in identifiers):
+            raise GristValidationError("The local import query contains an invalid table or column identifier.")
+        if not filters or any(not isinstance(values, list) or not values for values in filters.values()):
+            return []
+        selected = list(dict.fromkeys(["id", *columns]))
+        clauses, args = [], []
+        for column, values in filters.items():
+            clauses.append(f'"{column}" IN ({", ".join("?" for _ in values)})')
+            args.extend(values)
+        sql = "SELECT " + ", ".join(f'"{name}"' for name in selected) + f' FROM "{table_id}" WHERE ' + " AND ".join(clauses)
+        url = f"{self.base_url}/api/docs/{self.doc_id}/sql"
+        try:
+            response = requests.post(url, headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"sql": sql, "args": args, "timeout": max(1, min(int(timeout_ms), 15000))},
+                timeout=(3, max(1, min(17, int(timeout_ms) / 1000 + 2))))
+        except requests.RequestException as exc:
+            raise GristError(f"Could not query current local import rows: {exc}") from exc
+        if response.status_code >= 400:
+            raise GristError(f"Grist local import query returned {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        records = []
+        for item in payload.get("records", []):
+            fields = dict(item.get("fields", item))
+            record_id = item.get("id", fields.pop("id", None))
+            if record_id is None:
+                raise GristError("Grist local import query returned a row without its record ID.")
+            else:
+                fields.pop("id", None)
+            records.append({"id": record_id, "fields": fields})
+        return records
 
     def update_table_records(self, table_id: str, updates: list[dict[str, Any]]) -> None:
         """Patch Grist records with fields by record ID."""

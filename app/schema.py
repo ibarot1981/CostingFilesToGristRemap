@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from app.exceptions import GristValidationError
 from app.grist_admin import GristAdminClient, SAFARI_DOCUMENT_NAME, validate_safari_document
 
 
-SCHEMA_VERSION = "safari-part-definition-maintenance-grist-2026-11-19.v17"
+SCHEMA_VERSION = "safari-one-time-master-rates-grist-2026-11-25.v23"
 FOUNDATION_TABLES: tuple[dict[str, Any], ...] = (
     {"id": "Product", "name": "Product", "columns": [{"id": "Name", "type": "Text"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}]},
     {"id": "ProductModel", "name": "Product Model", "columns": [{"id": "Product", "type": "Ref:Product"}, {"id": "ModelNumber", "type": "Text"}, {"id": "Name", "type": "Text"}, {"id": "LegacySparesOnly", "type": "Bool"}, {"id": "SourceFile", "type": "Text"}, {"id": "SourceRow", "type": "Numeric"}, {"id": "Active", "type": "Bool"}, {"id": "SupersededById", "type": "Text"}, {"id": "SupersededAt", "type": "DateTime"}]},
@@ -86,6 +87,24 @@ def _merge_table_definitions(tables: tuple[dict[str, Any], ...]) -> tuple[dict[s
     return tuple(merged[table_id] for table_id in order)
 
 
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# Imported identities are created once using a deterministic source identity.
+FOUNDATION_TABLES += (
+    _table("Material", {"SourceImportKey": "Text"}),
+)
+FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
+
+# Package B: an explicit captured source observation is staged in immutable
+# version rows. A single control pointer publishes the complete generation.
+FOUNDATION_TABLES += (
+    _table("SafariMasterImport", {"ImportKey": "Text", "Version": "Numeric", "PredecessorImport": "Ref:SafariMasterImport", "PredecessorVersion": "Numeric", "SourceDocumentId": "Text", "SourceWorkspaceId": "Text", "CapturedAt": "DateTime", "PublishedAt": "DateTime", "Fingerprint": "Text", "Status": "Text", "PublicationResult": "Any", "MasterCount": "Numeric", "SteelRateCount": "Numeric", "PurchaseRateCount": "Numeric", "ExceptionCount": "Numeric", "Actor": "Text", "RequestKey": "Text", "RequestFingerprint": "Text"}),
+    _table("SafariMasterImportControl", {"ControlKey": "Text", "ActiveImport": "Ref:SafariMasterImport", "Version": "Numeric", "Fingerprint": "Text", "UpdatedAt": "DateTime", "RequestKey": "Text"}),
+    _table("SafariMasterImportMaterial", {"ImportRowKey": "Text", "Import": "Ref:SafariMasterImport", "SourceDocumentId": "Text", "SourceTable": "Text", "SourceRecordId": "Text", "CanonicalName": "Text", "Code": "Text", "InUse": "Bool", "KGsPerMeter": "Numeric", "LatestKGsPerMeterDate": "Any", "MaterialLatestRate": "Numeric", "DefaultMaterialRate": "Numeric", "TransportLatestRate": "Numeric", "TotalRate": "Numeric", "LatestRateDate": "Any", "RateBasis": "Text", "SelectedRateLogId": "Text", "SelectedRateDateEvidence": "Any", "RateLogEvidence": "Any", "Material": "Ref:Material", "ResolutionStatus": "Text", "Fingerprint": "Text"}),
+    _table("SafariMasterImportPurchase", {"ImportRowKey": "Text", "Import": "Ref:SafariMasterImport", "SourceDocumentId": "Text", "SourceTable": "Text", "SourceRecordId": "Text", "PartName": "Text", "PartCode": "Text", "MasterPartName": "Text", "Unit": "Text", "NosPerKG": "Numeric", "PerNosFromKg": "Numeric", "PerNosFromKgFlag": "Bool", "PerNosFromKgRaw": "Any", "PerNosFromKgSourceEvidence": "Any", "DefaultRate": "Numeric", "CurrentUnitRate": "Numeric", "Freight": "Numeric", "Handling": "Numeric", "TotalCurrentRate": "Numeric", "FreightIncluded": "Bool", "LastPurchaseDate": "Any", "SelectedRateLogId": "Text", "SelectedRateDateEvidence": "Any", "RateLogEvidence": "Any", "Vendor": "Text", "Currency": "Text", "CurrencyEvidence": "Text", "PurchaseItem": "Ref:PurchaseItem", "ResolutionStatus": "Text", "Fingerprint": "Text"}),
+    _table("SafariMasterImportCapture", {"CaptureChunkKey": "Text", "RequestKey": "Text", "ChunkIndex": "Numeric", "ChunkCount": "Numeric", "SourceFingerprint": "Text", "CaptureFingerprint": "Text", "PayloadEncoding": "Text", "PayloadChunk": "Text", "ChunkFingerprint": "Text"}),
+    _table("SafariMasterImportRequest", {"RequestKey": "Text", "Action": "Text", "RequestFingerprint": "Text", "Status": "Text", "Payload": "Any", "Result": "Any", "PredecessorImport": "Ref:SafariMasterImport", "PredecessorVersion": "Numeric", "ReservedVersion": "Numeric", "CreatedAt": "DateTime", "UpdatedAt": "DateTime", "FinalizedAt": "DateTime", "Actor": "Text", "Reason": "Text"}),
+)
 FOUNDATION_TABLES = _merge_table_definitions(FOUNDATION_TABLES)
 
 # v17 adds the durable B2-P1 Part-definition draft, approved change request,
@@ -216,7 +235,15 @@ class SchemaPlan:
 
 
 def validate_schema_target(document_id: str, *, document_name: str, legacy_doc_id: str | None = None) -> None:
-    if not document_id or document_name != SAFARI_DOCUMENT_NAME:
+    qa_document_id = os.getenv("SAFARI_QA_TARGET_DOC_ID", "").strip()
+    qa_workspace_id = os.getenv("SAFARI_QA_TARGET_WORKSPACE_ID", "").strip()
+    configured_workspace_id = os.getenv("SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID", "").strip()
+    qa_label = os.getenv("SAFARI_QA_TARGET_LABEL", "").strip()
+    explicit_qa = (document_id == qa_document_id and bool(qa_workspace_id)
+        and qa_workspace_id == configured_workspace_id and document_name == qa_label
+        and qa_label.startswith("QA - one-time-safari-master-rates-20261125 - ")
+        and document_id not in {"bAPdkEDn7brbqTrfVsRmXZ", "cPCjjr9oCzhWC7z8vJbcky"})
+    if not document_id or (document_name != SAFARI_DOCUMENT_NAME and not explicit_qa):
         raise GristValidationError("Schema apply requires an explicitly validated Safari Manufacturing document.")
     if legacy_doc_id and document_id == legacy_doc_id:
         raise GristValidationError("Schema apply refused: target matches the legacy Grist document ID.")
@@ -227,7 +254,13 @@ def _validate_remote_target(client: GristAdminClient, document_id: str, workspac
     document = client.get_document(document_id)
     if document.id != document_id:
         raise GristValidationError("Grist returned document metadata for a different document ID.")
-    validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id)
+    qa_document_id = os.getenv("SAFARI_QA_TARGET_DOC_ID", "").strip()
+    qa_workspace_id = os.getenv("SAFARI_QA_TARGET_WORKSPACE_ID", "").strip()
+    qa_label = os.getenv("SAFARI_QA_TARGET_LABEL", "").strip()
+    explicit_qa = (document_id == qa_document_id and workspace_id == qa_workspace_id
+        and document_name == qa_label and document_id not in {"bAPdkEDn7brbqTrfVsRmXZ", "cPCjjr9oCzhWC7z8vJbcky"})
+    validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id,
+        qa_document_id=qa_document_id if explicit_qa else None, qa_label=qa_label if explicit_qa else None)
 
 
 def _is_compatible_grist_type(table_id: str, column_id: str, current_type: Any, expected_type: Any) -> bool:

@@ -13,7 +13,7 @@ from app.catalog_import import approved_gc_code, import_catalog_rows, plan_catal
 from app.domain import CostingFile, Product, ProductModel, ProductModelCode
 from app.filesystem_catalog import FilesystemCatalog, PathSafetyError
 from app.exceptions import GristValidationError
-from app.grist_admin import GristAdminClient, GristConnectivityError, GristDocument, GristDuplicateNameError, GristPermissionError, ensure_safari_document
+from app.grist_admin import GristAdminClient, GristConnectivityError, GristDocument, GristDuplicateNameError, GristPermissionError, ensure_safari_document, validate_safari_document
 from app.grist_admin import GristWorkspace
 from app.grist import GristClient
 from app.repository import AssociationConflict, AssociationProposal, InMemorySafariRepository
@@ -21,6 +21,24 @@ from app.schema import FOUNDATION_TABLES, SCHEMA_VERSION, apply_schema, plan_sch
 
 
 class Phase0Tests(unittest.TestCase):
+    def test_explicit_one_time_import_qa_target_requires_exact_unique_label_and_identity(self) -> None:
+        qa_id = "bpLEB8ZTFdm8nGVhpssmSm"
+        qa_label = "QA - one-time-safari-master-rates-20261125 - isolated-round2"
+        document = GristDocument(qa_id, qa_label, "2")
+        self.assertEqual(validate_safari_document(document, workspace_id="2", qa_document_id=qa_id,
+            qa_label=qa_label).id, qa_id)
+        with self.assertRaises(GristValidationError):
+            validate_safari_document(GristDocument(qa_id, "Safari Manufacturing", "2"), workspace_id="2",
+                qa_document_id=qa_id, qa_label=qa_label)
+        with self.assertRaises(GristValidationError):
+            validate_safari_document(GristDocument("bAPdkEDn7brbqTrfVsRmXZ", qa_label, "3"), workspace_id="3",
+                qa_document_id="bAPdkEDn7brbqTrfVsRmXZ", qa_label=qa_label)
+        with patch.dict(os.environ, {"SAFARI_QA_TARGET_DOC_ID": qa_id, "SAFARI_QA_TARGET_WORKSPACE_ID": "2",
+                "SAFARI_QA_TARGET_LABEL": qa_label, "SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID": "2"}):
+            validate_schema_target(qa_id, document_name=qa_label)
+            with self.assertRaises(GristValidationError):
+                validate_schema_target("bAPdkEDn7brbqTrfVsRmXZ", document_name=qa_label)
+
     def test_export_workbook_with_costing_sheets_is_a_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,7 +340,7 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(client.writes, [])
         self.assertEqual(client.calls[:2], [("get_document", "safari-doc"), ("list_tables", "safari-doc")])
 
-    def test_schema_v17_plans_only_additive_identity_and_mapping_evidence_columns(self) -> None:
+    def test_current_schema_preserves_additive_identity_and_mapping_evidence_columns(self) -> None:
         client = _SchemaClient()
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
@@ -339,6 +357,9 @@ class Phase0Tests(unittest.TestCase):
                     or table["id"] == "PartPurchaseSpecification" and column["id"] == "SpecificationIdentity"
                     or table["id"] == "ConfigurationPartSelection" and column["id"] == "PartRevision"
                     or table["id"] == "CostingConfigurationRevision" and column["id"] in {"ChangeRequest", "PublicationCause"}
+                    or table["id"] == "SafariMasterImportMaterial" and column["id"] == "SelectedRateDateEvidence"
+                    or table["id"] == "SafariMasterImportPurchase" and column["id"] == "SelectedRateDateEvidence"
+                    or table["id"] == "SafariMasterImportRequest" and column["id"] == "FinalizedAt"
                 )
             ]}
             for table in FOUNDATION_TABLES
@@ -346,7 +367,7 @@ class Phase0Tests(unittest.TestCase):
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-part-definition-maintenance-grist-2026-11-19.v17")
+        self.assertEqual(SCHEMA_VERSION, "safari-one-time-master-rates-grist-2026-11-25.v23")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
         additions = {item["tableId"]: item["columns"] for item in plan.add_columns}
@@ -366,6 +387,9 @@ class Phase0Tests(unittest.TestCase):
             "PartPurchaseSpecification": [{"id": "SpecificationIdentity", "type": "Text"}],
             "ConfigurationPartSelection": [{"id": "PartRevision", "type": "Ref:PartRevision"}],
             "CostingConfigurationRevision": [{"id": "ChangeRequest", "type": "Ref:PartEngineeringChangeRequest"}, {"id": "PublicationCause", "type": "Text"}],
+            "SafariMasterImportMaterial": [{"id": "SelectedRateDateEvidence", "type": "Any"}],
+            "SafariMasterImportPurchase": [{"id": "SelectedRateDateEvidence", "type": "Any"}],
+            "SafariMasterImportRequest": [{"id": "FinalizedAt", "type": "DateTime"}],
         })
         self.assertEqual(client.writes, [])
 
@@ -375,7 +399,9 @@ class Phase0Tests(unittest.TestCase):
         new_columns = {"PartRevision": {"PreviousRevision", "ChangeRequest", "PublicationCause", "Actor", "Reason", "OccurredAt"},
             "PartRevisionLine": {"ProvenanceType", "ProvenanceEvidence"}, "PartComponentRevision": {"ComponentIdentity"},
             "PartPurchaseSpecification": {"SpecificationIdentity"}, "ConfigurationPartSelection": {"PartRevision"},
-            "CostingConfigurationRevision": {"ChangeRequest", "PublicationCause"}}
+            "CostingConfigurationRevision": {"ChangeRequest", "PublicationCause"},
+            "SafariMasterImportMaterial": {"SelectedRateDateEvidence"}, "SafariMasterImportPurchase": {"SelectedRateDateEvidence"},
+            "SafariMasterImportRequest": {"FinalizedAt"}}
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
                 {"id": column["id"], "fields": {"type": column["type"]}}
