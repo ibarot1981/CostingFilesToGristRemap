@@ -326,5 +326,50 @@ class WorkflowTests(unittest.TestCase):
             self.flow.apply('accept','task-1',1,'reviewing','wrong-sha',token=token,report=report)
 
 
+    def pending_observation_review(self):
+        original = self.implementation()
+        original['unverified_checks'] = ['Visual observation pending']
+        self.publish(self.claim(), report=original)
+        token = self.claim('review')
+        report = self.review()
+        report.update(validation_results=original['validation_results'],
+                      resolved_submission_checks=original['unverified_checks'])
+        return token, report
+
+    def test_pending_observation_addendum_is_audited_without_rewriting_submission(self):
+        token, report = self.pending_observation_review()
+        path = self.flow.path('task-1') / 'implementation-reports/001.json'
+        before = path.read_bytes()
+        args = dict(token=token, report=report, verification_addendum='Reviewer later inspected the exact tested UI.')
+        result = self.flow.apply('accept','task-1',1,'reviewing','late-verification',**args)
+        self.assertEqual(result['state'], 'complete')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue((self.flow.path('task-1')/'verification-addenda/001.json').exists())
+        self.assertTrue(self.flow.apply('accept','task-1',1,'reviewing','late-verification',**args)['idempotent'])
+
+    def test_pending_observation_still_requires_addendum_and_complete_independent_checks(self):
+        token, report = self.pending_observation_review()
+        for changes in ({'verification_addendum':''},
+                        {'report':{**report,'resolved_submission_checks':[]}},
+                        {'report':{**report,'validation_results':[]}},
+                        {'report':{**report,'findings':[{'title':'Open defect'}]}}):
+            with self.assertRaises(w.WorkflowError):
+                self.flow.apply('accept','task-1',1,'reviewing','invalid-late',
+                    **{**dict(token=token,report=report,verification_addendum='Actual later evidence'),**changes})
+        self.assertEqual(self.flow.status('task-1')['state'], 'reviewing')
+
+    def test_addendum_cannot_override_failed_implementation_check(self):
+        original = self.implementation()
+        original['validation_results'][0].update(status='fail',verified=True)
+        original['unverified_checks'] = ['Visual observation pending']
+        self.publish(self.claim(), report=original)
+        token = self.claim('review'); report = self.review()
+        report.update(resolved_submission_checks=original['unverified_checks'],
+            validation_results=[{'name':'fixture-check','status':'pass','verified':True,'evidence':'Later pass'}])
+        with self.assertRaises(w.WorkflowError):
+            self.flow.apply('accept','task-1',1,'reviewing','failed-override',token=token,
+                report=report,verification_addendum='Cannot override an implementation failure')
+        self.assertEqual(self.flow.status('task-1')['state'], 'reviewing')
+
 if __name__ == '__main__':
     unittest.main()

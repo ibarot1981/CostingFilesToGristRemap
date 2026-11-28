@@ -316,6 +316,18 @@ class Workflow:
                             or any(item.get('status') == 'fail' for item in submitted['validation_results'])):
                         raise WorkflowError('Merged acceptance needs explicit owner authority, verification addendum, and evidence resolving every pending submitted check; failed implementation checks require correction.')
                     pending = []
+                elif pending and p.get('verification_addendum', '').strip():
+                    later_checks = report.get('validation_results', [])
+                    later_passed = {item.get('name') for item in later_checks
+                                    if item.get('status') == 'pass' and item.get('verified') is True and item.get('evidence')}
+                    if (set(report.get('resolved_submission_checks', [])) != set(pending)
+                            or not set(state['required_checks']).issubset(later_passed)
+                            or any(item.get('status') != 'pass' or item.get('verified') is not True
+                                   or not item.get('evidence') for item in later_checks)):
+                        raise WorkflowError('Later verification must resolve every pending submission check and independently pass every required check.')
+                    # This supplements pending observations only. The original
+                    # implementation checks below must still all be passing.
+                    pending = []
                 if (any(item['status'] != 'pass' or item.get('verified') is not True for item in assessments)
                         or report['findings'] or report['unverified_checks'] or pending or submitted['blockers']
                         or any(item['status'] != 'pass' or item['verified'] is not True for item in checks)
@@ -330,6 +342,12 @@ class Workflow:
             if action == 'request-round':
                 self.artifact(state, f'correction-prompts/{number:03}.md', p['prompt'].encode())
             if action in ('accept', 'accept-merged'):
+                if action == 'accept' and p.get('verification_addendum', '').strip():
+                    self.artifact(state, f'verification-addenda/{number:03}.json', encoded({
+                        'reviewed_commit': submitted['commit_sha'],
+                        'verified_by': state['claim']['owner'],
+                        'verification_addendum': p['verification_addendum'],
+                        'resolved_submission_checks': report.get('resolved_submission_checks', [])}))
                 if action == 'accept-merged':
                     self.artifact(state, f'merged-acceptances/{number:03}.json', encoded({
                         'reviewed_commit': submitted['commit_sha'], 'merged_commit': p['merged_commit'],
@@ -445,6 +463,8 @@ def main():
             if action == 'accept-merged':
                 p.add_argument('--merged-commit', required=True)
                 p.add_argument('--verification-addendum', type=Path, required=True)
+            if action == 'accept':
+                p.add_argument('--verification-addendum', type=Path)
             if action == 'request-round':
                 p.add_argument('--prompt', type=Path, required=True)
                 p.add_argument('--criterion-id', action='append', required=True)
@@ -466,7 +486,10 @@ def main():
             task_id, round_no, expected_state, request_id = (args.pop(k) for k in ('task_id', 'round', 'expected_state', 'request_id'))
             for key in ('requirement', 'prompt', 'verification_addendum'):
                 if key in args:
-                    args[key] = args[key].read_text(encoding='utf-8')
+                    if args[key] is None:
+                        args.pop(key)
+                    else:
+                        args[key] = args[key].read_text(encoding='utf-8')
             for key in ('criteria', 'report'):
                 if key in args:
                     args[key] = read_json(args[key])
