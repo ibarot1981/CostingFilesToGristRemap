@@ -236,13 +236,23 @@ function cutLengthValue(detail: any) {
   return detail?.DimensionMM ?? (detail?.DimensionInches == null ? "" : Number(detail.DimensionInches) * 25.4);
 }
 function cutLengthUnit(detail: any) { return ["in", "inch", "inches"].includes(String(detail?.DimensionUOM || "").toLowerCase()) ? "in" : "mm"; }
+function cutLengthMillimeters(detail: any) {
+  const value = Number(cutLengthValue(detail));
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return cutLengthUnit(detail) === "in" ? value * LENGTH_TO_MM.in : value;
+}
 function cutLengthText(detail: any) {
   const text = String(detail?.DimensionText || "").trim();
   const mm = detail?.DimensionMM, inches = detail?.DimensionInches;
   if (mm != null && inches != null && Number.isFinite(Number(mm)) && Number.isFinite(Number(inches))
       && Math.abs(Number(mm) - Number(inches) * 25.4) > Math.max(0.01, Math.abs(Number(mm)) * 1e-7))
     return `${text || "Conflicting saved values"} · ${mm} mm / ${inches} in`;
-  if (text) return text;
+  if (text) {
+    const hasNumericDimension = mm != null || inches != null;
+    if (hasNumericDimension && Number.isFinite(Number(text)) && !/\b(?:mm|cm|in(?:ch(?:es)?)?|m|meters?|metres?)\s*$/i.test(text))
+      return `${text} ${cutLengthUnit(detail)}`;
+    return text;
+  }
   if (mm != null) return `${mm} mm`;
   if (inches != null) return `${inches} in`;
   return "—";
@@ -269,9 +279,9 @@ function cutWeight(item: any, materials: any[] = []) {
   const selected = materials.find(material => String(material.id) === String(detail.Material));
   const evidence = selected?.weightEvidence;
   const factor = Number(selected?.kgPerMeter ?? evidence?.kgPerMeter);
-  const mm = Number(cutLengthValue(detail));
+  const mm = cutLengthMillimeters(detail);
   const quantity = Number(item?.quantity);
-  if (!Number.isFinite(factor) || factor <= 0 || !Number.isFinite(mm) || mm <= 0) return { evidence, perPiece: null, total: null };
+  if (!Number.isFinite(factor) || factor <= 0 || mm == null) return { evidence, perPiece: null, total: null };
   const perPiece = mm / 1000 * factor;
   const total = perPiece * quantity;
   return { evidence, perPiece: Number.isFinite(perPiece) && perPiece > 0 ? perPiece : null,
@@ -327,8 +337,8 @@ function stablePhysicalNumber(value: number) {
 function derivedConsumptionForPhysicalBasis(family: string, detail: any, unit: string, materials: any[] = []) {
   const normalizedUnit = String(unit || "").trim().toLowerCase();
   if (["mcl", "toolshop"].includes(family)) {
-    const mm = Number(cutLengthValue(detail));
-    if (!Number.isFinite(mm) || mm <= 0) return null;
+    const mm = cutLengthMillimeters(detail);
+    if (mm == null) return null;
     if (LENGTH_TO_MM[normalizedUnit]) return stablePhysicalNumber(mm / LENGTH_TO_MM[normalizedUnit]);
     const massFactor = MASS_TO_KG[normalizedUnit];
     const kgPerMeter = materialWeightFactor(detail, materials);
@@ -562,7 +572,7 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
     const derived = derivedConsumptionForPhysicalBasis(current.family, detail, unit, options?.materials || []);
     const pieceUnits = new Set(["nos", "no", "each", "ea", "pcs", "piece", "pieces"]);
     const legacyQuantity = Number(detail.Quantity), occurrenceQuantity = Number(current.quantity);
-    const lengthMm = Number(cutLengthValue(detail));
+    const lengthMm = cutLengthMillimeters(detail) ?? NaN;
     const factor = material ? materialWeightFactor(detail, options?.materials || []) : null;
     const safelyResolveLegacyMcl = current.family === "mcl" && current.materialConsumptionStatus === "legacy_duplicate_ambiguous"
       && material && pieceUnits.has(unit) && Number.isFinite(legacyQuantity) && legacyQuantity > 0
@@ -1011,7 +1021,13 @@ export function PartDefinitionMaintenance({ partId, onSaved, onCompare }: { part
               </select>{unitError && <small className="parts-definition-error-text">{unitError}</small>}</label>
             </div><small>Occurrence quantity used once per parent Part.</small></td>
             {family !== "cnc" && <td><div className="parts-definition-inline-fields"><label>Dimension to Cut<input aria-label={`Dimension to Cut — ${rowName}`} inputMode="decimal" value={cutValue ?? ""} aria-invalid={Boolean(cutError)} onChange={event => updateCutLength(index, event.target.value, cutUnit.toLowerCase().startsWith("in") ? "in" : "mm")}/>{cutError && <small className="parts-definition-error-text">{cutError}</small>}</label>
-                <label>Cut-length unit<select aria-label={`Cut-length unit — ${rowName}`} value={cutUnit} onChange={event => updateCutLength(index, String(cutValue ?? ""), event.target.value === "in" ? "in" : "mm")}>
+                <label>Cut-length unit<select aria-label={`Cut-length unit — ${rowName}`} value={cutUnit} onChange={event => {
+                  const nextUnit = event.target.value === "in" ? "in" : "mm";
+                  const currentMm = cutLengthMillimeters(detail);
+                  const nextValue = currentMm == null ? String(cutValue ?? "")
+                    : String(nextUnit === "in" ? currentMm / LENGTH_TO_MM.in : currentMm);
+                  updateCutLength(index, nextValue, nextUnit);
+                }}>
                   {!["mm", "in"].includes(cutUnit) && <option value={cutUnit}>{cutUnit} · saved</option>}<option value="mm">mm</option><option value="in">inch</option>
                 </select></label></div><small>{cutLengthText(detail)} · saved cut-length evidence</small></td>}
             {family === "cnc" && <td><label>Per Part Weight (kg)<input aria-label={`Per Part Weight (kg) — ${rowName}`} inputMode="decimal" value={detail.PartWeightKg ?? ""} aria-invalid={Boolean(weightError)} onChange={event => updatePartWeight(index, event.target.value)}/>{weightError && <small className="parts-definition-error-text">{weightError}</small>}</label></td>}

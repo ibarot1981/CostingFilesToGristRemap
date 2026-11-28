@@ -440,6 +440,61 @@ it("opens a normalized known MCL baseline with its material selected and no dupl
   expect(screen.queryByLabelText("Resolve material consumption — MCL row 1")).toBeNull();
 });
 
+it("calculates inch cut weights in canonical millimetres while preserving the authored display unit", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",kgPerMeter:5.8,
+    weightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,requirements:[{requirementKey:"inch-mcl",identityStatus:"stable",family:"mcl",
+    quantity:2,uom:"Nos",processType:"material_cut",materialConsumptionStatus:"resolved",
+    detail:{Material:5,MaterialDisplayName:"MS-Angles 65 x 65 x 6",Quantity:0.29464,QuantityUOM:"kg",DimensionMM:50.8,
+      DimensionInches:2,DimensionText:"2",DimensionUOM:"in"},provenance:{type:"ods_baseline"}}]});
+
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+
+  expect(await screen.findByText("2 in")).toBeTruthy();
+  expect(screen.getByText("0.29464 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.58928 kg per parent Part")).toBeTruthy();
+});
+
+it("normalizes inches through legacy material resolution, unit switching, draft save and fresh readback", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",sourceAliases:["Angles 65x65x6"],kgPerMeter:5.8,
+    weightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  const unresolved = {requirementKey:"legacy-inch-mcl",identityStatus:"stable",family:"mcl",quantity:2,uom:"Nos",processType:"material_cut",
+    materialConsumptionStatus:"legacy_duplicate_ambiguous",
+    detail:{Material:null,MaterialDisplayName:"Angles 65x65x6",Quantity:2,QuantityUOM:"Nos",DimensionInches:2,DimensionText:"2",DimensionUOM:"in"},
+    provenance:{type:"ods_baseline",evidence:{sourceRow:77}}};
+  let readback: any = {...accepted,requirements:[unresolved]};
+  apiMocks.partDefinition.mockImplementation(async () => readback);
+  apiMocks.savePartDefinitionDraft.mockImplementation(async (_partId, payload) => {
+    readback = {...accepted,draft:{draftKey:"draft-inch",saveVersion:1,baseRevisionId:20,reason:"Normalize verified legacy MCL",content:payload}};
+    return {draftKey:"draft-inch",saveVersion:1,contentFingerprint:"inch-fp",content:payload};
+  });
+
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  const material = screen.getByLabelText("Material To Use — MCL row 1") as HTMLInputElement;
+  fireEvent.focus(material);
+  fireEvent.change(material,{target:{value:"Angles 65x65x6"}});
+  fireEvent.keyDown(material,{key:"ArrowDown"});
+  fireEvent.keyDown(material,{key:"Enter"});
+
+  expect(screen.getByText("0.29464 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.58928 kg per parent Part")).toBeTruthy();
+  const cutUnit = screen.getByLabelText("Cut-length unit — MCL row 1") as HTMLSelectElement;
+  fireEvent.change(cutUnit,{target:{value:"mm"}});
+  expect((screen.getByLabelText("Dimension to Cut — MCL row 1") as HTMLInputElement).value).toBe("50.8");
+  expect(screen.getByText("0.29464 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.58928 kg per parent Part")).toBeTruthy();
+
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Normalize verified legacy MCL"}});
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText("Draft saved in Safari Grist. It has not changed the accepted revision.");
+  const savedRow = apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements[0];
+  expect(savedRow).toMatchObject({materialConsumptionStatus:"resolved",materialConsumptionResolution:"mcl_kg_per_piece"});
+  expect(savedRow.detail).toMatchObject({Material:5,Quantity:0.29464,QuantityUOM:"kg",DimensionMM:50.8,DimensionInches:2,DimensionUOM:"mm"});
+  expect(screen.getByText("0.29464 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.58928 kg per parent Part")).toBeTruthy();
+});
+
 it("normalizes a legacy physical MCL row once after its canonical local material is chosen", async () => {
   apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",kgPerMeter:5.8,
     weightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
