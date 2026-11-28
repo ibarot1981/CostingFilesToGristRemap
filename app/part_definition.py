@@ -1298,10 +1298,6 @@ class GristPartDefinitionService:
             if record.get("localMaterialId") and str(record.get("factorStatus") or "").casefold() == "identity_conflict"}
         for row in material_rows:
             local_material_id = _int_ref(row.get("id"))
-            if local_material_id in inactive_imported_ids:
-                # Saved requirements retain their Material refs; this list is
-                # only the source for new selections in the editor.
-                continue
             fields = _fields(row)
             # Apply may have created a deterministic Material identity while
             # staging a new import version. Until the active manifest includes
@@ -1317,6 +1313,7 @@ class GristPartDefinitionService:
             materials.append({"id": int(row["id"]), "name": name, "code": fields.get("Code") or fields.get("MaterialCode") or "",
                 "sourceAliases": sorted(set(source_aliases), key=str.casefold),
                 "weightEvidence": evidence, "kgPerMeter": evidence.get("kgPerMeter") if evidence else None,
+                "selectable": local_material_id not in inactive_imported_ids,
                 "weightStatus": "identity_conflict" if local_material_id in conflicting_imported_ids else
                     evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
         material_catalog = []
@@ -1617,10 +1614,20 @@ class GristPartDefinitionService:
             submitted_material_basis = str(raw.get("materialConsumptionResolution") or "").strip().casefold()
             legacy_basis_review = bool(existing and self._legacy_duplicate_material_basis(existing))
             material_basis = submitted_material_basis if legacy_basis_review else (submitted_material_basis or saved_material_basis)
+            preserve_unresolved_legacy_basis = bool(legacy_basis_review and not submitted_material_basis
+                and unchanged_raw_detail_value("Quantity")
+                and unchanged_raw_detail_value("QuantityUOM")
+                and unchanged_raw_detail_value("Material")
+                and unchanged_raw_detail_value("DimensionMM")
+                and unchanged_raw_detail_value("DimensionInches")
+                and unchanged_raw_detail_value("DimensionText")
+                and unchanged_raw_detail_value("DimensionUOM")
+                and _num(raw.get("quantity"), allow_blank=True) == _num(existing.get("quantity"), allow_blank=True)
+                and str(raw.get("uom") or "").strip().casefold() == str(existing.get("uom") or "").strip().casefold())
             supported_material_bases = {WEIGHT_PER_PIECE, ONE_ITEM_PER_OCCURRENCE}
             if family == "mcl":
                 supported_material_bases.add(MCL_KG_PER_PIECE)
-            if legacy_basis_review and material_basis not in supported_material_bases:
+            if legacy_basis_review and material_basis not in supported_material_bases and not preserve_unresolved_legacy_basis:
                 raise PartIdentityError("PART_MATERIAL_BASIS_REVIEW_REQUIRED",
                     "This legacy MCL/Tool Shop row stores the same piece count in normalized consumption and Qty per Part. Review the per-piece material basis before saving.")
             if material_basis and material_basis not in supported_material_bases:
@@ -1793,8 +1800,8 @@ class GristPartDefinitionService:
                 "uom": uom, "detail": detail, "provenance": deepcopy(raw.get("provenance") or {"type": "safari_authored", "evidence": {}}),
                 "sourcePartName": str(raw.get("sourcePartName") or ""), "fieldStatus": field_status,
                 "materialWeightEvidence": deepcopy(material_weight_evidence) if family in {"mcl", "toolshop"} else None,
-                "materialConsumptionStatus": "resolved",
-                "materialConsumptionResolution": material_basis or None})
+                "materialConsumptionStatus": "legacy_duplicate_ambiguous" if preserve_unresolved_legacy_basis else "resolved",
+                "materialConsumptionResolution": None if preserve_unresolved_legacy_basis else material_basis or None})
 
         parts_by_stable = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}
         current_parts = {str(_fields(row).get("StablePartId") or ""): row for row in self._rows("ProductPart") if _fields(row).get("StablePartId")}

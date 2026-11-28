@@ -81,3 +81,19 @@
 .parts-definition-confirm-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:18px}
 .parts-definition-confirm-dialog :focus-visible{outline:3px solid #3975ca;outline-offset:2px}
 @media(max-width:760px){.parts-definition-table{min-width:850px}.parts-definition-family{padding:7px}.parts-definition-table th,.parts-definition-table td{padding:6px}}
+.parts-definition-table{min-width:820px;font-size:12px}
+.parts-definition-table th{font-size:11px}
+.parts-definition-table label{min-width:110px;font-size:11px}
+.parts-definition-table input,.parts-definition-table select,.parts-definition-table textarea{min-height:36px;padding:8px;font-size:12px}
+.parts-definition-table .parts-definition-inline-fields{min-width:150px;grid-template-columns:minmax(72px,1fr) minmax(68px,.7fr);gap:5px}
+.parts-definition-item-cell{position:relative;min-width:220px}
+.parts-definition-item-cell>label{min-width:0}
+.parts-definition-combobox{position:relative;min-width:0}
+.parts-definition-combobox input{min-width:0;width:100%;border:1px solid #ccd3dd;border-radius:5px;padding:8px;background:#fff;color:#34435a;font:inherit}
+.parts-definition-combobox input[aria-invalid="true"]{border-color:#b94237;background:#fff7f6}
+.parts-definition-combobox-options{position:absolute;z-index:5;top:calc(100% + 3px);left:0;right:0;max-height:260px;overflow:auto;border:1px solid #bfc9d5;border-radius:6px;background:#fff;box-shadow:0 8px 22px rgba(27,43,62,.17)}
+.parts-definition-combobox-options [role="option"]{display:grid;gap:2px;padding:9px 10px;border-bottom:1px solid #eef0f3;cursor:pointer}
+.parts-definition-combobox-options [role="option"]:last-child{border-bottom:0}
+.parts-definition-combobox-options [role="option"].is-active,.parts-definition-combobox-options [role="option"]:hover{background:#edf4fc}
+.parts-definition-combobox-options [role="option"] small{margin:0;color:#68778a;font-size:10px;overflow-wrap:anywhere}
+.parts-definition-combobox-options>p{margin:0;padding:10px;color:#5e6c7e;font-size:11px}

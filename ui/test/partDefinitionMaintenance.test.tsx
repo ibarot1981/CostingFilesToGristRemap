@@ -164,7 +164,8 @@ it("derives MCL mass consumption from piece count, cut length and the selected m
   render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
   fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
   fireEvent.click(screen.getByRole("button",{name:"Add MCL row"}));
-  fireEvent.change(screen.getByLabelText("Material To Use — MCL row 2"),{target:{value:"5"}});
+  fireEvent.focus(screen.getByLabelText("Material To Use — MCL row 2"));
+  fireEvent.click(screen.getByRole("option",{name:/Steel.*Local ID 5/}));
   fireEvent.change(screen.getByLabelText("Quantity — MCL row 2"),{target:{value:"4"}});
   fireEvent.change(screen.getByLabelText("Dimension to Cut — MCL row 2"),{target:{value:"200"}});
   fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Add measured MCL stock"}});
@@ -363,7 +364,7 @@ it("captures a source-only canonical identity from CNC and selects the new local
   expect(apiMocks.bindPartDefinitionMaterial).toHaveBeenCalledWith("part-1",{
     sourceMasterMaterialId:56,reason:"Capture reviewed source identity",captureCanonicalIdentity:true,
   },expect.stringMatching(/^material-binding:/));
-  expect((screen.getByLabelText("Material To Use — CNC row 1") as HTMLSelectElement).value).toBe("99");
+  expect((screen.getByLabelText("Material To Use — CNC row 1") as HTMLInputElement).value).toBe(canonical);
   expect((screen.getByLabelText("Per Part Weight (kg) — CNC row 1") as HTMLInputElement).value).toBe("0.25");
   fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
   await screen.findByText(/Draft saved in Safari Grist/);
@@ -435,8 +436,80 @@ it("opens a normalized known MCL baseline with its material selected and no dupl
   expect(screen.getByText("0.87 kg per parent Part")).toBeTruthy();
   expect(screen.queryByRole("group",{name:/Legacy consumption review/})).toBeNull();
   fireEvent.click(screen.getByRole("button",{name:"Edit Part"}));
-  expect((screen.getByLabelText("Material To Use — MCL row 1") as HTMLSelectElement).value).toBe("5");
+  expect((screen.getByLabelText("Material To Use — MCL row 1") as HTMLInputElement).value).toBe("MS-Angles 65 x 65 x 6");
   expect(screen.queryByLabelText("Resolve material consumption — MCL row 1")).toBeNull();
+});
+
+it("normalizes a legacy physical MCL row once after its canonical local material is chosen", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",kgPerMeter:5.8,
+    weightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"}}],purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,requirements:[{requirementKey:"legacy-mcl",identityStatus:"stable",family:"mcl",
+    quantity:2,uom:"Nos",processType:"material_cut",materialConsumptionStatus:"legacy_duplicate_ambiguous",
+    detail:{Material:null,MaterialDisplayName:"Angles 65 x 65 x 6",Quantity:2,QuantityUOM:"Nos",DimensionMM:75,DimensionText:"75",DimensionUOM:"mm"},
+    provenance:{type:"ods_baseline"}}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Edit Part"}));
+  expect(screen.queryByRole("group",{name:/Legacy consumption review/})).toBeNull();
+  expect(screen.getByText(/Legacy physical consumption is preserved as saved/)).toBeTruthy();
+  const material = screen.getByLabelText("Material To Use — MCL row 1") as HTMLInputElement;
+  fireEvent.focus(material);
+  fireEvent.click(screen.getByRole("option",{name:/MS-Angles 65 x 65 x 6.*Local ID 5/}));
+  expect(screen.getByText("0.435 kg / piece")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Engineering change reason"),{target:{value:"Resolve physical MCL material from local identity"}});
+  fireEvent.click(screen.getByRole("button",{name:"Save draft"}));
+  await screen.findByText(/Draft saved in Safari Grist/);
+  const authored = apiMocks.savePartDefinitionDraft.mock.calls[0][1].requirements[0];
+  expect(authored).toMatchObject({quantity:2,uom:"Nos",materialConsumptionResolution:"mcl_kg_per_piece"});
+  expect(authored.detail).toMatchObject({Material:5,Quantity:0.435,QuantityUOM:"kg",DimensionMM:75});
+});
+
+it("uses current local mass factors while retaining historical evidence and alias-selected identity", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"MS-Angles 65 x 65 x 6",sourceAliases:["Angles 65x65x6"],kgPerMeter:6,
+    weightEvidence:{status:"available",kgPerMeter:"6",factorUnit:"kg/m",source:"Safari local master",sourceDate:"2026-11-27"}}],purchaseItems:[],families:["mcl","toolshop","cnc"],
+    materialWeightSource:{status:"available",catalogCount:1}});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,requirements:[{requirementKey:"known-mcl",identityStatus:"stable",family:"mcl",
+    quantity:2,uom:"Nos",processType:"material_cut",materialConsumptionStatus:"resolved",
+    detail:{Material:5,MaterialDisplayName:"Angles 65x65x6",Quantity:0.435,QuantityUOM:"kg",DimensionMM:75,
+      DimensionText:"75",DimensionUOM:"mm",EngineeringAttributes:{materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"}}},
+    materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-24"},provenance:{type:"ods_baseline"}}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  expect(await screen.findByText("0.45 kg / piece")).toBeTruthy();
+  expect(screen.getByText("0.9 kg per parent Part")).toBeTruthy();
+  fireEvent.click(screen.getAllByText("Saved calculation and identity")[0]);
+  fireEvent.click(screen.getByText("Historical factor evidence"));
+  expect(screen.getAllByText(/5.8/).length).toBeGreaterThan(0);
+
+  fireEvent.click(screen.getByRole("button",{name:"Edit Part"}));
+  const material = screen.getByLabelText("Material To Use — MCL row 1") as HTMLInputElement;
+  expect(material.value).toBe("MS-Angles 65 x 65 x 6");
+  fireEvent.focus(material);
+  fireEvent.change(material,{target:{value:"Angles 65x65x6"}});
+  expect(screen.getByRole("option",{name:/MS-Angles 65 x 65 x 6.*Local ID 5.*Angles 65x65x6/})).toBeTruthy();
+  fireEvent.keyDown(material,{key:"ArrowDown"});
+  fireEvent.keyDown(material,{key:"Enter"});
+  expect(material.value).toBe("MS-Angles 65 x 65 x 6");
+  expect(screen.getByText("0.45 kg / piece")).toBeTruthy();
+});
+
+it("keeps a phased-out saved material visible with its current factor but excludes it from new choices", async () => {
+  apiMocks.partDefinitionOptions.mockResolvedValue({parts:[],materials:[{id:5,name:"Saved steel",selectable:false,kgPerMeter:7,
+    weightEvidence:{status:"available",kgPerMeter:"7",factorUnit:"kg/m",source:"Safari local master",sourceDate:"2026-11-27"}}],
+    purchaseItems:[],families:["mcl","toolshop","cnc"]});
+  apiMocks.partDefinition.mockResolvedValue({...accepted,requirements:[{requirementKey:"phased-out-mcl",identityStatus:"stable",family:"mcl",
+    quantity:2,uom:"Nos",processType:"material_cut",materialConsumptionStatus:"resolved",
+    detail:{Material:5,MaterialDisplayName:"Saved steel",Quantity:0.435,QuantityUOM:"kg",DimensionMM:75,DimensionText:"75",DimensionUOM:"mm",
+      EngineeringAttributes:{materialWeightEvidence:{status:"available",kgPerMeter:"5.8",factorUnit:"kg/m",sourceDate:"2026-11-20"}}},
+    provenance:{type:"ods_baseline"}}]});
+  render(<PartDefinitionMaintenance partId="part-1" onSaved={vi.fn()} onCompare={vi.fn()}/>);
+  expect(await screen.findByText("0.525 kg / piece")).toBeTruthy();
+  expect(screen.getByText("1.05 kg per parent Part")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"Edit Part"}));
+  const material=screen.getByLabelText("Material To Use — MCL row 1") as HTMLInputElement;
+  expect(material.value).toBe("Saved steel");
+  fireEvent.focus(material);
+  fireEvent.change(material,{target:{value:"Saved steel"}});
+  expect(screen.queryByRole("option",{name:/Saved steel/})).toBeNull();
+  expect(screen.getByText(/No local material matches/)).toBeTruthy();
 });
 
 it("distinguishes a missing saved CNC total from a zero weight", async () => {
