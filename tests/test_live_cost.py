@@ -625,6 +625,21 @@ class LiveCostTests(unittest.TestCase):
         trusted_line = next(line for line in trusted["lines"] if line["description"] == "Legacy four pieces")
         self.assertAlmostEqual(trusted_line["quantity"], expected_per_piece * 4 * 2)
 
+        # A second source identity with conflicting current facts must make
+        # Live Cost incomplete instead of allowing row order to choose kg/m.
+        self.client.create_table_records("SafariMasterImportMaterial", [{"fields": {
+            "ImportRowKey": "test-import-v1:conflicting-source-master", "Import": ["R", "SafariMasterImport", 900],
+            "SourceDocumentId": "costing-new-test", "SourceTable": "MasterMaterial", "SourceRecordId": "999",
+            "CanonicalName": "Review steel alias", "Material": ["R", "Material", material["id"]], "InUse": True,
+            "KGsPerMeter": 9.0, "MaterialLatestRate": 100, "DefaultMaterialRate": 100,
+            "RateBasis": "MaterialLatestRate", "ResolutionStatus": "identity_conflict", "Fingerprint": "conflicting-source-master"}}])
+        self.client.update_table_records("SafariMasterImport", [{"id": 900, "fields": {
+            "MasterCount": len(self.client.tables["SafariMasterImportMaterial"])}}])
+        conflicted = self.service.live_cost(100)
+        self.assertIn("MATERIAL_MASTER_IDENTITY_CONFLICT", {warning["code"] for warning in conflicted["warnings"]})
+        self.assertNotIn("Legacy four pieces", {line["description"] for line in conflicted["lines"]})
+        self.assertEqual(conflicted["status"], "incomplete")
+
     def test_rate_age_uses_kolkata_calendar_and_aggregates_unknown_and_future_inputs(self):
         now = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
         same_india_day = _rate_age("2026-11-18T20:00:00Z", as_of=now)

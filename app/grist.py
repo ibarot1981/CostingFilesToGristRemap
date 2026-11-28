@@ -72,7 +72,13 @@ class GristClient:
         if not any(item.id == workspace_id for item in writable):
             raise GristValidationError("The configured Safari Manufacturing workspace is not accessible and writable.")
         document = admin.get_document(self.doc_id)
-        validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id)
+        qa_document_id = os.getenv("SAFARI_QA_TARGET_DOC_ID", "").strip()
+        qa_workspace_id = os.getenv("SAFARI_QA_TARGET_WORKSPACE_ID", "").strip()
+        qa_label = os.getenv("SAFARI_QA_TARGET_LABEL", "").strip()
+        explicit_qa = (qa_document_id == self.doc_id and qa_workspace_id == workspace_id
+            and bool(qa_label) and self.doc_id not in {"bAPdkEDn7brbqTrfVsRmXZ", "cPCjjr9oCzhWC7z8vJbcky"})
+        validate_safari_document(document, workspace_id=workspace_id, legacy_doc_id=legacy_doc_id,
+            qa_document_id=qa_document_id if explicit_qa else None, qa_label=qa_label if explicit_qa else None)
 
     def fetch_table_records(self, table_id: str) -> list[dict[str, Any]]:
         """Fetch records from a Grist table and return the record fields."""

@@ -1275,6 +1275,8 @@ class GristPartDefinitionService:
             if record.get("localMaterialId") and not bool(record.get("inUse", True))}
         published_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
             if record.get("localMaterialId")}
+        conflicting_imported_ids = {_int_ref(record.get("localMaterialId")) for record in catalog.get("records", [])
+            if record.get("localMaterialId") and str(record.get("factorStatus") or "").casefold() == "identity_conflict"}
         for row in material_rows:
             local_material_id = _int_ref(row.get("id"))
             if local_material_id in inactive_imported_ids:
@@ -1288,14 +1290,16 @@ class GristPartDefinitionService:
             if fields.get("SourceImportKey") and local_material_id not in published_imported_ids:
                 continue
             name = self._material_name(fields) or fields.get("MaterialDisplayName") or fields.get("Description") or f"Material {row['id']}"
-            evidence = self._material_weight_evidence_for_identity(int(row["id"]))
+            evidence = (None if local_material_id in conflicting_imported_ids
+                else self._material_weight_evidence_for_identity(int(row["id"])))
             source_aliases = [str(record.get("canonicalName") or "") for record in catalog.get("records", [])
                 if _int_ref(record.get("masterMaterialId")) is not None
                 and material_ids_by_master.get(int(record["masterMaterialId"]), set()) == {int(row["id"])}]
             materials.append({"id": int(row["id"]), "name": name, "code": fields.get("Code") or fields.get("MaterialCode") or "",
                 "sourceAliases": sorted(set(source_aliases), key=str.casefold),
                 "weightEvidence": evidence, "kgPerMeter": evidence.get("kgPerMeter") if evidence else None,
-                "weightStatus": evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
+                "weightStatus": "identity_conflict" if local_material_id in conflicting_imported_ids else
+                    evidence.get("factorStatus", evidence.get("status", "unavailable")) if evidence else "unavailable"})
         material_catalog = []
         if catalog.get("status") == "available":
             for record in catalog.get("records", []):
@@ -1303,13 +1307,15 @@ class GristPartDefinitionService:
                 if master_id is None:
                     continue
                 bound_ids = material_ids_by_master.get(master_id, set())
+                local_id = next(iter(bound_ids)) if len(bound_ids) == 1 else None
+                fact_conflict = str(record.get("factorStatus") or "").casefold() == "identity_conflict"
                 material_catalog.append({"sourceKey": f"{source_document_id}:MasterMaterial:{master_id}",
                     "masterMaterialId": master_id, "canonicalName": str(record.get("canonicalName") or ""),
                     "code": str(record.get("code") or ""), "kgPerMeter": record.get("kgPerMeter"),
                     "inUse": bool(record.get("inUse", True)),
                     "factorStatus": record.get("factorStatus") or "unavailable", "sourceDate": record.get("sourceDate"),
-                    "materialId": next(iter(bound_ids)) if len(bound_ids) == 1 else None,
-                    "bindingStatus": "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
+                    "materialId": local_id,
+                    "bindingStatus": "conflict" if fact_conflict else "bound" if len(bound_ids) == 1 else ("ambiguous" if bound_ids else "unbound")})
             material_catalog = [item for item in material_catalog if item.get("inUse")]
         purchase_items = [{"id": int(row["id"]), "name": _fields(row).get("Name") or _fields(row).get("Description") or "", "code": _fields(row).get("Code") or ""}
             for row in self._rows("PurchaseItem")]

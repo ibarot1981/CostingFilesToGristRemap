@@ -29,6 +29,8 @@ READ_BATCH = 500
 WRITE_BATCH = 20
 CAPTURE_CHUNK_CHARS = 90_000
 CAPTURE_WRITE_BATCH = 6
+PER_NOS_FROM_KG_FORMULA = 'if($Unit=="Per Nos") and ($Nos_Per_KG>0):\n  return 1\nelse:\n  return 0'
+PER_NOS_PRICE_FORMULA_EVIDENCE = "SparesPartCostRs divides the selected/default rate by Nos_Per_KG when PerNos_FromKg is true; TotalSparesPartCost adds SparePartsFreight and SparesPartHandling."
 
 
 def _fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -41,6 +43,44 @@ def _num(value: Any) -> float | None:
         return number if number == number and abs(number) != float("inf") else None
     except (TypeError, ValueError):
         return None
+
+
+def _source_bool(value: Any) -> bool | None:
+    """Read Grist Bool outputs without interpreting them as physical quantities."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().casefold() in {"true", "false", "1", "0"}:
+        return value.strip().casefold() in {"true", "1"}
+    return None
+
+
+def _material_current_fact_signature(fields: dict[str, Any]) -> str:
+    """Facts that must agree before source aliases can share one local Material."""
+    names = ("InUse", "KGsPerMeter", "LatestKGsPerMeterDate", "MaterialLatestRate",
+        "DefaultMaterialRate", "RateBasis", "TransportLatestRate", "TotalRate", "LatestRateDate")
+    return _json({name: fields.get(name) for name in names})
+
+
+def _unique_material_rows(rows: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], set[int]]:
+    """Return a deterministic local-material map and IDs with conflicting current facts."""
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        fields = _fields(row)
+        material_id = _int_ref(fields.get("Material"))
+        if material_id:
+            groups.setdefault(material_id, []).append(row)
+    chosen: dict[int, dict[str, Any]] = {}
+    conflicts: set[int] = set()
+    for material_id, candidates in groups.items():
+        signatures = {_material_current_fact_signature(_fields(row)) for row in candidates}
+        if any(str(_fields(row).get("ResolutionStatus") or "").casefold() in {"identity_conflict", "ambiguous"}
+                for row in candidates) or len(signatures) != 1:
+            conflicts.add(material_id)
+            continue
+        chosen[material_id] = min(candidates, key=lambda row: (str(_fields(row).get("SourceRecordId") or ""), int(row.get("id", 0))))
+    return chosen, conflicts
 
 
 def _json(value: Any) -> str:
@@ -234,12 +274,17 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
         source_currency = explicit_currency or ("INR" if fields.get("SparesPartCostRs") not in (None, "") else "")
         currency_evidence = ("PurchasePartsMaster.Currency" if explicit_currency else
             "PurchasePartsMaster.SparesPartCostRs (source field is denominated in Rs)" if source_currency else "")
+        per_nos_flag = _source_bool(fields.get("PerNos_FromKg"))
         purchases.append({"sourceRecordId": str(source["id"]), "sourceTable": "PurchasePartsMaster",
             "sourceDocumentId": source_doc, "partName": name,
             "partCode": str(fields.get("SparesPartCode") or "").strip(),
             "masterPartName": str(fields.get("SparesMasterPartName") or name).strip(),
             "unit": str(fields.get("Unit") or "").strip(), "nosPerKg": _num(fields.get("Nos_Per_KG")),
-            "perNosFromKg": _num(fields.get("PerNos_FromKg")), "defaultRate": _num(fields.get("DefaultRate2")),
+            "perNosFromKgFlag": per_nos_flag, "perNosFromKgRaw": fields.get("PerNos_FromKg"),
+            "perNosFromKgSourceEvidence": {"sourceField": "PerNos_FromKg", "sourceFieldType": "Bool",
+                "sourceFormula": PER_NOS_FROM_KG_FORMULA, "sourceFormulaVerifiedAt": "2026-11-25",
+                "priceOutputField": "SparesPartCostRs", "priceFormulaSemantics": PER_NOS_PRICE_FORMULA_EVIDENCE},
+            "defaultRate": _num(fields.get("DefaultRate2")),
             "currentUnitRate": base_rate,
             "freight": freight, "handling": handling,
             "totalCurrentRate": total_rate,
@@ -257,8 +302,8 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
 def imported_purchase_rate(row: dict[str, Any], expected_uom: str, target_currency: str) -> dict[str, Any]:
     """Resolve a captured master price without inventing a unit conversion.
 
-    Costing-New's explicit Nos_Per_KG and PerNos_FromKg fields cover the
-    source's Nos/kg pair. Other unit changes require an existing approved
+    Costing-New's Nos_Per_KG quantity and PerNos_FromKg Bool formula flag cover
+    the source's Nos/kg pair. Other unit changes require an existing approved
     local transaction conversion and are not inferred here.
     """
     fields = _fields(row)
@@ -289,23 +334,33 @@ def imported_purchase_rate(row: dict[str, Any], expected_uom: str, target_curren
     factor = 1.0
     if source_kind != target_kind:
         nos_per_kg = _num(fields.get("NosPerKG"))
-        kg_per_nos = _num(fields.get("PerNosFromKg"))
-        if nos_per_kg is not None and nos_per_kg <= 0 or kg_per_nos is not None and kg_per_nos <= 0:
+        flag_value = fields.get("PerNosFromKgFlag")
+        flag = _source_bool(flag_value) if flag_value is not None else None
+        if flag_value is None:
+            # Compatibility for early B captures: their Numeric column held
+            # the Grist Bool output as 0/1. Values such as the mistaken 0.1
+            # unit conversion are deliberately not accepted as a factor.
+            legacy_flag = _num(fields.get("PerNosFromKg"))
+            flag = bool(legacy_flag) if legacy_flag in (0, 1) else None
+        if nos_per_kg is not None and nos_per_kg <= 0:
             return {"status": "review_required", "rate": None, "reason": "The imported Nos/kg conversion is not positive."}
-        if nos_per_kg is not None and kg_per_nos is not None and abs(nos_per_kg * kg_per_nos - 1.0) > 0.005:
-            return {"status": "review_required", "rate": None,
-                "reason": "The imported Nos/kg conversion fields conflict; no conversion was selected."}
-        if source_kind == "nos" and target_kind == "kg" and kg_per_nos:
-            factor = 1.0 / kg_per_nos
-        elif source_kind == "kg" and target_kind == "nos" and nos_per_kg:
+        if source_kind == "nos" and target_kind == "kg" and flag is True and nos_per_kg:
+            # SparesPartCostRs is already the authoritative per-Nos total;
+            # multiply it by pieces/kg exactly once to obtain a per-kg rate.
+            factor = nos_per_kg
+        elif source_kind == "kg" and target_kind == "nos" and flag is False and nos_per_kg:
             factor = 1.0 / nos_per_kg
         else:
+            if flag is None:
+                return {"status": "review_required", "rate": None,
+                    "reason": "The source PerNos_FromKg Bool flag or positive Nos_Per_KG conversion is missing/invalid."}
             return {"status": "review_required", "rate": None,
-                "reason": f"The imported purchase unit {source_unit} has no approved conversion to {target_unit}."}
+                "reason": "The source PerNos_FromKg Bool flag conflicts with Unit; no Nos/kg conversion was selected."}
     return {"status": "available", "sourceRate": amount, "rate": amount * factor, "currency": currency,
         "uom": target_unit, "sourceUOM": source_unit_label, "sourceCurrency": currency,
         "conversionFactor": factor, "conversionEvidence": {"NosPerKG": fields.get("NosPerKG"),
-            "PerNosFromKg": fields.get("PerNosFromKg")},
+            "PerNosFromKgFlag": fields.get("PerNosFromKgFlag", fields.get("PerNosFromKg")),
+            "PerNosFromKgSourceEvidence": fields.get("PerNosFromKgSourceEvidence")},
         "purchaseRecordId": str(fields.get("SourceRecordId") or ""),
         "selectedRateLogId": fields.get("SelectedRateLogId"), "vendor": fields.get("Vendor"),
         "currencyEvidence": fields.get("CurrencyEvidence"), "sourceTable": fields.get("SourceTable"),
@@ -337,7 +392,16 @@ class SafariMasterImportService:
         else:
             self.client.validate_safari_write_target()
         target = GristAdminClient(self.client.api_key, self.client.base_url).get_document(self.client.doc_id)
-        if target.name != "Safari Manufacturing" or str(getattr(target, "workspace_id", "")) != str(getattr(self.client, "safari_workspace_id", "")):
+        workspace_id = str(getattr(self.client, "safari_workspace_id", ""))
+        qa_id = os.getenv("SAFARI_QA_TARGET_DOC_ID", "").strip()
+        qa_workspace = os.getenv("SAFARI_QA_TARGET_WORKSPACE_ID", "").strip()
+        qa_label = os.getenv("SAFARI_QA_TARGET_LABEL", "").strip()
+        explicit_qa = (qa_id == self.client.doc_id and qa_workspace == workspace_id and bool(qa_label)
+            and self.client.doc_id not in {"bAPdkEDn7brbqTrfVsRmXZ", SOURCE_DOC_ID}
+            and qa_label.startswith("QA - one-time-safari-master-rates-20261125 - "))
+        expected_name = qa_label if explicit_qa else "Safari Manufacturing"
+        if (target.name != expected_name or str(getattr(target, "workspace_id", "") or "") != workspace_id
+                or (explicit_qa and qa_workspace != workspace_id)):
             raise GristValidationError("Import target is not the explicitly configured Safari Manufacturing document and workspace.")
         source_id = str(self.source_client.doc_id)
         if source_id != SOURCE_DOC_ID or source_id == self.client.doc_id:
@@ -426,6 +490,30 @@ class SafariMasterImportService:
             else:
                 source["bindingStatus"] = "create"
 
+        # Reverse uniqueness matters as much as source-name uniqueness. Two
+        # reviewed aliases may intentionally resolve to one Safari Material,
+        # but they cannot provide competing current factors/rates for it.
+        by_material: dict[int, list[dict[str, Any]]] = {}
+        for source in capture["materials"]:
+            if source.get("bindingStatus") == "bound" and source.get("materialId"):
+                by_material.setdefault(int(source["materialId"]), []).append(source)
+        for material_id, sources in by_material.items():
+            if len(sources) < 2:
+                continue
+            signatures = {request_fingerprint({name: source.get(name) for name in (
+                "inUse", "kgPerMeter", "latestKgPerMeterDate", "materialLatestRate", "defaultMaterialRate",
+                "rateBasis", "transportLatestRate", "totalRate", "latestRateDate")}) for source in sources}
+            if len(signatures) > 1:
+                for source in sources:
+                    source["bindingStatus"] = "identity_conflict"
+                    source["resolutionConflict"] = {"code": "MATERIAL_SOURCE_FACT_CONFLICT",
+                        "localMaterialId": material_id,
+                        "sourceRecordIds": sorted(item["sourceRecordId"] for item in sources)}
+                capture.setdefault("exceptions", []).append({"code": "MATERIAL_SOURCE_FACT_CONFLICT",
+                    "localMaterialId": material_id,
+                    "sourceRecordIds": sorted(item["sourceRecordId"] for item in sources),
+                    "message": "Multiple source masters resolve to this Safari Material with different current weight/rate facts."})
+
     def _resolve_purchases(self, capture: dict[str, Any]) -> None:
         items = self._rows("PurchaseItem")
         specs = self._rows("PartPurchaseSpecification")
@@ -470,7 +558,8 @@ class SafariMasterImportService:
                     source["resolutionStatus"] = "ambiguous"
 
     @staticmethod
-    def _preview_payload(capture: dict[str, Any], *, request_key: str) -> dict[str, Any]:
+    def _preview_payload(capture: dict[str, Any], *, request_key: str,
+                         publication_intent: dict[str, Any] | None = None) -> dict[str, Any]:
         materials = capture["materials"]
         purchases = capture["purchases"]
         return {"requestKey": request_key, "sourceDocumentId": capture["sourceDocumentId"],
@@ -478,10 +567,11 @@ class SafariMasterImportService:
             "sourceCounts": capture["sourceCounts"], "materialCount": len(materials), "steelRateCount": sum(row.get("materialLatestRate") is not None or row.get("defaultMaterialRate") is not None for row in materials),
             "purchaseRateCount": sum(row.get("totalCurrentRate") is not None for row in purchases),
             "materialCreates": sum(row.get("bindingStatus") == "create" for row in materials),
-            "materialConflicts": [row for row in materials if row.get("bindingStatus") == "ambiguous"],
+            "materialConflicts": [row for row in materials if row.get("bindingStatus") in {"ambiguous", "identity_conflict"}],
             "purchaseUnmapped": [row for row in purchases if row.get("resolutionStatus") != "bound"],
             "phaseOuts": [row["sourceRecordId"] for row in materials if not row.get("inUse")],
-            "conflicts": capture["exceptions"], "fingerprint": request_fingerprint(capture)}
+            "conflicts": capture["exceptions"], "publicationIntent": publication_intent,
+            "fingerprint": request_fingerprint({"capture": capture.get("captureFingerprint"), "publicationIntent": publication_intent})}
 
     @staticmethod
     def _preview_audit_payload(result: dict[str, Any]) -> dict[str, Any]:
@@ -492,49 +582,84 @@ class SafariMasterImportService:
             "purchaseUnmappedCount": len(result.get("purchaseUnmapped", [])),
             "phaseOutCount": len(result.get("phaseOuts", [])), "conflictCount": len(result.get("conflicts", []))}
 
+    def _current_pointer(self) -> dict[str, Any]:
+        control = _record_by_key(self._rows("SafariMasterImportControl"), "ControlKey", "active")
+        if not control:
+            return {"importId": None, "version": 0, "fingerprint": "", "requestKey": ""}
+        fields = _fields(control)
+        import_id = _int_ref(fields.get("ActiveImport"))
+        if not import_id:
+            raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current local import pointer has no version identity.")
+        header = next((row for row in self._rows("SafariMasterImport") if int(row.get("id", -1)) == import_id), None)
+        if not header or str(_fields(header).get("Status") or "") != "published":
+            raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current local import pointer does not reference a published import.")
+        return {"importId": import_id, "version": int(fields.get("Version") or 0),
+            "fingerprint": str(fields.get("Fingerprint") or ""),
+            "requestKey": str(fields.get("RequestKey") or "")}
+
+    @staticmethod
+    def _same_pointer(current: dict[str, Any], expected: dict[str, Any]) -> bool:
+        return (current.get("importId") == expected.get("importId")
+            and int(current.get("version") or 0) == int(expected.get("version") or 0)
+            and str(current.get("fingerprint") or "") == str(expected.get("fingerprint") or "")
+            and str(current.get("requestKey") or "") == str(expected.get("requestKey") or ""))
+
     def preview(self, *, request_key: str, actor: str, reason: str = "") -> dict[str, Any]:
         key = request_key.strip()
         if not key or not actor.strip():
             raise PartIdentityError("SAFARI_IMPORT_INPUT_INVALID", "A unique idempotency key and actor are required for a preview.")
         self._guard()
-        existing = _record_by_key(self._rows("SafariMasterImportRequest"), "RequestKey", key)
-        if existing:
-            fields = _fields(existing)
-            if fields.get("Action") != "preview":
-                raise PartIdentityError("SAFARI_IMPORT_REQUEST_CONFLICT", "This key belongs to a different import action.")
-            payload = _decode_json(fields.get("Payload"), {}) or {}
-            capture = _load_capture(self.client, key, expected_fingerprint=str(payload.get("captureFingerprint") or ""))
-            result = self._preview_payload(capture, request_key=key)
-            self._audit(f"{key}:preview", str(fields.get("Actor") or actor), self._preview_audit_payload(result),
-                str(fields.get("Reason") or reason), event_type="safari_master_rate_import_previewed",
-                entity_type="SafariMasterImportRequest")
+        # Serialize first use of a request key with the original coordinator.
+        with self.registry.lock:
+            existing = _record_by_key(self._rows("SafariMasterImportRequest"), "RequestKey", key)
+            if existing:
+                fields = _fields(existing)
+                if fields.get("Action") != "preview":
+                    raise PartIdentityError("SAFARI_IMPORT_REQUEST_CONFLICT", "This key belongs to a different import action.")
+                payload = _decode_json(fields.get("Payload"), {}) or {}
+                publication_intent = payload.get("publicationIntent")
+                if not isinstance(publication_intent, dict):
+                    raise PartIdentityError("SAFARI_IMPORT_PREVIEW_STALE", "This preview has no frozen predecessor version; start a new key.")
+                capture = _load_capture(self.client, key, expected_fingerprint=str(payload.get("captureFingerprint") or ""))
+                result = self._preview_payload(capture, request_key=key, publication_intent=publication_intent)
+                if result["fingerprint"] != str(payload.get("previewFingerprint") or ""):
+                    raise PartIdentityError("SAFARI_IMPORT_PREVIEW_STALE", "The saved preview no longer matches its frozen publication intent.")
+                self._audit(f"{key}:preview", str(fields.get("Actor") or actor), self._preview_audit_payload(result),
+                    str(fields.get("Reason") or reason), event_type="safari_master_rate_import_previewed",
+                    entity_type="SafariMasterImportRequest")
+                return result
+            saved_chunks = [row for row in self._rows("SafariMasterImportCapture")
+                if str(_fields(row).get("RequestKey") or "") == key]
+            if saved_chunks:
+                capture = _load_capture(self.client, key)
+            else:
+                capture = self._read_capture()
+                self._resolve_materials(capture)
+                self._resolve_purchases(capture)
+                _store_capture(self.client, key, capture)
+            predecessor = self._current_pointer()
+            publication_intent = {**predecessor, "reservedVersion": int(predecessor["version"]) + 1}
+            result = self._preview_payload(capture, request_key=key, publication_intent=publication_intent)
+            fp = request_fingerprint({"action": "preview", "captureFingerprint": capture["captureFingerprint"],
+                "publicationIntent": publication_intent})
+            result_summary = {name: result[name] for name in ("requestKey", "sourceDocumentId", "sourceFingerprint",
+                "captureFingerprint", "sourceCounts", "materialCount", "steelRateCount", "purchaseRateCount",
+                "materialCreates", "fingerprint")}
+            result_summary.update({"materialConflictCount": len(result.get("materialConflicts", [])),
+                "purchaseUnmappedCount": len(result.get("purchaseUnmapped", [])),
+                "phaseOutCount": len(result.get("phaseOuts", [])), "conflictCount": len(result.get("conflicts", []))})
+            from app.grist_types import canonical_grist_json_cell
+            payload = canonical_grist_json_cell({"captureKey": _capture_key(key),
+                "captureFingerprint": capture["captureFingerprint"], "previewFingerprint": result["fingerprint"],
+                "publicationIntent": publication_intent})
+            _create(self.client, "SafariMasterImportRequest", [{"RequestKey": key, "Action": "preview", "RequestFingerprint": fp,
+                "Status": "previewed", "Payload": payload, "Result": canonical_grist_json_cell(result_summary),
+                "PredecessorImport": publication_intent.get("importId"), "PredecessorVersion": publication_intent["version"],
+                "ReservedVersion": publication_intent["reservedVersion"], "CreatedAt": grist_datetime(utc_now()),
+                "UpdatedAt": grist_datetime(utc_now()), "Actor": actor.strip(), "Reason": reason.strip()}])
+            self._audit(f"{key}:preview", actor, self._preview_audit_payload(result), reason,
+                event_type="safari_master_rate_import_previewed", entity_type="SafariMasterImportRequest")
             return result
-        saved_chunks = [row for row in self._rows("SafariMasterImportCapture")
-            if str(_fields(row).get("RequestKey") or "") == key]
-        if saved_chunks:
-            capture = _load_capture(self.client, key)
-        else:
-            capture = self._read_capture()
-            self._resolve_materials(capture)
-            self._resolve_purchases(capture)
-            _store_capture(self.client, key, capture)
-        result = self._preview_payload(capture, request_key=key)
-        fp = request_fingerprint({"action": "preview", "captureFingerprint": capture["captureFingerprint"]})
-        result_summary = {name: result[name] for name in ("requestKey", "sourceDocumentId", "sourceFingerprint",
-            "captureFingerprint", "sourceCounts", "materialCount", "steelRateCount", "purchaseRateCount",
-            "materialCreates", "fingerprint")}
-        result_summary.update({"materialConflictCount": len(result.get("materialConflicts", [])),
-            "purchaseUnmappedCount": len(result.get("purchaseUnmapped", [])),
-            "phaseOutCount": len(result.get("phaseOuts", [])), "conflictCount": len(result.get("conflicts", []))})
-        from app.grist_types import canonical_grist_json_cell
-        payload = canonical_grist_json_cell({"captureKey": _capture_key(key), "captureFingerprint": capture["captureFingerprint"],
-            "previewFingerprint": result["fingerprint"]})
-        _create(self.client, "SafariMasterImportRequest", [{"RequestKey": key, "Action": "preview", "RequestFingerprint": fp,
-            "Status": "previewed", "Payload": payload, "Result": canonical_grist_json_cell(result_summary), "CreatedAt": grist_datetime(utc_now()),
-            "UpdatedAt": grist_datetime(utc_now()), "Actor": actor.strip(), "Reason": reason.strip()}])
-        self._audit(f"{key}:preview", actor, self._preview_audit_payload(result), reason,
-            event_type="safari_master_rate_import_previewed", entity_type="SafariMasterImportRequest")
-        return result
 
     def _find_request(self, request_key: str) -> dict[str, Any]:
         row = _record_by_key(self._rows("SafariMasterImportRequest"), "RequestKey", request_key)
@@ -543,6 +668,50 @@ class SafariMasterImportService:
         if _fields(row).get("Action") != "preview":
             raise PartIdentityError("SAFARI_IMPORT_REQUEST_CONFLICT", "The supplied key is not an import preview request.")
         return row
+
+    def _active_descends_from(self, active_import_id: int | None, ancestor_import_id: int) -> bool:
+        headers = self._rows("SafariMasterImport")
+        by_id = {int(row.get("id", -1)): _fields(row) for row in headers}
+        current = active_import_id
+        visited: set[int] = set()
+        while current and current not in visited:
+            if current == ancestor_import_id:
+                return True
+            visited.add(current)
+            fields = by_id.get(current)
+            if not fields:
+                return False
+            predecessor = _int_ref(fields.get("PredecessorImport"))
+            if predecessor == ancestor_import_id:
+                return True
+            current = predecessor
+        return False
+
+    def _finish_import_request(self, request: dict[str, Any], *, key: str, actor: str,
+                               reason: str, result: dict[str, Any]) -> dict[str, Any]:
+        from app.grist_types import canonical_grist_json_cell
+        status = str(result.get("status") or "")
+        _patch(self.client, "SafariMasterImportRequest", int(request["id"]),
+            {"Status": status, "Result": canonical_grist_json_cell(result),
+             "UpdatedAt": grist_datetime(utc_now()), "Reason": reason.strip()})
+        self._audit(key, actor, result, reason,
+            event_type="safari_master_rate_import_superseded" if status == "superseded" else "safari_master_rate_import_published")
+        return deepcopy(result)
+
+    def _superseded_result(self, *, request: dict[str, Any], key: str, actor: str, reason: str,
+                           current: dict[str, Any], publication_result: dict[str, Any] | None = None,
+                           was_published: bool = False) -> dict[str, Any]:
+        fields = _fields(request)
+        result = {"status": "superseded", "requestKey": key,
+            "importKey": str(fields.get("RequestKey") or key),
+            "predecessorImport": _int_ref(fields.get("PredecessorImport")),
+            "predecessorVersion": int(fields.get("PredecessorVersion") or 0),
+            "reservedVersion": int(fields.get("ReservedVersion") or 0),
+            "activeImportId": current.get("importId"), "activeVersion": current.get("version"),
+            "reason": "A different immutable import generation has advanced the active pointer; this key cannot republish its older capture."}
+        if was_published and publication_result:
+            result["originalPublication"] = publication_result
+        return self._finish_import_request(request, key=key, actor=actor, reason=reason, result=result)
 
     def _bind_or_create_materials(self, capture: dict[str, Any]) -> None:
         rows = self._rows("Material")
@@ -554,7 +723,7 @@ class SafariMasterImportService:
                 by_name.setdefault(name, []).append(row)
         pending: list[dict[str, Any]] = []
         for source in capture["materials"]:
-            if source.get("bindingStatus") == "bound":
+            if source.get("bindingStatus") in {"bound", "identity_conflict"}:
                 continue
             if source.get("bindingStatus") == "ambiguous":
                 continue
@@ -611,13 +780,49 @@ class SafariMasterImportService:
             request = self._find_request(key)
             fields = _fields(request)
             payload = _decode_json(fields.get("Payload"), {}) or {}
+            publication_intent = payload.get("publicationIntent")
+            if not isinstance(publication_intent, dict):
+                raise PartIdentityError("SAFARI_IMPORT_PREVIEW_STALE", "The saved preview has no frozen predecessor/version intent; create a new key.")
             capture = _load_capture(self.client, key, expected_fingerprint=str(payload.get("captureFingerprint") or ""))
-            preview = self._preview_payload(capture, request_key=key)
+            preview = self._preview_payload(capture, request_key=key, publication_intent=publication_intent)
             if preview.get("fingerprint") != expected_fingerprint or payload.get("previewFingerprint") != expected_fingerprint:
                 raise PartIdentityError("SAFARI_IMPORT_PREVIEW_STALE", "The exact persisted preview fingerprint is required; create a new preview after any source change.")
-            if fields.get("Status") == "published":
+            status = str(fields.get("Status") or "")
+            if status == "published":
                 return deepcopy(_decode_json(fields.get("Result"), {}) or {})
-            if fields.get("Status") == "previewed":
+            if status == "superseded":
+                return deepcopy(_decode_json(fields.get("Result"), {}) or {})
+            expected_predecessor = {name: publication_intent.get(name) for name in ("importId", "version", "fingerprint", "requestKey")}
+            current_pointer = self._current_pointer()
+            import_key = f"safari-master-import:{key}"
+            header = _record_by_key(self._rows("SafariMasterImport"), "ImportKey", import_key)
+            header_fields = _fields(header) if header else {}
+            import_id = int(header["id"]) if header else None
+            if import_id and current_pointer.get("importId") == import_id and current_pointer.get("requestKey") == key:
+                original_result = _decode_json(header_fields.get("PublicationResult"), {}) or {}
+                if not original_result:
+                    raise PartIdentityError("SAFARI_IMPORT_PUBLICATION_UNCONFIRMED", "The active pointer names this request but its immutable publication outcome is missing.")
+                return self._finish_import_request(request, key=key, actor=actor, reason=reason, result=original_result)
+            if not self._same_pointer(current_pointer, expected_predecessor):
+                if import_id and self._active_descends_from(current_pointer.get("importId"), import_id):
+                    return self._superseded_result(request=request, key=key, actor=actor, reason=reason,
+                        current=current_pointer, publication_result=_decode_json(header_fields.get("PublicationResult"), {}) or {}, was_published=True)
+                return self._superseded_result(request=request, key=key, actor=actor, reason=reason, current=current_pointer)
+            if status == "previewed":
+                # A reviewed local identity choice cannot silently drift between
+                # preview and first apply. Retries after applying use the
+                # immutable persisted capture and its original choices.
+                rebinding = deepcopy(capture)
+                self._resolve_materials(rebinding)
+                self._resolve_purchases(rebinding)
+                def bindings(snapshot):
+                    material_bindings = [(str(row.get("sourceRecordId") or ""), row.get("materialId"), row.get("bindingStatus"))
+                        for row in snapshot.get("materials", [])]
+                    purchase_bindings = [(str(row.get("sourceRecordId") or ""), row.get("purchaseItemId"), row.get("resolutionStatus"))
+                        for row in snapshot.get("purchases", [])]
+                    return material_bindings, purchase_bindings
+                if bindings(rebinding) != bindings(capture):
+                    raise PartIdentityError("SAFARI_IMPORT_BINDING_STALE", "A reviewed local source identity binding changed after preview. Start a new key and review the new resolution.")
                 observed = self._read_capture()
                 if observed["sourceFingerprint"] != capture.get("sourceFingerprint"):
                     raise PartIdentityError("SAFARI_IMPORT_SOURCE_DRIFT", "The source changed after preview. Start a new import key and preview.")
@@ -625,26 +830,27 @@ class SafariMasterImportService:
             # Once status is applying, all retries use the immutable capture
             # persisted with the original request and do not reread upstream.
             request = _record_by_key(self._rows("SafariMasterImportRequest"), "RequestKey", key) or request
-            active_rows = self._rows("SafariMasterImportControl")
-            control = _record_by_key(active_rows, "ControlKey", "active")
-            previous_version = int(_fields(control).get("Version") or 0) if control else 0
-            import_key = f"safari-master-import:{key}"
             import_fp = request_fingerprint({"request": key, "capture": capture.get("captureFingerprint")})
-            header = _record_by_key(self._rows("SafariMasterImport"), "ImportKey", import_key)
             if not header:
-                _create(self.client, "SafariMasterImport", [{"ImportKey": import_key, "Version": previous_version + 1,
+                _create(self.client, "SafariMasterImport", [{"ImportKey": import_key, "Version": int(publication_intent["reservedVersion"]),
+                    "PredecessorImport": publication_intent.get("importId"), "PredecessorVersion": int(publication_intent.get("version") or 0),
                     "SourceDocumentId": capture["sourceDocumentId"], "SourceWorkspaceId": capture.get("sourceWorkspaceId", ""),
                     "CapturedAt": grist_datetime(datetime.fromisoformat(capture["capturedAt"].replace("Z", "+00:00"))),
                     "Fingerprint": capture["sourceFingerprint"], "Status": "staging", "MasterCount": len(capture["materials"]),
                     "SteelRateCount": sum(row.get("materialLatestRate") is not None or row.get("defaultMaterialRate") is not None for row in capture["materials"]),
                     "PurchaseRateCount": sum(row.get("totalCurrentRate") is not None for row in capture["purchases"]),
-                    "ExceptionCount": len(preview.get("conflicts", [])) + len(preview.get("purchaseUnmapped", [])),
+                    "ExceptionCount": len(preview.get("conflicts", [])) + len(preview.get("materialConflicts", [])) + len(preview.get("purchaseUnmapped", [])),
                     "Actor": actor.strip(), "RequestKey": key, "RequestFingerprint": import_fp}])
                 header = _record_by_key(self._rows("SafariMasterImport"), "ImportKey", import_key)
             if not header:
                 raise PartIdentityError("SAFARI_IMPORT_WRITE_UNCONFIRMED", "Grist did not confirm the immutable import version header.")
             import_id = int(header["id"])
-            header_version = int(_fields(header).get("Version") or previous_version + 1)
+            header_fields = _fields(header)
+            if (int(header_fields.get("Version") or 0) != int(publication_intent["reservedVersion"])
+                    or _int_ref(header_fields.get("PredecessorImport")) != _int_ref(publication_intent.get("importId"))
+                    or int(header_fields.get("PredecessorVersion") or 0) != int(publication_intent.get("version") or 0)
+                    or str(header_fields.get("Fingerprint") or "") != str(capture.get("sourceFingerprint") or "")):
+                raise PartIdentityError("SAFARI_IMPORT_PUBLICATION_CONFLICT", "The durable import header differs from its frozen predecessor/version intent.")
             self._bind_or_create_materials(capture)
             material_rows = []
             for row in capture["materials"]:
@@ -656,7 +862,8 @@ class SafariMasterImportService:
                     "DefaultMaterialRate": row.get("defaultMaterialRate"), "TransportLatestRate": row.get("transportLatestRate"),
                     "TotalRate": row.get("totalRate"), "LatestRateDate": row.get("latestRateDate"), "RateBasis": row.get("rateBasis"),
                     "SelectedRateLogId": row.get("selectedRateLogId"), "RateLogEvidence": _json(row.get("rateLogEvidence") or []),
-                    "Material": row.get("materialId"), "Fingerprint": row["masterFingerprint"]}
+                    "Material": row.get("materialId"), "ResolutionStatus": row.get("bindingStatus"),
+                    "Fingerprint": row["masterFingerprint"]}
                 material_rows.append(fields_out)
             self._upsert_rows("SafariMasterImportMaterial", "ImportRowKey", material_rows)
             purchase_rows = []
@@ -665,7 +872,10 @@ class SafariMasterImportService:
                 purchase_rows.append({"ImportRowKey": row_key, "Import": import_id, "SourceDocumentId": row["sourceDocumentId"],
                     "SourceTable": row["sourceTable"], "SourceRecordId": row["sourceRecordId"], "PartName": row["partName"],
                     "PartCode": row["partCode"], "MasterPartName": row["masterPartName"], "Unit": row["unit"],
-                    "NosPerKG": row.get("nosPerKg"), "PerNosFromKg": row.get("perNosFromKg"), "DefaultRate": row.get("defaultRate"),
+                    "NosPerKG": row.get("nosPerKg"), "PerNosFromKgFlag": row.get("perNosFromKgFlag"),
+                    "PerNosFromKgRaw": row.get("perNosFromKgRaw"),
+                    "PerNosFromKgSourceEvidence": _json(row.get("perNosFromKgSourceEvidence") or {}),
+                    "DefaultRate": row.get("defaultRate"),
                     "CurrentUnitRate": row.get("currentUnitRate"), "Freight": row.get("freight"), "Handling": row.get("handling"),
                     "TotalCurrentRate": row.get("totalCurrentRate"), "FreightIncluded": row.get("freightIncluded"),
                     "LastPurchaseDate": row.get("lastPurchaseDate"), "SelectedRateLogId": row.get("selectedRateLogId"),
@@ -679,27 +889,47 @@ class SafariMasterImportService:
             staged_purchases = [row for row in self._rows("SafariMasterImportPurchase") if _int_ref(_fields(row).get("Import")) == import_id]
             if len(staged_materials) != len(material_rows) or len(staged_purchases) != len(purchase_rows):
                 raise PartIdentityError("SAFARI_IMPORT_STAGING_INCOMPLETE", "The local import is incomplete; the active pointer was not changed. Retry with the same preview key.")
-            _patch(self.client, "SafariMasterImport", int(header["id"]), {"Status": "published", "PublishedAt": grist_datetime(utc_now())})
             manifest_fp = request_fingerprint({"import": import_key, "capture": capture["sourceFingerprint"],
                 "materials": len(staged_materials), "purchases": len(staged_purchases)})
-            pointer_already_published = control and _int_ref(_fields(control).get("ActiveImport")) == import_id
-            published_version = int(_fields(control).get("Version") or header_version) if pointer_already_published else max(header_version, previous_version + 1)
-            control_fields = {"ActiveImport": import_id, "Version": published_version, "Fingerprint": manifest_fp,
+            saved_outcome = _decode_json(header_fields.get("PublicationResult"), {}) or {}
+            if saved_outcome:
+                if saved_outcome.get("fingerprint") != manifest_fp or int(saved_outcome.get("version") or 0) != int(publication_intent["reservedVersion"]):
+                    raise PartIdentityError("SAFARI_IMPORT_PUBLICATION_CONFLICT", "The saved immutable publication outcome differs from the frozen import manifest.")
+                result = saved_outcome
+            else:
+                result = {"status": "published", "importId": import_id, "importKey": import_key,
+                    "version": int(publication_intent["reservedVersion"]), "fingerprint": manifest_fp,
+                    "sourceFingerprint": capture["sourceFingerprint"], "materialCount": len(staged_materials),
+                    "purchaseCount": len(staged_purchases), "unmappedPurchaseCount": sum(row.get("resolutionStatus") != "bound" for row in capture["purchases"]),
+                    "createdAt": utc_now()}
+                from app.grist_types import canonical_grist_json_cell
+                _patch(self.client, "SafariMasterImport", int(header["id"]), {
+                    "Status": "published", "PublishedAt": grist_datetime(utc_now()),
+                    "PublicationResult": canonical_grist_json_cell(result)})
+
+            # The outcome and predecessor are durable before the only action
+            # that makes this generation current. Retries reuse this exact
+            # version/result and never derive a later version from a new head.
+            current_pointer = self._current_pointer()
+            if current_pointer.get("importId") == import_id and current_pointer.get("requestKey") == key:
+                return self._finish_import_request(request, key=key, actor=actor, reason=reason, result=result)
+            if not self._same_pointer(current_pointer, expected_predecessor):
+                if self._active_descends_from(current_pointer.get("importId"), import_id):
+                    return self._superseded_result(request=request, key=key, actor=actor, reason=reason,
+                        current=current_pointer, publication_result=result, was_published=True)
+                return self._superseded_result(request=request, key=key, actor=actor, reason=reason, current=current_pointer)
+
+            control = _record_by_key(self._rows("SafariMasterImportControl"), "ControlKey", "active")
+            control_fields = {"ActiveImport": import_id, "Version": int(publication_intent["reservedVersion"]), "Fingerprint": manifest_fp,
                 "UpdatedAt": grist_datetime(utc_now()), "RequestKey": key}
             if control:
                 _patch(self.client, "SafariMasterImportControl", int(control["id"]), control_fields)
             else:
                 _create(self.client, "SafariMasterImportControl", [{"ControlKey": "active", **control_fields}])
-            result = {"status": "published", "importId": import_id, "importKey": import_key,
-                "version": published_version, "fingerprint": manifest_fp,
-                "sourceFingerprint": capture["sourceFingerprint"], "materialCount": len(staged_materials),
-                "purchaseCount": len(staged_purchases), "unmappedPurchaseCount": sum(row.get("resolutionStatus") != "bound" for row in capture["purchases"]),
-                "createdAt": utc_now()}
-            self._audit(key, actor, result, reason)
-            from app.grist_types import canonical_grist_json_cell
-            _patch(self.client, "SafariMasterImportRequest", int(request["id"]), {"Status": "published", "Result": canonical_grist_json_cell(result),
-                "UpdatedAt": grist_datetime(utc_now()), "Reason": reason.strip()})
-            return result
+            current_pointer = self._current_pointer()
+            if current_pointer.get("importId") != import_id or current_pointer.get("requestKey") != key:
+                raise PartIdentityError("SAFARI_IMPORT_PUBLICATION_UNCONFIRMED", "The active local pointer did not confirm this exact original-key publication.")
+            return self._finish_import_request(request, key=key, actor=actor, reason=reason, result=result)
 
     def _audit(self, key: str, actor: str, result: dict[str, Any], reason: str, *,
                event_type: str = "safari_master_rate_import_published",
@@ -763,16 +993,19 @@ def load_local_material_weight_catalog(client: GristClient | None = None) -> dic
     if manifest is None:
         return {"status": "unavailable", "source": "Safari-local-import", "records": [], "message": "Run the explicit one-time Safari master import before selecting imported materials."}
     local = {int(row.get("id", -1)): _fields(row) for row in client.fetch_table_records_with_ids("Material")}
+    _, conflicts = _unique_material_rows(materials)
     records = []
     for row in materials:
         fields = _fields(row)
         material_id = _int_ref(fields.get("Material"))
         bound = local.get(material_id or -1, {})
         kgm = _num(fields.get("KGsPerMeter"))
+        conflicted = bool(material_id in conflicts)
         records.append({"canonicalName": str(fields.get("CanonicalName") or ""), "masterMaterialId": _int_ref(fields.get("SourceRecordId")),
             "materialId": material_id, "materialCanonicalName": str(bound.get("CanonicalName") or ""), "code": str(fields.get("Code") or ""),
-            "inUse": bool(fields.get("InUse")), "kgPerMeter": str(kgm) if kgm is not None and kgm > 0 else None,
-            "factorStatus": "available" if kgm is not None and kgm > 0 else "unavailable", "sourceDate": fields.get("LatestKGsPerMeterDate"),
+            "inUse": bool(fields.get("InUse")), "kgPerMeter": str(kgm) if not conflicted and kgm is not None and kgm > 0 else None,
+            "factorStatus": "identity_conflict" if conflicted else "available" if kgm is not None and kgm > 0 else "unavailable",
+            "sourceDate": fields.get("LatestKGsPerMeterDate"),
             "source": "Costing-New", "sourceDocumentId": manifest["sourceDocumentId"], "sourceTable": "MasterMaterial",
             "sourceField": "KGsPerMeter", "factorUnit": "kg/m", "localImportVersion": manifest["version"],
             "localImportFingerprint": manifest["fingerprint"], "localMaterialId": material_id})
@@ -788,12 +1021,28 @@ def load_local_interim_rates(names: list[str], client: GristClient | None = None
     wanted = {str(name).strip().casefold() for name in names}
     local = {int(row.get("id", -1)): _fields(row) for row in client.fetch_table_records_with_ids("Material")}
     output = []
+    chosen, conflicts = _unique_material_rows(rows)
+    groups: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
-        fields = _fields(row)
-        material = local.get(_int_ref(fields.get("Material")) or -1, {})
-        aliases = {str(fields.get("CanonicalName") or "").casefold(), str(material.get("CanonicalName") or "").casefold()}
+        material_id = _int_ref(_fields(row).get("Material"))
+        if material_id:
+            groups.setdefault(material_id, []).append(row)
+    for material_id, candidates in groups.items():
+        material = local.get(material_id, {})
+        aliases = {str(_fields(row).get("CanonicalName") or "").casefold() for row in candidates}
+        aliases.add(str(material.get("CanonicalName") or "").casefold())
         if not wanted.intersection(aliases):
             continue
+        if material_id in conflicts:
+            output.append({"material": str(material.get("CanonicalName") or ""),
+                "canonicalMaterial": str(material.get("CanonicalName") or ""), "status": "identity_conflict",
+                "costingNewRate": None, "localMaterialId": material_id,
+                "sourceMasterRecordIds": sorted(str(_fields(row).get("SourceRecordId") or "") for row in candidates),
+                "sourceDocumentId": manifest["sourceDocumentId"], "localImportVersion": manifest["version"],
+                "localImportFingerprint": manifest["fingerprint"]})
+            continue
+        row = chosen[material_id]
+        fields = _fields(row)
         rate = _num(fields.get("MaterialLatestRate")) if fields.get("RateBasis") == "MaterialLatestRate" else _num(fields.get("DefaultMaterialRate"))
         rate_log_rows = _decode_json(fields.get("RateLogEvidence"), []) or []
         selected = next((item.get("fields", {}) for item in rate_log_rows

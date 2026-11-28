@@ -476,9 +476,11 @@ class GristLiveCostService:
                 or int(active_import_header.get("PurchaseRateCount") or 0) > len(active_purchase_rows)):
             active_import_id = None
         current_material_factors = {}
+        current_material_conflicts: set[int] = set()
         if active_import_id:
-            current_material_factors = {ref_id(_fields(row).get("Material")): _fields(row)
-                for row in active_material_rows if ref_id(_fields(row).get("Material"))}
+            from app.safari_master_import import _unique_material_rows
+            unique_materials, current_material_conflicts = _unique_material_rows(active_material_rows)
+            current_material_factors = {material_id: _fields(row) for material_id, row in unique_materials.items()}
         current_purchase_rates = {}
         if active_import_id:
             current_purchase_rates = {ref_id(_fields(row).get("PurchaseItem")): _fields(row)
@@ -638,6 +640,9 @@ class GristLiveCostService:
                     # its signed evidence remain historical facts; they are not
                     # silently rewritten when a local master factor changes.
                     if is_material_process:
+                        if material_id in current_material_conflicts:
+                            warn("MATERIAL_MASTER_IDENTITY_CONFLICT", "Multiple current source masters map to this Safari Material with conflicting weight/rate facts; resolve the source identity before costing.", path)
+                            continue
                         imported = current_material_factors.get(material_id)
                         kgm = _num(imported.get("KGsPerMeter")) if imported else None
                         if not active_import_id or not imported or kgm is None or kgm <= 0 or cut_mm is None:

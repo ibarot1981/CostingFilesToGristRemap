@@ -11,6 +11,8 @@ This is the controlled operational procedure for the explicit Costing-New to Saf
 
 Use the already configured application instance. Before starting, confirm that `SAFARI_MANUFACTURING_GRIST_DOC_ID` is exactly the Safari ID above, `SAFARI_MANUFACTURING_GRIST_WORKSPACE_ID` is `3`, and `COSTING_NEW_GRIST_DOC_ID` is exactly the Costing-New ID above. The service also checks both document names/workspaces and rejects a source/target collision. Stop if any check differs; do not substitute a document based on its display name.
 
+Implementation and review must use a separately recorded disposable QA document. A QA target can pass the normal Safari writer guard only when `SAFARI_QA_TARGET_DOC_ID`, `SAFARI_QA_TARGET_WORKSPACE_ID`, and `SAFARI_QA_TARGET_LABEL` all match the configured target, and the remote document name exactly matches a unique label beginning `QA - one-time-safari-master-rates-20261125 - `. Production `bAPdkEDn7brbqTrfVsRmXZ` and Costing-New are always excluded. Record the exact QA document ID, workspace, label, purpose, and coordinator in the phase evidence; a matching name by itself is never a target selector. If the service is unavailable, stop live QA and report that dependency rather than weakening these guards.
+
 ## Preflight and backup
 
 1. Record operator, timestamp, application build/commit, target ID/workspace, and source ID. Confirm no other import is applying and that the Safari target is active.
@@ -48,11 +50,14 @@ Content-Type: application/json
 
 Verify the result reports `published`, the intended source fingerprint, one new active local version and complete staged material and purchase row counts. Confirm the Safari import control points to that version and that its manifest fingerprint matches the published rows. Run ordinary material options, baseline factor resolution and eligible live cost against Safari while access to Costing-New is blocked; they must use one local version and must not issue source table reads. Review unresolved-rate/conversion results as incomplete/null. Do not turn missing evidence into zero or complete cost.
 
+For purchased Nos/kg conversions, `PerNos_FromKg` is the source Bool formula flag, not a physical factor. With `Unit=Per Nos`, `Nos_Per_KG=10`, and an authoritative `TotalSparesPartCost` of ₹92.70 per piece, the imported ₹/kg is ₹927 (multiply once by 10). A `Per Kg` source with the false flag and the same positive conversion may resolve to ₹92.70/Nos. Same-unit prices remain unchanged. Freight and handling are already included only when the source exposes the base plus both charge values and the authoritative total; never add the charges again.
+
 Download a second native Safari backup and record its SHA-256, byte count, and SQLite integrity result. Compare the before/after snapshot header, part, line, and rate-evidence table hashes; they must be identical. Record the import audit and exact verification results with the operation record.
 
 ## Retry and recovery
 
 - For a lost response or partial application, call `GET /api/admin/safari-master-import/<request-key>/recovery`, inspect its stored request/capture status, and retry the same apply with the exact original key and preview fingerprint. Once a request is applying, recovery uses its persisted compressed capture and does not fetch mutable source tables again.
+- Every preview freezes its predecessor pointer and reserved version. If a separate deliberate import has advanced that pointer, retrying an older key returns `superseded`; it does not publish the old capture at a newly incremented version. Keep that request's immutable capture and outcome as history. Start a new preview/key for new source facts.
 - Never use a second key to continue a partial generation. The active pointer advances only after every version row is staged and verified.
 - A stale preview is not a recoverable apply. Preserve it, then run a fresh preview with a new key after source drift is reviewed.
 - If a target write is ambiguous, stop and preserve both native backups and the request/audit rows for review. Do not delete staged rows or manually advance the active pointer.

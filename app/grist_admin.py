@@ -257,11 +257,18 @@ def _reject_legacy(doc_id: str, new_ids: list[str]) -> None:
         raise GristValidationError("Safari Manufacturing writes cannot target the legacy Costing-New document ID.")
 
 
-def validate_safari_document(document: GristDocument, *, workspace_id: str, legacy_doc_id: str | None = None) -> GristDocument:
+def validate_safari_document(document: GristDocument, *, workspace_id: str, legacy_doc_id: str | None = None,
+                             qa_document_id: str | None = None, qa_label: str | None = None) -> GristDocument:
     _reject_legacy(legacy_doc_id or os.getenv("GRIST_DOC_ID", ""), [document.id])
     if not document.id:
         raise GristValidationError("Target document metadata did not include a document ID.")
-    if document.name != SAFARI_DOCUMENT_NAME:
+    explicit_qa = bool(qa_document_id and qa_label and document.id == qa_document_id
+        and qa_document_id not in {"bAPdkEDn7brbqTrfVsRmXZ", "cPCjjr9oCzhWC7z8vJbcky"}
+        and qa_label.startswith("QA - one-time-safari-master-rates-20261125 - "))
+    if explicit_qa:
+        if document.name != qa_label:
+            raise GristValidationError("QA target document name must exactly match its explicit QA label.")
+    elif document.name != SAFARI_DOCUMENT_NAME:
         raise GristValidationError(f"Target document must be named exactly {SAFARI_DOCUMENT_NAME!r}.")
     if not document.workspace_id or document.workspace_id != workspace_id:
         raise GristValidationError("Target document is not in the selected workspace.")
