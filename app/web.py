@@ -349,14 +349,16 @@ def _part_definition_service():
     if not isinstance(registry, GristPartRegistry):
         raise _error(503, "PART_GRIST_REQUIRED", "Direct Part-definition maintenance requires the configured Safari Manufacturing Grist adapter.")
     from app.safari_master_import import load_local_material_weight_catalog
-    return GristPartDefinitionService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(registry.client))
+    return GristPartDefinitionService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(
+        registry.client, coordinator_id=getattr(registry, "coordinator_id", None)))
 
 
 def _part_baseline_service():
     from app.part_baseline import PartBaselineService
     from app.safari_master_import import load_local_material_weight_catalog
     registry = _part_registry()
-    return PartBaselineService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(registry.client))
+    return PartBaselineService(registry, material_weight_catalog_provider=lambda: load_local_material_weight_catalog(
+        registry.client, coordinator_id=getattr(registry, "coordinator_id", None)))
 
 
 def _live_cost_service():

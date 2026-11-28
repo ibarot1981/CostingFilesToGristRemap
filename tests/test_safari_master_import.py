@@ -139,6 +139,74 @@ class SafariMasterImportTests(unittest.TestCase):
         self.assertEqual(len(registry._rows("SafariMasterImport")), 1)
         self.assertEqual(service._current_pointer()["version"], 1)
 
+    def test_publication_audit_finalizes_across_pre_and_post_commit_response_loss(self):
+        for boundary in ("before-audit", "after-audit", "after-terminal"):
+            with self.subTest(boundary=boundary):
+                capture_ref = [_memory_capture(5.8)]
+                service, registry = _memory_import_service(capture_ref)
+                preview = service.preview(request_key=f"audit-{boundary}", actor="qa")
+                client = registry.client
+                if boundary == "after-audit":
+                    client.lose_create_table = "AuditEvent"
+                elif boundary == "before-audit":
+                    original_audit = service._audit
+                    failed = False
+
+                    def fail_once(key, actor, result, reason, **kwargs):
+                        nonlocal failed
+                        if kwargs.get("event_type", "safari_master_rate_import_published") == "safari_master_rate_import_published" and not failed:
+                            failed = True
+                            raise TimeoutError("simulated failure before publication audit create")
+                        return original_audit(key, actor, result, reason, **kwargs)
+
+                    service._audit = fail_once
+                else:
+                    original_update = client.update_table_records
+
+                    def lose_terminal_response(table, updates):
+                        original_update(table, updates)
+                        if table == "SafariMasterImportRequest" and any(
+                                update.get("fields", {}).get("Status") == "published" for update in updates):
+                            raise TimeoutError("simulated lost terminal request response after commit")
+
+                    client.update_table_records = lose_terminal_response
+                with self.assertRaises(TimeoutError):
+                    service.apply(request_key=f"audit-{boundary}", expected_fingerprint=preview["fingerprint"],
+                        actor="qa", reason="audit recovery")
+                stored = next(row for row in registry._rows("SafariMasterImportRequest")
+                    if row["fields"].get("RequestKey") == f"audit-{boundary}")
+                self.assertIn(stored["fields"].get("Status"), {"finalizing", "published"})
+                # A fresh service/adapter can complete the frozen operation
+                # without recapturing upstream facts or changing its outcome.
+                fresh = SafariMasterImportService(registry, source_client=object())
+                fresh._guard = lambda **kwargs: None
+                outcome = fresh.recover(f"audit-{boundary}")
+                self.assertEqual(outcome["status"], "published")
+                audits = [row for row in registry._rows("AuditEvent")
+                    if row["fields"].get("RequestKey") == f"audit-{boundary}"]
+                self.assertEqual(len(audits), 1)
+                self.assertEqual(audits[0]["fields"].get("Actor"), "qa")
+                self.assertEqual(audits[0]["fields"].get("Reason"), "audit recovery")
+
+    def test_superseded_outcome_audit_recovers_without_advancing_the_current_pointer(self):
+        capture_ref = [_memory_capture(5.8)]
+        service, registry = _memory_import_service(capture_ref)
+        older = service.preview(request_key="stale-a", actor="qa")
+        newer = service.preview(request_key="stale-b", actor="qa")
+        current = service.apply(request_key="stale-a", expected_fingerprint=older["fingerprint"], actor="qa", reason="winner")
+        registry.client.lose_create_table = "AuditEvent"
+        with self.assertRaises(TimeoutError):
+            service.apply(request_key="stale-b", expected_fingerprint=newer["fingerprint"], actor="qa", reason="stale request")
+        fresh = SafariMasterImportService(registry, source_client=object())
+        fresh._guard = lambda **kwargs: None
+        recovered = fresh.recover("stale-b")
+        self.assertEqual(recovered["status"], "superseded")
+        self.assertEqual(service._current_pointer()["importId"], current["importId"])
+        audit = [row["fields"] for row in registry._rows("AuditEvent")
+            if row["fields"].get("RequestKey") == "stale-b"]
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0]["EventType"], "safari_master_rate_import_superseded")
+
     def test_competing_stale_previews_cannot_both_publish_over_the_same_predecessor(self):
         capture_ref = [_memory_capture(5.8)]
         service, _ = _memory_import_service(capture_ref)
@@ -291,7 +359,7 @@ class SafariMasterImportTests(unittest.TestCase):
         client = FakeClient({
             "SafariMasterImportControl": [{"id": 1, "fields": {"ControlKey": "active", "ActiveImport": ["R", "SafariMasterImport", 5],
                 "Version": 3, "Fingerprint": "manifest-3"}}],
-            "SafariMasterImport": [{"id": 5, "fields": {"Status": "published", "MasterCount": 1, "PurchaseRateCount": 1,
+            "SafariMasterImport": [{"id": 5, "fields": {"Status": "published", "Version": 3, "MasterCount": 1, "PurchaseRateCount": 1,
                 "SourceDocumentId": "costing-new", "Fingerprint": "source-sha"}}],
             "SafariMasterImportMaterial": [{"id": 8, "fields": {"Import": ["R", "SafariMasterImport", 5], "Material": ["R", "Material", 77],
                 "SourceRecordId": "8", "CanonicalName": "Steel", "InUse": True, "KGsPerMeter": 5.8,
@@ -302,7 +370,10 @@ class SafariMasterImportTests(unittest.TestCase):
         })
 
         manifest, materials, purchases = active_local_import(client)
+        client.reads.clear()
         catalog = load_local_material_weight_catalog(client)
+        self.assertNotIn("SafariMasterImportPurchase", client.reads,
+            "ordinary material factor options must not fetch purchased-rate history")
         rates = load_local_interim_rates(["Steel"], client)
 
         self.assertEqual(manifest["version"], 3)

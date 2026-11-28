@@ -96,6 +96,16 @@ class GristPartDefinitionService:
         self.features = GristPartFeatures(registry)
         self.material_weight_catalog_provider = material_weight_catalog_provider
         self._material_weight_catalog_cache: dict[str, Any] | None = None
+        self._material_mapping_cache: dict[str, Any] | None = None
+
+    def _material_mapping(self) -> dict[str, Any]:
+        if self._material_mapping_cache is None:
+            from app.config import load_material_mapping
+            try:
+                self._material_mapping_cache = load_material_mapping()
+            except Exception:
+                self._material_mapping_cache = {}
+        return self._material_mapping_cache
 
     def _rows(self, table: str) -> list[dict[str, Any]]:
         return self.registry._rows(table)
@@ -237,16 +247,25 @@ class GristPartDefinitionService:
                 and str(record.get("sourceDocumentId") or source_document_id) == source_document_id
                 and str(record.get("canonicalName") or "") == str(next(p["masterMaterialName"] for p in explicit if int(p["sourceMasterMaterialId"]) in explicit_ids))]
         else:
-            from app.config import load_material_mapping
-            from app.material_resolution import resolve_material
-            try:
-                resolved = resolve_material(material_name, load_material_mapping())
-                canonical = resolved.canonical_name or material_name
-            except Exception:
-                canonical = material_name
+            # The published Safari-local import already contains the reviewed
+            # source-to-local Material reference. Resolve through that stable
+            # identity instead of reparsing the source-name YAML once per row.
             matches = [record for record in records
-                if str(record.get("canonicalName") or "").strip().casefold() == canonical.strip().casefold()
+                if _int_ref(record.get("localMaterialId")) == material_id
                 and str(record.get("sourceDocumentId") or source_document_id) == source_document_id]
+            if not matches and not any(record.get("localMaterialId") is not None for record in records):
+                # Older injected providers do not expose the persisted local
+                # identity. Keep their established reviewed-name behavior,
+                # with the mapping parsed at most once per service/request.
+                from app.material_resolution import resolve_material
+                try:
+                    resolved = resolve_material(material_name, self._material_mapping())
+                    canonical = resolved.canonical_name or material_name
+                except Exception:
+                    canonical = material_name
+                matches = [record for record in records
+                    if str(record.get("canonicalName") or "").strip().casefold() == canonical.strip().casefold()
+                    and str(record.get("sourceDocumentId") or source_document_id) == source_document_id]
         if len(matches) != 1:
             return None, "ambiguous" if len(matches) > 1 else ("unavailable" if catalog.get("status") != "available" else "unbound"), material_name
         record = matches[0]

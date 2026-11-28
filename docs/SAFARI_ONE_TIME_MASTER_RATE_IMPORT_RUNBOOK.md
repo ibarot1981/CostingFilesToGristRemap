@@ -52,7 +52,7 @@ Verify the result reports `published`, the intended source fingerprint, one new 
 
 For purchased Nos/kg conversions, `PerNos_FromKg` is the source Bool formula flag, not a physical factor. With `Unit=Per Nos`, `Nos_Per_KG=10`, and an authoritative `TotalSparesPartCost` of ₹92.70 per piece, the imported ₹/kg is ₹927 (multiply once by 10). A `Per Kg` source with the false flag and the same positive conversion may resolve to ₹92.70/Nos. Same-unit prices remain unchanged. Freight and handling are already included only when the source exposes the base plus both charge values and the authoritative total; never add the charges again.
 
-Download a second native Safari backup and record its SHA-256, byte count, and SQLite integrity result. Compare the before/after snapshot header, part, line, and rate-evidence table hashes; they must be identical. Record the import audit and exact verification results with the operation record.
+Download a second native Safari backup and record its SHA-256, byte count, and SQLite integrity result. Compare the before/after `CostSnapshot`, `CostSnapshotPart`, `CostSnapshotLine`, `CostSnapshotRateEvidence`, and `CostSnapshotPublication` table hashes; all five must be identical. Record the import audit and exact verification results with the operation record.
 
 ## Retry and recovery
 

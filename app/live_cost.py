@@ -27,7 +27,6 @@ INPUT_TABLES = (
     "PartComponentRevision", "PartRevisionLine", "LineMaster", "LineRevision", "LineDetail",
     "PartPurchaseSpecification", "VendorPartMapping", "PartPurchaseRecord", "PartPurchaseUnitConversion",
     "PartPurchaseCurrencyConversion", "Vendor", "Material", "PurchaseItem", "CostingProcessRate", "PartRegistryRequest",
-    "SafariMasterImport", "SafariMasterImportControl", "SafariMasterImportMaterial", "SafariMasterImportPurchase",
 )
 POLICY_VERSION = "live-cost-v1"
 SNAPSHOT_CHECKSUM_V1_COLUMNS = {"RateSourceDate", "SourceRecordedAt", "SourceUpdatedAt", "RateAgeStatus",
@@ -187,13 +186,33 @@ class GristLiveCostService:
     def _read_inputs(self) -> dict[str, list[dict[str, Any]]]:
         return {table: self._rows(table) for table in INPUT_TABLES}
 
+    def _attach_local_import(self, tables: dict[str, list[dict[str, Any]]], *, manifest: dict[str, Any] | None,
+                             material_rows: list[dict[str, Any]], purchase_rows: list[dict[str, Any]]) -> None:
+        tables["SafariMasterImportMaterial"] = material_rows
+        tables["SafariMasterImportPurchase"] = purchase_rows
+        if not manifest:
+            tables["SafariMasterImportControl"] = []
+            tables["SafariMasterImport"] = []
+            tables["_LocalMasterImportManifest"] = {}
+            return
+        import_id = int(manifest["importId"])
+        tables["SafariMasterImportControl"] = [{"id": 1, "fields": {"ControlKey": "active",
+            "ActiveImport": ["R", "SafariMasterImport", import_id], "Version": manifest.get("version"),
+            "Fingerprint": manifest.get("fingerprint"), "RequestKey": manifest.get("requestKey")}}]
+        tables["SafariMasterImport"] = [{"id": import_id, "fields": {"Status": "published",
+            "MasterCount": manifest.get("masterCount"), "PurchaseRateCount": manifest.get("purchaseRateCount"),
+            "SourceDocumentId": manifest.get("sourceDocumentId"), "Fingerprint": manifest.get("sourceFingerprint"),
+            "Version": manifest.get("version"), "RequestKey": manifest.get("requestKey")}}]
+        tables["_LocalMasterImportManifest"] = dict(manifest)
+
     @staticmethod
     def _tables_fingerprint(tables: dict[str, list[dict[str, Any]]]) -> str:
         return request_fingerprint({name: rows for name, rows in tables.items()})
 
     def _load_material_rates(self, names: list[str]) -> dict[str, Any]:
         from app.safari_master_import import load_local_interim_rates
-        return load_local_interim_rates(sorted(set(names)), client=self.client)
+        return load_local_interim_rates(sorted(set(names)), client=self.client,
+            coordinator_id=getattr(self.registry, "coordinator_id", None))
 
     def _code(self, tables: dict[str, list[dict[str, Any]]], code_id: str | int) -> dict[str, Any]:
         target = int(code_id)
@@ -416,9 +435,9 @@ class GristLiveCostService:
 
     @staticmethod
     def _material_rates_from_inputs(names: list[str], tables: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-        control = next((_fields(row) for row in tables.get("SafariMasterImportControl", [])
-            if str(_fields(row).get("ControlKey") or "") == "active"), {})
-        import_id = ref_id(control.get("ActiveImport"))
+        manifest = tables.get("_LocalMasterImportManifest") or {}
+        import_id = ref_id(manifest.get("importId"))
+        control = {"Version": manifest.get("version"), "Fingerprint": manifest.get("fingerprint")}
         if not import_id:
             return {"status": "unavailable", "source": "Safari-local-import", "rows": [], "sourceDocumentId": ""}
         wanted = {str(name).strip().casefold() for name in names}
@@ -435,12 +454,11 @@ class GristLiveCostService:
             basis = str(fields.get("RateBasis") or "")
             rate = _num(fields.get("MaterialLatestRate")) if basis == "MaterialLatestRate" else _num(fields.get("DefaultMaterialRate"))
             from app.safari_master_import import _decode_json
-            rate_log_rows = _decode_json(fields.get("RateLogEvidence"), []) or []
-            selected = next((item.get("fields", {}) for item in rate_log_rows
-                if str(item.get("id")) == str(fields.get("SelectedRateLogId"))), {})
-            from app.cost_dates import cost_date_evidence
-            date_evidence = (cost_date_evidence(selected, source_kind="rate_log") if selected else
-                cost_date_evidence({"LatestRateDate": fields.get("LatestRateDate")}, source_kind="rate_master"))
+            rate_log_rows = []
+            date_evidence = _decode_json(fields.get("SelectedRateDateEvidence"), {}) or {}
+            if not date_evidence:
+                from app.cost_dates import cost_date_evidence
+                date_evidence = cost_date_evidence({"LatestRateDate": fields.get("LatestRateDate")}, source_kind="rate_master")
             output.append({"material": local_name, "canonicalMaterial": local_name,
                 "status": "available" if rate is not None else "rate_unavailable", "costingNewRate": str(rate) if rate is not None else None,
                 "basis": basis, "masterRecordId": ref_id(fields.get("SourceRecordId")),
@@ -461,20 +479,14 @@ class GristLiveCostService:
 
     def live_cost(self, code_id: str | int, *, check_consistency: bool = True) -> dict[str, Any]:
         tables = self._read_inputs()
+        from app.safari_master_import import current_local_import_rows
+        local_manifest, active_material_rows, _ = current_local_import_rows(self.client,
+            coordinator_id=getattr(self.registry, "coordinator_id", None), purchase_item_ids=[])
+        self._attach_local_import(tables, manifest=local_manifest, material_rows=active_material_rows, purchase_rows=[])
         start_fingerprint = self._tables_fingerprint(tables)
         import_control = next((_fields(row) for row in tables["SafariMasterImportControl"]
             if str(_fields(row).get("ControlKey") or "") == "active"), {})
         active_import_id = ref_id(import_control.get("ActiveImport"))
-        active_import_header = next((_fields(row) for row in tables["SafariMasterImport"]
-            if int(row.get("id", -1)) == active_import_id), None) if active_import_id else None
-        active_material_rows = [row for row in tables["SafariMasterImportMaterial"]
-            if ref_id(_fields(row).get("Import")) == active_import_id] if active_import_id else []
-        active_purchase_rows = [row for row in tables["SafariMasterImportPurchase"]
-            if ref_id(_fields(row).get("Import")) == active_import_id] if active_import_id else []
-        if (not active_import_header or str(active_import_header.get("Status") or "") != "published"
-                or int(active_import_header.get("MasterCount") or 0) != len(active_material_rows)
-                or int(active_import_header.get("PurchaseRateCount") or 0) > len(active_purchase_rows)):
-            active_import_id = None
         current_material_factors = {}
         current_material_conflicts: set[int] = set()
         if active_import_id:
@@ -482,9 +494,6 @@ class GristLiveCostService:
             unique_materials, current_material_conflicts = _unique_material_rows(active_material_rows)
             current_material_factors = {material_id: _fields(row) for material_id, row in unique_materials.items()}
         current_purchase_rates = {}
-        if active_import_id:
-            current_purchase_rates = {ref_id(_fields(row).get("PurchaseItem")): _fields(row)
-                for row in active_purchase_rows if ref_id(_fields(row).get("PurchaseItem"))}
         code = self._code(tables, code_id)
         config = self._configuration(tables, int(code["id"]))
         if not config or not config["selections"]:
@@ -723,6 +732,23 @@ class GristLiveCostService:
             occurrence = f"selection:{sf.get('SelectionIdentity') or sf.get('SelectionKey')}"
             expand(part_ref, rev_id, occurrence, qty, qty, uom, selection, None, str(sf.get("SourcingRoute") or "auto"))
 
+        purchase_item_ids = sorted({int(candidate["purchaseItem"]) for candidate in candidates
+            if candidate["kind"] == "purchase" and candidate.get("purchaseItem")})
+        # Purchased master rates are read only for PurchaseItems in this live
+        # BOM. The current pointer is rechecked by the reader and again during
+        # the final consistency pass.
+        if local_manifest:
+            current_manifest, active_material_rows, active_purchase_rows = current_local_import_rows(
+                self.client, coordinator_id=getattr(self.registry, "coordinator_id", None), purchase_item_ids=purchase_item_ids)
+            if not current_manifest or any(current_manifest.get(name) != local_manifest.get(name)
+                    for name in ("importId", "version", "fingerprint", "requestKey")):
+                raise PartIdentityError("SAFARI_IMPORT_POINTER_CHANGED", "The local master generation changed while Live Cost inputs were being assembled; retry the calculation.")
+            local_manifest = current_manifest
+            self._attach_local_import(tables, manifest=local_manifest, material_rows=active_material_rows,
+                purchase_rows=active_purchase_rows)
+            current_purchase_rates = {ref_id(_fields(row).get("PurchaseItem")): _fields(row)
+                for row in active_purchase_rows if ref_id(_fields(row).get("PurchaseItem"))}
+        start_fingerprint = self._tables_fingerprint(tables)
         direct_material_names = [candidate.get("materialName") for candidate in candidates if candidate["kind"] == "material" and candidate.get("materialName")]
         material_rates, material_response = self._rate_map(direct_material_names, tables=tables)
         evidence_rows: list[dict[str, Any]] = []
@@ -918,7 +944,18 @@ class GristLiveCostService:
                 "ratePolicy": "latest effective approved CostingProcessRate", "evidenceReference": _fields(row).get("SourceReference"),
                 "resolutionStatus": "available", "reason": _fields(row).get("Reason"), "processRateId": int(row["id"])})
 
-        check_fingerprint = self._tables_fingerprint(self._read_inputs()) if check_consistency else start_fingerprint
+        if check_consistency:
+            check_tables = self._read_inputs()
+            check_manifest, check_materials, check_purchases = current_local_import_rows(
+                self.client, coordinator_id=getattr(self.registry, "coordinator_id", None), purchase_item_ids=purchase_item_ids)
+            if check_manifest and local_manifest and any(check_manifest.get(name) != local_manifest.get(name)
+                    for name in ("importId", "version", "fingerprint", "requestKey")):
+                check_manifest = {**check_manifest, "pointerChangedDuringCalculation": True}
+            self._attach_local_import(check_tables, manifest=check_manifest, material_rows=check_materials,
+                purchase_rows=check_purchases)
+            check_fingerprint = self._tables_fingerprint(check_tables)
+        else:
+            check_fingerprint = start_fingerprint
         if check_fingerprint != start_fingerprint:
             warn("LIVE_INPUTS_CHANGED_DURING_READ", "A Grist costing input changed while this Live Cost was being assembled. Refresh before saving a snapshot.", "", blocker=True)
         available_lines = [line for line in lines_out if line.get("status") == "available"]

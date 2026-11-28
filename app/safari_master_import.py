@@ -7,12 +7,14 @@ Ordinary readers never call the upstream loader in this module.
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
 import base64
 import gzip
 import json
 import os
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -31,6 +33,18 @@ CAPTURE_CHUNK_CHARS = 90_000
 CAPTURE_WRITE_BATCH = 6
 PER_NOS_FROM_KG_FORMULA = 'if($Unit=="Per Nos") and ($Nos_Per_KG>0):\n  return 1\nelse:\n  return 0'
 PER_NOS_PRICE_FORMULA_EVIDENCE = "SparesPartCostRs divides the selected/default rate by Nos_Per_KG when PerNos_FromKg is true; TotalSparesPartCost adds SparePartsFreight and SparesPartHandling."
+
+MATERIAL_WEIGHT_COLUMNS = ("Import", "SourceDocumentId", "SourceTable", "SourceRecordId", "CanonicalName", "Code", "InUse",
+    "KGsPerMeter", "LatestKGsPerMeterDate", "Material", "ResolutionStatus", "Fingerprint")
+MATERIAL_COST_COLUMNS = (*MATERIAL_WEIGHT_COLUMNS, "MaterialLatestRate", "DefaultMaterialRate", "TransportLatestRate", "TotalRate",
+    "LatestRateDate", "RateBasis", "SelectedRateLogId", "SelectedRateDateEvidence")
+PURCHASE_COST_COLUMNS = ("Import", "SourceDocumentId", "SourceTable", "SourceRecordId", "PartName", "PartCode", "MasterPartName", "Unit",
+    "NosPerKG", "PerNosFromKgFlag", "PerNosFromKgSourceEvidence", "DefaultRate", "CurrentUnitRate", "Freight", "Handling",
+    "TotalCurrentRate", "FreightIncluded", "LastPurchaseDate", "SelectedRateLogId", "SelectedRateDateEvidence", "Vendor", "Currency",
+    "CurrencyEvidence", "PurchaseItem", "ResolutionStatus", "Fingerprint")
+_LOCAL_IMPORT_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
+_LOCAL_IMPORT_CACHE_LOCK = threading.RLock()
+_LOCAL_IMPORT_CACHE_LIMIT = 24
 
 
 def _fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -241,6 +255,10 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
             continue
         selected, evidence = _rate_evidence(material_logs.get(str(source.get("id")), []), int(source["id"]),
             "MasterMaterial", fields.get("LatestRateDate"), fields.get("MaterialLatestRate"))
+        selected_fields = next((row["fields"] for row in evidence if str(row.get("id")) == str(selected)), {})
+        from app.cost_dates import cost_date_evidence
+        selected_date = (cost_date_evidence(selected_fields, source_kind="rate_log") if selected_fields else
+            cost_date_evidence({"LatestRateDate": fields.get("LatestRateDate")}, source_kind="rate_master"))
         materials.append({"sourceRecordId": str(source["id"]), "sourceTable": "MasterMaterial",
             "sourceDocumentId": source_doc, "canonicalName": name,
             "code": str(fields.get("Code") or fields.get("MaterialCode") or "").strip(),
@@ -252,7 +270,7 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
             "totalRate": _num(fields.get("Total_Rate")),
             "latestRateDate": fields.get("LatestRateDate"),
             "rateBasis": "MaterialLatestRate" if material_logs.get(str(source.get("id"))) else "Default_MaterialRate",
-            "selectedRateLogId": selected, "rateLogEvidence": evidence,
+            "selectedRateLogId": selected, "selectedRateDateEvidence": selected_date, "rateLogEvidence": evidence,
             "masterFingerprint": request_fingerprint({"id": source.get("id"), "fields": fields})})
     purchases: list[dict[str, Any]] = []
     for source in tables["PurchasePartsMaster"]:
@@ -263,6 +281,9 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
         selected, evidence = _rate_evidence(purchase_logs.get(str(source.get("id")), []), int(source["id"]),
             "SparesPartMasterName2", fields.get("SparesPartLastPurchaseDate"), fields.get("SparesPartCostRs"))
         selected_fields = next((row["fields"] for row in evidence if str(row.get("id")) == str(selected)), {})
+        from app.cost_dates import cost_date_evidence
+        selected_date = (cost_date_evidence(selected_fields, source_kind="rate_log") if selected_fields else
+            cost_date_evidence({"PurchaseDate": fields.get("SparesPartLastPurchaseDate")}, source_kind="rate_master"))
         base_rate = _num(fields.get("SparesPartCostRs"))
         freight = _num(fields.get("SparePartsFreight"))
         handling = _num(fields.get("SparesPartHandling"))
@@ -292,7 +313,7 @@ def _source_rows(tables: dict[str, list[dict[str, Any]]], source_doc: str) -> tu
             # source exposes its base and both charge components.
             "freightIncluded": total_rate is not None and base_rate is not None and freight is not None and handling is not None,
             "lastPurchaseDate": fields.get("SparesPartLastPurchaseDate"),
-            "selectedRateLogId": selected, "rateLogEvidence": evidence,
+            "selectedRateLogId": selected, "selectedRateDateEvidence": selected_date, "rateLogEvidence": evidence,
             "vendor": str(selected_fields.get("Supplier") or selected_fields.get("Vendor") or ""),
             "currency": source_currency, "currencyEvidence": currency_evidence,
             "masterFingerprint": request_fingerprint({"id": source.get("id"), "fields": fields})})
@@ -690,12 +711,37 @@ class SafariMasterImportService:
     def _finish_import_request(self, request: dict[str, Any], *, key: str, actor: str,
                                reason: str, result: dict[str, Any]) -> dict[str, Any]:
         from app.grist_types import canonical_grist_json_cell
+        fields = _fields(request)
+        state = str(fields.get("Status") or "")
+        saved_result = _decode_json(fields.get("Result"), {}) or {}
+        if state in {"published", "superseded", "finalizing"}:
+            if not saved_result:
+                raise PartIdentityError("SAFARI_IMPORT_FINALIZATION_INCOMPLETE", "The persisted import finalization has no immutable result.")
+            result = saved_result
+            actor = str(fields.get("Actor") or actor)
+            reason = str(fields.get("Reason") or reason)
+            finalized_at = fields.get("FinalizedAt") or fields.get("UpdatedAt") or grist_datetime(utc_now())
+        else:
+            finalized_at = grist_datetime(utc_now())
+            # Persist a frozen terminal outcome before its required audit. A
+            # lost response can resume this exact result even if the current
+            # generation advances before recovery.
+            intent = {"Status": "finalizing", "Result": canonical_grist_json_cell(result),
+                "UpdatedAt": finalized_at, "FinalizedAt": finalized_at,
+                "Actor": actor.strip(), "Reason": reason.strip()}
+            _patch(self.client, "SafariMasterImportRequest", int(request["id"]), intent)
+            fields.update(intent)
+            request = {**request, "fields": fields}
         status = str(result.get("status") or "")
-        _patch(self.client, "SafariMasterImportRequest", int(request["id"]),
-            {"Status": status, "Result": canonical_grist_json_cell(result),
-             "UpdatedAt": grist_datetime(utc_now()), "Reason": reason.strip()})
+        if status not in {"published", "superseded"}:
+            raise PartIdentityError("SAFARI_IMPORT_FINALIZATION_INCOMPLETE", "Only published or superseded outcomes can be finalized.")
         self._audit(key, actor, result, reason,
-            event_type="safari_master_rate_import_superseded" if status == "superseded" else "safari_master_rate_import_published")
+            event_type="safari_master_rate_import_superseded" if status == "superseded" else "safari_master_rate_import_published",
+            occurred_at=finalized_at)
+        if state != status:
+            _patch(self.client, "SafariMasterImportRequest", int(request["id"]),
+                {"Status": status, "Result": canonical_grist_json_cell(result), "UpdatedAt": grist_datetime(utc_now()),
+                 "FinalizedAt": finalized_at, "Actor": actor.strip(), "Reason": reason.strip()})
         return deepcopy(result)
 
     def _superseded_result(self, *, request: dict[str, Any], key: str, actor: str, reason: str,
@@ -788,10 +834,15 @@ class SafariMasterImportService:
             if preview.get("fingerprint") != expected_fingerprint or payload.get("previewFingerprint") != expected_fingerprint:
                 raise PartIdentityError("SAFARI_IMPORT_PREVIEW_STALE", "The exact persisted preview fingerprint is required; create a new preview after any source change.")
             status = str(fields.get("Status") or "")
-            if status == "published":
-                return deepcopy(_decode_json(fields.get("Result"), {}) or {})
-            if status == "superseded":
-                return deepcopy(_decode_json(fields.get("Result"), {}) or {})
+            if status in {"published", "superseded", "finalizing"}:
+                saved_result = _decode_json(fields.get("Result"), {}) or {}
+                if not saved_result:
+                    raise PartIdentityError("SAFARI_IMPORT_FINALIZATION_INCOMPLETE", "The terminal import outcome is missing from its request record.")
+                return self._finish_import_request(request, key=key, actor=str(fields.get("Actor") or actor),
+                    reason=str(fields.get("Reason") or reason), result=saved_result)
+            if status == "applying":
+                actor = str(fields.get("Actor") or actor)
+                reason = str(fields.get("Reason") or reason)
             expected_predecessor = {name: publication_intent.get(name) for name in ("importId", "version", "fingerprint", "requestKey")}
             current_pointer = self._current_pointer()
             import_key = f"safari-master-import:{key}"
@@ -826,7 +877,12 @@ class SafariMasterImportService:
                 observed = self._read_capture()
                 if observed["sourceFingerprint"] != capture.get("sourceFingerprint"):
                     raise PartIdentityError("SAFARI_IMPORT_SOURCE_DRIFT", "The source changed after preview. Start a new import key and preview.")
-                _patch(self.client, "SafariMasterImportRequest", int(request["id"]), {"Status": "applying", "UpdatedAt": grist_datetime(utc_now())})
+                applying_at = grist_datetime(utc_now())
+                applying_fields = {"Status": "applying", "UpdatedAt": applying_at,
+                    "Actor": actor.strip(), "Reason": reason.strip()}
+                _patch(self.client, "SafariMasterImportRequest", int(request["id"]), applying_fields)
+                fields.update(applying_fields)
+                request = {**request, "fields": fields}
             # Once status is applying, all retries use the immutable capture
             # persisted with the original request and do not reread upstream.
             request = _record_by_key(self._rows("SafariMasterImportRequest"), "RequestKey", key) or request
@@ -861,7 +917,8 @@ class SafariMasterImportService:
                     "LatestKGsPerMeterDate": row.get("latestKgPerMeterDate"), "MaterialLatestRate": row.get("materialLatestRate"),
                     "DefaultMaterialRate": row.get("defaultMaterialRate"), "TransportLatestRate": row.get("transportLatestRate"),
                     "TotalRate": row.get("totalRate"), "LatestRateDate": row.get("latestRateDate"), "RateBasis": row.get("rateBasis"),
-                    "SelectedRateLogId": row.get("selectedRateLogId"), "RateLogEvidence": _json(row.get("rateLogEvidence") or []),
+                    "SelectedRateLogId": row.get("selectedRateLogId"), "SelectedRateDateEvidence": _json(row.get("selectedRateDateEvidence") or {}),
+                    "RateLogEvidence": _json(row.get("rateLogEvidence") or []),
                     "Material": row.get("materialId"), "ResolutionStatus": row.get("bindingStatus"),
                     "Fingerprint": row["masterFingerprint"]}
                 material_rows.append(fields_out)
@@ -879,6 +936,7 @@ class SafariMasterImportService:
                     "CurrentUnitRate": row.get("currentUnitRate"), "Freight": row.get("freight"), "Handling": row.get("handling"),
                     "TotalCurrentRate": row.get("totalCurrentRate"), "FreightIncluded": row.get("freightIncluded"),
                     "LastPurchaseDate": row.get("lastPurchaseDate"), "SelectedRateLogId": row.get("selectedRateLogId"),
+                    "SelectedRateDateEvidence": _json(row.get("selectedRateDateEvidence") or {}),
                     "RateLogEvidence": _json(row.get("rateLogEvidence") or []), "Vendor": row.get("vendor"), "Currency": row.get("currency"),
                     "CurrencyEvidence": row.get("currencyEvidence"),
                     "PurchaseItem": row.get("purchaseItemId"), "ResolutionStatus": row.get("resolutionStatus"),
@@ -933,19 +991,28 @@ class SafariMasterImportService:
 
     def _audit(self, key: str, actor: str, result: dict[str, Any], reason: str, *,
                event_type: str = "safari_master_rate_import_published",
-               entity_type: str = "SafariMasterImport") -> None:
+               entity_type: str = "SafariMasterImport", occurred_at: Any = None) -> None:
         rows = self._rows("AuditEvent")
-        if any(str(_fields(row).get("RequestKey") or "") == key for row in rows):
+        existing = next((row for row in rows if str(_fields(row).get("RequestKey") or "") == key), None)
+        if existing:
+            fields = _fields(existing)
+            if (str(fields.get("EventType") or "") != event_type
+                    or str(fields.get("Actor") or "") != actor
+                    or str(fields.get("Reason") or "") != reason
+                    or str(fields.get("RequestFingerprint") or "") != request_fingerprint(result)
+                    or str(fields.get("Payload") or "") != _json(result)):
+                raise PartIdentityError("SAFARI_IMPORT_AUDIT_CONFLICT", "An existing publication audit event does not match the frozen terminal outcome.")
             return
         _create(self.client, "AuditEvent", [{"EventType": event_type, "Actor": actor,
-            "OccurredAt": grist_datetime(utc_now()), "EntityType": entity_type, "EntityId": str(result.get("importId") or result.get("requestKey") or ""),
+            "OccurredAt": occurred_at or grist_datetime(utc_now()), "EntityType": entity_type, "EntityId": str(result.get("importId") or result.get("requestKey") or ""),
             "Reason": reason, "Payload": _json(result), "RequestKey": key, "RequestFingerprint": request_fingerprint(result)}])
 
     def recover(self, request_key: str) -> dict[str, Any]:
         row = self._find_request(request_key.strip())
         fields = _fields(row)
-        if fields.get("Status") == "published":
-            return deepcopy(_decode_json(fields.get("Result"), {}) or {})
+        if fields.get("Status") in {"published", "superseded", "finalizing"}:
+            return self._finish_import_request(row, key=request_key.strip(), actor=str(fields.get("Actor") or "recovery"),
+                reason=str(fields.get("Reason") or "same-key recovery"), result=_decode_json(fields.get("Result"), {}) or {})
         payload = _decode_json(fields.get("Payload"), {}) or {}
         return self.apply(request_key=request_key, expected_fingerprint=str(payload.get("previewFingerprint") or ""),
             actor=str(fields.get("Actor") or "recovery"), reason=str(fields.get("Reason") or "same-key recovery"))
@@ -961,38 +1028,171 @@ def _int_ref(value: Any) -> int | None:
         return None
 
 
-def active_local_import(client: GristClient) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
-    """One batched local read of the active manifest and both current rate tables."""
+_IMPORT_HEADER_COLUMNS = ("ImportKey", "Version", "PredecessorImport", "PredecessorVersion", "SourceDocumentId",
+    "Fingerprint", "Status", "MasterCount", "PurchaseRateCount", "RequestKey")
+
+
+def _filtered_projection(client: Any, table: str, columns: tuple[str, ...] | list[str],
+                         filters: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    if not filters or any(not values for values in filters.values()):
+        return []
+    fetch_projection = getattr(client, "fetch_table_projection", None)
+    if callable(fetch_projection):
+        return fetch_projection(table, list(columns), filters, timeout_ms=8000)
+    # Small deterministic in-memory adapters use this branch. The production
+    # GristClient always issues a filtered, projected SQL query above.
+    result = []
+    for row in client.fetch_table_records_with_ids(table):
+        fields = _fields(row)
+        matched = True
+        for name, values in filters.items():
+            current = row.get("id") if name == "id" else fields.get(name)
+            if isinstance(current, (list, tuple)) and len(current) > 2 and current[0] == "R":
+                current = current[2]
+            if current not in values:
+                matched = False
+                break
+        if matched:
+            result.append({"id": row.get("id"), "fields": {name: fields.get(name) for name in columns}})
+    return result
+
+
+def _cache_scope(client: Any, coordinator_id: str | None, manifest: dict[str, Any]) -> tuple[Any, ...]:
+    coordinator = str(coordinator_id or getattr(client, "safari_coordinator_id", "") or f"adapter:{id(client)}")
+    return (str(getattr(client, "doc_id", "")), coordinator, manifest.get("importId"),
+        manifest.get("version"), manifest.get("fingerprint"))
+
+
+def _cached_import_rows(scope: tuple[Any, ...], table: str, columns: tuple[str, ...],
+                        filters: dict[str, list[Any]]) -> list[dict[str, Any]] | None:
+    key = (*scope, table, columns, tuple((name, tuple(values)) for name, values in sorted(filters.items())))
+    with _LOCAL_IMPORT_CACHE_LOCK:
+        for old in list(_LOCAL_IMPORT_CACHE):
+            if old[0:2] == scope[0:2] and old[2:5] != scope[2:5]:
+                del _LOCAL_IMPORT_CACHE[old]
+        found = _LOCAL_IMPORT_CACHE.get(key)
+        if found is None:
+            return None
+        _LOCAL_IMPORT_CACHE.move_to_end(key)
+        return deepcopy(found)
+
+
+def _store_import_rows(scope: tuple[Any, ...], table: str, columns: tuple[str, ...],
+                       filters: dict[str, list[Any]], rows: list[dict[str, Any]]) -> None:
+    key = (*scope, table, columns, tuple((name, tuple(values)) for name, values in sorted(filters.items())))
+    with _LOCAL_IMPORT_CACHE_LOCK:
+        for old in list(_LOCAL_IMPORT_CACHE):
+            if old[0:2] == scope[0:2] and old[2:5] != scope[2:5]:
+                del _LOCAL_IMPORT_CACHE[old]
+        _LOCAL_IMPORT_CACHE[key] = deepcopy(rows)
+        _LOCAL_IMPORT_CACHE.move_to_end(key)
+        while len(_LOCAL_IMPORT_CACHE) > _LOCAL_IMPORT_CACHE_LIMIT:
+            _LOCAL_IMPORT_CACHE.popitem(last=False)
+
+
+def _local_import_control(client: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     controls = client.fetch_table_records_with_ids("SafariMasterImportControl")
     active = _record_by_key(controls, "ControlKey", "active")
     if not active:
-        return None, [], []
-    import_id = _int_ref(_fields(active).get("ActiveImport"))
+        return None, None, None
+    control_fields = _fields(active)
+    import_id = _int_ref(control_fields.get("ActiveImport"))
     if not import_id:
         raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The local current-rate pointer is incomplete.")
-    material_rows = client.fetch_table_records_with_ids("SafariMasterImportMaterial")
-    purchase_rows = client.fetch_table_records_with_ids("SafariMasterImportPurchase")
-    material_rows = [row for row in material_rows if _int_ref(_fields(row).get("Import")) == import_id]
-    purchase_rows = [row for row in purchase_rows if _int_ref(_fields(row).get("Import")) == import_id]
-    header = next((row for row in client.fetch_table_records_with_ids("SafariMasterImport") if int(row.get("id", -1)) == import_id), None)
-    if not header or _fields(header).get("Status") != "published":
-        raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current import version is not completely published.")
-    expected = int(_fields(header).get("MasterCount") or 0), int(_fields(header).get("PurchaseRateCount") or 0)
-    if expected[0] != len(material_rows) or expected[1] > len(purchase_rows):
-        raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current local import version is incomplete.")
-    manifest = {"importId": import_id, "version": _fields(active).get("Version"),
-        "fingerprint": _fields(active).get("Fingerprint"), "sourceFingerprint": _fields(header).get("Fingerprint"),
-        "sourceDocumentId": _fields(header).get("SourceDocumentId")}
-    return manifest, material_rows, purchase_rows
+    pointer = {"importId": import_id, "version": control_fields.get("Version"),
+        "fingerprint": str(control_fields.get("Fingerprint") or ""),
+        "requestKey": str(control_fields.get("RequestKey") or "")}
+    header_rows = _filtered_projection(client, "SafariMasterImport", _IMPORT_HEADER_COLUMNS, {"id": [import_id]})
+    header = header_rows[0] if len(header_rows) == 1 else None
+    header_fields = _fields(header) if header else None
+    if (not header_fields or str(header_fields.get("Status") or "") != "published"
+            or int(header_fields.get("Version") or 0) != int(pointer.get("version") or 0)
+            or (pointer["requestKey"] and str(header_fields.get("RequestKey") or "") != pointer["requestKey"])):
+        raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The local current-rate pointer does not identify one fully published import header.")
+    manifest = {**pointer, "sourceFingerprint": str(header_fields.get("Fingerprint") or ""),
+        "sourceDocumentId": str(header_fields.get("SourceDocumentId") or ""),
+        "predecessorImport": _int_ref(header_fields.get("PredecessorImport")),
+        "predecessorVersion": int(header_fields.get("PredecessorVersion") or 0),
+        "masterCount": int(header_fields.get("MasterCount") or 0),
+        "purchaseRateCount": int(header_fields.get("PurchaseRateCount") or 0)}
+    return active, header, manifest
 
 
-def load_local_material_weight_catalog(client: GristClient | None = None) -> dict[str, Any]:
+def current_local_import_rows(client: Any, *, coordinator_id: str | None = None,
+                              material_columns: tuple[str, ...] = MATERIAL_COST_COLUMNS,
+                              purchase_columns: tuple[str, ...] | None = None,
+                              purchase_item_ids: list[int] | None = None) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read one coherent immutable import generation using current-keyed local projections.
+
+    A small pointer/header read brackets the projected data reads. Cache entries
+    are scoped to document, writer coordinator, import id/version and fingerprint.
+    The optional PurchaseItem filter keeps Live Cost proportional to its current BOM.
+    """
+    if purchase_columns is None:
+        purchase_columns = PURCHASE_COST_COLUMNS
+    for _ in range(2):
+        active, header, manifest = _local_import_control(client)
+        if manifest is None:
+            return None, [], []
+        scope = _cache_scope(client, coordinator_id, manifest)
+        material_filters = {"Import": [manifest["importId"]]}
+        material_rows = _cached_import_rows(scope, "SafariMasterImportMaterial", material_columns, material_filters)
+        if material_rows is None:
+            material_rows = _filtered_projection(client, "SafariMasterImportMaterial", material_columns, material_filters)
+        if len(material_rows) != manifest["masterCount"]:
+            raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current local material generation is incomplete.")
+
+        purchase_rows: list[dict[str, Any]] = []
+        purchase_filters = {"Import": [manifest["importId"]]}
+        if purchase_item_ids is not None:
+            purchase_ids = sorted({int(value) for value in purchase_item_ids if int(value) > 0})
+            if purchase_ids:
+                purchase_filters["PurchaseItem"] = purchase_ids
+            else:
+                purchase_filters = {}
+        if purchase_filters:
+            cached_purchases = _cached_import_rows(scope, "SafariMasterImportPurchase", purchase_columns, purchase_filters)
+            if cached_purchases is None:
+                purchase_rows = _filtered_projection(client, "SafariMasterImportPurchase", purchase_columns, purchase_filters)
+            else:
+                purchase_rows = cached_purchases
+            if purchase_item_ids is None and manifest["purchaseRateCount"] > len(purchase_rows):
+                raise PartIdentityError("SAFARI_IMPORT_POINTER_INVALID", "The current local purchase generation is incomplete.")
+            observed_by_item: dict[int, int] = {}
+            for row in purchase_rows:
+                item_id = _int_ref(_fields(row).get("PurchaseItem"))
+                if item_id:
+                    observed_by_item[item_id] = observed_by_item.get(item_id, 0) + 1
+            if any(count > 1 for count in observed_by_item.values()):
+                raise PartIdentityError("SAFARI_IMPORT_PURCHASE_IDENTITY_CONFLICT", "A current PurchaseItem resolves to multiple imported source masters.")
+
+        _, _, current = _local_import_control(client)
+        if current is not None and all(current.get(name) == manifest.get(name)
+                for name in ("importId", "version", "fingerprint", "requestKey")):
+            _store_import_rows(scope, "SafariMasterImportMaterial", material_columns, material_filters, material_rows)
+            if purchase_filters:
+                _store_import_rows(scope, "SafariMasterImportPurchase", purchase_columns, purchase_filters, purchase_rows)
+            return manifest, deepcopy(material_rows), deepcopy(purchase_rows)
+    raise PartIdentityError("SAFARI_IMPORT_POINTER_CHANGED", "The current import generation changed while local costing inputs were being read; retry the calculation.")
+
+
+def active_local_import(client: GristClient) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read all current-generation facts for explicit import/recovery tooling."""
+    material_columns = tuple(dict.fromkeys((*MATERIAL_COST_COLUMNS, "RateLogEvidence")))
+    purchase_columns = tuple(dict.fromkeys((*PURCHASE_COST_COLUMNS, "RateLogEvidence")))
+    return current_local_import_rows(client, material_columns=material_columns, purchase_columns=purchase_columns)
+
+
+def load_local_material_weight_catalog(client: GristClient | None = None, *, coordinator_id: str | None = None) -> dict[str, Any]:
     """Ordinary Part option/factor readers resolve only published local rows."""
     client = client or GristClient.from_safari_environment()
-    manifest, materials, _ = active_local_import(client)
+    manifest, materials, _ = current_local_import_rows(client, coordinator_id=coordinator_id, material_columns=MATERIAL_WEIGHT_COLUMNS,
+        purchase_item_ids=[])
     if manifest is None:
         return {"status": "unavailable", "source": "Safari-local-import", "records": [], "message": "Run the explicit one-time Safari master import before selecting imported materials."}
-    local = {int(row.get("id", -1)): _fields(row) for row in client.fetch_table_records_with_ids("Material")}
+    material_ids = sorted({_int_ref(_fields(row).get("Material")) for row in materials} - {None})
+    local_rows = _filtered_projection(client, "Material", ("CanonicalName",), {"id": material_ids}) if material_ids else []
+    local = {int(row.get("id", -1)): _fields(row) for row in local_rows}
     _, conflicts = _unique_material_rows(materials)
     records = []
     for row in materials:
@@ -1013,13 +1213,16 @@ def load_local_material_weight_catalog(client: GristClient | None = None) -> dic
         "readOnly": True, "localManifest": manifest, "records": records}
 
 
-def load_local_interim_rates(names: list[str], client: GristClient | None = None) -> dict[str, Any]:
+def load_local_interim_rates(names: list[str], client: GristClient | None = None, *, coordinator_id: str | None = None) -> dict[str, Any]:
     client = client or GristClient.from_safari_environment()
-    manifest, rows, _ = active_local_import(client)
+    manifest, rows, _ = current_local_import_rows(client, coordinator_id=coordinator_id, material_columns=MATERIAL_COST_COLUMNS,
+        purchase_item_ids=[])
     if manifest is None:
         return {"status": "unavailable", "source": "Safari-local-import", "rows": [], "sourceDocumentId": ""}
     wanted = {str(name).strip().casefold() for name in names}
-    local = {int(row.get("id", -1)): _fields(row) for row in client.fetch_table_records_with_ids("Material")}
+    material_ids = sorted({_int_ref(_fields(row).get("Material")) for row in rows} - {None})
+    local_rows = _filtered_projection(client, "Material", ("CanonicalName",), {"id": material_ids}) if material_ids else []
+    local = {int(row.get("id", -1)): _fields(row) for row in local_rows}
     output = []
     chosen, conflicts = _unique_material_rows(rows)
     groups: dict[int, list[dict[str, Any]]] = {}
@@ -1044,13 +1247,9 @@ def load_local_interim_rates(names: list[str], client: GristClient | None = None
         row = chosen[material_id]
         fields = _fields(row)
         rate = _num(fields.get("MaterialLatestRate")) if fields.get("RateBasis") == "MaterialLatestRate" else _num(fields.get("DefaultMaterialRate"))
-        rate_log_rows = _decode_json(fields.get("RateLogEvidence"), []) or []
-        selected = next((item.get("fields", {}) for item in rate_log_rows
-            if str(item.get("id")) == str(fields.get("SelectedRateLogId"))), {})
-        if selected:
-            from app.cost_dates import cost_date_evidence
-            date_evidence = cost_date_evidence(selected, source_kind="rate_log")
-        else:
+        rate_log_rows = []
+        date_evidence = _decode_json(fields.get("SelectedRateDateEvidence"), {}) or {}
+        if not date_evidence:
             from app.cost_dates import cost_date_evidence
             date_evidence = cost_date_evidence({"LatestRateDate": fields.get("LatestRateDate")}, source_kind="rate_master")
         output.append({"material": str(material.get("CanonicalName") or fields.get("CanonicalName") or ""),

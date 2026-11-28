@@ -172,6 +172,12 @@ class LiveCostTests(unittest.TestCase):
             if row["fields"].get("Material") == ["R", "Material", material_id])
         self.client.update_table_records("SafariMasterImportMaterial", [{"id": row["id"], "fields": {"KGsPerMeter": kgm,
             "Fingerprint": f"test-material:{material_id}:kgm:{kgm}"}}])
+        # This fixture deliberately mutates a current import row in place to
+        # probe the costing arithmetic. Production updates publish a new
+        # pointer/version, which naturally invalidates the version-keyed cache.
+        from app.safari_master_import import _LOCAL_IMPORT_CACHE, _LOCAL_IMPORT_CACHE_LOCK
+        with _LOCAL_IMPORT_CACHE_LOCK:
+            _LOCAL_IMPORT_CACHE.clear()
 
     def purchase(self, tx, key, when, amount):
         return self.features.capture_purchase(part_id=self.purchased["id"], specification_id=self.spec_id, mapping_id=self.mapping_id,
@@ -635,6 +641,9 @@ class LiveCostTests(unittest.TestCase):
             "RateBasis": "MaterialLatestRate", "ResolutionStatus": "identity_conflict", "Fingerprint": "conflicting-source-master"}}])
         self.client.update_table_records("SafariMasterImport", [{"id": 900, "fields": {
             "MasterCount": len(self.client.tables["SafariMasterImportMaterial"])}}])
+        from app.safari_master_import import _LOCAL_IMPORT_CACHE, _LOCAL_IMPORT_CACHE_LOCK
+        with _LOCAL_IMPORT_CACHE_LOCK:
+            _LOCAL_IMPORT_CACHE.clear()
         conflicted = self.service.live_cost(100)
         self.assertIn("MATERIAL_MASTER_IDENTITY_CONFLICT", {warning["code"] for warning in conflicted["warnings"]})
         self.assertNotIn("Legacy four pieces", {line["description"] for line in conflicted["lines"]})

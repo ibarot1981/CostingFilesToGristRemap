@@ -357,6 +357,9 @@ class Phase0Tests(unittest.TestCase):
                     or table["id"] == "PartPurchaseSpecification" and column["id"] == "SpecificationIdentity"
                     or table["id"] == "ConfigurationPartSelection" and column["id"] == "PartRevision"
                     or table["id"] == "CostingConfigurationRevision" and column["id"] in {"ChangeRequest", "PublicationCause"}
+                    or table["id"] == "SafariMasterImportMaterial" and column["id"] == "SelectedRateDateEvidence"
+                    or table["id"] == "SafariMasterImportPurchase" and column["id"] == "SelectedRateDateEvidence"
+                    or table["id"] == "SafariMasterImportRequest" and column["id"] == "FinalizedAt"
                 )
             ]}
             for table in FOUNDATION_TABLES
@@ -364,7 +367,7 @@ class Phase0Tests(unittest.TestCase):
 
         plan = plan_schema(client, "safari-doc", workspace_id="ws1")
 
-        self.assertEqual(SCHEMA_VERSION, "safari-one-time-master-rates-grist-2026-11-25.v22")
+        self.assertEqual(SCHEMA_VERSION, "safari-one-time-master-rates-grist-2026-11-25.v23")
         self.assertEqual(plan.create_tables, ())
         self.assertEqual(plan.update_columns, ())
         additions = {item["tableId"]: item["columns"] for item in plan.add_columns}
@@ -384,6 +387,9 @@ class Phase0Tests(unittest.TestCase):
             "PartPurchaseSpecification": [{"id": "SpecificationIdentity", "type": "Text"}],
             "ConfigurationPartSelection": [{"id": "PartRevision", "type": "Ref:PartRevision"}],
             "CostingConfigurationRevision": [{"id": "ChangeRequest", "type": "Ref:PartEngineeringChangeRequest"}, {"id": "PublicationCause", "type": "Text"}],
+            "SafariMasterImportMaterial": [{"id": "SelectedRateDateEvidence", "type": "Any"}],
+            "SafariMasterImportPurchase": [{"id": "SelectedRateDateEvidence", "type": "Any"}],
+            "SafariMasterImportRequest": [{"id": "FinalizedAt", "type": "DateTime"}],
         })
         self.assertEqual(client.writes, [])
 
@@ -393,7 +399,9 @@ class Phase0Tests(unittest.TestCase):
         new_columns = {"PartRevision": {"PreviousRevision", "ChangeRequest", "PublicationCause", "Actor", "Reason", "OccurredAt"},
             "PartRevisionLine": {"ProvenanceType", "ProvenanceEvidence"}, "PartComponentRevision": {"ComponentIdentity"},
             "PartPurchaseSpecification": {"SpecificationIdentity"}, "ConfigurationPartSelection": {"PartRevision"},
-            "CostingConfigurationRevision": {"ChangeRequest", "PublicationCause"}}
+            "CostingConfigurationRevision": {"ChangeRequest", "PublicationCause"},
+            "SafariMasterImportMaterial": {"SelectedRateDateEvidence"}, "SafariMasterImportPurchase": {"SelectedRateDateEvidence"},
+            "SafariMasterImportRequest": {"FinalizedAt"}}
         client.list_tables = lambda document_id: [
             {"id": table["id"], "columns": [
                 {"id": column["id"], "fields": {"type": column["type"]}}
